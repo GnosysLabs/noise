@@ -1,0 +1,347 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0CE1677BFA5E9A5D40E20EAE /* NoiseApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE2BB8365DD3BA21E7A690EA /* NoiseApp.swift */; };
+		349173BED20D2C2D326B5F87 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C17EB0E84A15F82926884511 /* AppModel.swift */; };
+		607B14218DE7980F40185E87 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71171305D97CD33A9B2C1E46 /* ContentView.swift */; };
+		F103D023117074BE23D79C76 /* NoiseBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 427B5DA5956778268F2225CA /* NoiseBridge.swift */; };
+		FA6539075EAB84723023D272 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7182108D7A54F4CB6AB7E767 /* Models.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		1423EB4A837729C4730AC04D /* Noise-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Noise-Bridging-Header.h"; sourceTree = "<group>"; };
+		427B5DA5956778268F2225CA /* NoiseBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NoiseBridge.swift; sourceTree = "<group>"; };
+		71171305D97CD33A9B2C1E46 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		7182108D7A54F4CB6AB7E767 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		957648EC3A16BFB5E08410B9 /* Noise.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Noise.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		BE2BB8365DD3BA21E7A690EA /* NoiseApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NoiseApp.swift; sourceTree = "<group>"; };
+		C17EB0E84A15F82926884511 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		045BF6ED0F3074C4B4A01A41 /* Noise */ = {
+			isa = PBXGroup;
+			children = (
+				C17EB0E84A15F82926884511 /* AppModel.swift */,
+				71171305D97CD33A9B2C1E46 /* ContentView.swift */,
+				7182108D7A54F4CB6AB7E767 /* Models.swift */,
+				BE2BB8365DD3BA21E7A690EA /* NoiseApp.swift */,
+				427B5DA5956778268F2225CA /* NoiseBridge.swift */,
+				BA54DCDDDC7E0122DC0A5061 /* Bridge */,
+			);
+			path = Noise;
+			sourceTree = "<group>";
+		};
+		8EAE0406B63555405E94FA73 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				957648EC3A16BFB5E08410B9 /* Noise.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		B14BE08AF94248B78803095B = {
+			isa = PBXGroup;
+			children = (
+				045BF6ED0F3074C4B4A01A41 /* Noise */,
+				8EAE0406B63555405E94FA73 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		BA54DCDDDC7E0122DC0A5061 /* Bridge */ = {
+			isa = PBXGroup;
+			children = (
+				1423EB4A837729C4730AC04D /* Noise-Bridging-Header.h */,
+			);
+			path = Bridge;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		917818A13E5CF04D10DCCA2E /* Noise */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D7278D2EC3C668AD347953E3 /* Build configuration list for PBXNativeTarget "Noise" */;
+			buildPhases = (
+				00C498166F90191A644FF572 /* Build shared Noise core */,
+				2E06567A6D45E18E5F5DB015 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Noise;
+			packageProductDependencies = (
+			);
+			productName = Noise;
+			productReference = 957648EC3A16BFB5E08410B9 /* Noise.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		34E55871C0A5E9B5BCBDB934 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+				};
+			};
+			buildConfigurationList = FEC345090276DA0295C4BD53 /* Build configuration list for PBXProject "Noise" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = B14BE08AF94248B78803095B;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 8EAE0406B63555405E94FA73 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				917818A13E5CF04D10DCCA2E /* Noise */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		00C498166F90191A644FF572 /* Build shared Noise core */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build shared Noise core";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\ncd \"$SRCROOT/../..\"\ncargo build -p noise-ffi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		2E06567A6D45E18E5F5DB015 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				349173BED20D2C2D326B5F87 /* AppModel.swift in Sources */,
+				607B14218DE7980F40185E87 /* ContentView.swift in Sources */,
+				FA6539075EAB84723023D272 /* Models.swift in Sources */,
+				0CE1677BFA5E9A5D40E20EAE /* NoiseApp.swift in Sources */,
+				F103D023117074BE23D79C76 /* NoiseBridge.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		01212559A29F4AEC7F7AD8D7 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "-";
+				COMBINE_HIDPI_IMAGES = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = noise;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.social-networking";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/../../target/debug";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				OTHER_LDFLAGS = "$(inherited) -lnoise_ffi -framework Security -framework SystemConfiguration";
+				PRODUCT_BUNDLE_IDENTIFIER = xyz.gnosyslabs.noise;
+				PRODUCT_NAME = noise;
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/Noise/Bridge/Noise-Bridging-Header.h";
+			};
+			name = Release;
+		};
+		295AFA10323B9AB3C9E64FB6 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_STRICT_CONCURRENCY = minimal;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		8621C559B00B5AC5B0CFD607 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_STRICT_CONCURRENCY = minimal;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		CE7A8914464C5CEB7431B12E /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "-";
+				COMBINE_HIDPI_IMAGES = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = noise;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.social-networking";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/../../target/debug";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				OTHER_LDFLAGS = "$(inherited) -lnoise_ffi -framework Security -framework SystemConfiguration";
+				PRODUCT_BUNDLE_IDENTIFIER = xyz.gnosyslabs.noise;
+				PRODUCT_NAME = noise;
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/Noise/Bridge/Noise-Bridging-Header.h";
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		D7278D2EC3C668AD347953E3 /* Build configuration list for PBXNativeTarget "Noise" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				CE7A8914464C5CEB7431B12E /* Debug */,
+				01212559A29F4AEC7F7AD8D7 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		FEC345090276DA0295C4BD53 /* Build configuration list for PBXProject "Noise" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				8621C559B00B5AC5B0CFD607 /* Debug */,
+				295AFA10323B9AB3C9E64FB6 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 34E55871C0A5E9B5BCBDB934 /* Project object */;
+}

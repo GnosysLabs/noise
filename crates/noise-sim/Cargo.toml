@@ -1,0 +1,10 @@
+[package]
+name = "noise-sim"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+noise-core = { path = "../noise-core" }
+serde_json.workspace = true

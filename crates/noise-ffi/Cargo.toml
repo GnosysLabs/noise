@@ -1,0 +1,13 @@
+[package]
+name = "noise-ffi"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+noise-client = { path = "../noise-client" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

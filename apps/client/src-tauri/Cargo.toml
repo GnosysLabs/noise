@@ -1,0 +1,13 @@
+[package]
+name = "noise-desktop"
+version.workspace = true
+edition.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+dirs = "6"
+noise-ffi = { path = "../../../crates/noise-ffi" }
+serde_json.workspace = true
+tauri = { version = "2", features = [] }

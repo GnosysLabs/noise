@@ -1,0 +1,14 @@
+/target
+/.noise
+*.local.json
+.DS_Store
+.env
+.env.*
+!.env.example
+node_modules/
+dist/
+/apps/macos/.derived
+/apps/macos/DerivedData
+/apps/client/src-tauri/gen
+xcuserdata/
+*.xcuserstate
