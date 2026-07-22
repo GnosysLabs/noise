@@ -158,6 +158,8 @@ pub struct GroupProfile {
     #[serde(default)]
     pub description: String,
     #[serde(default)]
+    pub rules: String,
+    #[serde(default)]
     pub avatar: Option<ProfileImage>,
 }
 
@@ -167,6 +169,8 @@ pub struct GroupMembership {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub rules: String,
     #[serde(default)]
     pub avatar: Option<ProfileImage>,
     #[serde(default)]
@@ -184,6 +188,7 @@ impl GroupMembership {
             group_id: blake3::hash(&random_id).to_hex().to_string(),
             name: name.into(),
             description: String::new(),
+            rules: String::new(),
             avatar: None,
             owner_public_key: String::new(),
             authority_nonce_base64: String::new(),
@@ -199,6 +204,7 @@ impl GroupMembership {
             group_id: authoritative_group_id(&owner_public_key, &authority_nonce),
             name: name.into(),
             description: String::new(),
+            rules: String::new(),
             avatar: None,
             owner_public_key,
             authority_nonce_base64: STANDARD_NO_PAD.encode(authority_nonce),
@@ -210,6 +216,7 @@ impl GroupMembership {
         GroupProfile {
             name: self.name.clone(),
             description: self.description.clone(),
+            rules: self.rules.clone(),
             avatar: self.avatar.clone(),
         }
     }
@@ -776,6 +783,7 @@ fn valid_group_profile(profile: &GroupProfile) -> bool {
     name_length > 0
         && name_length <= 80
         && profile.description.chars().count() <= 200
+        && profile.rules.chars().count() <= 4000
         && profile
             .avatar
             .as_ref()

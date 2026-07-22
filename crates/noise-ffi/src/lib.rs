@@ -36,6 +36,8 @@ enum Request {
         state_path: String,
         name: String,
         description: String,
+        #[serde(default)]
+        rules: String,
         avatar_data_base64: Option<String>,
         avatar_mime_type: Option<String>,
         remove_avatar: bool,
@@ -64,6 +66,11 @@ enum Request {
     },
     Conversation {
         state_path: String,
+        relays: Vec<String>,
+    },
+    WatchGroup {
+        state_path: String,
+        since: Option<u64>,
         relays: Vec<String>,
     },
     Leave {
@@ -149,6 +156,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             state_path,
             name,
             description,
+            rules,
             avatar_data_base64,
             avatar_mime_type,
             remove_avatar,
@@ -159,6 +167,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                     state_path,
                     name,
                     description,
+                    rules,
                     avatar_data_base64,
                     avatar_mime_type,
                     remove_avatar,
@@ -214,6 +223,16 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         Request::Conversation { state_path, relays } => serde_json::to_value(
             runtime()?
                 .block_on(client.conversation(state_path, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::WatchGroup {
+            state_path,
+            since,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.watch_group(state_path, since, relays))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),

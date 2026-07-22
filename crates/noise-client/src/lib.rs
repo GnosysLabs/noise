@@ -29,7 +29,7 @@ impl Default for NoiseClient {
         Self {
             http: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(20))
+                .timeout(std::time::Duration::from_secs(40))
                 .build()
                 .expect("Noise HTTP configuration is valid"),
         }
@@ -49,6 +49,7 @@ pub struct GroupSummary {
     pub group_id: String,
     pub name: String,
     pub description: String,
+    pub rules: String,
     pub avatar: Option<ProfileImage>,
     pub owner_public_key: String,
     pub remote_deletion_supported: bool,
@@ -98,6 +99,12 @@ pub struct Conversation {
     pub members: Vec<MemberSummary>,
     pub messages: Vec<MessageSummary>,
     pub rejected_events: usize,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct GroupWatch {
+    pub revision: u64,
+    pub changed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -166,6 +173,7 @@ impl ClientState {
                     group_id: group.group_id.clone(),
                     name: group.name.clone(),
                     description: group.description.clone(),
+                    rules: group.rules.clone(),
                     avatar: group.avatar.clone(),
                     owner_public_key: group.owner_public_key.clone(),
                     remote_deletion_supported: !group.authority_nonce_base64.is_empty(),
@@ -222,6 +230,39 @@ impl NoiseClient {
         state.active_group_id = Some(group_id.to_owned());
         save_state(path, &state)?;
         state.summary()
+    }
+
+    pub async fn watch_group(
+        &self,
+        path: impl AsRef<Path>,
+        since: Option<u64>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<GroupWatch> {
+        let state = load_state(path.as_ref())?;
+        let group = state.active_group()?;
+        let relays = relay_list(relays)?;
+        let revision = since
+            .map(|revision| revision.to_string())
+            .unwrap_or_else(|| "initial".to_owned());
+        let endpoint = format!("/v1/groups/{}/watch/{revision}", group.group_id);
+
+        for index in 0..relays.len() {
+            let Ok(response) = self
+                .relay_request(&relays, index, "GET", &endpoint, &[])
+                .await
+            else {
+                continue;
+            };
+            if response.status == 410 {
+                bail!("group has been deleted")
+            }
+            if (200..300).contains(&response.status)
+                && let Ok(change) = serde_json::from_slice::<GroupWatch>(&response.body)
+            {
+                return Ok(change);
+            }
+        }
+        bail!("no relay could hold the group watch")
     }
 
     pub async fn update_profile(
@@ -285,6 +326,7 @@ impl NoiseClient {
         path: impl AsRef<Path>,
         name: impl Into<String>,
         description: impl Into<String>,
+        rules: impl Into<String>,
         avatar_data_base64: Option<String>,
         avatar_mime_type: Option<String>,
         remove_avatar: bool,
@@ -294,11 +336,15 @@ impl NoiseClient {
         let mut state = load_state(path)?;
         let name = name.into().trim().to_owned();
         let description = description.into().trim().to_owned();
+        let rules = rules.into().trim().to_owned();
         if name.is_empty() || name.chars().count() > 80 {
             bail!("group names must contain between 1 and 80 characters")
         }
         if description.chars().count() > 200 {
             bail!("group descriptions can contain at most 200 characters")
+        }
+        if rules.chars().count() > 4000 {
+            bail!("group rules can contain at most 4000 characters")
         }
         let relays = relay_list(relays)?;
         let group_id = state.active_group()?.group_id.clone();
@@ -346,6 +392,7 @@ impl NoiseClient {
 
         state.groups[group_index].name = name.clone();
         state.groups[group_index].description = description.clone();
+        state.groups[group_index].rules = rules.clone();
         state.groups[group_index].avatar = avatar.clone();
         if state.groups[group_index].owner_public_key.is_empty()
             && let Some(owner) = view.owner_public_key
@@ -360,6 +407,7 @@ impl NoiseClient {
             &GroupProfile {
                 name,
                 description,
+                rules,
                 avatar,
             },
             sequence,
@@ -446,6 +494,7 @@ impl NoiseClient {
                 group_id: group.group_id,
                 name: group.name,
                 description: group.description,
+                rules: group.rules,
                 avatar: group.avatar,
                 owner_public_key: group.owner_public_key,
                 remote_deletion_supported: !group.authority_nonce_base64.is_empty(),
@@ -483,6 +532,7 @@ impl NoiseClient {
                 group_id: group.group_id,
                 name: group.name,
                 description: group.description,
+                rules: group.rules,
                 avatar: group.avatar,
                 owner_public_key: group.owner_public_key,
                 remote_deletion_supported: !group.authority_nonce_base64.is_empty(),
@@ -595,11 +645,13 @@ impl NoiseClient {
         let resolved_profile = view.profile.clone();
         if state.groups[group_index].name != resolved_profile.name
             || state.groups[group_index].description != resolved_profile.description
+            || state.groups[group_index].rules != resolved_profile.rules
             || state.groups[group_index].avatar != resolved_profile.avatar
             || state.groups[group_index].owner_public_key != resolved_owner
         {
             state.groups[group_index].name = resolved_profile.name.clone();
             state.groups[group_index].description = resolved_profile.description.clone();
+            state.groups[group_index].rules = resolved_profile.rules.clone();
             state.groups[group_index].avatar = resolved_profile.avatar.clone();
             state.groups[group_index].owner_public_key = resolved_owner.clone();
             save_state(path, &state)?;
@@ -620,6 +672,7 @@ impl NoiseClient {
                 group_id: group.group_id.clone(),
                 name: resolved_profile.name,
                 description: resolved_profile.description,
+                rules: resolved_profile.rules,
                 avatar: resolved_profile.avatar,
                 owner_public_key: resolved_owner,
                 remote_deletion_supported: !group.authority_nonce_base64.is_empty(),

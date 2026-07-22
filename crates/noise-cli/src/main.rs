@@ -53,6 +53,15 @@ enum Command {
         #[arg(long)]
         relay: Vec<String>,
     },
+    /// Wait privately until the active group's revision changes.
+    Watch {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        since: Option<u64>,
+        #[arg(long)]
+        relay: Vec<String>,
+    },
     /// Display membership reconstructed from signed group events.
     Members {
         #[arg(long)]
@@ -68,6 +77,8 @@ enum Command {
         name: String,
         #[arg(long, default_value = "")]
         description: String,
+        #[arg(long, default_value = "")]
+        rules: String,
         #[arg(long)]
         relay: Vec<String>,
     },
@@ -136,6 +147,14 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        Command::Watch {
+            state,
+            since,
+            relay,
+        } => {
+            let change = client.watch_group(state, since, relay).await?;
+            println!("{} {}", change.revision, change.changed);
+        }
         Command::Members { state, relay } => {
             let conversation = client.conversation(state, relay).await?;
             println!("{}", member_count(conversation.members.len()));
@@ -153,10 +172,20 @@ async fn main() -> anyhow::Result<()> {
             state,
             name,
             description,
+            rules,
             relay,
         } => {
             client
-                .update_group_profile(&state, name, description, None, None, false, relay.clone())
+                .update_group_profile(
+                    &state,
+                    name,
+                    description,
+                    rules,
+                    None,
+                    None,
+                    false,
+                    relay.clone(),
+                )
                 .await?;
             let conversation = client.conversation(state, relay).await?;
             println!(

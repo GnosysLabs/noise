@@ -7,10 +7,9 @@ import {
   LoaderCircle,
   Plus,
   Radio,
-  RefreshCw,
+  ScrollText,
   Settings2,
   Trash2,
-  Users,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -20,6 +19,7 @@ import type {
   AvatarData,
   Conversation,
   GroupSummary,
+  GroupWatch,
   IdentitySummary,
   LocalSummary,
   MakeResult,
@@ -34,8 +34,8 @@ type Dialog =
   | { type: "frequency"; group: string; frequency: string }
   | { type: "profile"; profile: IdentitySummary }
   | { type: "group"; group: GroupSummary }
+  | { type: "rules"; group: GroupSummary }
   | { type: "delete_group"; group: GroupSummary }
-  | { type: "members"; members: MemberSummary[] }
   | { type: "person"; person: Pick<MemberSummary, "username" | "bio" | "avatar"> };
 
 const avatarCache = new Map<string, string>();
@@ -47,6 +47,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const refreshGeneration = useRef(0);
   const [groupMenu, setGroupMenu] = useState<{
     group: GroupSummary;
     x: number;
@@ -54,16 +55,17 @@ export default function App() {
   } | null>(null);
 
   const refresh = useCallback(async () => {
+    const generation = ++refreshGeneration.current;
     const local = await noise<LocalSummary>({ action: "status" });
-    setSummary(local);
+    let nextConversation: Conversation | null = null;
+    let reconciled = local;
     if (local?.groups.some((group) => group.is_active)) {
-      const next = await noise<Conversation>({ action: "conversation", relays });
-      setConversation(next);
-      const reconciled = await noise<LocalSummary>({ action: "status" });
-      setSummary(reconciled);
-    } else {
-      setConversation(null);
+      nextConversation = await noise<Conversation>({ action: "conversation", relays });
+      reconciled = await noise<LocalSummary>({ action: "status" });
     }
+    if (generation !== refreshGeneration.current) return;
+    setSummary(reconciled);
+    setConversation(nextConversation);
   }, []);
 
   useEffect(() => {
@@ -75,6 +77,34 @@ export default function App() {
       .catch((cause) => setError(message(cause)))
       .finally(() => setLoading(false));
   }, [refresh]);
+
+  const activeGroupId = summary?.groups.find((group) => group.is_active)?.group_id ?? null;
+  useEffect(() => {
+    if (!isTauri || !activeGroupId) return;
+    let stopped = false;
+    const watch = async () => {
+      let revision: number | null = null;
+      while (!stopped) {
+        try {
+          const initial = revision === null;
+          const change: GroupWatch | null = await noise<GroupWatch>({
+            action: "watch_group",
+            since: revision,
+            relays,
+          });
+          if (stopped || !change) return;
+          revision = change.revision;
+          if (initial || change.changed) await refresh();
+        } catch {
+          await new Promise((resolve) => window.setTimeout(resolve, 1500));
+        }
+      }
+    };
+    void watch();
+    return () => {
+      stopped = true;
+    };
+  }, [activeGroupId, refresh]);
 
   async function perform(operation: () => Promise<void>) {
     if (busy) return false;
@@ -136,10 +166,10 @@ export default function App() {
           <ConversationPanel
             conversation={conversation}
             busy={busy}
+            canEditGroup={conversation.group.owner_public_key === summary.identity.public_key}
             onGroup={() => setDialog({ type: "group", group: conversation.group })}
-            onMembers={() => setDialog({ type: "members", members: conversation.members })}
+            onRules={() => setDialog({ type: "rules", group: conversation.group })}
             onPerson={(person) => setDialog({ type: "person", person })}
-            onRefresh={() => void perform(refresh)}
             onSend={(text) =>
               perform(async () => {
                 await noise<null>({ action: "say", text, relays });
@@ -234,9 +264,35 @@ export default function App() {
                 action: "update_group_profile",
                 name,
                 description,
+                rules: dialog.group.rules,
                 avatar_data_base64: avatar,
                 avatar_mime_type: avatar ? "image/jpeg" : null,
                 remove_avatar: removeAvatar,
+                relays,
+              });
+              setSummary(local);
+              await refresh();
+              setDialog(null);
+            })
+          }
+        />
+      )}
+      {dialog?.type === "rules" && (
+        <RulesDialog
+          group={dialog.group}
+          canEdit={dialog.group.owner_public_key === summary.identity.public_key}
+          busy={busy}
+          onClose={() => setDialog(null)}
+          onSave={(rules) =>
+            perform(async () => {
+              const local = await noise<LocalSummary>({
+                action: "update_group_profile",
+                name: dialog.group.name,
+                description: dialog.group.description,
+                rules,
+                avatar_data_base64: null,
+                avatar_mime_type: null,
+                remove_avatar: false,
                 relays,
               });
               setSummary(local);
@@ -265,9 +321,6 @@ export default function App() {
             })
           }
         />
-      )}
-      {dialog?.type === "members" && (
-        <MembersDialog members={dialog.members} onClose={() => setDialog(null)} />
       )}
       {dialog?.type === "person" && (
         <PersonDialog person={dialog.person} onClose={() => setDialog(null)} />
@@ -376,18 +429,18 @@ function GroupContextMenu({
 function ConversationPanel({
   conversation,
   busy,
+  canEditGroup,
   onGroup,
-  onMembers,
+  onRules,
   onPerson,
-  onRefresh,
   onSend,
 }: {
   conversation: Conversation;
   busy: boolean;
+  canEditGroup: boolean;
   onGroup: () => void;
-  onMembers: () => void;
+  onRules: () => void;
   onPerson: (person: Pick<MemberSummary, "username" | "bio" | "avatar">) => void;
-  onRefresh: () => void;
   onSend: (text: string) => Promise<boolean>;
 }) {
   const [draft, setDraft] = useState("");
@@ -402,14 +455,20 @@ function ConversationPanel({
   return (
     <div className="conversation">
       <header className="chat-header" data-tauri-drag-region>
-        <button className="group-identity" onClick={onGroup}>
-          <Avatar name={conversation.group.name} image={conversation.group.avatar} size={36} square />
-          <span><strong>{conversation.group.name}</strong><small>{conversation.group.description || "view group profile"}</small></span>
-        </button>
+        {canEditGroup ? (
+          <button className="group-identity" onClick={onGroup}>
+            <Avatar name={conversation.group.name} image={conversation.group.avatar} size={36} square />
+            <span><strong>{conversation.group.name}</strong><small>{conversation.group.description || "edit group profile"}</small></span>
+          </button>
+        ) : (
+          <div className="group-identity static">
+            <Avatar name={conversation.group.name} image={conversation.group.avatar} size={36} square />
+            <span><strong>{conversation.group.name}</strong><small>{conversation.group.description || "group"}</small></span>
+          </div>
+        )}
         <div className="chat-header-actions">
-          <button onClick={onMembers}>{conversation.members.length} {conversation.members.length === 1 ? "signal" : "signals"}</button>
+          <button className="rules-button" onClick={onRules}>Rules</button>
           {busy && <LoaderCircle className="spinner" size={14} />}
-          <button className="icon-button" onClick={onRefresh} title="refresh"><RefreshCw size={14} /></button>
         </div>
       </header>
       <div className="messages">
@@ -559,15 +618,16 @@ function GroupDialog({ group, canEdit, busy, onClose, onSave }: { group: GroupSu
   return <Modal onClose={onClose}><div className="identity-editor"><ImagePicker name={group.name} existing={group.avatar} selection={image} square disabled={!canEdit} /><small>{canEdit ? "group identity" : "group"}</small></div><LabeledArea label="name"><input value={name} disabled={!canEdit} onChange={(event) => setName(event.target.value)} /></LabeledArea><LabeledArea label="description" count={canEdit ? `${description.length}/200` : undefined}><textarea value={description} disabled={!canEdit} onChange={(event) => setDescription(event.target.value)} /></LabeledArea>{!canEdit && <p className="founder-note">managed by the group founder</p>}<DialogButtons onClose={onClose}>{canEdit && (group.avatar || image.preview) && <button className="danger" onClick={image.remove}>remove icon</button>}{canEdit && <button className="primary" disabled={!name.trim() || name.length > 80 || description.length > 200 || busy} onClick={() => void onSave(name.trim(), description, image.base64, image.removed)}>save group</button>}</DialogButtons></Modal>;
 }
 
+function RulesDialog({ group, canEdit, busy, onClose, onSave }: { group: GroupSummary; canEdit: boolean; busy: boolean; onClose: () => void; onSave: (rules: string) => Promise<boolean> }) {
+  const [rules, setRules] = useState(group.rules);
+  return <Modal onClose={onClose}><DialogHeading icon={<ScrollText />} title="group rules" detail={group.name} />{canEdit ? <LabeledArea label="rules" count={`${rules.length}/4000`}><textarea className="rules-editor" autoFocus value={rules} placeholder="write the rules for this group" onChange={(event) => setRules(event.target.value)} /></LabeledArea> : group.rules ? <div className="rules-copy">{group.rules}</div> : <p className="empty-rules">no rules have been set for this group</p>}<DialogButtons onClose={onClose} closeLabel={canEdit ? "cancel" : "close"}>{canEdit && <button className="primary" disabled={rules.length > 4000 || busy} onClick={() => void onSave(rules)}>save rules</button>}</DialogButtons></Modal>;
+}
+
 function DeleteGroupDialog({ group, busy, onClose, onDelete }: { group: GroupSummary; busy: boolean; onClose: () => void; onDelete: () => Promise<boolean> }) {
   const warning = group.remote_deletion_supported
     ? "This permanently erases its messages, invitation, and group media from the relays. It cannot be undone."
     : "This older group predates authenticated relay deletion. It will be removed from this device; groups made from this version onward are erased from the relays too.";
   return <Modal onClose={onClose} compact><DialogHeading icon={<Trash2 />} title="delete group?" detail={group.name} /><p className="deletion-warning">{warning}</p><DialogButtons onClose={onClose}><button className="delete-confirm" disabled={busy} onClick={() => void onDelete()}>{busy && <LoaderCircle className="spinner" size={13} />} {group.remote_deletion_supported ? "delete group" : "remove group"}</button></DialogButtons></Modal>;
-}
-
-function MembersDialog({ members, onClose }: { members: MemberSummary[]; onClose: () => void }) {
-  return <Modal onClose={onClose} compact><DialogHeading icon={<Users />} title="signals" detail={`${members.length} tuned in`} /><div className="member-list">{members.map((member) => <div key={member.public_key}><Avatar name={member.username} image={member.avatar} size={38} /><span><strong>@{member.username}</strong><small>{member.bio}</small></span></div>)}</div></Modal>;
 }
 
 function PersonDialog({ person, onClose }: { person: Pick<MemberSummary, "username" | "bio" | "avatar">; onClose: () => void }) {
@@ -582,8 +642,8 @@ function DialogHeading({ icon, title, detail }: { icon: React.ReactNode; title: 
   return <div className="dialog-heading"><span>{icon}</span><h2>{title}</h2><p>{detail}</p></div>;
 }
 
-function DialogButtons({ children, onClose }: { children: React.ReactNode; onClose?: () => void }) {
-  return <div className="dialog-buttons">{onClose && <button onClick={onClose}>cancel</button>}<span />{children}</div>;
+function DialogButtons({ children, onClose, closeLabel = "cancel" }: { children: React.ReactNode; onClose?: () => void; closeLabel?: string }) {
+  return <div className="dialog-buttons">{onClose && <button onClick={onClose}>{closeLabel}</button>}<span />{children}</div>;
 }
 
 function LabeledArea({ label, count, children }: { label: string; count?: string; children: React.ReactNode }) {

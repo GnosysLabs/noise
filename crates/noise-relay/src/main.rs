@@ -28,8 +28,8 @@ use noise_transport::{
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpListener,
-    sync::{Mutex, RwLock},
-    time::sleep,
+    sync::{Mutex, RwLock, watch},
+    time::{sleep, timeout},
 };
 use tower_http::cors::CorsLayer;
 
@@ -57,6 +57,7 @@ struct AppState {
     events: Arc<RwLock<HashMap<String, SignedEvent>>>,
     blobs: Arc<RwLock<HashMap<String, EncryptedBlob>>>,
     deletions: Arc<RwLock<HashMap<String, GroupDeletion>>>,
+    group_changes: Arc<RwLock<HashMap<String, watch::Sender<u64>>>>,
     mutations: Arc<Mutex<()>>,
     peers: Arc<Vec<String>>,
     client: reqwest::Client,
@@ -84,6 +85,12 @@ struct Health {
     peers: usize,
     privacy_gateway: bool,
     mask_targets: usize,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct GroupWatchResponse {
+    revision: u64,
+    changed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
         .collect::<Vec<_>>();
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(40))
         .build()
         .context("could not initialize relay HTTP")?;
     let state = AppState {
@@ -131,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
         events: Arc::new(RwLock::new(recovered.events)),
         blobs: Arc::new(RwLock::new(recovered.blobs)),
         deletions: Arc::new(RwLock::new(recovered.deletions)),
+        group_changes: Arc::new(RwLock::new(HashMap::new())),
         mutations: Arc::new(Mutex::new(())),
         peers: Arc::new(peers),
         client,
@@ -148,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/invites/{locator}", get(get_invite))
         .route("/v1/events", post(publish_event))
         .route("/v1/groups/{group_id}/events", get(group_events))
+        .route("/v1/groups/{group_id}/watch/{since}", get(group_watch))
         .route("/v1/blobs", post(publish_blob))
         .route("/v1/blobs/{blob_id}", get(get_blob))
         .route("/v1/group-deletions", post(publish_group_deletion))
@@ -273,6 +282,16 @@ async fn group_events(
             .then_with(|| left.event_id.cmp(&right.event_id))
     });
     Ok(Json(events))
+}
+
+async fn group_watch(
+    State(state): State<AppState>,
+    Path((group_id, since)): Path<(String, String)>,
+) -> Result<Json<GroupWatchResponse>, StatusCode> {
+    let since = parse_watch_revision(&since).ok_or(StatusCode::BAD_REQUEST)?;
+    wait_for_group_change(&state, &group_id, since)
+        .await
+        .map(Json)
 }
 
 async fn publish_blob(
@@ -442,6 +461,20 @@ async fn dispatch_private_request(
     state: &AppState,
     request: PlainRequest,
 ) -> (StatusCode, Vec<u8>) {
+    if request.method == "GET"
+        && let Some((group_id, revision)) = parse_private_watch_path(&request.path)
+    {
+        let Some(since) = parse_watch_revision(revision) else {
+            return private_error(StatusCode::BAD_REQUEST, "invalid group revision");
+        };
+        return match wait_for_group_change(state, group_id, since).await {
+            Ok(response) => private_json(StatusCode::OK, &response),
+            Err(StatusCode::GONE) => private_error(StatusCode::GONE, "group has been deleted"),
+            Err(StatusCode::NOT_FOUND) => private_error(StatusCode::NOT_FOUND, "nothing here"),
+            Err(status) => private_error(status, "group watch failed"),
+        };
+    }
+
     match (request.method.as_str(), request.path.as_str()) {
         ("POST", "/v1/invites") => {
             let Ok(record) = serde_json::from_slice::<InviteRecord>(&request.body) else {
@@ -581,6 +614,90 @@ fn private_error(status: StatusCode, message: &str) -> (StatusCode, Vec<u8>) {
     (status, message.as_bytes().to_vec())
 }
 
+fn parse_private_watch_path(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("/v1/groups/")?;
+    let (group_id, revision) = rest.split_once("/watch/")?;
+    if group_id.contains('/') || revision.contains('/') {
+        return None;
+    }
+    Some((group_id, revision))
+}
+
+fn parse_watch_revision(value: &str) -> Option<Option<u64>> {
+    if value == "initial" {
+        Some(None)
+    } else {
+        value.parse::<u64>().ok().map(Some)
+    }
+}
+
+async fn wait_for_group_change(
+    state: &AppState,
+    group_id: &str,
+    since: Option<u64>,
+) -> Result<GroupWatchResponse, StatusCode> {
+    if group_id.len() != 64 || !group_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let (current, mut changes) = {
+        let _guard = state.mutations.lock().await;
+        if state.deletions.read().await.contains_key(group_id) {
+            return Err(StatusCode::GONE);
+        }
+        let current = state
+            .events
+            .read()
+            .await
+            .values()
+            .filter(|event| event.group_id == group_id)
+            .count() as u64;
+        if current == 0 {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let sender = state
+            .group_changes
+            .write()
+            .await
+            .entry(group_id.to_owned())
+            .or_insert_with(|| watch::channel(current).0)
+            .clone();
+        (current, sender.subscribe())
+    };
+
+    let Some(since) = since else {
+        return Ok(GroupWatchResponse {
+            revision: current,
+            changed: false,
+        });
+    };
+    if current != since {
+        return Ok(GroupWatchResponse {
+            revision: current,
+            changed: true,
+        });
+    }
+
+    if timeout(Duration::from_secs(20), changes.changed())
+        .await
+        .is_ok_and(|result| result.is_ok())
+    {
+        if state.deletions.read().await.contains_key(group_id) {
+            return Err(StatusCode::GONE);
+        }
+        let revision = *changes.borrow_and_update();
+        return Ok(GroupWatchResponse {
+            revision,
+            changed: revision != since,
+        });
+    }
+
+    Ok(GroupWatchResponse {
+        revision: since,
+        changed: false,
+    })
+}
+
 fn has_media_type(headers: &HeaderMap, expected: &str) -> bool {
     headers
         .get(CONTENT_TYPE)
@@ -637,6 +754,7 @@ async fn insert_event(state: &AppState, event: SignedEvent) -> anyhow::Result<In
     if state.deletions.read().await.contains_key(&event.group_id) {
         return Ok(InsertResult::Deleted);
     }
+    let group_id = event.group_id.clone();
     let object_id = event.event_id.clone();
     let inserted = state
         .store
@@ -644,6 +762,10 @@ async fn insert_event(state: &AppState, event: SignedEvent) -> anyhow::Result<In
         .await?;
     if inserted {
         state.events.write().await.insert(object_id, event);
+        if let Some(sender) = state.group_changes.read().await.get(&group_id) {
+            let revision = sender.borrow().saturating_add(1);
+            sender.send_replace(revision);
+        }
     }
     Ok(if inserted {
         InsertResult::Inserted
@@ -728,7 +850,8 @@ async fn apply_group_deletion(state: &AppState, deletion: GroupDeletion) -> anyh
         .deletions
         .write()
         .await
-        .insert(deletion.group_id.clone(), deletion);
+        .insert(deletion.group_id.clone(), deletion.clone());
+    state.group_changes.write().await.remove(&deletion.group_id);
     Ok(true)
 }
 

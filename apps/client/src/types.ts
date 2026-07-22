@@ -16,6 +16,7 @@ export type GroupSummary = {
   group_id: string;
   name: string;
   description: string;
+  rules: string;
   avatar: ProfileImage | null;
   owner_public_key: string;
   remote_deletion_supported: boolean;
@@ -49,6 +50,11 @@ export type Conversation = {
   members: MemberSummary[];
   messages: MessageSummary[];
   rejected_events: number;
+};
+
+export type GroupWatch = {
+  revision: number;
+  changed: boolean;
 };
 
 export type MakeResult = {
