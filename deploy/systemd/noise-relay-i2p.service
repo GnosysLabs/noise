@@ -1,0 +1,33 @@
+[Unit]
+Description=Noise untrusted relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=noise-relay
+Group=noise-relay
+StateDirectory=noise-relay
+StateDirectoryMode=0700
+ExecStart=/opt/noise-relay/noise-relay --listen 127.0.0.1:4301 --data /var/lib/noise-relay --public-url https://noiserelay.irisirc.chat --mask-target https://noiserelay.gnosyslabs.xyz
+Restart=on-failure
+RestartSec=2s
+UMask=0077
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

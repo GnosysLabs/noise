@@ -48,6 +48,8 @@ enum Request {
     Make {
         state_path: String,
         name: String,
+        avatar_data_base64: Option<String>,
+        avatar_mime_type: Option<String>,
         relays: Vec<String>,
     },
     Join {
@@ -66,6 +68,11 @@ enum Request {
     },
     Leave {
         state_path: String,
+        relays: Vec<String>,
+    },
+    DeleteGroup {
+        state_path: String,
+        group_id: String,
         relays: Vec<String>,
     },
 }
@@ -169,10 +176,18 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         Request::Make {
             state_path,
             name,
+            avatar_data_base64,
+            avatar_mime_type,
             relays,
         } => serde_json::to_value(
             runtime()?
-                .block_on(client.make(state_path, name, relays))
+                .block_on(client.make(
+                    state_path,
+                    name,
+                    avatar_data_base64,
+                    avatar_mime_type,
+                    relays,
+                ))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
@@ -208,6 +223,16 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?;
             Ok(Value::Null)
         }
+        Request::DeleteGroup {
+            state_path,
+            group_id,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.delete_group(state_path, &group_id, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
     }
 }
 

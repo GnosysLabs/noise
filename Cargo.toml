@@ -3,6 +3,7 @@ members = [
     "apps/client/src-tauri",
     "crates/noise-core",
     "crates/noise-client",
+    "crates/noise-transport",
     "crates/noise-ffi",
     "crates/noise-relay",
     "crates/noise-cli",
@@ -18,10 +19,12 @@ edition = "2024"
 anyhow = "1"
 axum = "0.8"
 base64 = "0.22"
+bhttp = "0.8"
 blake3 = "1"
 chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = "2"
+ohttp = { version = "0.8", default-features = false, features = ["client", "server", "rust-hpke"] }
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -29,3 +32,5 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors"] }
+turso = { version = "0.8.0-pre.1", default-features = false }
+url = "2"

@@ -7,9 +7,8 @@ type Envelope<T> = {
 };
 
 const defaultRelays = [
-  "http://127.0.0.1:4301",
-  "http://127.0.0.1:4302",
-  "http://127.0.0.1:4303",
+  "https://noiserelay.gnosyslabs.xyz#ohttp=AQAgZEyD0P-eAYiQd9F8r4_4ah2EoI_nWvs4QtUSTbVse1sABAABAAM",
+  "https://noiserelay.irisirc.chat#ohttp=AQAggzUeerBJnmwbryX5FUuHI5N7DLozSUnf2kYKnfMmkl8ABAABAAM",
 ];
 
 const configuredRelays = import.meta.env.VITE_NOISE_RELAYS

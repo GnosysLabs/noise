@@ -36,6 +36,8 @@ pub enum NoiseError {
     GroupMismatch,
     #[error("the encrypted blob does not match its identifier")]
     BlobMismatch,
+    #[error("invalid group authority")]
+    InvalidGroupAuthority,
     #[error("serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
 }
@@ -91,21 +93,38 @@ pub struct ProfileImage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EncryptedBlob {
     pub blob_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
     pub nonce_base64: String,
     pub ciphertext_base64: String,
 }
 
 impl EncryptedBlob {
     pub fn create(plaintext: &[u8]) -> Result<(Self, String), NoiseError> {
+        Self::create_inner(plaintext, None)
+    }
+
+    pub fn create_for_group(
+        plaintext: &[u8],
+        group_id: impl Into<String>,
+    ) -> Result<(Self, String), NoiseError> {
+        Self::create_inner(plaintext, Some(group_id.into()))
+    }
+
+    fn create_inner(
+        plaintext: &[u8],
+        group_id: Option<String>,
+    ) -> Result<(Self, String), NoiseError> {
         let key: [u8; 32] = random();
         let nonce: [u8; 24] = random();
         let ciphertext = XChaCha20Poly1305::new((&key).into())
             .encrypt(XNonce::from_slice(&nonce), plaintext)
             .map_err(|_| NoiseError::Crypto)?;
-        let blob_id = blob_id(&nonce, &ciphertext);
+        let blob_id = blob_id(group_id.as_deref(), &nonce, &ciphertext);
         Ok((
             Self {
                 blob_id,
+                group_id,
                 nonce_base64: STANDARD_NO_PAD.encode(nonce),
                 ciphertext_base64: STANDARD_NO_PAD.encode(ciphertext),
             },
@@ -116,7 +135,7 @@ impl EncryptedBlob {
     pub fn verify(&self) -> Result<(), NoiseError> {
         let nonce = decode_array::<24>(&self.nonce_base64, "blob nonce")?;
         let ciphertext = decode(&self.ciphertext_base64, "blob ciphertext")?;
-        if blob_id(&nonce, &ciphertext) != self.blob_id {
+        if blob_id(self.group_id.as_deref(), &nonce, &ciphertext) != self.blob_id {
             return Err(NoiseError::BlobMismatch);
         }
         Ok(())
@@ -152,6 +171,8 @@ pub struct GroupMembership {
     pub avatar: Option<ProfileImage>,
     #[serde(default)]
     pub owner_public_key: String,
+    #[serde(default)]
+    pub authority_nonce_base64: String,
     pub secret_base64: String,
 }
 
@@ -165,14 +186,24 @@ impl GroupMembership {
             description: String::new(),
             avatar: None,
             owner_public_key: String::new(),
+            authority_nonce_base64: String::new(),
             secret_base64: STANDARD_NO_PAD.encode(secret),
         }
     }
 
     pub fn create_owned(name: impl Into<String>, owner_public_key: impl Into<String>) -> Self {
-        let mut group = Self::create(name);
-        group.owner_public_key = owner_public_key.into();
-        group
+        let owner_public_key = owner_public_key.into();
+        let authority_nonce: [u8; 32] = random();
+        let secret: [u8; 32] = random();
+        Self {
+            group_id: authoritative_group_id(&owner_public_key, &authority_nonce),
+            name: name.into(),
+            description: String::new(),
+            avatar: None,
+            owner_public_key,
+            authority_nonce_base64: STANDARD_NO_PAD.encode(authority_nonce),
+            secret_base64: STANDARD_NO_PAD.encode(secret),
+        }
     }
 
     pub fn profile(&self) -> GroupProfile {
@@ -194,6 +225,8 @@ pub struct InvitePayload {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InviteRecord {
     pub locator: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
     pub salt_base64: String,
     pub nonce_base64: String,
     pub ciphertext_base64: String,
@@ -202,8 +235,18 @@ pub struct InviteRecord {
 }
 
 #[derive(Serialize)]
-struct UnsignedInviteRecord<'a> {
+struct UnsignedInviteRecordV1<'a> {
     locator: &'a str,
+    salt_base64: &'a str,
+    nonce_base64: &'a str,
+    ciphertext_base64: &'a str,
+    issuer_public_key: &'a str,
+}
+
+#[derive(Serialize)]
+struct UnsignedInviteRecordV2<'a> {
+    locator: &'a str,
+    group_id: &'a str,
     salt_base64: &'a str,
     nonce_base64: &'a str,
     ciphertext_base64: &'a str,
@@ -240,6 +283,7 @@ impl InviteRecord {
 
         let mut record = Self {
             locator,
+            group_id: Some(payload.group.group_id.clone()),
             salt_base64: STANDARD_NO_PAD.encode(salt),
             nonce_base64: STANDARD_NO_PAD.encode(nonce),
             ciphertext_base64: STANDARD_NO_PAD.encode(ciphertext),
@@ -281,16 +325,98 @@ impl InviteRecord {
         if payload.created_by != self.issuer_public_key {
             return Err(NoiseError::IdentityMismatch);
         }
+        if self
+            .group_id
+            .as_deref()
+            .is_some_and(|group_id| group_id != payload.group.group_id)
+        {
+            return Err(NoiseError::GroupMismatch);
+        }
         Ok(payload)
     }
 
     fn signing_bytes(&self) -> Result<Vec<u8>, NoiseError> {
-        Ok(serde_json::to_vec(&UnsignedInviteRecord {
-            locator: &self.locator,
-            salt_base64: &self.salt_base64,
-            nonce_base64: &self.nonce_base64,
-            ciphertext_base64: &self.ciphertext_base64,
-            issuer_public_key: &self.issuer_public_key,
+        if let Some(group_id) = self.group_id.as_deref() {
+            Ok(serde_json::to_vec(&UnsignedInviteRecordV2 {
+                locator: &self.locator,
+                group_id,
+                salt_base64: &self.salt_base64,
+                nonce_base64: &self.nonce_base64,
+                ciphertext_base64: &self.ciphertext_base64,
+                issuer_public_key: &self.issuer_public_key,
+            })?)
+        } else {
+            Ok(serde_json::to_vec(&UnsignedInviteRecordV1 {
+                locator: &self.locator,
+                salt_base64: &self.salt_base64,
+                nonce_base64: &self.nonce_base64,
+                ciphertext_base64: &self.ciphertext_base64,
+                issuer_public_key: &self.issuer_public_key,
+            })?)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GroupDeletion {
+    pub group_id: String,
+    pub owner_public_key: String,
+    pub authority_nonce_base64: String,
+    pub deleted_at_millis: u64,
+    pub signature_base64: String,
+}
+
+#[derive(Serialize)]
+struct UnsignedGroupDeletion<'a> {
+    operation: &'static str,
+    group_id: &'a str,
+    owner_public_key: &'a str,
+    authority_nonce_base64: &'a str,
+    deleted_at_millis: u64,
+}
+
+impl GroupDeletion {
+    pub fn create(identity: &Identity, group: &GroupMembership) -> Result<Self, NoiseError> {
+        let owner_public_key = identity.public_key_base64();
+        if group.owner_public_key != owner_public_key {
+            return Err(NoiseError::InvalidGroupAuthority);
+        }
+        let authority_nonce =
+            decode_array::<32>(&group.authority_nonce_base64, "group authority nonce")?;
+        if authoritative_group_id(&owner_public_key, &authority_nonce) != group.group_id {
+            return Err(NoiseError::InvalidGroupAuthority);
+        }
+        let mut deletion = Self {
+            group_id: group.group_id.clone(),
+            owner_public_key,
+            authority_nonce_base64: group.authority_nonce_base64.clone(),
+            deleted_at_millis: now_millis(),
+            signature_base64: String::new(),
+        };
+        deletion.signature_base64 = identity.sign(&deletion.signing_bytes()?);
+        Ok(deletion)
+    }
+
+    pub fn verify(&self) -> Result<(), NoiseError> {
+        let authority_nonce =
+            decode_array::<32>(&self.authority_nonce_base64, "group authority nonce")?;
+        if authoritative_group_id(&self.owner_public_key, &authority_nonce) != self.group_id {
+            return Err(NoiseError::InvalidGroupAuthority);
+        }
+        verify_signature(
+            &self.owner_public_key,
+            &self.signature_base64,
+            &self.signing_bytes()?,
+        )
+    }
+
+    fn signing_bytes(&self) -> Result<Vec<u8>, NoiseError> {
+        Ok(serde_json::to_vec(&UnsignedGroupDeletion {
+            operation: "delete_group_v1",
+            group_id: &self.group_id,
+            owner_public_key: &self.owner_public_key,
+            authority_nonce_base64: &self.authority_nonce_base64,
+            deleted_at_millis: self.deleted_at_millis,
         })?)
     }
 }
@@ -712,10 +838,21 @@ fn frequency_key(frequency: &str, salt: &[u8; 16]) -> [u8; 32] {
     blake3::derive_key(INVITE_KDF_CONTEXT, &input)
 }
 
-fn blob_id(nonce: &[u8; 24], ciphertext: &[u8]) -> String {
+fn blob_id(group_id: Option<&str>, nonce: &[u8; 24], ciphertext: &[u8]) -> String {
     let mut hasher = blake3::Hasher::new();
+    if let Some(group_id) = group_id {
+        hasher.update(b"noise-group-blob-v1");
+        hasher.update(group_id.as_bytes());
+    }
     hasher.update(nonce);
     hasher.update(ciphertext);
+    hasher.finalize().to_hex().to_string()
+}
+
+fn authoritative_group_id(owner_public_key: &str, authority_nonce: &[u8; 32]) -> String {
+    let mut hasher = blake3::Hasher::new_derive_key("xyz.gnosyslabs.noise.group-authority.v1");
+    hasher.update(owner_public_key.as_bytes());
+    hasher.update(authority_nonce);
     hasher.finalize().to_hex().to_string()
 }
 

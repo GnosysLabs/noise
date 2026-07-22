@@ -9,6 +9,8 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@dicebear/core": "^10.3.0",
+    "@dicebear/styles": "^10.2.0",
     "@tauri-apps/api": "^2.8.0",
     "lucide-react": "^0.468.0",
     "react": "^19.1.1",

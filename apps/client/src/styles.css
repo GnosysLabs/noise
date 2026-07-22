@@ -34,6 +34,9 @@ html[data-runtime="tauri"] .sidebar { padding-top: 44px; }
 .group-row.active { background: rgba(255,255,255,.095); }
 .group-row > span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 560; }
 .group-row i { width: 6px; height: 6px; border-radius: 50%; background: var(--purple); margin-left: auto; box-shadow: 0 0 8px rgba(119,88,237,.8); }
+.group-context-menu { position: fixed; z-index: 60; width: 178px; padding: 5px; border: 1px solid rgba(255,255,255,.09); border-radius: 9px; background: rgba(37,34,41,.98); box-shadow: 0 16px 46px rgba(0,0,0,.5); }
+.group-context-menu button { width: 100%; display: flex; align-items: center; gap: 9px; padding: 8px 9px; border-radius: 6px; background: transparent; color: #ff8585; text-align: left; font-size: 12px; }
+.group-context-menu button:hover { background: rgba(255,105,105,.1); }
 .self-profile { display: flex; align-items: center; gap: 10px; min-height: 58px; padding: 10px 14px; background: rgba(0,0,0,.12); text-align: left; }
 .self-profile > span:nth-child(2) { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 2px; }
 .self-profile strong { font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
@@ -112,6 +115,8 @@ html[data-runtime="tauri"] .sidebar { padding-top: 44px; }
 .dialog-buttons button { display: inline-flex; align-items: center; gap: 6px; min-height: 31px; padding: 6px 11px; border-radius: 8px; background: rgba(255,255,255,.07); font-size: 12px; }
 .dialog-buttons .primary { background: var(--purple); }
 .dialog-buttons .danger { color: #ff7979; background: transparent; }
+.dialog-buttons .delete-confirm { background: #b3424c; color: #fff; }
+.deletion-warning { margin: -4px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .frequency-input, .frequency-card { font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; letter-spacing: .8px; }
 .frequency-card { padding: 16px; border-radius: 11px; background: rgba(255,255,255,.055); text-align: center; font-size: 26px; font-weight: 650; }
 .identity-editor { display: flex; align-items: center; flex-direction: column; gap: 4px; }

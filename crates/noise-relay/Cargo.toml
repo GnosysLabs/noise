@@ -8,7 +8,12 @@ anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
 noise-core = { path = "../noise-core" }
+noise-transport = { path = "../noise-transport" }
+ohttp.workspace = true
+rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
+turso.workspace = true

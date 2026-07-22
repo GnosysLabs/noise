@@ -12,6 +12,7 @@ client directly; the earlier native macOS client remains as a design reference.
 
 - `noise-core`: identity, frequency, invitation, and signed-event primitives
 - `noise-client`: reusable profile, group, and conversation operations
+- `noise-transport`: padded Binary HTTP and RFC 9458 oblivious relay transport
 - `noise-ffi`: narrow native bridge into the shared client
 - `noise-relay`: an untrusted store-and-forward relay with peer replication
 - `noise`: a small CLI that exercises the protocol end to end
@@ -47,15 +48,19 @@ pnpm tauri build --debug
 open ../../target/debug/bundle/macos/noise.app
 ```
 
-Clients must point at at least one relay they can both reach. Set a comma-separated
-relay list at build time when the relays are not on the same machine:
+Clients must point at relays they can both reach. A single relay remains usable
+in direct compatibility mode. Two or more production relays use their pinned
+private relay descriptors so each storage request travels through a different
+mask relay:
 
 ```sh
-VITE_NOISE_RELAYS=http://RELAY_HOST:4301 pnpm tauri build --debug
+VITE_NOISE_RELAYS='https://RELAY_ONE#ohttp=KEY,https://RELAY_TWO#ohttp=KEY' \
+  pnpm tauri build --debug
 ```
 
-Localhost remains the default for development. The relay is currently in-memory,
-so do not restart the existing development relays expecting their data to survive.
+Localhost remains the default for development. Relay data is durable, but the
+three older development processes must be restarted on the current build before
+they begin writing their existing in-memory state to disk.
 
 ## Native macOS client
 
@@ -81,29 +86,54 @@ the CLI and does not contain a web view. Local identity state is stored at
 
 ## Local demonstration
 
-Start three relays in separate terminals:
+Start three relays in separate terminals. Each relay explicitly allowlists the
+other two as privacy-mask destinations, preventing it from becoming an open
+proxy:
 
 ```sh
-cargo run -p noise-relay -- --listen 127.0.0.1:4301 --peer http://127.0.0.1:4302 --peer http://127.0.0.1:4303
-cargo run -p noise-relay -- --listen 127.0.0.1:4302 --peer http://127.0.0.1:4301 --peer http://127.0.0.1:4303
-cargo run -p noise-relay -- --listen 127.0.0.1:4303 --peer http://127.0.0.1:4301 --peer http://127.0.0.1:4302
+cargo run -p noise-relay -- --listen 127.0.0.1:4301 --public-url http://127.0.0.1:4301 --mask-target http://127.0.0.1:4302 --mask-target http://127.0.0.1:4303
+cargo run -p noise-relay -- --listen 127.0.0.1:4302 --public-url http://127.0.0.1:4302 --mask-target http://127.0.0.1:4301 --mask-target http://127.0.0.1:4303
+cargo run -p noise-relay -- --listen 127.0.0.1:4303 --public-url http://127.0.0.1:4303 --mask-target http://127.0.0.1:4301 --mask-target http://127.0.0.1:4302
 ```
+
+Each startup prints a shareable address containing the relay's pinned OHTTP
+public key. The fragment is never sent in an HTTP request. Pass at least two of
+those complete addresses to the CLI or desktop build. The mask sees the client
+IP and destination relay but only padded ciphertext; the storage relay sees the
+decrypted Noise request coming from the mask, not the client connection. Masks
+and storage relays must be operated independently for that separation to mean
+anything.
+
+Each relay persists verified invitations, signed events, and encrypted blobs in
+an embedded, self-hosted Turso database under `relay-data/<port>` by default. No
+Turso Cloud account, remote database, or auth token is involved. A server
+deployment should use an explicit data directory on a durable volume:
+
+```sh
+noise-relay --listen 127.0.0.1:4301 --data /var/lib/noise-relay \
+  --public-url https://relay.example
+```
+
+The relay commits an object before acknowledging it and cryptographically
+re-verifies every object recovered at startup.
 
 Then create two local identities:
 
 ```sh
 cargo run -p noise-cli -- init --state .noise/alice.json --username alice
 cargo run -p noise-cli -- init --state .noise/bob.json --username bob
+RELAY_ONE=$(curl -fsS http://127.0.0.1:4301/v1/relay-descriptor)
+RELAY_TWO=$(curl -fsS http://127.0.0.1:4302/v1/relay-descriptor)
 ```
 
 Make noise, copy the returned frequency, and join it from the second identity:
 
 ```sh
-cargo run -p noise-cli -- make --state .noise/alice.json --name afterhours --relay http://127.0.0.1:4301
-cargo run -p noise-cli -- join --state .noise/bob.json --frequency "0000 0000 0000" --relay http://127.0.0.1:4303
-cargo run -p noise-cli -- say --state .noise/alice.json --text "hello" --relay http://127.0.0.1:4301
-cargo run -p noise-cli -- read --state .noise/bob.json --relay http://127.0.0.1:4303
-cargo run -p noise-cli -- members --state .noise/bob.json --relay http://127.0.0.1:4303
+cargo run -p noise-cli -- make --state .noise/alice.json --name afterhours --relay "$RELAY_ONE" --relay "$RELAY_TWO"
+cargo run -p noise-cli -- join --state .noise/bob.json --frequency "0000 0000 0000" --relay "$RELAY_ONE" --relay "$RELAY_TWO"
+cargo run -p noise-cli -- say --state .noise/alice.json --text "hello" --relay "$RELAY_ONE" --relay "$RELAY_TWO"
+cargo run -p noise-cli -- read --state .noise/bob.json --relay "$RELAY_ONE" --relay "$RELAY_TWO"
+cargo run -p noise-cli -- members --state .noise/bob.json --relay "$RELAY_ONE" --relay "$RELAY_TWO"
 ```
 
 ## Membership scale simulation

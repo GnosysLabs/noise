@@ -9,11 +9,13 @@ import {
   Radio,
   RefreshCw,
   Settings2,
+  Trash2,
   Users,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { isTauri, noise, prepareImage, relays } from "./api";
+import { generateGroupAvatar } from "./groupAvatar";
 import type {
   AvatarData,
   Conversation,
@@ -32,6 +34,7 @@ type Dialog =
   | { type: "frequency"; group: string; frequency: string }
   | { type: "profile"; profile: IdentitySummary }
   | { type: "group"; group: GroupSummary }
+  | { type: "delete_group"; group: GroupSummary }
   | { type: "members"; members: MemberSummary[] }
   | { type: "person"; person: Pick<MemberSummary, "username" | "bio" | "avatar"> };
 
@@ -44,6 +47,11 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [groupMenu, setGroupMenu] = useState<{
+    group: GroupSummary;
+    x: number;
+    y: number;
+  } | null>(null);
 
   const refresh = useCallback(async () => {
     const local = await noise<LocalSummary>({ action: "status" });
@@ -106,6 +114,10 @@ export default function App() {
         onMake={() => setDialog({ type: "make" })}
         onJoin={() => setDialog({ type: "join" })}
         onProfile={() => setDialog({ type: "profile", profile: summary.identity })}
+        onContextMenu={(group, x, y) => {
+          if (group.owner_public_key !== summary.identity.public_key) return;
+          setGroupMenu({ group, x, y });
+        }}
         onSelect={(group) => {
           if (group.is_active) return;
           void perform(async () => {
@@ -149,8 +161,15 @@ export default function App() {
           onClose={() => setDialog(null)}
           onSubmit={(name) =>
             perform(async () => {
-              const result = await noise<MakeResult>({ action: "make", name, relays });
-              if (!result) throw new Error("the frequency was not created");
+              const avatar = await generateGroupAvatar(`${name}:${crypto.randomUUID()}`);
+              const result = await noise<MakeResult>({
+                action: "make",
+                name,
+                avatar_data_base64: avatar,
+                avatar_mime_type: "image/png",
+                relays,
+              });
+              if (!result) throw new Error("the group was not created");
               await refresh();
               setDialog({
                 type: "frequency",
@@ -227,11 +246,42 @@ export default function App() {
           }
         />
       )}
+      {dialog?.type === "delete_group" && (
+        <DeleteGroupDialog
+          group={dialog.group}
+          busy={busy}
+          onClose={() => setDialog(null)}
+          onDelete={() =>
+            perform(async () => {
+              const local = await noise<LocalSummary>({
+                action: "delete_group",
+                group_id: dialog.group.group_id,
+                relays,
+              });
+              setSummary(local);
+              avatarCache.clear();
+              await refresh();
+              setDialog(null);
+            })
+          }
+        />
+      )}
       {dialog?.type === "members" && (
         <MembersDialog members={dialog.members} onClose={() => setDialog(null)} />
       )}
       {dialog?.type === "person" && (
         <PersonDialog person={dialog.person} onClose={() => setDialog(null)} />
+      )}
+      {groupMenu && (
+        <GroupContextMenu
+          x={groupMenu.x}
+          y={groupMenu.y}
+          onClose={() => setGroupMenu(null)}
+          onDelete={() => {
+            setDialog({ type: "delete_group", group: groupMenu.group });
+            setGroupMenu(null);
+          }}
+        />
       )}
       {error && <ErrorToast error={error} onClose={() => setError(null)} />}
     </div>
@@ -243,12 +293,14 @@ function Sidebar({
   onMake,
   onJoin,
   onProfile,
+  onContextMenu,
   onSelect,
 }: {
   summary: LocalSummary;
   onMake: () => void;
   onJoin: () => void;
   onProfile: () => void;
+  onContextMenu: (group: GroupSummary, x: number, y: number) => void;
   onSelect: (group: GroupSummary) => void;
 }) {
   return (
@@ -265,6 +317,10 @@ function Sidebar({
             className={`group-row ${group.is_active ? "active" : ""}`}
             key={group.group_id}
             onClick={() => onSelect(group)}
+            onContextMenu={(event) => {
+              event.preventDefault();
+              onContextMenu(group, event.clientX, event.clientY);
+            }}
           >
             <Avatar name={group.name} image={group.avatar} size={27} square />
             <span>{group.name}</span>
@@ -278,6 +334,42 @@ function Sidebar({
         <Settings2 size={13} />
       </button>
     </aside>
+  );
+}
+
+function GroupContextMenu({
+  x,
+  y,
+  onClose,
+  onDelete,
+}: {
+  x: number;
+  y: number;
+  onClose: () => void;
+  onDelete: () => void;
+}) {
+  useEffect(() => {
+    const close = () => onClose();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("mousedown", close);
+    window.addEventListener("blur", close);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [onClose]);
+  return (
+    <div
+      className="group-context-menu"
+      style={{ left: Math.min(x, window.innerWidth - 190), top: Math.min(y, window.innerHeight - 58) }}
+      onMouseDown={(event) => event.stopPropagation()}
+    >
+      <button onClick={onDelete}><Trash2 size={14} /> delete group</button>
+    </div>
   );
 }
 
@@ -312,7 +404,7 @@ function ConversationPanel({
       <header className="chat-header" data-tauri-drag-region>
         <button className="group-identity" onClick={onGroup}>
           <Avatar name={conversation.group.name} image={conversation.group.avatar} size={36} square />
-          <span><strong>{conversation.group.name}</strong><small>{conversation.group.description || "view frequency profile"}</small></span>
+          <span><strong>{conversation.group.name}</strong><small>{conversation.group.description || "view group profile"}</small></span>
         </button>
         <div className="chat-header-actions">
           <button onClick={onMembers}>{conversation.members.length} {conversation.members.length === 1 ? "signal" : "signals"}</button>
@@ -321,7 +413,7 @@ function ConversationPanel({
         </div>
       </header>
       <div className="messages">
-        {conversation.messages.length === 0 && <div className="quiet">the frequency is quiet</div>}
+        {conversation.messages.length === 0 && <div className="quiet">the group is quiet</div>}
         {conversation.messages.map((item) => (
           <MessageRow key={item.event_id} message={item} onPerson={onPerson} />
         ))}
@@ -383,18 +475,37 @@ function MessageRow({
 }
 
 function Avatar({ name, image, size, square = false }: { name: string; image: ProfileImage | null; size: number; square?: boolean }) {
-  const [source, setSource] = useState(image ? avatarCache.get(image.blob_id) : undefined);
+  const [loaded, setLoaded] = useState<{ blobId: string; source: string } | null>(() => {
+    if (!image) return null;
+    const source = avatarCache.get(image.blob_id);
+    return source ? { blobId: image.blob_id, source } : null;
+  });
+  const source = image
+    ? loaded?.blobId === image.blob_id
+      ? loaded.source
+      : avatarCache.get(image.blob_id)
+    : undefined;
   useEffect(() => {
-    if (!image || source) return;
+    if (!image) {
+      setLoaded(null);
+      return;
+    }
+    const target = image;
+    const cached = avatarCache.get(target.blob_id);
+    if (cached) {
+      setLoaded({ blobId: target.blob_id, source: cached });
+      return;
+    }
+    setLoaded(null);
     let active = true;
-    void noise<AvatarData>({ action: "fetch_avatar", image, relays }).then((data) => {
+    void noise<AvatarData>({ action: "fetch_avatar", image: target, relays }).then((data) => {
       if (!data || !active) return;
       const value = `data:${data.mime_type};base64,${data.data_base64}`;
-      avatarCache.set(image.blob_id, value);
-      setSource(value);
+      avatarCache.set(target.blob_id, value);
+      setLoaded({ blobId: target.blob_id, source: value });
     }).catch(() => undefined);
     return () => { active = false; };
-  }, [image, source]);
+  }, [image]);
   return (
     <span className={`avatar ${square ? "square" : ""}`} style={{ width: size, height: size }}>
       {source ? <img src={source} alt="" /> : <b>{name.slice(0, 1).toUpperCase()}</b>}
@@ -417,12 +528,12 @@ function Onboarding({ busy, onSubmit }: { busy: boolean; onSubmit: (username: st
 }
 
 function EmptyGroup({ onMake, onJoin }: { onMake: () => void; onJoin: () => void }) {
-  return <div className="empty-group"><Radio size={38} /><h2>nothing but noise</h2><p>make a frequency or tune into one someone gave you</p><div><button onClick={onMake}>make noise</button><button onClick={onJoin}>tune in</button></div></div>;
+  return <div className="empty-group"><Radio size={38} /><h2>nothing but noise</h2><p>make a group or enter a frequency someone gave you</p><div><button onClick={onMake}>make noise</button><button onClick={onJoin}>tune in</button></div></div>;
 }
 
 function MakeDialog({ busy, onClose, onSubmit }: { busy: boolean; onClose: () => void; onSubmit: (name: string) => Promise<boolean> }) {
   const [name, setName] = useState("");
-  return <Modal onClose={onClose}><DialogHeading icon={<AudioWaveform />} title="make noise" detail="name the frequency" /><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="group name" /><DialogButtons onClose={onClose}><button className="primary" disabled={!name.trim() || busy} onClick={() => void onSubmit(name.trim())}>make noise</button></DialogButtons></Modal>;
+  return <Modal onClose={onClose}><DialogHeading icon={<AudioWaveform />} title="make noise" detail="name the group" /><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="group name" /><DialogButtons onClose={onClose}><button className="primary" disabled={!name.trim() || busy} onClick={() => void onSubmit(name.trim())}>make noise</button></DialogButtons></Modal>;
 }
 
 function JoinDialog({ busy, onClose, onSubmit }: { busy: boolean; onClose: () => void; onSubmit: (frequency: string) => Promise<boolean> }) {
@@ -445,7 +556,14 @@ function GroupDialog({ group, canEdit, busy, onClose, onSave }: { group: GroupSu
   const [name, setName] = useState(group.name);
   const [description, setDescription] = useState(group.description);
   const image = useImageSelection();
-  return <Modal onClose={onClose}><div className="identity-editor"><ImagePicker name={group.name} existing={group.avatar} selection={image} square disabled={!canEdit} /><small>{canEdit ? "frequency identity" : "frequency"}</small></div><LabeledArea label="name"><input value={name} disabled={!canEdit} onChange={(event) => setName(event.target.value)} /></LabeledArea><LabeledArea label="description" count={canEdit ? `${description.length}/200` : undefined}><textarea value={description} disabled={!canEdit} onChange={(event) => setDescription(event.target.value)} /></LabeledArea>{!canEdit && <p className="founder-note">managed by the frequency founder</p>}<DialogButtons onClose={onClose}>{canEdit && (group.avatar || image.preview) && <button className="danger" onClick={image.remove}>remove icon</button>}{canEdit && <button className="primary" disabled={!name.trim() || name.length > 80 || description.length > 200 || busy} onClick={() => void onSave(name.trim(), description, image.base64, image.removed)}>save frequency</button>}</DialogButtons></Modal>;
+  return <Modal onClose={onClose}><div className="identity-editor"><ImagePicker name={group.name} existing={group.avatar} selection={image} square disabled={!canEdit} /><small>{canEdit ? "group identity" : "group"}</small></div><LabeledArea label="name"><input value={name} disabled={!canEdit} onChange={(event) => setName(event.target.value)} /></LabeledArea><LabeledArea label="description" count={canEdit ? `${description.length}/200` : undefined}><textarea value={description} disabled={!canEdit} onChange={(event) => setDescription(event.target.value)} /></LabeledArea>{!canEdit && <p className="founder-note">managed by the group founder</p>}<DialogButtons onClose={onClose}>{canEdit && (group.avatar || image.preview) && <button className="danger" onClick={image.remove}>remove icon</button>}{canEdit && <button className="primary" disabled={!name.trim() || name.length > 80 || description.length > 200 || busy} onClick={() => void onSave(name.trim(), description, image.base64, image.removed)}>save group</button>}</DialogButtons></Modal>;
+}
+
+function DeleteGroupDialog({ group, busy, onClose, onDelete }: { group: GroupSummary; busy: boolean; onClose: () => void; onDelete: () => Promise<boolean> }) {
+  const warning = group.remote_deletion_supported
+    ? "This permanently erases its messages, invitation, and group media from the relays. It cannot be undone."
+    : "This older group predates authenticated relay deletion. It will be removed from this device; groups made from this version onward are erased from the relays too.";
+  return <Modal onClose={onClose} compact><DialogHeading icon={<Trash2 />} title="delete group?" detail={group.name} /><p className="deletion-warning">{warning}</p><DialogButtons onClose={onClose}><button className="delete-confirm" disabled={busy} onClick={() => void onDelete()}>{busy && <LoaderCircle className="spinner" size={13} />} {group.remote_deletion_supported ? "delete group" : "remove group"}</button></DialogButtons></Modal>;
 }
 
 function MembersDialog({ members, onClose }: { members: MemberSummary[]; onClose: () => void }) {
@@ -503,7 +621,7 @@ function ErrorToast({ error, onClose }: { error: string; onClose: () => void }) 
 function Loading() { return <div className="loading"><LoaderCircle className="spinner" /></div>; }
 
 function BrowserFoundation() {
-  return <div className="browser-foundation"><Globe2 size={42} /><h1>noise for the browser</h1><p>The shared interface is running. The browser still needs the Rust cryptography compiled to WASM and IndexedDB identity storage before it can safely enter a live frequency.</p><small>desktop uses this exact React build through Tauri</small></div>;
+  return <div className="browser-foundation"><Globe2 size={42} /><h1>noise for the browser</h1><p>The shared interface is running. The browser still needs the Rust cryptography compiled to WASM and IndexedDB identity storage before it can safely enter a live group.</p><small>desktop uses this exact React build through Tauri</small></div>;
 }
 
 function formatTime(millis: number) {

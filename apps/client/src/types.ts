@@ -18,6 +18,7 @@ export type GroupSummary = {
   description: string;
   avatar: ProfileImage | null;
   owner_public_key: string;
+  remote_deletion_supported: boolean;
   is_active: boolean;
 };
 

@@ -1,4 +1,5 @@
 /target
+/relay-data
 /.noise
 *.local.json
 .DS_Store

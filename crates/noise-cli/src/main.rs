@@ -60,7 +60,7 @@ enum Command {
         #[arg(long)]
         relay: Vec<String>,
     },
-    /// Update the active frequency's founder-controlled identity.
+    /// Update the active group's founder-controlled identity.
     GroupProfile {
         #[arg(long)]
         state: PathBuf,
@@ -73,6 +73,13 @@ enum Command {
     },
     /// Publish a signed departure from the active group.
     Leave {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        relay: Vec<String>,
+    },
+    /// Permanently delete a group you founded.
+    Delete {
         #[arg(long)]
         state: PathBuf,
         #[arg(long)]
@@ -92,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
             println!("public key: {}", summary.identity.public_key);
         }
         Command::Make { state, name, relay } => {
-            let result = client.make(state, name, relay).await?;
+            let result = client.make(state, name, None, None, relay).await?;
             println!("you made noise: {}", result.group.name);
             println!("frequency");
             println!("{}", result.display_frequency);
@@ -160,6 +167,17 @@ async fn main() -> anyhow::Result<()> {
         Command::Leave { state, relay } => {
             client.leave(state, relay).await?;
             println!("left active group");
+        }
+        Command::Delete { state, relay } => {
+            let group_id = client
+                .local_summary(&state)?
+                .groups
+                .into_iter()
+                .find(|group| group.is_active)
+                .map(|group| group.group_id)
+                .ok_or_else(|| anyhow::anyhow!("no active group"))?;
+            client.delete_group(state, &group_id, relay).await?;
+            println!("deleted group");
         }
     }
 

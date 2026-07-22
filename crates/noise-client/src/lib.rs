@@ -8,9 +8,15 @@ use anyhow::{Context, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 pub use noise_core::ProfileImage;
 use noise_core::{
-    EncryptedBlob, GroupMembership, GroupProfile, GroupState, Identity, InviteRecord, Profile,
-    SignedEvent, display_frequency, frequency_locator, generate_frequency, normalize_frequency,
+    EncryptedBlob, GroupDeletion, GroupEventPayload, GroupMembership, GroupProfile, GroupState,
+    Identity, InviteRecord, Profile, SignedEvent, display_frequency, frequency_locator,
+    generate_frequency, normalize_frequency,
 };
+use noise_transport::{
+    GATEWAY_HEADER, OHTTP_RELAY_PATH, OHTTP_REQUEST_MEDIA_TYPE, OHTTP_RESPONSE_MEDIA_TYPE,
+    PlainResponse, RelayDescriptor, decode_response, encode_request,
+};
+use ohttp::ClientRequest;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -21,7 +27,11 @@ pub struct NoiseClient {
 impl Default for NoiseClient {
     fn default() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(20))
+                .build()
+                .expect("Noise HTTP configuration is valid"),
         }
     }
 }
@@ -41,6 +51,7 @@ pub struct GroupSummary {
     pub description: String,
     pub avatar: Option<ProfileImage>,
     pub owner_public_key: String,
+    pub remote_deletion_supported: bool,
     pub is_active: bool,
 }
 
@@ -114,7 +125,7 @@ impl ClientState {
 
     fn active_group(&self) -> anyhow::Result<&GroupMembership> {
         let Some(group_id) = self.active_group_id.as_deref() else {
-            bail!("no active group; make noise or join a frequency first")
+            bail!("no active group; make a group or join with a frequency first")
         };
         self.groups
             .iter()
@@ -157,6 +168,7 @@ impl ClientState {
                     description: group.description.clone(),
                     avatar: group.avatar.clone(),
                     owner_public_key: group.owner_public_key.clone(),
+                    remote_deletion_supported: !group.authority_nonce_base64.is_empty(),
                     is_active: self.active_group_id.as_deref() == Some(&group.group_id),
                 })
                 .collect(),
@@ -227,7 +239,7 @@ impl NoiseClient {
         if bio.chars().count() > 160 {
             bail!("bios can contain at most 160 characters")
         }
-        let relays = relay_list(relays);
+        let relays = relay_list(relays)?;
         let avatar = if remove_avatar {
             None
         } else if let Some(encoded) = avatar_data_base64 {
@@ -288,7 +300,7 @@ impl NoiseClient {
         if description.chars().count() > 200 {
             bail!("group descriptions can contain at most 200 characters")
         }
-        let relays = relay_list(relays);
+        let relays = relay_list(relays)?;
         let group_id = state.active_group()?.group_id.clone();
         let group_index = state
             .groups
@@ -300,7 +312,7 @@ impl NoiseClient {
         let events = self.fetch_events(&current_group, relays.clone()).await?;
         let view = GroupState::rebuild(&current_group, &events);
         if view.owner_public_key.as_deref() != Some(identity.public_key_base64().as_str()) {
-            bail!("only the frequency founder can edit its identity right now")
+            bail!("only the group founder can edit its identity right now")
         }
 
         let avatar = if remove_avatar {
@@ -319,7 +331,8 @@ impl NoiseClient {
             if data.is_empty() || data.len() > 256 * 1024 {
                 bail!("group icons must contain between 1 byte and 256 KiB")
             }
-            let (blob, key_base64) = EncryptedBlob::create(&data)?;
+            let (blob, key_base64) =
+                EncryptedBlob::create_for_group(&data, current_group.group_id.clone())?;
             self.publish_blob(&relays, &blob).await?;
             Some(ProfileImage {
                 blob_id: blob.blob_id,
@@ -364,7 +377,9 @@ impl NoiseClient {
         if image.byte_length == 0 || image.byte_length > 256 * 1024 {
             bail!("avatar reference has an invalid size")
         }
-        let blob = self.fetch_blob(&relay_list(relays), &image.blob_id).await?;
+        let blob = self
+            .fetch_blob(&relay_list(relays)?, &image.blob_id)
+            .await?;
         let data = blob.open(&image.key_base64)?;
         if data.len() != image.byte_length as usize {
             bail!("avatar data does not match its profile reference")
@@ -379,6 +394,8 @@ impl NoiseClient {
         &self,
         path: impl AsRef<Path>,
         name: impl Into<String>,
+        avatar_data_base64: Option<String>,
+        avatar_mime_type: Option<String>,
         relays: Vec<String>,
     ) -> anyhow::Result<MakeResult> {
         let path = path.as_ref();
@@ -389,9 +406,33 @@ impl NoiseClient {
         }
         let mut state = load_state(path)?;
         let identity = state.identity()?;
-        let group = GroupMembership::create_owned(name, identity.public_key_base64());
+        let relays = relay_list(relays)?;
+        let mut group = GroupMembership::create_owned(name, identity.public_key_base64());
+        if let Some(encoded) = avatar_data_base64 {
+            let mime_type = avatar_mime_type.context("group icon media type is missing")?;
+            if !matches!(
+                mime_type.as_str(),
+                "image/jpeg" | "image/png" | "image/webp"
+            ) {
+                bail!("group icons must be JPEG, PNG, or WebP images")
+            }
+            let data = STANDARD
+                .decode(encoded)
+                .context("group icon encoding is invalid")?;
+            if data.is_empty() || data.len() > 256 * 1024 {
+                bail!("group icons must contain between 1 byte and 256 KiB")
+            }
+            let (blob, key_base64) =
+                EncryptedBlob::create_for_group(&data, group.group_id.clone())?;
+            self.publish_blob(&relays, &blob).await?;
+            group.avatar = Some(ProfileImage {
+                blob_id: blob.blob_id,
+                key_base64,
+                mime_type,
+                byte_length: data.len() as u32,
+            });
+        }
         let frequency = generate_frequency();
-        let relays = relay_list(relays);
         let invitation = InviteRecord::create(&identity, &frequency, group.clone())?;
         self.publish_invite(&relays, &invitation).await?;
         state.add_group(group);
@@ -407,6 +448,7 @@ impl NoiseClient {
                 description: group.description,
                 avatar: group.avatar,
                 owner_public_key: group.owner_public_key,
+                remote_deletion_supported: !group.authority_nonce_base64.is_empty(),
                 is_active: true,
             },
             display_frequency: display_frequency(&frequency)?,
@@ -422,7 +464,7 @@ impl NoiseClient {
     ) -> anyhow::Result<JoinResult> {
         let path = path.as_ref();
         let mut state = load_state(path)?;
-        let relays = relay_list(relays);
+        let relays = relay_list(relays)?;
         let frequency = normalize_frequency(frequency)?;
         let locator = frequency_locator(&frequency);
         let invitation = self.fetch_invite(&relays, &locator).await?;
@@ -443,6 +485,7 @@ impl NoiseClient {
                 description: group.description,
                 avatar: group.avatar,
                 owner_public_key: group.owner_public_key,
+                remote_deletion_supported: !group.authority_nonce_base64.is_empty(),
                 is_active: true,
             },
         })
@@ -463,7 +506,7 @@ impl NoiseClient {
         let sequence = state.take_sequence();
         let group = state.active_group()?.clone();
         let event = SignedEvent::chat(&state.identity()?, &group, text, sequence)?;
-        self.publish_event(&relay_list(relays), &event).await?;
+        self.publish_event(&relay_list(relays)?, &event).await?;
         save_state(path, &state)?;
         Ok(())
     }
@@ -474,9 +517,45 @@ impl NoiseClient {
         let sequence = state.take_sequence();
         let group = state.active_group()?.clone();
         let event = SignedEvent::member_left(&state.identity()?, &group, sequence)?;
-        self.publish_event(&relay_list(relays), &event).await?;
+        self.publish_event(&relay_list(relays)?, &event).await?;
         save_state(path, &state)?;
         Ok(())
+    }
+
+    pub async fn delete_group(
+        &self,
+        path: impl AsRef<Path>,
+        group_id: &str,
+        relays: Vec<String>,
+    ) -> anyhow::Result<LocalSummary> {
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        let group_index = state
+            .groups
+            .iter()
+            .position(|group| group.group_id == group_id)
+            .context("group is missing from local state")?;
+        let group = state.groups[group_index].clone();
+        let identity = state.identity()?;
+        if group.owner_public_key != identity.public_key_base64() {
+            bail!("only the group founder can delete it")
+        }
+
+        // Groups created before authenticated deletion existed have no
+        // authority nonce. They can still be removed locally; current relays
+        // cannot safely accept a purge claim for those legacy identifiers.
+        if !group.authority_nonce_base64.is_empty() {
+            let deletion = GroupDeletion::create(&identity, &group)?;
+            let relays = relay_list(relays)?;
+            self.publish_group_deletion(&relays, &deletion).await?;
+        }
+
+        state.groups.remove(group_index);
+        if state.active_group_id.as_deref() == Some(group_id) {
+            state.active_group_id = state.groups.first().map(|group| group.group_id.clone());
+        }
+        save_state(path, &state)?;
+        state.summary()
     }
 
     pub async fn conversation(
@@ -493,7 +572,24 @@ impl NoiseClient {
             .position(|group| group.group_id == group_id)
             .context("active group is missing from local state")?;
         let group = state.groups[group_index].clone();
-        let events = self.fetch_events(&group, relay_list(relays)).await?;
+        let relays = relay_list(relays)?;
+        let mut events = self.fetch_events(&group, relays.clone()).await?;
+        let identity = state.identity()?;
+        let identity_public_key = identity.public_key_base64();
+        let founder_join_exists = events.iter().any(|event| {
+            event.author_public_key == identity_public_key
+                && matches!(
+                    event.decrypt(&group),
+                    Ok(GroupEventPayload::MemberJoined { .. })
+                )
+        });
+        if group.owner_public_key == identity_public_key && !founder_join_exists {
+            let sequence = state.take_sequence();
+            let joined = SignedEvent::member_joined(&identity, &group, &state.profile, sequence)?;
+            self.publish_event(&relays, &joined).await?;
+            events.push(joined);
+            save_state(path, &state)?;
+        }
         let view = GroupState::rebuild(&group, &events);
         let resolved_owner = view.owner_public_key.clone().unwrap_or_default();
         let resolved_profile = view.profile.clone();
@@ -526,6 +622,7 @@ impl NoiseClient {
                 description: resolved_profile.description,
                 avatar: resolved_profile.avatar,
                 owner_public_key: resolved_owner,
+                remote_deletion_supported: !group.authority_nonce_base64.is_empty(),
                 is_active: true,
             },
             members,
@@ -548,14 +645,16 @@ impl NoiseClient {
 
     async fn publish_invite(
         &self,
-        relays: &[String],
+        relays: &[RelayDescriptor],
         invitation: &InviteRecord,
     ) -> anyhow::Result<()> {
+        let body = serde_json::to_vec(invitation)?;
         let mut accepted = 0usize;
-        for relay in relays {
-            let endpoint = format!("{}/v1/invites", relay.trim_end_matches('/'));
-            if let Ok(response) = self.http.post(endpoint).json(invitation).send().await
-                && response.status().is_success()
+        for index in 0..relays.len() {
+            if let Ok(response) = self
+                .relay_request(relays, index, "POST", "/v1/invites", &body)
+                .await
+                && (200..300).contains(&response.status)
             {
                 accepted += 1;
             }
@@ -566,12 +665,18 @@ impl NoiseClient {
         Ok(())
     }
 
-    async fn publish_event(&self, relays: &[String], event: &SignedEvent) -> anyhow::Result<()> {
+    async fn publish_event(
+        &self,
+        relays: &[RelayDescriptor],
+        event: &SignedEvent,
+    ) -> anyhow::Result<()> {
+        let body = serde_json::to_vec(event)?;
         let mut accepted = 0usize;
-        for relay in relays {
-            let endpoint = format!("{}/v1/events", relay.trim_end_matches('/'));
-            if let Ok(response) = self.http.post(endpoint).json(event).send().await
-                && response.status().is_success()
+        for index in 0..relays.len() {
+            if let Ok(response) = self
+                .relay_request(relays, index, "POST", "/v1/events", &body)
+                .await
+                && (200..300).contains(&response.status)
             {
                 accepted += 1;
             }
@@ -582,12 +687,18 @@ impl NoiseClient {
         Ok(())
     }
 
-    async fn publish_blob(&self, relays: &[String], blob: &EncryptedBlob) -> anyhow::Result<()> {
+    async fn publish_blob(
+        &self,
+        relays: &[RelayDescriptor],
+        blob: &EncryptedBlob,
+    ) -> anyhow::Result<()> {
+        let body = serde_json::to_vec(blob)?;
         let mut accepted = 0usize;
-        for relay in relays {
-            let endpoint = format!("{}/v1/blobs", relay.trim_end_matches('/'));
-            if let Ok(response) = self.http.post(endpoint).json(blob).send().await
-                && response.status().is_success()
+        for index in 0..relays.len() {
+            if let Ok(response) = self
+                .relay_request(relays, index, "POST", "/v1/blobs", &body)
+                .await
+                && (200..300).contains(&response.status)
             {
                 accepted += 1;
             }
@@ -598,14 +709,42 @@ impl NoiseClient {
         Ok(())
     }
 
-    async fn fetch_blob(&self, relays: &[String], blob_id: &str) -> anyhow::Result<EncryptedBlob> {
-        for relay in relays {
-            let endpoint = format!("{}/v1/blobs/{blob_id}", relay.trim_end_matches('/'));
-            let Ok(response) = self.http.get(endpoint).send().await else {
+    async fn publish_group_deletion(
+        &self,
+        relays: &[RelayDescriptor],
+        deletion: &GroupDeletion,
+    ) -> anyhow::Result<()> {
+        let body = serde_json::to_vec(deletion)?;
+        let mut accepted = 0usize;
+        for index in 0..relays.len() {
+            if let Ok(response) = self
+                .relay_request(relays, index, "POST", "/v1/group-deletions", &body)
+                .await
+                && (200..300).contains(&response.status)
+            {
+                accepted += 1;
+            }
+        }
+        if accepted != relays.len() {
+            bail!("the group could not be deleted from every relay; try again")
+        }
+        Ok(())
+    }
+
+    async fn fetch_blob(
+        &self,
+        relays: &[RelayDescriptor],
+        blob_id: &str,
+    ) -> anyhow::Result<EncryptedBlob> {
+        for index in 0..relays.len() {
+            let Ok(response) = self
+                .relay_request(relays, index, "GET", &format!("/v1/blobs/{blob_id}"), &[])
+                .await
+            else {
                 continue;
             };
-            if response.status().is_success()
-                && let Ok(blob) = response.json::<EncryptedBlob>().await
+            if (200..300).contains(&response.status)
+                && let Ok(blob) = serde_json::from_slice::<EncryptedBlob>(&response.body)
                 && blob.verify().is_ok()
             {
                 return Ok(blob);
@@ -614,14 +753,20 @@ impl NoiseClient {
         bail!("avatar is not available from any relay")
     }
 
-    async fn fetch_invite(&self, relays: &[String], locator: &str) -> anyhow::Result<InviteRecord> {
-        for relay in relays {
-            let endpoint = format!("{}/v1/invites/{locator}", relay.trim_end_matches('/'));
-            let Ok(response) = self.http.get(endpoint).send().await else {
+    async fn fetch_invite(
+        &self,
+        relays: &[RelayDescriptor],
+        locator: &str,
+    ) -> anyhow::Result<InviteRecord> {
+        for index in 0..relays.len() {
+            let Ok(response) = self
+                .relay_request(relays, index, "GET", &format!("/v1/invites/{locator}"), &[])
+                .await
+            else {
                 continue;
             };
-            if response.status().is_success()
-                && let Ok(invitation) = response.json::<InviteRecord>().await
+            if (200..300).contains(&response.status)
+                && let Ok(invitation) = serde_json::from_slice::<InviteRecord>(&response.body)
             {
                 return Ok(invitation);
             }
@@ -632,23 +777,27 @@ impl NoiseClient {
     async fn fetch_events(
         &self,
         group: &GroupMembership,
-        relays: Vec<String>,
+        relays: Vec<RelayDescriptor>,
     ) -> anyhow::Result<Vec<SignedEvent>> {
         let mut merged = HashMap::<String, SignedEvent>::new();
         let mut reachable = 0usize;
-        for relay in relays {
-            let endpoint = format!(
-                "{}/v1/groups/{}/events",
-                relay.trim_end_matches('/'),
-                group.group_id
-            );
-            let Ok(response) = self.http.get(endpoint).send().await else {
+        for index in 0..relays.len() {
+            let Ok(response) = self
+                .relay_request(
+                    &relays,
+                    index,
+                    "GET",
+                    &format!("/v1/groups/{}/events", group.group_id),
+                    &[],
+                )
+                .await
+            else {
                 continue;
             };
-            let Ok(response) = response.error_for_status() else {
+            if !(200..300).contains(&response.status) {
                 continue;
-            };
-            let Ok(events) = response.json::<Vec<SignedEvent>>().await else {
+            }
+            let Ok(events) = serde_json::from_slice::<Vec<SignedEvent>>(&response.body) else {
                 continue;
             };
             reachable += 1;
@@ -663,10 +812,132 @@ impl NoiseClient {
         }
         Ok(merged.into_values().collect())
     }
+
+    async fn relay_request(
+        &self,
+        relays: &[RelayDescriptor],
+        storage_index: usize,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> anyhow::Result<PlainResponse> {
+        let storage = relays
+            .get(storage_index)
+            .context("relay index is invalid")?;
+        let mask = (1..relays.len())
+            .map(|offset| &relays[(storage_index + offset) % relays.len()])
+            .find(|candidate| candidate.base_url != storage.base_url);
+        if let (Some(config), Some(mask)) = (storage.ohttp_config.as_deref(), mask) {
+            return self
+                .oblivious_request(storage, mask, config, method, path, body)
+                .await;
+        }
+        self.direct_request(storage, method, path, body).await
+    }
+
+    async fn oblivious_request(
+        &self,
+        storage: &RelayDescriptor,
+        mask: &RelayDescriptor,
+        config: &[u8],
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> anyhow::Result<PlainResponse> {
+        let storage_url =
+            reqwest::Url::parse(&storage.base_url).context("storage relay address is invalid")?;
+        let host = storage_url
+            .host_str()
+            .context("storage relay has no host")?;
+        let host = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.to_owned()
+        };
+        let authority = storage_url
+            .port()
+            .map_or(host.clone(), |port| format!("{host}:{port}"));
+        let request = encode_request(method, storage_url.scheme(), &authority, path, body)?;
+        let client = ClientRequest::from_encoded_config(config)
+            .context("storage relay privacy key is invalid")?;
+        let (encrypted_request, response_context) = client
+            .encapsulate(&request)
+            .context("could not seal private relay request")?;
+        let endpoint = format!("{}{OHTTP_RELAY_PATH}", mask.base_url);
+        let response = self
+            .http
+            .post(endpoint)
+            .header(reqwest::header::CONTENT_TYPE, OHTTP_REQUEST_MEDIA_TYPE)
+            .header(GATEWAY_HEADER, &storage.base_url)
+            .body(encrypted_request)
+            .send()
+            .await
+            .context("privacy mask is unreachable")?;
+        if !response.status().is_success() {
+            bail!(
+                "privacy mask rejected the request with {}",
+                response.status()
+            )
+        }
+        if response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_none_or(|value| !value.trim().eq_ignore_ascii_case(OHTTP_RESPONSE_MEDIA_TYPE))
+        {
+            bail!("privacy mask returned an invalid response")
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > 2_600_000)
+        {
+            bail!("privacy response is too large")
+        }
+        let encrypted_response = response.bytes().await?;
+        if encrypted_response.len() > 2_600_000 {
+            bail!("privacy response is too large")
+        }
+        let response = response_context
+            .decapsulate(&encrypted_response)
+            .context("could not open private relay response")?;
+        decode_response(&response)
+    }
+
+    async fn direct_request(
+        &self,
+        relay: &RelayDescriptor,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> anyhow::Result<PlainResponse> {
+        let method = reqwest::Method::from_bytes(method.as_bytes())?;
+        let mut request = self
+            .http
+            .request(method, format!("{}{path}", relay.base_url));
+        if !body.is_empty() {
+            request = request
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.to_vec());
+        }
+        let response = request.send().await?;
+        let status = response.status().as_u16();
+        if response
+            .content_length()
+            .is_some_and(|length| length > 2_600_000)
+        {
+            bail!("relay response is too large")
+        }
+        let body = response.bytes().await?.to_vec();
+        if body.len() > 2_600_000 {
+            bail!("relay response is too large")
+        }
+        Ok(PlainResponse { status, body })
+    }
 }
 
-fn relay_list(relays: Vec<String>) -> Vec<String> {
-    if relays.is_empty() {
+fn relay_list(relays: Vec<String>) -> anyhow::Result<Vec<RelayDescriptor>> {
+    let relays = if relays.is_empty() {
         vec![
             "http://127.0.0.1:4301".into(),
             "http://127.0.0.1:4302".into(),
@@ -674,7 +945,25 @@ fn relay_list(relays: Vec<String>) -> Vec<String> {
         ]
     } else {
         relays
+    };
+    let relays = relays
+        .iter()
+        .map(|relay| RelayDescriptor::parse(relay))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if relays.len() > 1
+        && relays
+            .iter()
+            .any(|relay| !is_local_relay(&relay.base_url) && relay.ohttp_config.is_none())
+    {
+        bail!("multi-relay configurations require pinned privacy keys")
     }
+    Ok(relays)
+}
+
+fn is_local_relay(base_url: &str) -> bool {
+    base_url.starts_with("http://127.0.0.1")
+        || base_url.starts_with("http://localhost")
+        || base_url.starts_with("http://[::1]")
 }
 
 fn validate_username(username: &str) -> anyhow::Result<()> {
