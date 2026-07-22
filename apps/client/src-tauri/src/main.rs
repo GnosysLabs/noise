@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
+use tauri::Manager;
 
 fn state_path() -> Result<PathBuf, String> {
     dirs::data_dir()
@@ -9,7 +10,7 @@ fn state_path() -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-async fn noise_invoke(mut request: Value) -> Value {
+async fn noise_invoke(app: tauri::AppHandle, mut request: Value) -> Value {
     let Ok(path) = state_path() else {
         return json!({ "ok": false, "error": "could not locate Noise identity storage" });
     };
@@ -19,6 +20,13 @@ async fn noise_invoke(mut request: Value) -> Value {
     request_object.insert(
         "state_path".into(),
         Value::String(path.to_string_lossy().into_owned()),
+    );
+    let Ok(cache_path) = app.path().app_cache_dir() else {
+        return json!({ "ok": false, "error": "could not locate Noise media cache" });
+    };
+    request_object.insert(
+        "cache_path".into(),
+        Value::String(cache_path.to_string_lossy().into_owned()),
     );
 
     match tauri::async_runtime::spawn_blocking(move || {
@@ -34,6 +42,8 @@ async fn noise_invoke(mut request: Value) -> Value {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![noise_invoke])
         .run(tauri::generate_context!())
         .expect("error while running Noise");

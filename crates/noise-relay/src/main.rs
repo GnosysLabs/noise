@@ -19,7 +19,9 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use noise_core::{EncryptedBlob, GroupDeletion, InviteRecord, SignedEvent};
+use noise_core::{
+    AccountVault, EncryptedBlob, GroupDeletion, InviteRecord, InviteRotation, SignedEvent,
+};
 use noise_transport::{
     GATEWAY_HEADER, OHTTP_GATEWAY_PATH, OHTTP_KEYS_MEDIA_TYPE, OHTTP_KEYS_PATH, OHTTP_RELAY_PATH,
     OHTTP_REQUEST_MEDIA_TYPE, OHTTP_RESPONSE_MEDIA_TYPE, PlainRequest, RelayDescriptor,
@@ -53,7 +55,9 @@ struct Args {
 
 #[derive(Clone)]
 struct AppState {
+    accounts: Arc<RwLock<HashMap<String, AccountVault>>>,
     invites: Arc<RwLock<HashMap<String, InviteRecord>>>,
+    invite_rotations: Arc<RwLock<HashMap<String, InviteRotation>>>,
     events: Arc<RwLock<HashMap<String, SignedEvent>>>,
     blobs: Arc<RwLock<HashMap<String, EncryptedBlob>>>,
     deletions: Arc<RwLock<HashMap<String, GroupDeletion>>>,
@@ -69,7 +73,11 @@ struct AppState {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Snapshot {
+    #[serde(default)]
+    accounts: Vec<AccountVault>,
     deletions: Vec<GroupDeletion>,
+    #[serde(default)]
+    invite_rotations: Vec<InviteRotation>,
     invites: Vec<InviteRecord>,
     events: Vec<SignedEvent>,
     blob_ids: Vec<String>,
@@ -78,6 +86,7 @@ struct Snapshot {
 #[derive(Serialize)]
 struct Health {
     status: &'static str,
+    accounts: usize,
     invitations: usize,
     events: usize,
     blobs: usize,
@@ -134,7 +143,9 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .context("could not initialize relay HTTP")?;
     let state = AppState {
+        accounts: Arc::new(RwLock::new(recovered.accounts)),
         invites: Arc::new(RwLock::new(recovered.invites)),
+        invite_rotations: Arc::new(RwLock::new(recovered.invite_rotations)),
         events: Arc::new(RwLock::new(recovered.events)),
         blobs: Arc::new(RwLock::new(recovered.blobs)),
         deletions: Arc::new(RwLock::new(recovered.deletions)),
@@ -152,8 +163,11 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/v1/accounts", post(publish_account))
+        .route("/v1/accounts/{locator}", get(get_account))
         .route("/v1/invites", post(publish_invite))
         .route("/v1/invites/{locator}", get(get_invite))
+        .route("/v1/invite-rotations", post(publish_invite_rotation))
         .route("/v1/events", post(publish_event))
         .route("/v1/groups/{group_id}/events", get(group_events))
         .route("/v1/groups/{group_id}/watch/{since}", get(group_watch))
@@ -193,6 +207,13 @@ async fn main() -> anyhow::Result<()> {
 async fn health(State(state): State<AppState>) -> Json<Health> {
     Json(Health {
         status: "ok",
+        accounts: state
+            .accounts
+            .read()
+            .await
+            .values()
+            .filter(|vault| !vault.deleted)
+            .count(),
         invitations: state.invites.read().await.len(),
         events: state.events.read().await.len(),
         blobs: state.blobs.read().await.len(),
@@ -201,6 +222,41 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         privacy_gateway: true,
         mask_targets: state.mask_targets.len(),
     })
+}
+
+async fn publish_account(
+    State(state): State<AppState>,
+    Json(vault): Json<AccountVault>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    vault
+        .verify()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    match apply_account_vault(&state, vault.clone()).await {
+        Ok(InsertResult::Inserted) => {
+            tokio::spawn(gossip_account(state, vault));
+        }
+        Ok(InsertResult::Present) => {}
+        Ok(InsertResult::Deleted) => unreachable!("account vaults use signed tombstones"),
+        Err(error) => {
+            eprintln!("account vault update rejected: {error:#}");
+            return Err((
+                StatusCode::CONFLICT,
+                "account vault revision conflicts".into(),
+            ));
+        }
+    }
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn get_account(
+    State(state): State<AppState>,
+    Path(locator): Path<String>,
+) -> Result<Json<AccountVault>, StatusCode> {
+    match state.accounts.read().await.get(&locator).cloned() {
+        Some(vault) if vault.deleted => Err(StatusCode::GONE),
+        Some(vault) => Ok(Json(vault)),
+        None => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 async fn publish_invite(
@@ -237,6 +293,28 @@ async fn get_invite(
         .cloned()
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn publish_invite_rotation(
+    State(state): State<AppState>,
+    Json(rotation): Json<InviteRotation>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    rotation
+        .verify()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    match apply_invite_rotation(&state, rotation.clone())
+        .await
+        .map_err(storage_error)?
+    {
+        InsertResult::Inserted => {
+            tokio::spawn(gossip_invite_rotation(state, rotation));
+        }
+        InsertResult::Deleted => {
+            return Err((StatusCode::GONE, "group has been deleted".into()));
+        }
+        InsertResult::Present => {}
+    }
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn publish_event(
@@ -476,6 +554,26 @@ async fn dispatch_private_request(
     }
 
     match (request.method.as_str(), request.path.as_str()) {
+        ("POST", "/v1/accounts") => {
+            let Ok(vault) = serde_json::from_slice::<AccountVault>(&request.body) else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid account vault");
+            };
+            if let Err(error) = vault.verify() {
+                return private_error(StatusCode::BAD_REQUEST, &error.to_string());
+            }
+            match apply_account_vault(state, vault.clone()).await {
+                Ok(InsertResult::Inserted) => {
+                    tokio::spawn(gossip_account(state.clone(), vault));
+                    (StatusCode::ACCEPTED, Vec::new())
+                }
+                Ok(InsertResult::Present) => (StatusCode::ACCEPTED, Vec::new()),
+                Ok(InsertResult::Deleted) => unreachable!("account vaults use signed tombstones"),
+                Err(error) => {
+                    eprintln!("account vault update rejected: {error:#}");
+                    private_error(StatusCode::CONFLICT, "account vault revision conflicts")
+                }
+            }
+        }
         ("POST", "/v1/invites") => {
             let Ok(record) = serde_json::from_slice::<InviteRecord>(&request.body) else {
                 return private_error(StatusCode::BAD_REQUEST, "invalid invitation");
@@ -486,6 +584,28 @@ async fn dispatch_private_request(
             match insert_invite(state, record.clone()).await {
                 Ok(InsertResult::Inserted) => {
                     tokio::spawn(gossip_invite(state.clone(), record));
+                    (StatusCode::ACCEPTED, Vec::new())
+                }
+                Ok(InsertResult::Present) => (StatusCode::ACCEPTED, Vec::new()),
+                Ok(InsertResult::Deleted) => {
+                    private_error(StatusCode::GONE, "group has been deleted")
+                }
+                Err(error) => {
+                    eprintln!("relay storage error: {error:#}");
+                    private_error(StatusCode::INTERNAL_SERVER_ERROR, "storage failed")
+                }
+            }
+        }
+        ("POST", "/v1/invite-rotations") => {
+            let Ok(rotation) = serde_json::from_slice::<InviteRotation>(&request.body) else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid invite rotation");
+            };
+            if let Err(error) = rotation.verify() {
+                return private_error(StatusCode::BAD_REQUEST, &error.to_string());
+            }
+            match apply_invite_rotation(state, rotation.clone()).await {
+                Ok(InsertResult::Inserted) => {
+                    tokio::spawn(gossip_invite_rotation(state.clone(), rotation));
                     (StatusCode::ACCEPTED, Vec::new())
                 }
                 Ok(InsertResult::Present) => (StatusCode::ACCEPTED, Vec::new()),
@@ -568,6 +688,16 @@ async fn dispatch_private_request(
             let locator = path.trim_start_matches("/v1/invites/");
             match state.invites.read().await.get(locator).cloned() {
                 Some(record) => private_json(StatusCode::OK, &record),
+                None => private_error(StatusCode::NOT_FOUND, "nothing here"),
+            }
+        }
+        ("GET", path) if path.starts_with("/v1/accounts/") => {
+            let locator = path.trim_start_matches("/v1/accounts/");
+            match state.accounts.read().await.get(locator).cloned() {
+                Some(vault) if vault.deleted => {
+                    private_error(StatusCode::GONE, "account was deleted")
+                }
+                Some(vault) => private_json(StatusCode::OK, &vault),
                 None => private_error(StatusCode::NOT_FOUND, "nothing here"),
             }
         }
@@ -712,7 +842,15 @@ async fn snapshot(State(state): State<AppState>) -> Json<Snapshot> {
 
 async fn current_snapshot(state: &AppState) -> Snapshot {
     Snapshot {
+        accounts: state.accounts.read().await.values().cloned().collect(),
         deletions: state.deletions.read().await.values().cloned().collect(),
+        invite_rotations: state
+            .invite_rotations
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect(),
         invites: state.invites.read().await.values().cloned().collect(),
         events: state.events.read().await.values().cloned().collect(),
         blob_ids: state.blobs.read().await.keys().cloned().collect(),
@@ -727,12 +865,52 @@ fn storage_error(error: anyhow::Error) -> (StatusCode, String) {
     )
 }
 
+async fn apply_account_vault(
+    state: &AppState,
+    vault: AccountVault,
+) -> anyhow::Result<InsertResult> {
+    let _guard = state.mutations.lock().await;
+    if let Some(current) = state.accounts.read().await.get(&vault.locator) {
+        if current.identity_public_key != vault.identity_public_key {
+            bail!("account identity does not match the existing vault")
+        }
+        if current.revision > vault.revision {
+            bail!("account vault revision is stale")
+        }
+        if current.revision == vault.revision {
+            if current.signature_base64 == vault.signature_base64 {
+                return Ok(InsertResult::Present);
+            }
+            bail!("account vault revision is already occupied")
+        }
+        if current.deleted {
+            bail!("deleted accounts cannot be restored")
+        }
+    }
+    state.store.upsert_account(&vault).await?;
+    state
+        .accounts
+        .write()
+        .await
+        .insert(vault.locator.clone(), vault);
+    Ok(InsertResult::Inserted)
+}
+
 async fn insert_invite(state: &AppState, record: InviteRecord) -> anyhow::Result<InsertResult> {
     let _guard = state.mutations.lock().await;
     if let Some(group_id) = record.group_id.as_ref()
         && state.deletions.read().await.contains_key(group_id)
     {
         return Ok(InsertResult::Deleted);
+    }
+    if let Some(group_id) = record.group_id.as_ref()
+        && let Some(rotation) = state.invite_rotations.read().await.get(group_id)
+        && rotation
+            .new_invite
+            .as_ref()
+            .is_none_or(|current| current.locator != record.locator)
+    {
+        return Ok(InsertResult::Present);
     }
     let object_id = record.locator.clone();
     let inserted = state
@@ -747,6 +925,61 @@ async fn insert_invite(state: &AppState, record: InviteRecord) -> anyhow::Result
     } else {
         InsertResult::Present
     })
+}
+
+async fn apply_invite_rotation(
+    state: &AppState,
+    rotation: InviteRotation,
+) -> anyhow::Result<InsertResult> {
+    let _guard = state.mutations.lock().await;
+    if state
+        .deletions
+        .read()
+        .await
+        .contains_key(&rotation.group_id)
+    {
+        return Ok(InsertResult::Deleted);
+    }
+    if let Some(current) = state.invite_rotations.read().await.get(&rotation.group_id) {
+        if current.owner_sequence == rotation.owner_sequence
+            && current.signature_base64 == rotation.signature_base64
+        {
+            return Ok(InsertResult::Present);
+        }
+        if current.owner_sequence >= rotation.owner_sequence {
+            bail!("invite rotation sequence is stale")
+        }
+    }
+    let invite_ids = state
+        .invites
+        .read()
+        .await
+        .iter()
+        .filter(|(_, invite)| invite.group_id.as_deref() == Some(rotation.group_id.as_str()))
+        .map(|(locator, _)| locator.clone())
+        .collect::<Vec<_>>();
+    state
+        .store
+        .apply_invite_rotation(&rotation, &invite_ids)
+        .await?;
+    state
+        .invites
+        .write()
+        .await
+        .retain(|_, invite| invite.group_id.as_deref() != Some(rotation.group_id.as_str()));
+    if let Some(invite) = rotation.new_invite.as_ref() {
+        state
+            .invites
+            .write()
+            .await
+            .insert(invite.locator.clone(), invite.clone());
+    }
+    state
+        .invite_rotations
+        .write()
+        .await
+        .insert(rotation.group_id.clone(), rotation);
+    Ok(InsertResult::Inserted)
 }
 
 async fn insert_event(state: &AppState, event: SignedEvent) -> anyhow::Result<InsertResult> {
@@ -837,6 +1070,11 @@ async fn apply_group_deletion(state: &AppState, deletion: GroupDeletion) -> anyh
         .await
         .retain(|_, invite| invite.group_id.as_deref() != Some(deletion.group_id.as_str()));
     state
+        .invite_rotations
+        .write()
+        .await
+        .remove(&deletion.group_id);
+    state
         .events
         .write()
         .await
@@ -861,6 +1099,28 @@ async fn gossip_invite(state: AppState, record: InviteRecord) {
             .client
             .post(format!("{peer}/v1/invites"))
             .json(&record)
+            .send()
+            .await;
+    }
+}
+
+async fn gossip_account(state: AppState, vault: AccountVault) {
+    for peer in state.peers.iter() {
+        let _ = state
+            .client
+            .post(format!("{peer}/v1/accounts"))
+            .json(&vault)
+            .send()
+            .await;
+    }
+}
+
+async fn gossip_invite_rotation(state: AppState, rotation: InviteRotation) {
+    for peer in state.peers.iter() {
+        let _ = state
+            .client
+            .post(format!("{peer}/v1/invite-rotations"))
+            .json(&rotation)
             .send()
             .await;
     }
@@ -914,11 +1174,34 @@ async fn anti_entropy_loop(state: AppState) {
             let Ok(snapshot) = snapshot.json::<Snapshot>().await else {
                 continue;
             };
+            for account in snapshot.accounts {
+                if state
+                    .accounts
+                    .read()
+                    .await
+                    .get(&account.locator)
+                    .is_some_and(|current| current.revision >= account.revision)
+                {
+                    continue;
+                }
+                if account.verify().is_ok()
+                    && let Err(error) = apply_account_vault(&state, account).await
+                {
+                    eprintln!("could not persist gossiped account vault: {error:#}");
+                }
+            }
             for deletion in snapshot.deletions {
                 if deletion.verify().is_ok()
                     && let Err(error) = apply_group_deletion(&state, deletion).await
                 {
                     eprintln!("could not persist gossiped group deletion: {error:#}");
+                }
+            }
+            for rotation in snapshot.invite_rotations {
+                if rotation.verify().is_ok()
+                    && let Err(error) = apply_invite_rotation(&state, rotation).await
+                {
+                    eprintln!("could not persist gossiped invite rotation: {error:#}");
                 }
             }
             for invite in snapshot.invites {

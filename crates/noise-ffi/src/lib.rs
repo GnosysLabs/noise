@@ -2,10 +2,10 @@ use std::{
     ffi::{CStr, CString, c_char},
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
-    sync::OnceLock,
+    sync::{Mutex, OnceLock},
 };
 
-use noise_client::{NoiseClient, ProfileImage};
+use noise_client::{MediaAttachment, NoiseClient, ProfileImage};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
@@ -19,6 +19,24 @@ enum Request {
     Initialize {
         state_path: String,
         username: String,
+        password: String,
+        avatar_data_base64: Option<String>,
+        avatar_mime_type: Option<String>,
+        relays: Vec<String>,
+    },
+    SignIn {
+        state_path: String,
+        noise_id: String,
+        password: String,
+        relays: Vec<String>,
+    },
+    SyncAccount {
+        state_path: String,
+        relays: Vec<String>,
+    },
+    Logout {
+        state_path: String,
+        cache_path: String,
     },
     SelectGroup {
         state_path: String,
@@ -26,10 +44,12 @@ enum Request {
     },
     UpdateProfile {
         state_path: String,
+        username: String,
         bio: String,
         avatar_data_base64: Option<String>,
         avatar_mime_type: Option<String>,
         remove_avatar: bool,
+        accepts_direct_messages: bool,
         relays: Vec<String>,
     },
     UpdateGroupProfile {
@@ -41,10 +61,34 @@ enum Request {
         avatar_data_base64: Option<String>,
         avatar_mime_type: Option<String>,
         remove_avatar: bool,
+        members_can_send_messages: Option<bool>,
+        members_can_send_media: Option<bool>,
+        relays: Vec<String>,
+    },
+    RotateFrequency {
+        state_path: String,
+        revoke_only: bool,
         relays: Vec<String>,
     },
     FetchAvatar {
         image: ProfileImage,
+        relays: Vec<String>,
+    },
+    FetchAttachment {
+        state_path: String,
+        cache_path: String,
+        scope_id: Option<String>,
+        attachment: MediaAttachment,
+        relays: Vec<String>,
+    },
+    UploadMediaChunk {
+        state_path: String,
+        data_base64: String,
+        relays: Vec<String>,
+    },
+    UploadDirectMediaChunk {
+        state_path: String,
+        data_base64: String,
         relays: Vec<String>,
     },
     Make {
@@ -62,6 +106,73 @@ enum Request {
     Say {
         state_path: String,
         text: String,
+        attachment: Option<MediaAttachment>,
+        #[serde(default)]
+        reply_to_message_id: Option<String>,
+        relays: Vec<String>,
+    },
+    StartDirect {
+        state_path: String,
+        public_key: String,
+        username: String,
+        bio: String,
+        avatar: Option<ProfileImage>,
+        accepts_direct_messages: bool,
+    },
+    SelectDirect {
+        state_path: String,
+        public_key: String,
+    },
+    SyncDirects {
+        state_path: String,
+        cache_path: String,
+        relays: Vec<String>,
+    },
+    DirectConversation {
+        state_path: String,
+        cache_path: String,
+        relays: Vec<String>,
+    },
+    WatchDirect {
+        state_path: String,
+        since: Option<u64>,
+        relays: Vec<String>,
+    },
+    SayDirect {
+        state_path: String,
+        text: String,
+        attachment: Option<MediaAttachment>,
+        #[serde(default)]
+        reply_to_message_id: Option<String>,
+        relays: Vec<String>,
+    },
+    DeleteDirect {
+        state_path: String,
+        cache_path: String,
+        public_key: String,
+        for_both: bool,
+        relays: Vec<String>,
+    },
+    SetModerator {
+        state_path: String,
+        member_public_key: String,
+        enabled: bool,
+        relays: Vec<String>,
+    },
+    DeleteMessage {
+        state_path: String,
+        message_event_id: String,
+        relays: Vec<String>,
+    },
+    BanMember {
+        state_path: String,
+        member_public_key: String,
+        delete_messages: bool,
+        relays: Vec<String>,
+    },
+    UnbanMember {
+        state_path: String,
+        member_public_key: String,
         relays: Vec<String>,
     },
     Conversation {
@@ -75,11 +186,20 @@ enum Request {
     },
     Leave {
         state_path: String,
+        cache_path: String,
         relays: Vec<String>,
     },
     DeleteGroup {
         state_path: String,
+        cache_path: String,
         group_id: String,
+        relays: Vec<String>,
+    },
+    DeleteAccount {
+        state_path: String,
+        cache_path: String,
+        delete_group_messages: bool,
+        delete_direct_threads: bool,
         relays: Vec<String>,
     },
 }
@@ -97,9 +217,34 @@ fn runtime() -> Result<&'static Runtime, String> {
         .map_err(Clone::clone)
 }
 
+fn state_lock() -> &'static Mutex<()> {
+    static STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    STATE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn invoke(request_json: &str) -> Result<Value, String> {
     let request =
         serde_json::from_str::<Request>(request_json).map_err(|error| error.to_string())?;
+    // The watch holds a network request for up to 20 seconds and never writes
+    // local state. Everything else is serialized so a refresh cannot save an
+    // older state snapshot over a message or profile update in progress.
+    let _state_guard = if matches!(
+        &request,
+        Request::WatchGroup { .. }
+            | Request::WatchDirect { .. }
+            | Request::FetchAvatar { .. }
+            | Request::FetchAttachment { .. }
+            | Request::UploadMediaChunk { .. }
+            | Request::UploadDirectMediaChunk { .. }
+    ) {
+        None
+    } else {
+        Some(
+            state_lock()
+                .lock()
+                .map_err(|_| "local state lock is unavailable".to_owned())?,
+        )
+    };
     let client = NoiseClient::default();
 
     match request {
@@ -117,12 +262,49 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         Request::Initialize {
             state_path,
             username,
+            password,
+            avatar_data_base64,
+            avatar_mime_type,
+            relays,
         } => serde_json::to_value(
-            client
-                .initialize(state_path, username)
+            runtime()?
+                .block_on(client.initialize(
+                    state_path,
+                    username,
+                    password,
+                    avatar_data_base64,
+                    avatar_mime_type,
+                    relays,
+                ))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
+        Request::SignIn {
+            state_path,
+            noise_id,
+            password,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.sign_in(state_path, &noise_id, password, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::SyncAccount { state_path, relays } => serde_json::to_value(
+            runtime()?
+                .block_on(client.sync_account(state_path, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::Logout {
+            state_path,
+            cache_path,
+        } => {
+            client
+                .logout(state_path, cache_path)
+                .map_err(|error| error.to_string())?;
+            Ok(Value::Null)
+        }
         Request::SelectGroup {
             state_path,
             group_id,
@@ -134,19 +316,23 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         .map_err(|error| error.to_string()),
         Request::UpdateProfile {
             state_path,
+            username,
             bio,
             avatar_data_base64,
             avatar_mime_type,
             remove_avatar,
+            accepts_direct_messages,
             relays,
         } => serde_json::to_value(
             runtime()?
                 .block_on(client.update_profile(
                     state_path,
+                    username,
                     bio,
                     avatar_data_base64,
                     avatar_mime_type,
                     remove_avatar,
+                    accepts_direct_messages,
                     relays,
                 ))
                 .map_err(|error| error.to_string())?,
@@ -160,6 +346,8 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             avatar_data_base64,
             avatar_mime_type,
             remove_avatar,
+            members_can_send_messages,
+            members_can_send_media,
             relays,
         } => serde_json::to_value(
             runtime()?
@@ -171,14 +359,64 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                     avatar_data_base64,
                     avatar_mime_type,
                     remove_avatar,
+                    members_can_send_messages,
+                    members_can_send_media,
                     relays,
                 ))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::RotateFrequency {
+            state_path,
+            revoke_only,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.rotate_frequency(state_path, revoke_only, relays))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
         Request::FetchAvatar { image, relays } => serde_json::to_value(
             runtime()?
                 .block_on(client.fetch_avatar(&image, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::FetchAttachment {
+            state_path,
+            cache_path,
+            scope_id,
+            attachment,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.fetch_attachment(
+                    state_path,
+                    cache_path,
+                    scope_id,
+                    &attachment,
+                    relays,
+                ))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::UploadMediaChunk {
+            state_path,
+            data_base64,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.upload_media_chunk(state_path, data_base64, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::UploadDirectMediaChunk {
+            state_path,
+            data_base64,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.upload_direct_media_chunk(state_path, data_base64, relays))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
@@ -213,10 +451,165 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         Request::Say {
             state_path,
             text,
+            attachment,
+            reply_to_message_id,
+            relays,
+        } => {
+            match attachment {
+                Some(attachment) => runtime()?
+                    .block_on(client.say_with_attachment_reply(
+                        state_path,
+                        text,
+                        attachment,
+                        reply_to_message_id,
+                        relays,
+                    ))
+                    .map_err(|error| error.to_string())?,
+                None => runtime()?
+                    .block_on(client.say_reply(state_path, text, reply_to_message_id, relays))
+                    .map_err(|error| error.to_string())?,
+            }
+            Ok(Value::Null)
+        }
+        Request::StartDirect {
+            state_path,
+            public_key,
+            username,
+            bio,
+            avatar,
+            accepts_direct_messages,
+        } => serde_json::to_value(
+            client
+                .start_direct(
+                    state_path,
+                    &public_key,
+                    username,
+                    bio,
+                    avatar,
+                    accepts_direct_messages,
+                )
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::SelectDirect {
+            state_path,
+            public_key,
+        } => serde_json::to_value(
+            client
+                .select_direct(state_path, &public_key)
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::SyncDirects {
+            state_path,
+            cache_path,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.sync_directs(state_path, cache_path, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::DirectConversation {
+            state_path,
+            cache_path,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.direct_conversation(state_path, cache_path, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::WatchDirect {
+            state_path,
+            since,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.watch_direct(state_path, since, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::SayDirect {
+            state_path,
+            text,
+            attachment,
+            reply_to_message_id,
             relays,
         } => {
             runtime()?
-                .block_on(client.say(state_path, text, relays))
+                .block_on(client.say_direct(
+                    state_path,
+                    text,
+                    attachment,
+                    reply_to_message_id,
+                    relays,
+                ))
+                .map_err(|error| error.to_string())?;
+            Ok(Value::Null)
+        }
+        Request::DeleteDirect {
+            state_path,
+            cache_path,
+            public_key,
+            for_both,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.delete_direct(
+                    state_path,
+                    cache_path,
+                    &public_key,
+                    for_both,
+                    relays,
+                ))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::SetModerator {
+            state_path,
+            member_public_key,
+            enabled,
+            relays,
+        } => {
+            runtime()?
+                .block_on(client.set_moderator(state_path, &member_public_key, enabled, relays))
+                .map_err(|error| error.to_string())?;
+            Ok(Value::Null)
+        }
+        Request::DeleteMessage {
+            state_path,
+            message_event_id,
+            relays,
+        } => {
+            runtime()?
+                .block_on(client.delete_message(state_path, &message_event_id, relays))
+                .map_err(|error| error.to_string())?;
+            Ok(Value::Null)
+        }
+        Request::BanMember {
+            state_path,
+            member_public_key,
+            delete_messages,
+            relays,
+        } => {
+            runtime()?
+                .block_on(client.ban_member(
+                    state_path,
+                    &member_public_key,
+                    delete_messages,
+                    relays,
+                ))
+                .map_err(|error| error.to_string())?;
+            Ok(Value::Null)
+        }
+        Request::UnbanMember {
+            state_path,
+            member_public_key,
+            relays,
+        } => {
+            runtime()?
+                .block_on(client.unban_member(state_path, &member_public_key, relays))
                 .map_err(|error| error.to_string())?;
             Ok(Value::Null)
         }
@@ -236,22 +629,45 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
-        Request::Leave { state_path, relays } => {
+        Request::Leave {
+            state_path,
+            cache_path,
+            relays,
+        } => serde_json::to_value(
             runtime()?
-                .block_on(client.leave(state_path, relays))
-                .map_err(|error| error.to_string())?;
-            Ok(Value::Null)
-        }
+                .block_on(client.leave(state_path, cache_path, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         Request::DeleteGroup {
             state_path,
+            cache_path,
             group_id,
             relays,
         } => serde_json::to_value(
             runtime()?
-                .block_on(client.delete_group(state_path, &group_id, relays))
+                .block_on(client.delete_group(state_path, cache_path, &group_id, relays))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
+        Request::DeleteAccount {
+            state_path,
+            cache_path,
+            delete_group_messages,
+            delete_direct_threads,
+            relays,
+        } => {
+            runtime()?
+                .block_on(client.delete_account(
+                    state_path,
+                    cache_path,
+                    delete_group_messages,
+                    delete_direct_threads,
+                    relays,
+                ))
+                .map_err(|error| error.to_string())?;
+            Ok(Value::Null)
+        }
     }
 }
 

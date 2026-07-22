@@ -6,12 +6,16 @@ use std::{
 };
 
 use anyhow::{Context, anyhow};
-use noise_core::{EncryptedBlob, GroupDeletion, InviteRecord, SignedEvent};
+use noise_core::{
+    AccountVault, EncryptedBlob, GroupDeletion, InviteRecord, InviteRotation, SignedEvent,
+};
 use serde::Serialize;
 use turso::{Builder, Connection, params};
 
 pub struct RecoveredState {
+    pub accounts: HashMap<String, AccountVault>,
     pub invites: HashMap<String, InviteRecord>,
+    pub invite_rotations: HashMap<String, InviteRotation>,
     pub events: HashMap<String, SignedEvent>,
     pub blobs: HashMap<String, EncryptedBlob>,
     pub deletions: HashMap<String, GroupDeletion>,
@@ -81,6 +85,22 @@ impl DurableStore {
         Ok(changed == 1)
     }
 
+    pub async fn upsert_account(&self, vault: &AccountVault) -> anyhow::Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO relay_objects (kind, object_id, payload)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(kind, object_id) DO UPDATE SET payload = excluded.payload",
+                params![
+                    "account",
+                    vault.locator.clone(),
+                    serde_json::to_string(vault)?
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn apply_group_deletion(
         &self,
         deletion: &GroupDeletion,
@@ -96,6 +116,12 @@ impl DurableStore {
                     "INSERT OR IGNORE INTO relay_objects (kind, object_id, payload)
                      VALUES (?1, ?2, ?3)",
                     params!["deletion", deletion.group_id.clone(), payload],
+                )
+                .await?;
+            self.connection
+                .execute(
+                    "DELETE FROM relay_objects WHERE kind = ?1 AND object_id = ?2",
+                    params!["invite_rotation", deletion.group_id.clone()],
                 )
                 .await?;
             for (kind, object_ids) in [
@@ -122,10 +148,60 @@ impl DurableStore {
         self.connection.execute_batch("COMMIT;").await?;
         Ok(())
     }
+
+    pub async fn apply_invite_rotation(
+        &self,
+        rotation: &InviteRotation,
+        invite_ids: &[String],
+    ) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(rotation)?;
+        self.connection.execute_batch("BEGIN IMMEDIATE;").await?;
+        let result = async {
+            self.connection
+                .execute(
+                    "INSERT INTO relay_objects (kind, object_id, payload)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(kind, object_id) DO UPDATE SET payload = excluded.payload",
+                    params!["invite_rotation", rotation.group_id.clone(), payload],
+                )
+                .await?;
+            for object_id in invite_ids {
+                self.connection
+                    .execute(
+                        "DELETE FROM relay_objects WHERE kind = ?1 AND object_id = ?2",
+                        params!["invite", object_id.clone()],
+                    )
+                    .await?;
+            }
+            if let Some(invite) = rotation.new_invite.as_ref() {
+                self.connection
+                    .execute(
+                        "INSERT OR REPLACE INTO relay_objects (kind, object_id, payload)
+                         VALUES (?1, ?2, ?3)",
+                        params![
+                            "invite",
+                            invite.locator.clone(),
+                            serde_json::to_string(invite)?
+                        ],
+                    )
+                    .await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = self.connection.execute_batch("ROLLBACK;").await;
+            return Err(error);
+        }
+        self.connection.execute_batch("COMMIT;").await?;
+        Ok(())
+    }
 }
 
 async fn recover(connection: &Connection) -> anyhow::Result<RecoveredState> {
+    let mut accounts = HashMap::new();
     let mut invites = HashMap::new();
+    let mut invite_rotations = HashMap::new();
     let mut events = HashMap::new();
     let mut blobs = HashMap::new();
     let mut deletions = HashMap::new();
@@ -143,6 +219,17 @@ async fn recover(connection: &Connection) -> anyhow::Result<RecoveredState> {
         let object_id: String = row.get(1)?;
         let payload: String = row.get(2)?;
         match kind.as_str() {
+            "account" => {
+                let vault: AccountVault = serde_json::from_str(&payload)
+                    .with_context(|| format!("stored account {object_id} is invalid JSON"))?;
+                vault
+                    .verify()
+                    .with_context(|| format!("stored account {object_id} failed verification"))?;
+                if vault.locator != object_id {
+                    return Err(anyhow!("stored account key does not match its locator"));
+                }
+                accounts.insert(object_id, vault);
+            }
             "invite" => {
                 let record: InviteRecord = serde_json::from_str(&payload)
                     .with_context(|| format!("stored invitation {object_id} is invalid JSON"))?;
@@ -153,6 +240,21 @@ async fn recover(connection: &Connection) -> anyhow::Result<RecoveredState> {
                     return Err(anyhow!("stored invitation key does not match its locator"));
                 }
                 invites.insert(object_id, record);
+            }
+            "invite_rotation" => {
+                let rotation: InviteRotation =
+                    serde_json::from_str(&payload).with_context(|| {
+                        format!("stored invite rotation {object_id} is invalid JSON")
+                    })?;
+                rotation.verify().with_context(|| {
+                    format!("stored invite rotation {object_id} failed verification")
+                })?;
+                if rotation.group_id != object_id {
+                    return Err(anyhow!(
+                        "stored invite rotation key does not match its group id"
+                    ));
+                }
+                invite_rotations.insert(object_id, rotation);
             }
             "event" => {
                 let event: SignedEvent = serde_json::from_str(&payload)
@@ -196,6 +298,19 @@ async fn recover(connection: &Connection) -> anyhow::Result<RecoveredState> {
             .as_ref()
             .is_none_or(|group_id| !deletions.contains_key(group_id))
     });
+    invite_rotations.retain(|group_id, _| !deletions.contains_key(group_id));
+    for rotation in invite_rotations.values() {
+        invites.retain(|locator, invite| {
+            invite.group_id.as_deref() != Some(rotation.group_id.as_str())
+                || rotation
+                    .new_invite
+                    .as_ref()
+                    .is_some_and(|current| current.locator == *locator)
+        });
+        if let Some(invite) = rotation.new_invite.as_ref() {
+            invites.insert(invite.locator.clone(), invite.clone());
+        }
+    }
     events.retain(|_, event| !deletions.contains_key(&event.group_id));
     blobs.retain(|_, blob| {
         blob.group_id
@@ -204,7 +319,9 @@ async fn recover(connection: &Connection) -> anyhow::Result<RecoveredState> {
     });
 
     Ok(RecoveredState {
+        accounts,
         invites,
+        invite_rotations,
         events,
         blobs,
         deletions,

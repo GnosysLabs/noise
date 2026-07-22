@@ -10,4 +10,6 @@ tauri-build = { version = "2", features = [] }
 dirs = "6"
 noise-ffi = { path = "../../../crates/noise-ffi" }
 serde_json.workspace = true
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-process = "2"
+tauri-plugin-updater = "2"

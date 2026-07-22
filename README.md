@@ -1,8 +1,9 @@
 # noise
 
-Noise is a group-first messaging protocol. Groups are entered through numeric
-frequencies and replicated across replaceable relays. Profiles require no phone
-number, email address, or other personally identifying information.
+Noise is a group-first messaging protocol. Groups are joined through numeric
+frequencies and replicated across replaceable relays. Accounts use a random
+12-digit Noise ID, a strong password, and a freely changeable display name—no
+phone number, email address, or other personally identifying information.
 
 The primary client is one React interface shared by Tauri on macOS and Windows
 and, as the browser adapter comes online, the web. Tauri calls the shared Rust
@@ -35,18 +36,6 @@ Build the shared browser interface with `pnpm build`. The browser currently
 shows a foundation screen until the Rust protocol core, IndexedDB identity
 store, and browser transport adapter are connected; see
 [`docs/CLIENTS.md`](docs/CLIENTS.md).
-
-### Install on another Mac
-
-The second Mac needs Node.js, pnpm, Rust, and the Xcode command-line tools. Then:
-
-```sh
-git clone https://github.com/GnosysLabs/noise.git
-cd noise/apps/client
-pnpm install
-pnpm tauri build --debug
-open ../../target/debug/bundle/macos/noise.app
-```
 
 Clients must point at relays they can both reach. A single relay remains usable
 in direct compatibility mode. Two or more production relays use their pinned
@@ -104,10 +93,11 @@ decrypted Noise request coming from the mask, not the client connection. Masks
 and storage relays must be operated independently for that separation to mean
 anything.
 
-Each relay persists verified invitations, signed events, and encrypted blobs in
-an embedded, self-hosted Turso database under `relay-data/<port>` by default. No
-Turso Cloud account, remote database, or auth token is involved. A server
-deployment should use an explicit data directory on a durable volume:
+Each relay persists encrypted account vaults, verified invitations, signed
+events, and encrypted blobs in an embedded, self-hosted Turso database under
+`relay-data/<port>` by default. No Turso Cloud account, remote database, or auth
+token is involved. A server deployment should use an explicit data directory on
+a durable volume:
 
 ```sh
 noise-relay --listen 127.0.0.1:4301 --data /var/lib/noise-relay \
@@ -120,13 +110,13 @@ re-verifies every object recovered at startup.
 Then create two local identities:
 
 ```sh
-cargo run -p noise-cli -- init --state .noise/alice.json --username alice
-cargo run -p noise-cli -- init --state .noise/bob.json --username bob
 RELAY_ONE=$(curl -fsS http://127.0.0.1:4301/v1/relay-descriptor)
 RELAY_TWO=$(curl -fsS http://127.0.0.1:4302/v1/relay-descriptor)
+cargo run -p noise-cli -- init --state .noise/alice.json --username alice --password 'violet-rivers-glow-after-midnight' --relay "$RELAY_ONE" --relay "$RELAY_TWO"
+cargo run -p noise-cli -- init --state .noise/bob.json --username bob --password 'amber-clouds-drift-before-sunrise' --relay "$RELAY_ONE" --relay "$RELAY_TWO"
 ```
 
-Make noise, copy the returned frequency, and join it from the second identity:
+Create a group, copy the returned frequency, and join it from the second identity:
 
 ```sh
 cargo run -p noise-cli -- make --state .noise/alice.json --name afterhours --relay "$RELAY_ONE" --relay "$RELAY_TWO"

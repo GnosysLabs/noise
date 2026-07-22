@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "noise",
+  "productName": "Noise",
   "version": "0.1.0",
-  "identifier": "xyz.gnosyslabs.noise.tauri",
+  "identifier": "xyz.gnosyslabs.noise",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -26,18 +26,35 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:* https://*"
+      "csp": "default-src 'self'; img-src 'self' data: blob: asset: http://asset.localhost; media-src 'self' blob: asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:* https://*",
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$APPCACHE/media/**/*"]
+      }
     }
   },
   "bundle": {
     "active": true,
     "targets": ["app"],
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "macOS": {
+      "minimumSystemVersion": "12.0",
+      "signingIdentity": "Developer ID Application: Christopher McElvogue (4PDUNTF69S)"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDFFMzA1OEQyNEM5NzNFNjQKUldSa1BwZE0wbGd3SG80R21QOGRsTkI3am1IUFFCWWhSSzhpRkEvZVBodGZEYkZLWjdCNUVPSVAK",
+      "endpoints": [
+        "https://github.com/GnosysLabs/noise/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

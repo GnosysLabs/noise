@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use noise_client::NoiseClient;
@@ -12,12 +12,27 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Generate a local identity with no phone number or email address.
+    /// Create a Noise ID and encrypted account vault.
     Init {
         #[arg(long)]
         state: PathBuf,
         #[arg(long)]
         username: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long)]
+        relay: Vec<String>,
+    },
+    /// Restore an identity with its Noise ID and password.
+    Login {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        noise_id: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long)]
+        relay: Vec<String>,
     },
     /// Create a group and publish its frequency invitation.
     Make {
@@ -96,6 +111,13 @@ enum Command {
         #[arg(long)]
         relay: Vec<String>,
     },
+    /// Permanently delete the account vault and local identity.
+    DeleteAccount {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        relay: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -104,14 +126,39 @@ async fn main() -> anyhow::Result<()> {
     let client = NoiseClient::default();
 
     match args.command {
-        Command::Init { state, username } => {
-            let summary = client.initialize(state, username)?;
-            println!("identity ready: @{}", summary.identity.username);
+        Command::Init {
+            state,
+            username,
+            password,
+            relay,
+        } => {
+            let summary = client
+                .initialize(state, username, password, None, None, relay)
+                .await?;
+            println!("identity ready: {}", summary.identity.username);
+            println!(
+                "Noise ID: {}",
+                summary
+                    .identity
+                    .noise_id
+                    .as_deref()
+                    .unwrap_or("unavailable")
+            );
             println!("public key: {}", summary.identity.public_key);
         }
+        Command::Login {
+            state,
+            noise_id,
+            password,
+            relay,
+        } => {
+            let summary = client.sign_in(state, &noise_id, password, relay).await?;
+            println!("signed in as {}", summary.identity.username);
+        }
         Command::Make { state, name, relay } => {
-            let result = client.make(state, name, None, None, relay).await?;
-            println!("you made noise: {}", result.group.name);
+            let result = client.make(&state, name, None, None, relay.clone()).await?;
+            client.sync_account(&state, relay).await?;
+            println!("created group: {}", result.group.name);
             println!("frequency");
             println!("{}", result.display_frequency);
         }
@@ -120,11 +167,13 @@ async fn main() -> anyhow::Result<()> {
             frequency,
             relay,
         } => {
-            let result = client.join(state, &frequency, relay).await?;
+            let result = client.join(&state, &frequency, relay.clone()).await?;
+            client.sync_account(&state, relay).await?;
             println!("joined {}", result.group.name);
         }
         Command::Say { state, text, relay } => {
-            client.say(state, text, relay).await?;
+            client.say(&state, text, relay.clone()).await?;
+            client.sync_account(&state, relay).await?;
             println!("sent");
         }
         Command::Read { state, relay } => {
@@ -184,9 +233,12 @@ async fn main() -> anyhow::Result<()> {
                     None,
                     None,
                     false,
+                    None,
+                    None,
                     relay.clone(),
                 )
                 .await?;
+            client.sync_account(&state, relay.clone()).await?;
             let conversation = client.conversation(state, relay).await?;
             println!(
                 "updated {} · {}",
@@ -194,7 +246,9 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Command::Leave { state, relay } => {
-            client.leave(state, relay).await?;
+            let cache = cli_cache_path(&state);
+            client.leave(&state, cache, relay.clone()).await?;
+            client.sync_account(&state, relay).await?;
             println!("left active group");
         }
         Command::Delete { state, relay } => {
@@ -205,12 +259,30 @@ async fn main() -> anyhow::Result<()> {
                 .find(|group| group.is_active)
                 .map(|group| group.group_id)
                 .ok_or_else(|| anyhow::anyhow!("no active group"))?;
-            client.delete_group(state, &group_id, relay).await?;
+            let cache = cli_cache_path(&state);
+            client
+                .delete_group(&state, cache, &group_id, relay.clone())
+                .await?;
+            client.sync_account(&state, relay).await?;
             println!("deleted group");
+        }
+        Command::DeleteAccount { state, relay } => {
+            let cache = cli_cache_path(&state);
+            client
+                .delete_account(state, cache, false, false, relay)
+                .await?;
+            println!("deleted account");
         }
     }
 
     Ok(())
+}
+
+fn cli_cache_path(state: &Path) -> PathBuf {
+    state
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("cache")
 }
 
 fn member_count(count: usize) -> String {
