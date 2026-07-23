@@ -1,30 +1,199 @@
 # noise
 
-Noise is a group-first messaging protocol. Groups are joined through numeric
-frequencies and replicated across replaceable relays. Accounts use a random
-12-digit Noise ID, a strong password, and a freely changeable display name—no
-phone number, email address, or other personally identifying information.
+**Noise is a private, group-first messenger built around the people you
+actually choose.**
 
-The primary client is one React interface shared by Tauri on macOS and Windows
-and, as the browser adapter comes online, the web. Tauri calls the shared Rust
-client directly; the earlier native macOS client remains as a design reference.
+There is no public directory, algorithmic feed, phone number, or email signup.
+Create a group, share its secret 12-digit frequency, and the right people can
+join. Profiles can have a name, avatar, and bio without attaching the account
+to personally identifying information.
 
-## Workspace
+[Download the latest alpha for macOS or Windows](https://github.com/GnosysLabs/noise/releases/latest)
 
-- `noise-core`: identity, frequency, invitation, and signed-event primitives
-- `noise-client`: reusable profile, group, and conversation operations
-- `noise-transport`: padded Binary HTTP and RFC 9458 oblivious relay transport
-- `noise-ffi`: narrow native bridge into the shared client
-- `noise-relay`: one untrusted relay binary for masking, metadata, and shard storage
-- `noise`: a small CLI that exercises the protocol end to end
-- `noise-sim`: a real signed-event membership scale simulator
-- `apps/client`: shared React interface and Tauri desktop shell
-- `apps/macos`: earlier native SwiftUI macOS client, kept as a reference
+## What makes Noise different
 
-## Shared desktop client
+- **Groups are the center.** Large private communities are the product, not an
+  afterthought bolted onto direct messages.
+- **Joining feels intentional.** Groups are found through people, not search or
+  recommendations. You join with a frequency shared by someone you trust.
+- **No phone number or email.** Your account uses a random Noise ID and a
+  password. Your display name can change without changing your identity.
+- **Private messages and media.** Message and media payloads are encrypted on
+  your device before replaceable relays carry them.
+- **Communities have character.** Group icons, backgrounds, accent colors,
+  rules, replies, reactions, media galleries, moderation, and roles are built
+  into the experience.
 
-The app currently expects the three development relays below to be running. It
-reuses the same identity file as the native client. Run it with:
+Noise is currently an early alpha. It is ready for experimentation and real
+communities, but it should not yet be treated as a life-safety tool or a
+guarantee of high-risk anonymity.
+
+## How it works
+
+Noise does not have one central server that owns every community.
+
+Clients encrypt content and send signed, padded objects through a network of
+replaceable relays. A relay can help mask where a request is going, carry
+encrypted group and account state, and store only the opaque media shards
+assigned to it. A storage relay sees a request arriving from a mask relay
+instead of directly from the client; the mask can forward the request without
+reading the encrypted Noise payload.
+
+There is only **one relay program**. “Mask,” “metadata,” and “media storage” are
+jobs the same binary can perform for a request, not separate node types an
+operator has to understand or maintain.
+
+## Strength in numbers
+
+Every independently operated relay makes Noise harder to erase and less
+dependent on any one company or machine.
+
+More relays provide:
+
+- more paths between clients and storage, reducing reliance on a single
+  operator;
+- more aggregate storage without making every relay host every file;
+- better media durability when a machine or provider disappears;
+- more geographic and provider diversity; and
+- a network that communities can keep alive with inexpensive infrastructure.
+
+Media is encrypted first, then Reed-Solomon encoded and distributed across a
+client-selected relay constellation. In a mature 12-relay constellation, any
+eight shards can reconstruct the encrypted object. No participating relay
+needs the whole object, and no relay mirrors the whole network. The profile
+adapts when fewer relays exist.
+
+Independence matters as much as raw count: ten relays run by ten people are more
+valuable than ten relays controlled by one provider. Even a small Ubuntu VPS
+can make a meaningful contribution.
+
+## Run a relay
+
+The recommended setup is to give the prompt below to a capable coding agent
+that can SSH into your Ubuntu VPS. The agent installs a prebuilt, statically
+linked package for either x86-64 (`amd64`) or ARM64 (`arm64`). ARM64 here means
+Linux servers such as AWS Graviton, Ampere, and many Oracle Cloud machines—not
+just Macs.
+
+You do **not** need Docker, Node.js, Rust, a source checkout, or an installer
+script hosted by Noise. The package contains one binary and systemd units.
+After installation, the relay checks a detached Ed25519-signed release manifest
+on a randomized timer. It only installs a package whose exact byte length and
+SHA-256 hash were covered by that signature. A failed restart restores the
+previous binary and service units, and temporary update files are removed.
+
+### Prompt for your coding agent
+
+Copy this, replace the bracketed values, and give it to an agent with SSH access:
+
+```text
+Set up an official Noise relay on my Ubuntu VPS.
+
+SSH host: [HOST OR TAILSCALE IP]
+SSH user: [USER]
+Public relay domain: [relay.example.com]
+Storage: [local disk OR S3-compatible]
+Storage quota: [NUMBER OF GB, OR NO APPLICATION QUOTA]
+
+Use the prebuilt noise-relay Debian package from GnosysLabs/noise. Do not use
+Docker, do not build from source, and do not run a curl-piped installer.
+
+Before trusting any download URL, fetch these three files directly from the
+GnosysLabs/noise repository:
+- deploy/relay-channels/stable.json
+- deploy/relay-channels/stable.json.sig
+- deploy/relay-release-public.pem
+
+Verify the detached Ed25519 signature over the exact stable.json bytes with
+OpenSSL. Read the signed manifest only after verification. Detect whether the
+VPS uses amd64 or arm64, download the matching .deb from the URL in that
+manifest, and verify both its exact byte length and SHA-256 hash before
+installing it with apt.
+
+Configure /etc/noise-relay/config.toml with:
+- listen = 127.0.0.1:4301
+- data = /var/lib/noise-relay
+- public_url = the HTTPS domain above
+- both official bootstrap relays from the example config
+- both official mask targets from the example config
+- the requested storage quota
+
+If S3-compatible storage was selected, put its credentials in
+/etc/noise-relay/storage.env with mode 600. Never print the secrets. Otherwise
+use local storage and do not create that file.
+
+Set up the public domain with a normal HTTPS reverse proxy from port 443 to
+127.0.0.1:4301 using a distro package already available for Ubuntu. Preserve
+any unrelated web services and firewall rules. Enable and start
+noise-relay.service and noise-relay-update.timer.
+
+Finally run:
+- noise-relay --config /etc/noise-relay/config.toml status
+- noise-relay --config /etc/noise-relay/config.toml doctor
+- systemctl status noise-relay.service --no-pager
+- systemctl status noise-relay-update.timer --no-pager
+
+Confirm the public /health endpoint reports the relay software and protocol
+versions, the signed public relay descriptor verifies, the durable data
+directory is owned by noise-relay, and the service survives one restart.
+Report exactly what was installed and any step that still needs my input.
+```
+
+### Storage choices
+
+Local storage is the default. Encrypted shards live under
+`/var/lib/noise-relay/shards`, while signed indexes and small deletion records
+live in the relay's embedded, self-hosted Turso database. Media bytes are not
+stored in Turso and are not loaded into RAM when the relay starts.
+
+For an S3-compatible bucket, copy
+[`deploy/storage.env.example`](deploy/storage.env.example) to
+`/etc/noise-relay/storage.env`, fill it in, and set its mode to `600`. Amazon
+S3, Cloudflare R2, Backblaze B2, MinIO, and compatible providers can be used.
+The bucket receives only the opaque shards assigned to this relay—not a copy of
+the network and not plaintext media.
+
+The main relay configuration starts from
+[`deploy/noise-relay.toml.example`](deploy/noise-relay.toml.example). Package
+installation preserves operator changes to `/etc/noise-relay/config.toml`.
+
+### Operator commands
+
+```sh
+# Configuration and version, formatted for a human
+noise-relay --config /etc/noise-relay/config.toml status
+
+# The same status as JSON for an agent or monitoring system
+noise-relay --config /etc/noise-relay/config.toml status --json
+
+# Local health, public reachability, signed identity, and durable data
+noise-relay --config /etc/noise-relay/config.toml doctor
+
+# Check the signed stable channel without installing anything
+noise-relay update
+
+# Follow the service
+journalctl -u noise-relay.service -f
+```
+
+Operators remain in control of their machines. Noise can offer signed updates,
+but no central authority can force an independently operated relay to install
+one.
+
+## Development
+
+The repository is a Rust workspace with one React interface shared by Tauri on
+macOS and Windows:
+
+- `apps/client`: desktop interface and Tauri shell
+- `noise-core`: identity, groups, encryption, signed events, and media coding
+- `noise-client`: reusable profile, group, DM, and moderation operations
+- `noise-transport`: padded Binary HTTP and oblivious relay transport
+- `noise-relay`: the single relay binary
+- `noise-cli`: protocol exercise and debugging client
+- `noise-sim`: signed-event membership scale simulator
+
+Run the desktop app:
 
 ```sh
 cd apps/client
@@ -32,162 +201,25 @@ pnpm install
 pnpm tauri dev
 ```
 
-Build the shared browser interface with `pnpm build`. The browser currently
-shows a foundation screen until the Rust protocol core, IndexedDB identity
-store, and browser transport adapter are connected; see
-[`docs/CLIENTS.md`](docs/CLIENTS.md).
-
-Clients must point at relays they can both reach. Two or more production relays
-use pinned private relay descriptors so each storage request travels through a
-different mask relay:
+Run two local relays:
 
 ```sh
-VITE_NOISE_RELAYS='https://RELAY_ONE#ohttp=KEY,https://RELAY_TWO#ohttp=KEY' \
-  pnpm tauri build --debug
-```
+cargo run -p noise-relay -- \
+  --listen 127.0.0.1:4301 \
+  --public-url http://127.0.0.1:4301 \
+  --mask-target http://127.0.0.1:4302
 
-Localhost remains the default for development. Relay data is durable, but the
-three older development processes must be restarted on the current build before
-they begin writing their existing in-memory state to disk.
-
-## Native macOS client
-
-The app currently expects the three development relays below to be running.
-Generate the Xcode project and build it with:
-
-```sh
-cd apps/macos
-xcodegen generate
-DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer xcodebuild \
-  -project Noise.xcodeproj \
-  -scheme Noise \
-  -configuration Debug \
-  -derivedDataPath .derived \
-  CODE_SIGNING_ALLOWED=NO \
-  build
-open .derived/Build/Products/Debug/noise.app
-```
-
-The Xcode build phase compiles and links `noise-ffi`; the UI never shells out to
-the CLI and does not contain a web view. Local identity state is stored at
-`~/Library/Application Support/noise/profile.json` with private file permissions.
-
-## Local demonstration
-
-Start three relays in separate terminals. Each relay explicitly allowlists the
-other two as privacy-mask destinations, preventing it from becoming an open
-proxy:
-
-```sh
-cargo run -p noise-relay -- --listen 127.0.0.1:4301 --public-url http://127.0.0.1:4301 --mask-target http://127.0.0.1:4302 --mask-target http://127.0.0.1:4303
-cargo run -p noise-relay -- --listen 127.0.0.1:4302 --public-url http://127.0.0.1:4302 --mask-target http://127.0.0.1:4301 --mask-target http://127.0.0.1:4303
-cargo run -p noise-relay -- --listen 127.0.0.1:4303 --public-url http://127.0.0.1:4303 --mask-target http://127.0.0.1:4301 --mask-target http://127.0.0.1:4302
+cargo run -p noise-relay -- \
+  --listen 127.0.0.1:4302 \
+  --public-url http://127.0.0.1:4302 \
+  --mask-target http://127.0.0.1:4301
 ```
 
 Each startup prints a shareable address containing the relay's pinned OHTTP
-public key. The fragment is never sent in an HTTP request. Pass at least two of
-those complete addresses to the CLI or desktop build. The mask sees the client
-IP and destination relay but only padded ciphertext; the storage relay sees the
-decrypted Noise request coming from the mask, not the client connection. Masks
-and storage relays must be operated independently for that separation to mean
-anything.
+public key. The fragment is not sent in an HTTP request.
 
-There is one relay program and one relay protocol. Every `noise-relay` can mask
-traffic, replicate signed account/group metadata, and contribute media storage.
-“Mask” and “storage” describe a relay's role for one private request; they are
-not different server types or binaries.
-
-Small indexes, signed events, invitations, and deletion records live in an
-embedded, self-hosted Turso database under `relay-data/<port>` by default.
-Media never does. The client encrypts each 1 MiB media chunk, Reed–Solomon
-encodes the encrypted object, and assigns one opaque shard to each relay in a
-keyed rendezvous-ranked constellation. A mature 12-relay constellation is
-8-of-12: any eight shards reconstruct the object, while no relay stores the
-whole network or even the whole object. The coding profile adapts to the
-available network; today's two-relay network is necessarily 1-of-2 so either
-relay can fail. Shard bytes live under `relay-data/<port>/shards` and only small
-hash/size/deletion metadata lives in Turso, so media is never loaded into RAM
-at startup. No Turso Cloud account, remote database, or auth token is involved.
-A server deployment should use an explicit data directory on a durable volume:
-
-```sh
-noise-relay --listen 127.0.0.1:4301 --data /var/lib/noise-relay \
-  --public-url https://relay.example
-```
-
-The same binary can put encrypted media in any S3-compatible object store
-instead. S3 receives only the shards assigned to that relay, never a network
-mirror. Configure its service environment and leave the command unchanged:
-
-```sh
-NOISE_STORAGE_BACKEND=s3
-NOISE_S3_BUCKET=noise-relay-example
-NOISE_S3_PREFIX=relay-1
-NOISE_STORAGE_LIMIT_BYTES=1099511627776
-AWS_DEFAULT_REGION=us-east-1
-AWS_ACCESS_KEY_ID=...
-AWS_SECRET_ACCESS_KEY=...
-# Optional for R2, MinIO, Backblaze, or another compatible service:
-AWS_ENDPOINT_URL_S3=https://s3.example
-```
-
-`NOISE_S3_PREFIX` is optional and defaults to `noise-relay`. Standard AWS
-session-token, workload-identity, and container credentials are also supported.
-HTTPS is required unless the operator explicitly sets `AWS_ALLOW_HTTP=true`.
-`NOISE_STORAGE_LIMIT_BYTES` is optional; zero or unset means no application
-quota beyond the disk/bucket's own limit. A bounded relay advertises its
-remaining capacity in its signed v3 descriptor and rejects writes beyond the
-allocation.
-Secrets belong in a root-readable service environment file, not on the command
-line. The included systemd units optionally load
-`/etc/noise-relay/storage.env`; local-disk relays do not need that file at all.
-
-The relay writes a shard to its configured destination before acknowledging it.
-Shard IDs, provider locations, and deletion capabilities are carried inside the
-encrypted media manifest. Relays cannot infer the group from a shard. Authorized
-clients erase shards with per-object deletion capabilities; failed object-store
-deletes stay in a durable retry queue.
-
-This is a deliberately breaking storage cutover. Protocol v3 has no full-blob
-upload/download endpoint and relays do not gossip media. On first v3 startup,
-legacy full-blob rows and object files are purged rather than retained as dead
-copies. Existing clients must update before the relays are upgraded; media
-already cached on a device remains local, while uncached pre-v3 media is no
-longer fetchable.
-
-Then create two local identities:
-
-```sh
-RELAY_ONE=$(curl -fsS http://127.0.0.1:4301/v1/relay-descriptor)
-RELAY_TWO=$(curl -fsS http://127.0.0.1:4302/v1/relay-descriptor)
-cargo run -p noise-cli -- init --state .noise/alice.json --username alice --password 'violet-rivers-glow-after-midnight' --relay "$RELAY_ONE" --relay "$RELAY_TWO"
-cargo run -p noise-cli -- init --state .noise/bob.json --username bob --password 'amber-clouds-drift-before-sunrise' --relay "$RELAY_ONE" --relay "$RELAY_TWO"
-```
-
-Create a group, copy the returned frequency, and join it from the second identity:
-
-```sh
-cargo run -p noise-cli -- make --state .noise/alice.json --name afterhours --relay "$RELAY_ONE" --relay "$RELAY_TWO"
-cargo run -p noise-cli -- join --state .noise/bob.json --frequency "0000 0000 0000" --relay "$RELAY_ONE" --relay "$RELAY_TWO"
-cargo run -p noise-cli -- say --state .noise/alice.json --text "hello" --relay "$RELAY_ONE" --relay "$RELAY_TWO"
-cargo run -p noise-cli -- read --state .noise/bob.json --relay "$RELAY_ONE" --relay "$RELAY_TWO"
-cargo run -p noise-cli -- members --state .noise/bob.json --relay "$RELAY_ONE" --relay "$RELAY_TWO"
-```
-
-## Membership scale simulation
-
-Generate 50,000 identities and signed encrypted join events, then verify,
-decrypt, and reduce them into one deterministic group view:
-
-```sh
-cargo run --release -p noise-sim -- --members 50000
-```
-
-This measures the membership log and client-side reducer. It does not pretend
-to simulate 50,000 simultaneous sockets or a production group-key rotation.
-The first recorded result is in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
-
-
-The twelve-digit frequency is an intentionally human-sized development
-rendezvous code. It is not yet a production-grade capability secret; see
-[`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+Protocol details live in [`docs/PROTOCOL.md`](docs/PROTOCOL.md), client notes in
+[`docs/CLIENTS.md`](docs/CLIENTS.md), and the 50,000-member reducer benchmark in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). The signed relay publication
+process is documented in
+[`docs/RELAY_RELEASES.md`](docs/RELAY_RELEASES.md).

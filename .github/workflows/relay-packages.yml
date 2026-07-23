@@ -1,0 +1,101 @@
+name: Relay packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "relay-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Ubuntu ${{ matrix.deb_arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            deb_arch: amd64
+            rust_target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            deb_arch: arm64
+            rust_target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${{ matrix.rust_target }}"
+
+      - name: Install static Linux toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+
+      - name: Confirm release version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          package_version=$(awk -F '"' '/^version = / { print $2; exit }' crates/noise-relay/Cargo.toml)
+          test "${GITHUB_REF_NAME}" = "relay-v${package_version}"
+
+      - name: Build relay
+        run: cargo build --locked --release -p noise-relay --target "${{ matrix.rust_target }}"
+
+      - name: Build Debian package
+        run: |
+          package_version=$(awk -F '"' '/^version = / { print $2; exit }' crates/noise-relay/Cargo.toml)
+          scripts/package-relay-deb.sh \
+            "target/${{ matrix.rust_target }}/release/noise-relay" \
+            "${{ matrix.deb_arch }}" \
+            "${package_version}" \
+            dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: noise-relay-${{ matrix.deb_arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  draft-release:
+    name: Assemble relay release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: noise-relay-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(find dist -maxdepth 1 -name '*.deb' -type f | wc -l)" -eq 2
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload \
+              "${GITHUB_REF_NAME}" \
+              dist/*.deb \
+              --clobber \
+              --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create \
+              "${GITHUB_REF_NAME}" \
+              dist/*.deb \
+              --draft \
+              --latest=false \
+              --verify-tag \
+              --title "Noise relay ${GITHUB_REF_NAME#relay-v}" \
+              --notes "Signed, self-updating Noise relay packages for Ubuntu x86-64 and ARM64." \
+              --repo "${GITHUB_REPOSITORY}"
+          fi

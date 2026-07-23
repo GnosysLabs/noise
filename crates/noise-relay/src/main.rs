@@ -1,8 +1,10 @@
+mod config;
 mod discovery;
 mod identity;
 mod privacy;
 mod shard_store;
 mod store;
+mod update;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -25,7 +27,7 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
-use clap::Parser;
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use noise_core::{
     AccountVault, GroupDeletion, GroupPresence, InviteRecord, InviteRotation, ShardDeletion,
     SignedEvent, StorageShard,
@@ -33,7 +35,8 @@ use noise_core::{
 use noise_transport::{
     GATEWAY_HEADER, OHTTP_GATEWAY_PATH, OHTTP_KEYS_MEDIA_TYPE, OHTTP_KEYS_PATH, OHTTP_RELAY_PATH,
     OHTTP_REQUEST_MEDIA_TYPE, OHTTP_RESPONSE_MEDIA_TYPE, PlainRequest, RELAY_DIRECTORY_PATH,
-    RelayDescriptor, SIGNED_RELAY_DESCRIPTOR_PATH, SignedRelayDescriptor, encode_response,
+    RELAY_PROTOCOL_VERSION, RelayDescriptor, SIGNED_RELAY_DESCRIPTOR_PATH, SignedRelayDescriptor,
+    encode_response,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -43,6 +46,7 @@ use tokio::{
 };
 use tower_http::cors::CorsLayer;
 
+use config::RelayConfig;
 use discovery::{
     AnnouncementLimiter, RelayDirectory, announce_relay, client_for_verified_relay,
     fetch_relay_directory, verify_relay_reachability,
@@ -59,10 +63,24 @@ const RECENT_GROUP_PRESENCE_MILLIS: u64 = 5 * 60_000;
 const MAX_GROUP_PRESENCES: usize = 100_000;
 
 #[derive(Debug, Parser)]
-#[command(name = "noise-relay", about = "An untrusted Noise protocol relay")]
+#[command(
+    name = "noise-relay",
+    version,
+    about = "An untrusted Noise protocol relay"
+)]
 struct Args {
-    #[arg(long, default_value = "127.0.0.1:4301")]
-    listen: SocketAddr,
+    #[arg(long, global = true, env = "NOISE_RELAY_CONFIG")]
+    config: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<RelayCommand>,
+    #[command(flatten)]
+    server: ServerOverrides,
+}
+
+#[derive(Debug, Default, ClapArgs)]
+struct ServerOverrides {
+    #[arg(long)]
+    listen: Option<SocketAddr>,
     #[arg(long)]
     peer: Vec<String>,
     #[arg(long)]
@@ -73,9 +91,43 @@ struct Args {
     mask_target: Vec<String>,
     #[arg(long)]
     bootstrap_relay: Vec<String>,
-    #[arg(long, default_value_t = 30)]
+    #[arg(long)]
+    discovery_interval_seconds: Option<u64>,
+    #[arg(long, env = "NOISE_STORAGE_LIMIT_BYTES")]
+    storage_limit_bytes: Option<u64>,
+}
+
+#[derive(Debug, Subcommand)]
+enum RelayCommand {
+    Update {
+        #[arg(long)]
+        apply: bool,
+        #[arg(long, default_value = update::DEFAULT_MANIFEST_URL)]
+        manifest_url: String,
+        #[arg(long)]
+        signature_url: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct ServerSettings {
+    listen: SocketAddr,
+    peer: Vec<String>,
+    data: Option<PathBuf>,
+    public_url: Option<String>,
+    mask_target: Vec<String>,
+    bootstrap_relay: Vec<String>,
     discovery_interval_seconds: u64,
-    #[arg(long, env = "NOISE_STORAGE_LIMIT_BYTES", default_value_t = 0)]
     storage_limit_bytes: u64,
 }
 
@@ -122,6 +174,8 @@ struct Snapshot {
 #[derive(Serialize)]
 struct Health {
     status: &'static str,
+    software_version: &'static str,
+    protocol_version: u16,
     accounts: usize,
     invitations: usize,
     events: usize,
@@ -156,12 +210,241 @@ enum ShardInsertError {
     Storage(anyhow::Error),
 }
 
+fn resolve_server_settings(args: &Args) -> anyhow::Result<ServerSettings> {
+    let mut config = RelayConfig::load(args.config.as_deref())?;
+    if let Some(listen) = args.server.listen {
+        config.listen = listen;
+    }
+    if !args.server.peer.is_empty() {
+        config.peers = args.server.peer.clone();
+    }
+    if let Some(data) = args.server.data.clone() {
+        config.data = Some(data);
+    }
+    if let Some(public_url) = args.server.public_url.clone() {
+        config.public_url = Some(public_url);
+    }
+    if !args.server.mask_target.is_empty() {
+        config.mask_targets = args.server.mask_target.clone();
+    }
+    if !args.server.bootstrap_relay.is_empty() {
+        config.bootstrap_relays = args.server.bootstrap_relay.clone();
+    }
+    if let Some(interval) = args.server.discovery_interval_seconds {
+        config.discovery_interval_seconds = interval;
+    }
+    if let Some(limit) = args.server.storage_limit_bytes {
+        config.storage_limit_bytes = limit;
+    }
+    config.validate()?;
+    Ok(ServerSettings {
+        listen: config.listen,
+        peer: config.peers,
+        data: config.data,
+        public_url: config.public_url,
+        mask_target: config.mask_targets,
+        bootstrap_relay: config.bootstrap_relays,
+        discovery_interval_seconds: config.discovery_interval_seconds,
+        storage_limit_bytes: config.storage_limit_bytes,
+    })
+}
+
+fn settings_data_directory(settings: &ServerSettings) -> PathBuf {
+    settings
+        .data
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("relay-data").join(settings.listen.port().to_string()))
+}
+
+fn settings_health_url(settings: &ServerSettings) -> String {
+    let host = if settings.listen.ip().is_unspecified() {
+        if settings.listen.is_ipv6() {
+            "[::1]".to_owned()
+        } else {
+            "127.0.0.1".to_owned()
+        }
+    } else if settings.listen.is_ipv6() {
+        format!("[{}]", settings.listen.ip())
+    } else {
+        settings.listen.ip().to_string()
+    };
+    format!("http://{host}:{}/health", settings.listen.port())
+}
+
+fn print_status(settings: &ServerSettings, json: bool) -> anyhow::Result<()> {
+    let status = serde_json::json!({
+        "software_version": env!("CARGO_PKG_VERSION"),
+        "protocol_version": RELAY_PROTOCOL_VERSION,
+        "listen": settings.listen.to_string(),
+        "data": settings_data_directory(settings),
+        "public_url": settings.public_url,
+        "peers": settings.peer.len(),
+        "mask_targets": settings.mask_target.len(),
+        "bootstrap_relays": settings.bootstrap_relay.len(),
+        "storage_limit_bytes": (settings.storage_limit_bytes != 0).then_some(settings.storage_limit_bytes),
+        "storage_backend": std::env::var("NOISE_STORAGE_BACKEND").unwrap_or_else(|_| "local".into()),
+    });
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        println!(
+            "noise relay {} (protocol {})",
+            env!("CARGO_PKG_VERSION"),
+            RELAY_PROTOCOL_VERSION
+        );
+        println!("listen: {}", settings.listen);
+        println!("data: {}", settings_data_directory(settings).display());
+        println!(
+            "public URL: {}",
+            settings.public_url.as_deref().unwrap_or("not configured")
+        );
+        println!(
+            "network: {} bootstrap relay(s), {} mask target(s), {} replication peer(s)",
+            settings.bootstrap_relay.len(),
+            settings.mask_target.len(),
+            settings.peer.len()
+        );
+    }
+    Ok(())
+}
+
+async fn doctor(settings: &ServerSettings, json: bool) -> anyhow::Result<()> {
+    let data_directory = settings_data_directory(settings);
+    if !data_directory.exists() {
+        bail!(
+            "relay data directory {} does not exist",
+            data_directory.display()
+        )
+    }
+    let local_host = if settings.listen.ip().is_unspecified() {
+        if settings.listen.is_ipv6() {
+            "[::1]".to_owned()
+        } else {
+            "127.0.0.1".to_owned()
+        }
+    } else {
+        settings.listen.ip().to_string()
+    };
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(8))
+        .build()
+        .context("could not initialize relay diagnostics")?;
+    let local_health_url = format!("http://{local_host}:{}/health", settings.listen.port());
+    let local_health = client
+        .get(&local_health_url)
+        .send()
+        .await
+        .context("relay is not reachable on its configured listen address")?
+        .error_for_status()
+        .context("local relay health check failed")?
+        .json::<serde_json::Value>()
+        .await
+        .context("local relay health response is invalid")?;
+    if local_health.get("status").and_then(|value| value.as_str()) != Some("ok") {
+        bail!("local relay is not healthy")
+    }
+
+    let mut public_reachable = false;
+    if let Some(public_url) = settings.public_url.as_deref() {
+        let descriptor = client
+            .get(format!(
+                "{}{}",
+                public_url.trim_end_matches('/'),
+                SIGNED_RELAY_DESCRIPTOR_PATH
+            ))
+            .send()
+            .await
+            .context("public relay URL is not reachable")?
+            .error_for_status()
+            .context("public relay descriptor request failed")?
+            .json::<SignedRelayDescriptor>()
+            .await
+            .context("public relay descriptor is invalid")?;
+        descriptor.verify_at(unix_seconds()?)?;
+        if descriptor.base_url != public_url.trim_end_matches('/') {
+            bail!("public relay descriptor advertises a different URL")
+        }
+        public_reachable = true;
+    }
+
+    let report = serde_json::json!({
+        "ok": true,
+        "software_version": env!("CARGO_PKG_VERSION"),
+        "protocol_version": RELAY_PROTOCOL_VERSION,
+        "local_health": local_health,
+        "public_reachable": public_reachable,
+        "data": data_directory,
+    });
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "healthy: noise relay {} (protocol {})",
+            env!("CARGO_PKG_VERSION"),
+            RELAY_PROTOCOL_VERSION
+        );
+        println!("local health: {local_health_url}");
+        println!(
+            "public reachability: {}",
+            if public_reachable {
+                "verified"
+            } else {
+                "not configured"
+            }
+        );
+        println!("data: {}", data_directory.display());
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-    let data_directory = args
-        .data
-        .unwrap_or_else(|| PathBuf::from("relay-data").join(args.listen.port().to_string()));
+    let parsed = Args::parse();
+    match &parsed.command {
+        Some(RelayCommand::Update {
+            apply,
+            manifest_url,
+            signature_url,
+            json,
+        }) => {
+            let settings = resolve_server_settings(&parsed)?;
+            let status = update::run(update::UpdateOptions {
+                manifest_url: manifest_url.clone(),
+                signature_url: signature_url.clone(),
+                apply: *apply,
+                health_url: settings_health_url(&settings),
+            })
+            .await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else if status.update_available {
+                println!(
+                    "relay {} is available for {} (running {}){}",
+                    status.latest_version,
+                    status.target,
+                    status.current_version,
+                    if *apply { " and was installed" } else { "" }
+                );
+            } else {
+                println!("noise relay {} is current", status.current_version);
+            }
+            return Ok(());
+        }
+        Some(RelayCommand::Status { json }) => {
+            let settings = resolve_server_settings(&parsed)?;
+            print_status(&settings, *json)?;
+            return Ok(());
+        }
+        Some(RelayCommand::Doctor { json }) => {
+            let settings = resolve_server_settings(&parsed)?;
+            doctor(&settings, *json).await?;
+            return Ok(());
+        }
+        None => {}
+    }
+    let args = resolve_server_settings(&parsed)?;
+    let data_directory = settings_data_directory(&args);
     let shard_store = ShardStore::open(&data_directory)?;
     let (mut store, mut recovered) = DurableStore::open(&data_directory).await?;
     let inline_blob_count = recovered.legacy_blobs.len();
@@ -344,6 +627,8 @@ async fn main() -> anyhow::Result<()> {
 async fn health(State(state): State<AppState>) -> Json<Health> {
     Json(Health {
         status: "ok",
+        software_version: env!("CARGO_PKG_VERSION"),
+        protocol_version: RELAY_PROTOCOL_VERSION,
         accounts: state
             .accounts
             .read()

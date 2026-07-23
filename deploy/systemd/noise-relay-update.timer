@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically check for signed Noise relay updates
+
+[Timer]
+OnBootSec=15m
+OnUnitActiveSec=30m
+RandomizedDelaySec=15m
+Persistent=true
+Unit=noise-relay-update.service
+
+[Install]
+WantedBy=timers.target

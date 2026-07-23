@@ -1,0 +1,26 @@
+# Noise listens on localhost. Put a normal HTTPS reverse proxy in front of it.
+listen = "127.0.0.1:4301"
+data = "/var/lib/noise-relay"
+public_url = "https://relay.example"
+
+# Existing storage peers can be listed here when an operator intentionally
+# wants signed metadata copied directly between specific relays.
+peers = []
+
+# These relays can mask requests so the destination relay does not see the
+# client connection. Discovered relays expand this set automatically.
+mask_targets = [
+  "https://noiserelay.gnosyslabs.xyz",
+  "https://noiserelay.irisirc.chat",
+]
+
+# Bootstrap discovery from multiple independently hosted relays.
+bootstrap_relays = [
+  "https://noiserelay.gnosyslabs.xyz",
+  "https://noiserelay.irisirc.chat",
+]
+
+discovery_interval_seconds = 30
+
+# Zero means no application-level quota beyond the disk or bucket limit.
+storage_limit_bytes = 0
