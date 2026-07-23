@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
