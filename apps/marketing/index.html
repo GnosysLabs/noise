@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#0b0910" />
+    <meta name="theme-color" content="#09080c" />
     <meta
       name="description"
       content="Noise is a private, group-first messenger. No public directory, phone number, or email—just a frequency and the people you choose."
@@ -34,7 +34,7 @@
 
     <header class="site-header" data-header>
       <a class="wordmark" href="#" aria-label="Noise home">
-        <img src="/noise.svg" alt="" width="34" height="34" />
+        <img src="/noise.svg" alt="" width="32" height="32" />
         <span>noise</span>
       </a>
 
@@ -50,140 +50,54 @@
 
     <main id="main">
       <section class="hero">
-        <div class="hero-orbit hero-orbit-one"></div>
-        <div class="hero-orbit hero-orbit-two"></div>
-
+        <div class="hero-grid-lines" aria-hidden="true"></div>
         <div class="hero-copy">
           <div class="eyebrow"><i></i> private groups. no audience.</div>
-          <h1>Make some<br /><em>noise.</em></h1>
+          <h1>Make some <em>noise.</em></h1>
           <p>
             A private, group-first messenger built around the people you actually choose.
-            No public directory. No phone number. No email. Just a frequency and your people.
+            No public directory. No phone number. No email.
           </p>
-          <div class="hero-actions">
-            <a class="button primary" href="https://app.makenoise.chat">
-              Open Noise <span aria-hidden="true">↗</span>
+
+          <div class="hero-downloads" aria-label="Download Noise">
+            <a
+              class="download-button mac-download"
+              data-download="mac"
+              href="https://github.com/GnosysLabs/noise/releases/latest"
+            >
+              <span class="platform-mark" aria-hidden="true">●</span>
+              <span><small>Download for</small><strong>macOS</strong></span>
+              <b>↓</b>
             </a>
-            <a class="button secondary" href="https://github.com/GnosysLabs/noise/releases/latest">
-              Download alpha <span aria-hidden="true">↓</span>
-            </a>
+            <button class="download-button windows-download" data-windows-open type="button">
+              <span class="windows-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+              <span><small>Download for</small><strong>Windows</strong></span>
+              <b>↓</b>
+            </button>
+            <a class="web-button" href="https://app.makenoise.chat">Use the web app <span>↗</span></a>
           </div>
-          <small>Available on the web, macOS, and Windows.</small>
+          <small class="platform-note">macOS Apple silicon · Windows 10/11 64-bit · early alpha</small>
         </div>
 
-        <div class="hero-product" aria-label="Noise app interface preview">
-          <div class="app-window">
-            <div class="app-titlebar">
-              <div class="traffic-lights"><i></i><i></i><i></i></div>
-              <span>noise</span>
-              <b>•••</b>
-            </div>
-
-            <aside class="preview-sidebar">
-              <div class="preview-brand">
-                <img src="/noise.svg" alt="" width="27" height="27" />
-                <strong>noise</strong>
-              </div>
-              <div class="preview-tabs">
-                <span class="active">groups</span>
-                <span>dms</span>
-              </div>
-              <button class="create-group" tabindex="-1">＋ create group</button>
-              <div class="preview-group active">
-                <i class="group-art group-art-one">A</i>
-                <span><strong>After Hours</strong><small>3 new signals</small></span>
-                <b></b>
-              </div>
-              <div class="preview-group">
-                <i class="group-art group-art-two">N</i>
-                <span><strong>Night Shift</strong><small>12 members</small></span>
-              </div>
-              <div class="preview-group">
-                <i class="group-art group-art-three">R</i>
-                <span><strong>Room 404</strong><small>quiet for now</small></span>
-              </div>
-              <div class="preview-self">
-                <span class="avatar avatar-you">Y<i class="online"></i></span>
-                <span><strong>you</strong><small>on frequency</small></span>
-              </div>
-            </aside>
-
-            <section class="preview-chat">
-              <div class="chat-atmosphere"></div>
-              <div class="preview-chat-header">
-                <span class="group-art group-art-one">A</span>
-                <span><strong>After Hours</strong><small>private group · 8 members</small></span>
-                <div>△　▧　Rules</div>
-              </div>
-
-              <div class="preview-messages">
-                <article class="message incoming">
-                  <span class="avatar avatar-maya">M<i class="online"></i></span>
-                  <div>
-                    <strong>Maya</strong>
-                    <p>frequency confirmed. everybody made it.</p>
-                    <time>10:42 PM</time>
-                  </div>
-                </article>
-
-                <article class="message own">
-                  <span class="avatar avatar-you">Y<i class="online"></i></span>
-                  <div>
-                    <strong>you</strong>
-                    <p>perfect. this room is ours.</p>
-                    <time>10:43 PM</time>
-                  </div>
-                </article>
-
-                <article class="message incoming media-message">
-                  <span class="avatar avatar-jonah">J<i class="recent"></i></span>
-                  <div>
-                    <strong>Jonah</strong>
-                    <div class="media-card">
-                      <span>AFTER<br />HOURS</span>
-                      <i>▶</i>
-                    </div>
-                    <div class="reaction">⚡ 4</div>
-                    <time>10:45 PM</time>
-                  </div>
-                </article>
-              </div>
-
-              <div class="preview-composer">
-                <button tabindex="-1">⌕</button>
-                <span>send noise</span>
-                <button tabindex="-1">↑</button>
-              </div>
-            </section>
-
-            <aside class="preview-members">
-              <div class="member-heading">MEMBERS <span>8</span></div>
-              <div class="member">
-                <span class="avatar avatar-maya">M<i class="online"></i></span>
-                <span><strong>Maya</strong><small>founder</small></span>
-              </div>
-              <div class="member">
-                <span class="avatar avatar-you">Y<i class="online"></i></span>
-                <span><strong>you</strong><small>tuned in</small></span>
-              </div>
-              <div class="member">
-                <span class="avatar avatar-jonah">J<i class="recent"></i></span>
-                <span><strong>Jonah</strong><small>recently active</small></span>
-              </div>
-              <div class="member">
-                <span class="avatar avatar-lena">L<i class="offline"></i></span>
-                <span><strong>Lena</strong><small>offline</small></span>
-              </div>
-              <div class="beta-label">Beta V.0.1.7　ⓘ</div>
-            </aside>
+        <div class="signal-field" aria-label="A private Noise group frequency">
+          <div class="signal-field-header">
+            <span>NOISE / PRIVATE GROUP</span>
+            <span>12 DIGITS</span>
           </div>
-        </div>
-
-        <div class="hero-proof" aria-label="Noise product highlights">
-          <span><b>01</b> No phone number</span>
-          <span><b>02</b> No public directory</span>
-          <span><b>03</b> Encrypted by default</span>
-          <span><b>04</b> Open source</span>
+          <div class="signal-frequency">
+            <span>4021</span><i></i><span>7738</span><i></i><span>1964</span>
+          </div>
+          <div class="waveform" aria-hidden="true">
+            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+          </div>
+          <div class="signal-field-footer">
+            <span><b></b> ENCRYPTED ON DEVICE</span>
+            <span>SHARE PERSON TO PERSON</span>
+            <span>NO PUBLIC INDEX</span>
+          </div>
         </div>
       </section>
 
@@ -202,88 +116,97 @@
         </div>
       </section>
 
-      <section class="pillars section-shell">
-        <article class="pillar pillar-featured">
-          <div class="pillar-number">01</div>
-          <div class="frequency-demo" aria-hidden="true">
-            <span>4021</span><i></i><span>7738</span><i></i><span>1964</span>
+      <section class="principles section-shell" aria-label="Noise principles">
+        <article>
+          <div class="principle-index">01</div>
+          <div class="principle-title">
+            <p>Groups are the product</p>
+            <h3>Built for the whole room.</h3>
           </div>
-          <div>
-            <h3>Invite by frequency.</h3>
-            <p>
-              Every group gets a private 12-digit frequency. No searchable directory,
-              no algorithmic discovery, no accidental audience.
-            </p>
-          </div>
-        </article>
-
-        <article class="pillar">
-          <div class="pillar-number">02</div>
-          <div class="identity-orb">
-            <span>n</span>
-            <b>3a:9f:71:0c</b>
-          </div>
-          <div>
-            <h3>Identity without PII.</h3>
-            <p>
-              A Noise ID and password are enough. Add a display name, avatar, and bio
-              without attaching a phone number or email.
-            </p>
+          <p class="principle-copy">
+            Large private communities are the starting point—not an afterthought bolted onto
+            one-to-one chat.
+          </p>
+          <div class="principle-proof">
+            <span>GROUP SIZE</span>
+            <strong>50K<span>target</span></strong>
           </div>
         </article>
 
-        <article class="pillar">
-          <div class="pillar-number">03</div>
-          <div class="privacy-path" aria-hidden="true">
-            <i></i><span></span><i></i><span></span><i></i>
+        <article>
+          <div class="principle-index">02</div>
+          <div class="principle-title">
+            <p>Identity without PII</p>
+            <h3>Known without being exposed.</h3>
           </div>
-          <div>
-            <h3>Encrypted before transit.</h3>
-            <p>
-              Messages and media are encrypted on your device before replaceable relays
-              carry them across the network.
-            </p>
+          <p class="principle-copy">
+            A Noise ID and password are enough. Your display name, avatar, and bio stay
+            separate from phone numbers and email addresses.
+          </p>
+          <div class="principle-proof signature-proof">
+            <span>NOISE SIGNATURE</span>
+            <strong>3A:9F:71:0C</strong>
+          </div>
+        </article>
+
+        <article>
+          <div class="principle-index">03</div>
+          <div class="principle-title">
+            <p>Private in transit</p>
+            <h3>Encrypted before it leaves.</h3>
+          </div>
+          <p class="principle-copy">
+            Message and media payloads are encrypted on your device before replaceable relays
+            carry them across the network.
+          </p>
+          <div class="principle-proof route-proof" aria-hidden="true">
+            <span class="route-node active"></span><i></i><span class="route-node"></span><i></i><span class="route-node"></span>
           </div>
         </article>
       </section>
 
       <section class="groups-showcase" id="groups">
-        <div class="section-shell showcase-grid">
-          <div class="showcase-copy">
-            <p class="section-kicker">Groups, properly</p>
-            <h2>The room is the product.</h2>
-            <p>
-              Noise starts where other messengers get awkward: large, private groups with
-              their own identity, culture, and control.
-            </p>
-            <ul>
-              <li><span>✦</span> Custom icons, backgrounds, and accent colors</li>
-              <li><span>✦</span> Media galleries, replies, and reactions</li>
-              <li><span>✦</span> Rules, moderators, reports, and bans</li>
-              <li><span>✦</span> Encrypted DMs when the group conversation becomes personal</li>
-            </ul>
-          </div>
+        <div class="section-shell showcase-heading">
+          <p class="section-kicker">Groups, properly</p>
+          <h2>The room is the product.</h2>
+          <p>
+            Every group can have its own identity, culture, rules, and visual world.
+            Noise gives communities real tools without turning them into public content.
+          </p>
+        </div>
 
-          <div class="group-canvas">
-            <div class="canvas-noise"></div>
-            <div class="group-card card-back">
-              <div class="mini-icon">R</div>
-              <span><strong>Room 404</strong><small>frequency · 8841 0029 3417</small></span>
+        <div class="capability-grid section-shell">
+          <article class="capability-wide">
+            <span>01 / IDENTITY</span>
+            <h3>Make the room unmistakably yours.</h3>
+            <p>Group icon, background, description, rules, and accent color.</p>
+            <div class="accent-line" aria-hidden="true">
+              <i></i><i></i><i></i><i></i><i></i><i></i>
             </div>
-            <div class="group-card card-mid">
-              <div class="mini-icon">N</div>
-              <span><strong>Night Shift</strong><small>24 members · 6 online</small></span>
+          </article>
+          <article>
+            <span>02 / CONVERSATION</span>
+            <h3>Replies.<br />Reactions.<br />Real context.</h3>
+            <p>Fast group chat that feels like chat—not a forum wearing a messenger costume.</p>
+          </article>
+          <article>
+            <span>03 / MEDIA</span>
+            <h3>Share the moment, not a filename.</h3>
+            <p>Adaptive media, video previews, galleries, and encrypted distributed storage.</p>
+          </article>
+          <article>
+            <span>04 / CONTROL</span>
+            <h3>Govern the room.</h3>
+            <p>Founders, moderators, member permissions, reports, bans, and message deletion.</p>
+          </article>
+          <article class="capability-wide capability-dm">
+            <span>05 / DIRECT MESSAGES</span>
+            <h3>The group comes first. Private conversation is one click away.</h3>
+            <p>Start an encrypted DM from a shared group profile—without making yourself searchable.</p>
+            <div class="dm-path" aria-hidden="true">
+              <b>GROUP</b><i></i><em>PRIVATE</em><i></i><b>DM</b>
             </div>
-            <div class="group-card card-front">
-              <div class="mini-icon pulse-mark">A</div>
-              <span><strong>After Hours</strong><small>where the good ideas happen</small></span>
-              <b>tuned in</b>
-            </div>
-            <div class="accent-picker">
-              <small>group accent</small>
-              <i class="selected"></i><i></i><i></i><i></i><i></i>
-            </div>
-          </div>
+          </article>
         </div>
       </section>
 
@@ -296,7 +219,7 @@
             to understand before saying hello.
           </p>
         </div>
-        <div class="privacy-grid">
+        <div class="privacy-list">
           <article>
             <span>01</span>
             <h3>No phone number</h3>
@@ -321,16 +244,11 @@
       </section>
 
       <section class="network" id="network">
-        <div class="network-lines" aria-hidden="true">
-          <i class="node node-one"></i>
-          <i class="node node-two"></i>
-          <i class="node node-three"></i>
-          <i class="node node-four"></i>
-          <i class="node node-five"></i>
-          <span class="line line-one"></span>
-          <span class="line line-two"></span>
-          <span class="line line-three"></span>
-          <span class="line line-four"></span>
+        <div class="network-plane" aria-hidden="true">
+          <i class="node n1"></i><i class="node n2"></i><i class="node n3"></i>
+          <i class="node n4"></i><i class="node n5"></i><i class="node n6"></i>
+          <span class="network-ring r1"></span><span class="network-ring r2"></span>
+          <span class="network-ring r3"></span>
         </div>
         <div class="section-shell network-content">
           <p class="section-kicker">Strength in numbers</p>
@@ -355,30 +273,43 @@
       </section>
 
       <section class="download section-shell" id="download">
-        <div class="download-card">
-          <div class="download-glow"></div>
-          <img src="/noise.svg" alt="" width="84" height="84" />
+        <div class="download-heading">
+          <img src="/noise.svg" alt="" width="70" height="70" />
           <p class="section-kicker">Early alpha</p>
           <h2>Find your frequency.</h2>
-          <p>
-            Start a private group on the web, or bring Noise home with the desktop app.
-          </p>
-          <div class="download-actions">
-            <a class="button primary" href="https://app.makenoise.chat">Open web app <span>↗</span></a>
-            <a class="button secondary" href="https://github.com/GnosysLabs/noise/releases/latest">macOS <span>↓</span></a>
-            <a class="button secondary" href="https://github.com/GnosysLabs/noise/releases/latest">Windows <span>↓</span></a>
-          </div>
-          <small>
-            Noise is early alpha software. Use it, stress it, and help shape what it becomes.
-          </small>
+          <p>Start on the web, or bring Noise home with the desktop app.</p>
         </div>
+        <div class="download-options">
+          <a
+            class="download-option"
+            data-download="mac"
+            href="https://github.com/GnosysLabs/noise/releases/latest"
+          >
+            <span><small>01</small><strong>macOS</strong></span>
+            <p>Apple silicon</p>
+            <b>Download ↓</b>
+          </a>
+          <button class="download-option" data-windows-open type="button">
+            <span><small>02</small><strong>Windows</strong></span>
+            <p>Windows 10/11 · 64-bit</p>
+            <b>Download ↓</b>
+          </button>
+          <a class="download-option" href="https://app.makenoise.chat">
+            <span><small>03</small><strong>Web</strong></span>
+            <p>No installation</p>
+            <b>Open ↗</b>
+          </a>
+        </div>
+        <small class="alpha-note">
+          Noise is early alpha software. Use it, stress it, and help shape what it becomes.
+        </small>
       </section>
     </main>
 
     <footer>
       <div class="footer-brand">
         <a class="wordmark" href="#">
-          <img src="/noise.svg" alt="" width="34" height="34" />
+          <img src="/noise.svg" alt="" width="32" height="32" />
           <span>noise</span>
         </a>
         <p>Private groups, on your frequency.</p>
@@ -387,7 +318,7 @@
         <div>
           <strong>Product</strong>
           <a href="https://app.makenoise.chat">Web app</a>
-          <a href="https://github.com/GnosysLabs/noise/releases/latest">Downloads</a>
+          <a href="#download">Downloads</a>
         </div>
         <div>
           <strong>Network</strong>
@@ -405,5 +336,65 @@
         <span>Built out loud.</span>
       </div>
     </footer>
+
+    <div class="modal-backdrop" data-windows-modal hidden>
+      <section
+        class="windows-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="windows-modal-title"
+        aria-describedby="windows-modal-description"
+      >
+        <button class="modal-close" data-windows-close type="button" aria-label="Close">×</button>
+        <div class="modal-platform">
+          <span class="windows-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+          Windows alpha
+        </div>
+        <h2 id="windows-modal-title">Windows may show a SmartScreen warning.</h2>
+        <p id="windows-modal-description">
+          Noise is new, so its installer may not have enough download reputation yet.
+          SmartScreen can warn about an <strong>unrecognized app</strong> even when it has
+          not detected malware.
+        </p>
+
+        <div class="smartscreen-steps">
+          <article>
+            <span>01</span>
+            <div><strong>Open the downloaded installer.</strong><p>If Windows says “Windows protected your PC,” stay on that screen.</p></div>
+          </article>
+          <article>
+            <span>02</span>
+            <div><strong>Click “More info.”</strong><p>Windows will reveal the filename and the option to continue.</p></div>
+          </article>
+          <article>
+            <span>03</span>
+            <div><strong>Click “Run anyway.”</strong><p>The normal Noise setup will begin.</p></div>
+          </article>
+        </div>
+
+        <div class="modal-note">
+          <span>Why this happens</span>
+          <p>
+            SmartScreen uses reputation signals including download history and file signing.
+            A warning does not automatically mean the file is malicious. Noise is open source,
+            and every release is published from the public repository.
+          </p>
+        </div>
+
+        <div class="modal-actions">
+          <button data-windows-close type="button">Not now</button>
+          <a
+            class="button primary"
+            data-download="windows"
+            href="https://github.com/GnosysLabs/noise/releases/latest"
+          >
+            Download for Windows <span>↓</span>
+          </a>
+        </div>
+        <small>
+          On managed work or school PCs, policy may remove the “Run anyway” option.
+        </small>
+      </section>
+    </div>
   </body>
 </html>
