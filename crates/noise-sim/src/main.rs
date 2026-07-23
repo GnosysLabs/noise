@@ -43,6 +43,7 @@ fn main() -> anyhow::Result<()> {
                 username: format!("member-{index:05}"),
                 bio: String::new(),
                 avatar: None,
+                accepts_direct_messages: true,
             },
             0,
         )?;
