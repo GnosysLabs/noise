@@ -8,6 +8,7 @@ import {
   ChevronRight,
   Copy,
   Crown,
+  Download,
   Images,
   Info,
   LoaderCircle,
@@ -364,20 +365,35 @@ function prepareVideoPreview(file: File): Promise<MediaPreview | null> {
           video.currentTime = previewTimes[previewIndex];
           return;
         }
-        const scale = Math.min(1, 360 / Math.max(video.videoWidth, video.videoHeight));
-        const canvas = document.createElement("canvas");
-        canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
-        canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
-        const context = canvas.getContext("2d");
-        if (!context) return finish(null);
-        context.drawImage(video, 0, 0, canvas.width, canvas.height);
-        let preview = await new Promise<Blob | null>((done) => canvas.toBlob(done, "image/jpeg", 0.6));
-        if (preview && preview.size > 58_000) {
-          preview = await new Promise<Blob | null>((done) => canvas.toBlob(done, "image/jpeg", 0.4));
+        const profiles = [
+          { edge: 840, quality: 0.82 },
+          { edge: 840, quality: 0.72 },
+          { edge: 720, quality: 0.8 },
+          { edge: 720, quality: 0.68 },
+          { edge: 600, quality: 0.76 },
+          { edge: 600, quality: 0.62 },
+          { edge: 480, quality: 0.68 },
+        ];
+        let dataBase64: string | null = null;
+        for (const profile of profiles) {
+          const scale = Math.min(1, profile.edge / Math.max(video.videoWidth, video.videoHeight));
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+          canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+          const context = canvas.getContext("2d");
+          if (!context) return finish(null);
+          context.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const preview = await new Promise<Blob | null>((done) =>
+            canvas.toBlob(done, "image/jpeg", profile.quality)
+          );
+          if (!preview || preview.size > 58_000) continue;
+          const encoded = await fileBase64(preview);
+          if (encoded.length <= 80_000) {
+            dataBase64 = encoded;
+            break;
+          }
         }
-        if (!preview) return finish(null);
-        const dataBase64 = await fileBase64(preview);
-        if (dataBase64.length > 80_000) return finish(null);
+        if (!dataBase64) return finish(null);
         finish({
           dataBase64,
           mimeType: "image/jpeg",
@@ -567,6 +583,7 @@ export default function App() {
   const refreshGeneration = useRef(0);
   const groupConversationCache = useRef(new Map<string, Conversation>());
   const directConversationCache = useRef(new Map<string, DirectConversation>());
+  const groupReadInFlight = useRef(new Set<string>());
   const sidebarModeRef = useRef(sidebarMode);
   const desiredDirectPublicKeyRef = useRef<string | null>(null);
   sidebarModeRef.current = sidebarMode;
@@ -793,6 +810,21 @@ export default function App() {
     });
   }, []);
 
+  const markActiveGroupRead = useCallback(async (groupId: string) => {
+    if (groupReadInFlight.current.has(groupId)) return;
+    groupReadInFlight.current.add(groupId);
+    try {
+      const marked = await markGroupRead(groupId);
+      if (!marked) return;
+      setSummary(marked);
+      void noise({ action: "sync_account", relays }).catch(() => {
+        // The local group read marker is immediate; cross-device sync retries normally.
+      });
+    } finally {
+      groupReadInFlight.current.delete(groupId);
+    }
+  }, []);
+
   const syncDirectInbox = useCallback(async (markActiveRead: boolean) => {
     const generation = refreshGeneration.current;
     const inbox = await noise<DirectInbox>({ action: "direct_inbox", relays });
@@ -819,6 +851,7 @@ export default function App() {
         setGroupEncryption(null);
         return;
       }
+      const needsReadBaseline = !activeGroup.read_state_initialized;
       const cached = groupConversationCache.current.get(activeGroup.group_id);
       if (cached) setConversation(cached);
       const encryption = await syncGroupEncryption();
@@ -847,6 +880,15 @@ export default function App() {
         setConversation(nextConversation);
       }
       setSummary(reconciled);
+      if (needsReadBaseline) {
+        void noise<LocalSummary>({ action: "sync_account", relays })
+          .then((synced) => {
+            if (synced) setSummary(synced);
+          })
+          .catch(() => {
+            // The local baseline is durable; encrypted cross-device sync retries normally.
+          });
+      }
       return;
     }
 
@@ -867,9 +909,59 @@ export default function App() {
   const activeGroup = summary?.groups.find((group) => group.is_active) ?? null;
   const activeGroupId = activeGroup?.group_id ?? null;
   const activeDirectPublicKey = summary?.directs.find((direct) => direct.is_active)?.public_key ?? null;
+  const markCurrentGroupRead = useCallback(() => {
+    if (activeGroupId) void markActiveGroupRead(activeGroupId);
+  }, [activeGroupId, markActiveGroupRead]);
   const activeGroupBackground = sidebarMode === "groups" ? activeGroup?.background ?? null : null;
   const activeAccentStyle = accentStyle(sidebarMode === "groups" ? activeGroup?.accent_color : null);
   const appBackgroundSource = useProfileImageSource(activeGroupBackground);
+  const groupWatchKey = summary?.groups
+    .map((group) => group.group_id)
+    .sort()
+    .join("|") ?? "";
+
+  useEffect(() => {
+    if (!identityPublicKey || !summary) return;
+    const groups = summary.groups
+      .filter((group) => sidebarMode !== "groups" || group.group_id !== activeGroupId);
+    let stopped = false;
+    const watch = async (group: GroupSummary) => {
+      let revision: number | null = null;
+      while (!stopped) {
+        try {
+          const initial = revision === null;
+          const change: GroupWatch | null = await noise<GroupWatch>({
+            action: "watch_group_id",
+            group_id: group.group_id,
+            since: revision,
+            relays,
+          });
+          if (stopped || !change) return;
+          revision = change.revision;
+          if (initial || change.changed) {
+            const reconciled = await syncGroupActivity(group.group_id);
+            if (!stopped && reconciled) setSummary(reconciled);
+            if (initial && !group.read_state_initialized) {
+              void noise<LocalSummary>({ action: "sync_account", relays })
+                .then((synced) => {
+                  if (!stopped && synced) setSummary(synced);
+                })
+                .catch(() => {
+                  // The local baseline is durable; encrypted cross-device sync retries normally.
+                });
+            }
+          }
+        } catch {
+          await new Promise((resolve) => window.setTimeout(resolve, 1500));
+        }
+      }
+    };
+    for (const group of groups) void watch(group);
+    return () => {
+      stopped = true;
+    };
+  }, [activeGroupId, groupWatchKey, identityPublicKey, sidebarMode]);
+
   useEffect(() => {
     if (sidebarMode !== "groups" || !activeGroupId) return;
     let stopped = false;
@@ -981,6 +1073,7 @@ export default function App() {
 
   async function selectGroup(group: GroupSummary) {
     if (group.is_active) return;
+    const needsReadBaseline = !group.read_state_initialized;
     const generation = ++refreshGeneration.current;
     setError(null);
     setGroupEncryption(null);
@@ -1024,6 +1117,15 @@ export default function App() {
         setConversation(fresh);
       }
       setSummary(reconciled);
+      if (needsReadBaseline) {
+        void noise<LocalSummary>({ action: "sync_account", relays })
+          .then((synced) => {
+            if (synced) setSummary(synced);
+          })
+          .catch(() => {
+            // The local baseline is durable; encrypted cross-device sync retries normally.
+          });
+      }
     } catch (cause) {
       if (generation === refreshGeneration.current) setError(message(cause));
     }
@@ -1244,6 +1346,7 @@ export default function App() {
               busy={busy}
               hasBackground={Boolean(appBackgroundSource)}
               canEditGroup={selectedConversation.group.owner_public_key === summary.identity.public_key}
+              unreadCount={activeGroup?.unread_count ?? 0}
               selfPublicKey={summary.identity.public_key}
               presenceStatuses={selectedPresenceStatuses}
               onGroupSettings={() => setDialog({ type: "group", group: selectedConversation.group })}
@@ -1297,6 +1400,7 @@ export default function App() {
               }
               onBan={(member) => setDialog({ type: "ban_member", member })}
               onReport={(message) => setDialog({ type: "report_message", message })}
+              onReachedBottom={markCurrentGroupRead}
               onSend={async (text, pending, onProgress, replyToMessageId, signal) => {
                 const groupId = selectedConversation.group.group_id;
                 const optimistic = optimisticMessage(summary.identity, text, pending, replyToMessageId);
@@ -1792,6 +1896,14 @@ function Sidebar({
           >
             <Avatar name={group.name} image={group.avatar} size={27} square />
             <span>{group.name}</span>
+            {group.unread_count > 0 && (
+              <span
+                className="group-unread-count"
+                aria-label={`${group.unread_count} unread ${group.unread_count === 1 ? "message" : "messages"}`}
+              >
+                {group.unread_count > 99 ? "99+" : group.unread_count}
+              </span>
+            )}
           </button>
         )) : summary.directs.map((direct) => (
           <button
@@ -1928,6 +2040,7 @@ function useChunkedMessageList<T extends { event_id: string }>(
   const previousMessageCount = useRef(messages.length);
   const savedScroll = useRef<SavedMessageScroll>({ stuckAtBottom: true });
   const loadingOlder = useRef(false);
+  const [atBottom, setAtBottom] = useState(true);
   const [visibleCount, setVisibleCount] = useState(() =>
     Math.min(
       messages.length,
@@ -1945,8 +2058,10 @@ function useChunkedMessageList<T extends { event_id: string }>(
     const bottomDistance = element.scrollHeight - element.scrollTop - element.clientHeight;
     if (bottomDistance < 96) {
       savedScroll.current = { stuckAtBottom: true };
+      setAtBottom(true);
       return;
     }
+    setAtBottom(false);
     const containerTop = element.getBoundingClientRect().top;
     const rows = element.querySelectorAll<HTMLElement>("[data-message-id]");
     for (const row of rows) {
@@ -1969,6 +2084,7 @@ function useChunkedMessageList<T extends { event_id: string }>(
       element.scrollTop = element.scrollHeight;
       positionedConversation.current = conversationKey;
       savedScroll.current = { stuckAtBottom: true };
+      setAtBottom(true);
     } else if (savedScroll.current.stuckAtBottom) {
       const bottomDistance = element.scrollHeight - element.scrollTop - element.clientHeight;
       if (bottomDistance > 0) element.scrollBy({ top: bottomDistance, behavior: "auto" });
@@ -2016,7 +2132,7 @@ function useChunkedMessageList<T extends { event_id: string }>(
     });
   }, [conversationKey, hasOlder, messages.length, saveScrollPosition]);
 
-  return { ref, onScroll, visibleMessages, renderedCount };
+  return { ref, onScroll, visibleMessages, renderedCount, atBottom };
 }
 
 function useAutosizeComposer(
@@ -2038,6 +2154,7 @@ function ConversationPanel({
   busy,
   hasBackground,
   canEditGroup,
+  unreadCount,
   selfPublicKey,
   presenceStatuses,
   onGroupSettings,
@@ -2051,12 +2168,14 @@ function ConversationPanel({
   onSetModerator,
   onBan,
   onReport,
+  onReachedBottom,
   onSend,
 }: {
   conversation: Conversation;
   busy: boolean;
   hasBackground: boolean;
   canEditGroup: boolean;
+  unreadCount: number;
   selfPublicKey: string;
   presenceStatuses: Map<string, PresenceStatus>;
   onGroupSettings: () => void;
@@ -2070,6 +2189,7 @@ function ConversationPanel({
   onSetModerator: (member: MemberSummary, enabled: boolean) => Promise<boolean>;
   onBan: (member: MemberSummary) => void;
   onReport: (message: MessageSummary) => void;
+  onReachedBottom: () => void;
   onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null, signal: AbortSignal) => Promise<boolean>;
 }) {
   const [draft, setDraft] = useState("");
@@ -2088,6 +2208,9 @@ function ConversationPanel({
     conversation.group.group_id,
     conversation.messages,
   );
+  useEffect(() => {
+    if (messageList.atBottom && unreadCount > 0) onReachedBottom();
+  }, [conversation.messages.length, messageList.atBottom, onReachedBottom, unreadCount]);
   useWarmConversationMedia(
     conversation.messages,
     conversation.group.group_id,
@@ -2098,8 +2221,15 @@ function ConversationPanel({
   const canSendMessages = canModerate || conversation.group.members_can_send_messages;
   const canSendMedia = canModerate || conversation.group.members_can_send_media;
   const sortedMembers = [...conversation.members].sort((left, right) => {
-    const rank = (member: MemberSummary) => member.public_key === conversation.group.owner_public_key ? 0 : member.is_moderator ? 1 : 2;
-    return rank(left) - rank(right);
+    const roleRank = (member: MemberSummary) =>
+      member.public_key === conversation.group.owner_public_key ? 0 : member.is_moderator ? 1 : 2;
+    const presenceRank = (member: MemberSummary) => {
+      const status = presenceStatuses.get(member.public_key) ?? "offline";
+      return status === "online" ? 0 : status === "recently-active" ? 1 : 2;
+    };
+    return roleRank(left) - roleRank(right)
+      || presenceRank(left) - presenceRank(right)
+      || left.username.localeCompare(right.username);
   });
   const attachmentPreview = attachment?.previewUrl;
   useEffect(() => () => {
@@ -2400,9 +2530,17 @@ function AppVersionFooter() {
       .catch(() => undefined);
     return () => { active = false; };
   }, [version]);
+  const browserPlatform = `${navigator.platform ?? ""} ${navigator.userAgent}`;
+  const desktopDownloadLabel = /Windows/i.test(browserPlatform)
+    ? "Download Windows app"
+    : /Macintosh|Mac OS X|MacIntel/i.test(browserPlatform)
+      ? "Download macOS app"
+      : "Download desktop app";
   return <>
     <div className="member-sidebar-footer">
-      <span>{version ? `Beta V.${version}` : "Beta"}</span>
+      {isTauri
+        ? <span>{version ? `Beta V.${version}` : "Beta"}</span>
+        : <a href="https://makenoise.chat/#download" target="_blank" rel="noreferrer"><Download size={13} />{desktopDownloadLabel}</a>}
       <button onClick={() => setShowAbout(true)} aria-label="about Noise" title="about Noise"><Info size={13} /></button>
     </div>
     {showAbout && <AboutNoiseDialog onClose={() => setShowAbout(false)} />}
@@ -2640,7 +2778,6 @@ function prepareMediaSource(attachment: MediaAttachment, source: string) {
     );
   } else if (
     attachment.mime_type.startsWith("video/")
-    && !mediaPoster(attachment)
     && !videoPosterCache.has(cacheKey)
   ) {
     request = prepareVideoMediaSource(source, cacheKey);
@@ -2744,14 +2881,14 @@ function prepareVideoMediaSource(source: string, cacheKey: string) {
         return;
       }
       try {
-        const scale = Math.min(1, 480 / Math.max(video.videoWidth, video.videoHeight));
+        const scale = Math.min(1, 960 / Math.max(video.videoWidth, video.videoHeight));
         const canvas = document.createElement("canvas");
         canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
         canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
         const context = canvas.getContext("2d");
         if (context) {
           context.drawImage(video, 0, 0, canvas.width, canvas.height);
-          videoPosterCache.set(cacheKey, canvas.toDataURL("image/jpeg", 0.68));
+          videoPosterCache.set(cacheKey, canvas.toDataURL("image/jpeg", 0.82));
         }
       } catch {
         // The locally cached video still opens even when this codec blocks canvas capture.
@@ -3049,8 +3186,9 @@ function ChatVideo({
     void imageIsNearBlack(poster).then((nearBlack) => {
       if (!active) return;
       if (nearBlack) {
-        if (posterCacheKey) videoPosterCache.delete(posterCacheKey);
-        setDecodedPoster(undefined);
+        setDecodedPoster(
+          posterCacheKey ? videoPosterCache.get(posterCacheKey) : undefined,
+        );
         const element = video.current;
         if (element && element.readyState >= HTMLMediaElement.HAVE_METADATA) {
           element.dataset.thumbnailPrimed = "false";
@@ -3058,13 +3196,19 @@ function ChatVideo({
         }
         return;
       }
-      if (posterCacheKey) videoPosterCache.set(posterCacheKey, poster);
-      setDecodedPoster(poster);
+      setDecodedPoster(
+        (posterCacheKey ? videoPosterCache.get(posterCacheKey) : undefined) ?? poster,
+      );
     });
     return () => { active = false; };
   }, [poster, posterCacheKey]);
   const capturePoster = (element: HTMLVideoElement) => {
-    if (decodedPoster || !posterCacheKey || !element.videoWidth || !element.videoHeight) return;
+    if (!posterCacheKey || !element.videoWidth || !element.videoHeight) return;
+    const cached = videoPosterCache.get(posterCacheKey);
+    if (cached) {
+      if (decodedPoster !== cached) setDecodedPoster(cached);
+      return;
+    }
     try {
       if (videoFrameIsNearBlack(element)) {
         const previewTimes = videoPreviewTimes(element.duration);
@@ -3076,14 +3220,14 @@ function ChatVideo({
           return;
         }
       }
-      const scale = Math.min(1, 480 / Math.max(element.videoWidth, element.videoHeight));
+      const scale = Math.min(1, 960 / Math.max(element.videoWidth, element.videoHeight));
       const canvas = document.createElement("canvas");
       canvas.width = Math.max(1, Math.round(element.videoWidth * scale));
       canvas.height = Math.max(1, Math.round(element.videoHeight * scale));
       const context = canvas.getContext("2d");
       if (!context) return;
       context.drawImage(element, 0, 0, canvas.width, canvas.height);
-      const next = canvas.toDataURL("image/jpeg", 0.68);
+      const next = canvas.toDataURL("image/jpeg", 0.82);
       videoPosterCache.set(posterCacheKey, next);
       setDecodedPoster(next);
     } catch {
@@ -3152,7 +3296,9 @@ function ChatVideo({
         setDuration(Number.isFinite(element.duration) ? element.duration : 0);
         setCurrentTime(element.currentTime);
         setMuted(element.muted);
-        if (!decodedPoster) primeVideoFrame(element);
+        if (!posterCacheKey || !videoPosterCache.has(posterCacheKey)) {
+          primeVideoFrame(element);
+        }
       }}
       onLoadedData={(event) => capturePoster(event.currentTarget)}
       onSeeked={(event) => capturePoster(event.currentTarget)}
@@ -3289,10 +3435,6 @@ function useGalleryThumbnail(attachment: MediaAttachment, source: string | null)
     : imagePosterCache.get(cacheKey);
   const [generated, setGenerated] = useState<string | null>(() => cachedPoster() ?? null);
   useEffect(() => {
-    if (embedded) {
-      setGenerated(null);
-      return;
-    }
     const cached = cachedPoster();
     if (cached) {
       setGenerated(cached);
@@ -3310,7 +3452,7 @@ function useGalleryThumbnail(attachment: MediaAttachment, source: string | null)
     });
     return () => { active = false; };
   }, [attachment, cacheKey, embedded, source]);
-  return embedded ?? generated;
+  return generated ?? embedded;
 }
 
 function useProfileImageSource(image: ProfileImage | null) {
@@ -3861,6 +4003,31 @@ async function syncGroupEncryption(): Promise<GroupEncryptionStatus | null> {
     });
   } catch (cause) {
     if (message(cause).includes("unknown variant `sync_group_encryption`")) return null;
+    throw cause;
+  }
+}
+
+async function syncGroupActivity(groupId: string): Promise<LocalSummary | null> {
+  try {
+    return await noise<LocalSummary>({
+      action: "sync_group_activity",
+      group_id: groupId,
+      relays,
+    });
+  } catch (cause) {
+    if (message(cause).includes("unknown variant `sync_group_activity`")) return null;
+    throw cause;
+  }
+}
+
+async function markGroupRead(groupId: string): Promise<LocalSummary | null> {
+  try {
+    return await noise<LocalSummary>({
+      action: "mark_group_read",
+      group_id: groupId,
+    });
+  } catch (cause) {
+    if (message(cause).includes("unknown variant `mark_group_read`")) return null;
     throw cause;
   }
 }

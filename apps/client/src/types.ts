@@ -29,6 +29,8 @@ export type GroupSummary = {
   owner_public_key: string;
   remote_deletion_supported: boolean;
   is_active: boolean;
+  unread_count: number;
+  read_state_initialized: boolean;
 };
 
 export type LocalSummary = {

@@ -32,14 +32,14 @@ use anyhow::{Context, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use noise_core::{
-    AccountCredentials, AccountVault, EncryptedBlob, GroupDeletion, GroupEventPayload,
-    GroupMembership, GroupPresence, GroupProfile, GroupState, HistoryKeyLink, Identity,
-    InviteRecord, InviteRotation, MlsAccountState, MlsControlLog, MlsEpochRecord, MlsGroupGenesis,
-    MlsJoinRequest, MlsRemovalReason, MlsRemovalRequest, Profile, SignedEvent, StorageManifest,
-    StorageShard, derive_account_credentials, direct_mailbox_id, direct_message_id,
-    display_frequency, display_noise_id, encode_blob_for_storage, frequency_locator,
-    generate_frequency, generate_noise_id, media_preview_is_valid, normalize_frequency,
-    reconstruct_blob_from_storage, valid_reaction_emoji,
+    AcceptedMessage, AccountCredentials, AccountVault, EncryptedBlob, GroupDeletion,
+    GroupEventPayload, GroupMembership, GroupPresence, GroupProfile, GroupState, HistoryKeyLink,
+    Identity, InviteRecord, InviteRotation, MlsAccountState, MlsControlLog, MlsEpochRecord,
+    MlsGroupGenesis, MlsJoinRequest, MlsRemovalReason, MlsRemovalRequest, Profile, SignedEvent,
+    StorageManifest, StorageShard, derive_account_credentials, direct_mailbox_id,
+    direct_message_id, display_frequency, display_noise_id, encode_blob_for_storage,
+    frequency_locator, generate_frequency, generate_noise_id, media_preview_is_valid,
+    normalize_frequency, reconstruct_blob_from_storage, valid_reaction_emoji,
 };
 pub use noise_core::{MediaAttachment, MediaChunk, ProfileImage};
 use noise_transport::{
@@ -107,6 +107,8 @@ pub struct GroupSummary {
     pub owner_public_key: String,
     pub remote_deletion_supported: bool,
     pub is_active: bool,
+    pub unread_count: usize,
+    pub read_state_initialized: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -340,6 +342,16 @@ struct ClientState {
     #[serde(default)]
     direct_read_through: HashMap<String, DirectMessageMarker>,
     #[serde(default)]
+    group_latest_incoming: HashMap<String, MessageMarker>,
+    #[serde(default)]
+    group_latest_activity: HashMap<String, MessageMarker>,
+    #[serde(default)]
+    group_read_through: HashMap<String, MessageMarker>,
+    #[serde(default)]
+    group_unread_messages: HashMap<String, Vec<MessageMarker>>,
+    #[serde(default)]
+    group_activity_initialized: HashSet<String>,
+    #[serde(default)]
     group_frequencies: HashMap<String, String>,
     #[serde(default)]
     next_author_sequence: u64,
@@ -371,6 +383,12 @@ struct AccountVaultContents {
     direct_read_through: HashMap<String, DirectMessageMarker>,
     #[serde(default)]
     direct_latest_activity: HashMap<String, DirectMessageMarker>,
+    #[serde(default)]
+    group_read_through: HashMap<String, MessageMarker>,
+    #[serde(default)]
+    group_latest_activity: HashMap<String, MessageMarker>,
+    #[serde(default)]
+    group_activity_initialized: HashSet<String>,
     group_frequencies: HashMap<String, String>,
     next_author_sequence: u64,
 }
@@ -394,14 +412,16 @@ struct DirectClosedPeriod {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-struct DirectMessageMarker {
+struct MessageMarker {
     created_at_millis: u64,
     event_id: String,
 }
 
+type DirectMessageMarker = MessageMarker;
+
 fn merge_read_markers(
-    current: &mut HashMap<String, DirectMessageMarker>,
-    incoming: &HashMap<String, DirectMessageMarker>,
+    current: &mut HashMap<String, MessageMarker>,
+    incoming: &HashMap<String, MessageMarker>,
 ) -> bool {
     let before = current.clone();
     for (public_key, marker) in incoming {
@@ -494,6 +514,9 @@ impl ClientState {
             direct_closed_periods: self.direct_closed_periods.clone(),
             direct_read_through: self.direct_read_through.clone(),
             direct_latest_activity: self.direct_latest_activity.clone(),
+            group_read_through: self.group_read_through.clone(),
+            group_latest_activity: self.group_latest_activity.clone(),
+            group_activity_initialized: self.group_activity_initialized.clone(),
             group_frequencies: self.group_frequencies.clone(),
             next_author_sequence: self.next_author_sequence,
         }
@@ -526,6 +549,11 @@ impl ClientState {
             direct_latest_incoming: HashMap::new(),
             direct_latest_activity: contents.direct_latest_activity,
             direct_read_through: contents.direct_read_through,
+            group_latest_incoming: HashMap::new(),
+            group_latest_activity: contents.group_latest_activity,
+            group_read_through: contents.group_read_through,
+            group_unread_messages: HashMap::new(),
+            group_activity_initialized: contents.group_activity_initialized,
             group_frequencies: contents.group_frequencies,
             next_author_sequence: contents.next_author_sequence,
             account: Some(account),
@@ -558,6 +586,111 @@ impl ClientState {
         incoming: &HashMap<String, DirectMessageMarker>,
     ) -> bool {
         merge_read_markers(&mut self.direct_read_through, incoming)
+    }
+
+    fn group_unread_count(&self, group_id: &str) -> usize {
+        self.group_unread_messages
+            .get(group_id)
+            .map(Vec::len)
+            .unwrap_or_default()
+    }
+
+    fn merge_group_read_through(&mut self, incoming: &HashMap<String, MessageMarker>) -> bool {
+        let changed = merge_read_markers(&mut self.group_read_through, incoming);
+        if changed {
+            for (group_id, marker) in &self.group_read_through {
+                if let Some(unread) = self.group_unread_messages.get_mut(group_id) {
+                    unread.retain(|candidate| candidate > marker);
+                }
+            }
+            self.group_unread_messages
+                .retain(|_, unread| !unread.is_empty());
+        }
+        changed
+    }
+
+    fn record_group_activity(
+        &mut self,
+        group_id: &str,
+        messages: &[AcceptedMessage],
+        self_public_key: &str,
+    ) -> bool {
+        let before = (
+            self.group_latest_activity.get(group_id).cloned(),
+            self.group_latest_incoming.get(group_id).cloned(),
+            self.group_read_through.get(group_id).cloned(),
+            self.group_unread_messages.get(group_id).cloned(),
+            self.group_activity_initialized.contains(group_id),
+        );
+        let mut activity = messages
+            .iter()
+            .map(|message| MessageMarker {
+                created_at_millis: message.created_at_millis,
+                event_id: message.event_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        activity.sort();
+        activity.dedup();
+        let incoming = messages
+            .iter()
+            .filter(|message| message.author_public_key != self_public_key)
+            .map(|message| MessageMarker {
+                created_at_millis: message.created_at_millis,
+                event_id: message.event_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut incoming = incoming;
+        incoming.sort();
+        incoming.dedup();
+
+        if let Some(latest) = activity.last().cloned() {
+            self.group_latest_activity
+                .insert(group_id.to_owned(), latest);
+        } else {
+            self.group_latest_activity.remove(group_id);
+        }
+        if let Some(latest) = incoming.last().cloned() {
+            self.group_latest_incoming
+                .insert(group_id.to_owned(), latest);
+        } else {
+            self.group_latest_incoming.remove(group_id);
+        }
+
+        if self.group_activity_initialized.insert(group_id.to_owned()) {
+            if let Some(latest) = incoming.last().cloned() {
+                self.group_read_through.insert(group_id.to_owned(), latest);
+            }
+            self.group_unread_messages.remove(group_id);
+        } else {
+            let read_through = self.group_read_through.get(group_id);
+            let unread = incoming
+                .into_iter()
+                .filter(|marker| read_through.is_none_or(|read| marker > read))
+                .collect::<Vec<_>>();
+            if unread.is_empty() {
+                self.group_unread_messages.remove(group_id);
+            } else {
+                self.group_unread_messages
+                    .insert(group_id.to_owned(), unread);
+            }
+        }
+
+        before
+            != (
+                self.group_latest_activity.get(group_id).cloned(),
+                self.group_latest_incoming.get(group_id).cloned(),
+                self.group_read_through.get(group_id).cloned(),
+                self.group_unread_messages.get(group_id).cloned(),
+                self.group_activity_initialized.contains(group_id),
+            )
+    }
+
+    fn forget_group_activity(&mut self, group_id: &str) {
+        self.group_latest_incoming.remove(group_id);
+        self.group_latest_activity.remove(group_id);
+        self.group_read_through.remove(group_id);
+        self.group_unread_messages.remove(group_id);
+        self.group_activity_initialized.remove(group_id);
     }
 
     fn upsert_known_person(&mut self, contact: DirectContact) {
@@ -621,28 +754,51 @@ impl ClientState {
                 avatar: self.profile.avatar.clone(),
                 accepts_direct_messages: self.profile.accepts_direct_messages,
             },
-            groups: self
-                .groups
-                .iter()
-                .map(|group| GroupSummary {
-                    group_id: group.group_id.clone(),
-                    name: group.name.clone(),
-                    description: group.description.clone(),
-                    rules: group.rules.clone(),
-                    avatar: group.avatar.clone(),
-                    background: group.background.clone(),
-                    accent_color: group.accent_color.clone(),
-                    members_can_send_messages: group.members_can_send_messages,
-                    members_can_send_media: group.members_can_send_media,
-                    frequency: self
-                        .group_frequencies
-                        .get(&group.group_id)
-                        .and_then(|frequency| display_frequency(frequency).ok()),
-                    owner_public_key: group.owner_public_key.clone(),
-                    remote_deletion_supported: !group.authority_nonce_base64.is_empty(),
-                    is_active: self.active_group_id.as_deref() == Some(&group.group_id),
-                })
-                .collect(),
+            groups: {
+                let mut groups = self.groups.iter().collect::<Vec<_>>();
+                groups.sort_by(|left, right| {
+                    let left_unread = self.group_unread_count(&left.group_id) > 0;
+                    let right_unread = self.group_unread_count(&right.group_id) > 0;
+                    right_unread
+                        .cmp(&left_unread)
+                        .then_with(|| {
+                            let markers = if left_unread && right_unread {
+                                &self.group_latest_incoming
+                            } else {
+                                &self.group_latest_activity
+                            };
+                            markers
+                                .get(&right.group_id)
+                                .cmp(&markers.get(&left.group_id))
+                        })
+                        .then_with(|| left.group_id.cmp(&right.group_id))
+                });
+                groups
+                    .into_iter()
+                    .map(|group| GroupSummary {
+                        group_id: group.group_id.clone(),
+                        name: group.name.clone(),
+                        description: group.description.clone(),
+                        rules: group.rules.clone(),
+                        avatar: group.avatar.clone(),
+                        background: group.background.clone(),
+                        accent_color: group.accent_color.clone(),
+                        members_can_send_messages: group.members_can_send_messages,
+                        members_can_send_media: group.members_can_send_media,
+                        frequency: self
+                            .group_frequencies
+                            .get(&group.group_id)
+                            .and_then(|frequency| display_frequency(frequency).ok()),
+                        owner_public_key: group.owner_public_key.clone(),
+                        remote_deletion_supported: !group.authority_nonce_base64.is_empty(),
+                        is_active: self.active_group_id.as_deref() == Some(&group.group_id),
+                        unread_count: self.group_unread_count(&group.group_id),
+                        read_state_initialized: self
+                            .group_activity_initialized
+                            .contains(&group.group_id),
+                    })
+                    .collect()
+            },
             directs: {
                 let mut contacts = self.direct_contacts.iter().collect::<Vec<_>>();
                 contacts.sort_by(|left, right| {
@@ -787,6 +943,11 @@ impl NoiseClient {
             direct_latest_incoming: HashMap::new(),
             direct_latest_activity: HashMap::new(),
             direct_read_through: HashMap::new(),
+            group_latest_incoming: HashMap::new(),
+            group_latest_activity: HashMap::new(),
+            group_read_through: HashMap::new(),
+            group_unread_messages: HashMap::new(),
+            group_activity_initialized: HashSet::new(),
             group_frequencies: HashMap::new(),
             next_author_sequence: 0,
             account: Some(AccountSession {
@@ -1747,6 +1908,7 @@ impl NoiseClient {
             state.mls_local_geneses.remove(&group.group_id);
             state.mls_control_logs.remove(&group.group_id);
             state.group_frequencies.remove(&group.group_id);
+            state.forget_group_activity(&group.group_id);
             state
                 .groups
                 .retain(|candidate| candidate.group_id != group.group_id);
@@ -2048,6 +2210,8 @@ impl NoiseClient {
                 owner_public_key: group.owner_public_key,
                 remote_deletion_supported: !group.authority_nonce_base64.is_empty(),
                 is_active: true,
+                unread_count: 0,
+                read_state_initialized: false,
             },
             display_frequency: display_frequency(&frequency)?,
             frequency,
@@ -2115,6 +2279,8 @@ impl NoiseClient {
                 owner_public_key: group.owner_public_key,
                 remote_deletion_supported: !group.authority_nonce_base64.is_empty(),
                 is_active: true,
+                unread_count: 0,
+                read_state_initialized: false,
             },
         })
     }
@@ -2988,6 +3154,7 @@ impl NoiseClient {
         state.mls_local_geneses.remove(&group.group_id);
         state.mls_control_logs.remove(&group.group_id);
         state.group_frequencies.remove(&group.group_id);
+        state.forget_group_activity(&group.group_id);
         state
             .groups
             .retain(|candidate| candidate.group_id != group.group_id);
@@ -3039,6 +3206,7 @@ impl NoiseClient {
         }
         state.groups.remove(group_index);
         state.group_frequencies.remove(group_id);
+        state.forget_group_activity(group_id);
         state.mls_join_requests.remove(group_id);
         state.mls_local_geneses.remove(group_id);
         state.mls_control_logs.remove(group_id);
@@ -3162,6 +3330,56 @@ impl NoiseClient {
         Ok(())
     }
 
+    pub async fn sync_group_activity(
+        &self,
+        path: impl AsRef<Path>,
+        group_id: &str,
+        relays: Vec<String>,
+    ) -> anyhow::Result<LocalSummary> {
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        let group = state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .cloned()
+            .context("unknown group")?;
+        let identity_public_key = state.identity()?.public_key_base64();
+        let events = self.fetch_events(&group, relay_list(relays)?).await?;
+        let view = rebuild_group_state(&state, &group, &events)?;
+        if view.members.contains_key(&identity_public_key)
+            && state.record_group_activity(group_id, &view.messages, &identity_public_key)
+        {
+            save_state(path, &state)?;
+        }
+        state.summary()
+    }
+
+    pub fn mark_group_read(
+        &self,
+        path: impl AsRef<Path>,
+        group_id: &str,
+    ) -> anyhow::Result<LocalSummary> {
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        if !state.groups.iter().any(|group| group.group_id == group_id) {
+            bail!("unknown group")
+        }
+        let was_initialized = state.group_activity_initialized.insert(group_id.to_owned());
+        let latest = state.group_latest_incoming.get(group_id).cloned();
+        let marker_changed = latest
+            .as_ref()
+            .is_some_and(|marker| state.group_read_through.get(group_id) != Some(marker));
+        if let Some(marker) = latest {
+            state.group_read_through.insert(group_id.to_owned(), marker);
+        }
+        let had_unread = state.group_unread_messages.remove(group_id).is_some();
+        if was_initialized || marker_changed || had_unread {
+            save_state(path, &state)?;
+        }
+        state.summary()
+    }
+
     pub async fn conversation(
         &self,
         path: impl AsRef<Path>,
@@ -3202,6 +3420,8 @@ impl NoiseClient {
             events.push(joined);
         }
         let view = rebuild_group_state(&state, &group, &events)?;
+        let mut state_changed =
+            state.record_group_activity(&group.group_id, &view.messages, &identity_public_key);
         let resolved_owner = view.owner_public_key.clone().unwrap_or_default();
         let resolved_profile = view.profile.clone();
         let moderators = view.moderators.clone();
@@ -3250,9 +3470,12 @@ impl NoiseClient {
             state.groups[group_index].members_can_send_media =
                 resolved_profile.members_can_send_media;
             state.groups[group_index].owner_public_key = resolved_owner.clone();
-            save_state(path, &state)?;
+            state_changed = true;
         }
         if state.known_people != known_people_before {
+            state_changed = true;
+        }
+        if state_changed {
             save_state(path, &state)?;
         }
         let can_view_reports =
@@ -3353,6 +3576,8 @@ impl NoiseClient {
                 owner_public_key: resolved_owner,
                 remote_deletion_supported: !group.authority_nonce_base64.is_empty(),
                 is_active: true,
+                unread_count: state.group_unread_count(&group.group_id),
+                read_state_initialized: state.group_activity_initialized.contains(&group.group_id),
             },
             members,
             banned_members,
@@ -3793,14 +4018,28 @@ impl NoiseClient {
         if contents.version != 1 {
             bail!("this account vault was created by an unsupported Noise version")
         }
-        let reads_changed = state.merge_direct_read_through(&contents.direct_read_through);
+        let direct_reads_changed = state.merge_direct_read_through(&contents.direct_read_through);
+        let group_reads_changed = state.merge_group_read_through(&contents.group_read_through);
+        let group_activity_changed = merge_read_markers(
+            &mut state.group_latest_activity,
+            &contents.group_latest_activity,
+        );
+        let initialized_before = state.group_activity_initialized.len();
+        state
+            .group_activity_initialized
+            .extend(contents.group_activity_initialized);
+        let initialized_changed = state.group_activity_initialized.len() != initialized_before;
         let account = state
             .account
             .as_mut()
             .context("this identity has no Noise ID")?;
         let revision_changed = remote.revision > account.revision;
         account.revision = account.revision.max(remote.revision);
-        Ok(reads_changed || revision_changed)
+        Ok(direct_reads_changed
+            || group_reads_changed
+            || group_activity_changed
+            || initialized_changed
+            || revision_changed)
     }
 
     async fn publish_account_vault(
@@ -5032,13 +5271,6 @@ fn validate_password(password: &str) -> anyhow::Result<()> {
     let length = password.chars().count();
     if !(16..=256).contains(&length) {
         bail!("passwords must contain between 16 and 256 characters")
-    }
-    let lowered = password.to_lowercase();
-    if ["password", "qwerty", "letmein", "123456"]
-        .iter()
-        .any(|weak| lowered.contains(weak))
-    {
-        bail!("choose a less predictable password")
     }
     let classes = [
         password.chars().any(|character| character.is_lowercase()),

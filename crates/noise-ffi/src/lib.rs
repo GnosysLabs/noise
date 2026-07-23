@@ -130,6 +130,15 @@ enum Request {
         cache_path: String,
         relays: Vec<String>,
     },
+    SyncGroupActivity {
+        state_path: String,
+        group_id: String,
+        relays: Vec<String>,
+    },
+    MarkGroupRead {
+        state_path: String,
+        group_id: String,
+    },
     Say {
         state_path: String,
         text: String,
@@ -576,6 +585,25 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         } => serde_json::to_value(
             runtime()?
                 .block_on(client.sync_active_group_encryption(state_path, cache_path, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::SyncGroupActivity {
+            state_path,
+            group_id,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.sync_group_activity(state_path, &group_id, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::MarkGroupRead {
+            state_path,
+            group_id,
+        } => serde_json::to_value(
+            client
+                .mark_group_read(state_path, &group_id)
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
