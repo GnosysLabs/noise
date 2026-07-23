@@ -2170,10 +2170,11 @@ fn valid_media(media: &MediaAttachment) -> bool {
             .map(|chunk| u64::from(chunk.byte_length))
             .sum::<u64>()
             == media.byte_length
-        && valid_media_preview(media)
+        && media_preview_is_valid(media)
 }
 
-fn valid_media_preview(media: &MediaAttachment) -> bool {
+#[must_use]
+pub fn media_preview_is_valid(media: &MediaAttachment) -> bool {
     match (
         media.preview_data_base64.as_deref(),
         media.preview_mime_type.as_deref(),
@@ -2182,7 +2183,7 @@ fn valid_media_preview(media: &MediaAttachment) -> bool {
     ) {
         (None, None, None, None) => true,
         (Some(data), Some("image/jpeg"), Some(width), Some(height)) => {
-            media.mime_type.starts_with("video/")
+            (media.mime_type.starts_with("image/") || media.mime_type.starts_with("video/"))
                 && !data.is_empty()
                 && data.len() <= 80_000
                 && width > 0
@@ -2354,6 +2355,26 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_image_and_video_previews_are_valid() {
+        for mime_type in ["image/jpeg", "image/png", "image/gif", "video/mp4"] {
+            let media = MediaAttachment {
+                file_name: "media".into(),
+                mime_type: mime_type.into(),
+                byte_length: 1,
+                chunks: Vec::new(),
+                preview_data_base64: Some("preview".into()),
+                preview_mime_type: Some("image/jpeg".into()),
+                pixel_width: Some(1920),
+                pixel_height: Some(1080),
+            };
+            assert!(
+                media_preview_is_valid(&media),
+                "{mime_type} should accept a generated JPEG preview"
+            );
+        }
+    }
 
     #[test]
     fn twelve_shard_storage_reconstructs_from_any_eight() {

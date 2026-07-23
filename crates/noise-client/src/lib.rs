@@ -14,7 +14,8 @@ use noise_core::{
     InviteRotation, Profile, SignedEvent, StorageManifest, StorageShard,
     derive_account_credentials, direct_mailbox_id, direct_message_id, display_frequency,
     display_noise_id, encode_blob_for_storage, frequency_locator, generate_frequency,
-    generate_noise_id, normalize_frequency, reconstruct_blob_from_storage, valid_reaction_emoji,
+    generate_noise_id, media_preview_is_valid, normalize_frequency,
+    reconstruct_blob_from_storage, valid_reaction_emoji,
 };
 pub use noise_core::{MediaAttachment, MediaChunk, ProfileImage};
 use noise_transport::{
@@ -3992,22 +3993,8 @@ fn validate_media_reference(media: &MediaAttachment) -> anyhow::Result<()> {
     if byte_length != media.byte_length {
         bail!("media chunk sizes do not match the manifest")
     }
-    match (
-        media.preview_data_base64.as_deref(),
-        media.preview_mime_type.as_deref(),
-        media.pixel_width,
-        media.pixel_height,
-    ) {
-        (None, None, None, None) => {}
-        (Some(data), Some("image/jpeg"), Some(width), Some(height))
-            if media.mime_type.starts_with("video/")
-                && !data.is_empty()
-                && data.len() <= 80_000
-                && width > 0
-                && width <= 16_384
-                && height > 0
-                && height <= 16_384 => {}
-        _ => bail!("media has an invalid preview"),
+    if !media_preview_is_valid(media) {
+        bail!("media has an invalid preview")
     }
     Ok(())
 }
