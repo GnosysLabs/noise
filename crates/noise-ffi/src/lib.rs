@@ -324,6 +324,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         Request::DiscoverRelayMasks { .. }
             | Request::WatchGroup { .. }
             | Request::WatchGroupId { .. }
+            | Request::SyncGroupActivity { .. }
             | Request::HeartbeatPresence { .. }
             | Request::ReplyNotificationSnapshot { .. }
             | Request::WatchDirect { .. }
@@ -592,12 +593,20 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             state_path,
             group_id,
             relays,
-        } => serde_json::to_value(
-            runtime()?
-                .block_on(client.sync_group_activity(state_path, &group_id, relays))
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string()),
+        } => {
+            let update = runtime()?
+                .block_on(client.fetch_group_activity(&state_path, &group_id, relays))
+                .map_err(|error| error.to_string())?;
+            let _state_guard = state_lock()
+                .lock()
+                .map_err(|_| "local state lock is unavailable".to_owned())?;
+            serde_json::to_value(
+                client
+                    .apply_group_activity(state_path, update)
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())
+        }
         Request::MarkGroupRead {
             state_path,
             group_id,

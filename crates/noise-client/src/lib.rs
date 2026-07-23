@@ -63,6 +63,11 @@ pub struct NoiseClient {
     mask_relays: Vec<RelayDescriptor>,
 }
 
+pub struct GroupActivityUpdate {
+    group_id: String,
+    events: Vec<SignedEvent>,
+}
+
 impl Default for NoiseClient {
     fn default() -> Self {
         #[cfg(not(target_arch = "wasm32"))]
@@ -3336,19 +3341,51 @@ impl NoiseClient {
         group_id: &str,
         relays: Vec<String>,
     ) -> anyhow::Result<LocalSummary> {
+        let update = self
+            .fetch_group_activity(path.as_ref(), group_id, relays)
+            .await?;
+        self.apply_group_activity(path, update)
+    }
+
+    pub async fn fetch_group_activity(
+        &self,
+        path: impl AsRef<Path>,
+        group_id: &str,
+        relays: Vec<String>,
+    ) -> anyhow::Result<GroupActivityUpdate> {
         let path = path.as_ref();
-        let mut state = load_state(path)?;
+        let state = load_state(path)?;
         let group = state
             .groups
             .iter()
             .find(|group| group.group_id == group_id)
             .cloned()
             .context("unknown group")?;
-        let identity_public_key = state.identity()?.public_key_base64();
         let events = self.fetch_events(&group, relay_list(relays)?).await?;
-        let view = rebuild_group_state(&state, &group, &events)?;
+        Ok(GroupActivityUpdate {
+            group_id: group_id.to_owned(),
+            events,
+        })
+    }
+
+    pub fn apply_group_activity(
+        &self,
+        path: impl AsRef<Path>,
+        update: GroupActivityUpdate,
+    ) -> anyhow::Result<LocalSummary> {
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        let group = state
+            .groups
+            .iter()
+            .find(|group| group.group_id == update.group_id)
+            .cloned()
+            .context("unknown group")?;
+        let identity_public_key = state.identity()?.public_key_base64();
+        let group_id = group.group_id.clone();
+        let view = rebuild_group_state(&state, &group, &update.events)?;
         if view.members.contains_key(&identity_public_key)
-            && state.record_group_activity(group_id, &view.messages, &identity_public_key)
+            && state.record_group_activity(&group_id, &view.messages, &identity_public_key)
         {
             save_state(path, &state)?;
         }
