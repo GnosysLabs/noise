@@ -1,4 +1,5 @@
 import type { NoiseRequest } from "./types";
+import { persistBrowserVault, restoreBrowserVault } from "./webVault";
 
 type Envelope<T> = {
   ok: boolean;
@@ -24,6 +25,61 @@ document.documentElement.dataset.runtime = isTauri ? "tauri" : "browser";
 let relayDiscoveryStarted = false;
 let maskRelays: string[] = [];
 let maskRelayOffset = 0;
+type BrowserAdapter = {
+  default(): Promise<unknown>;
+  noise_invoke(request: unknown): Promise<unknown>;
+  restore_session(bytes: Uint8Array): void;
+  session_state(): Uint8Array;
+};
+let browserAdapterPromise: Promise<BrowserAdapter> | null = null;
+let browserMutationQueue = Promise.resolve();
+
+const browserConcurrentActions = new Set([
+  "discover_relay_masks",
+  "fetch_avatar",
+  "fetch_attachment",
+  "heartbeat_presence",
+  "reply_notification_snapshot",
+  "status",
+  "upload_direct_media_chunk",
+  "upload_media_chunk",
+  "watch_account",
+  "watch_direct",
+  "watch_group",
+  "watch_group_id",
+]);
+
+async function browserAdapter() {
+  if (!browserAdapterPromise) {
+    const adapterUrl = "/wasm/noise_web.js";
+    browserAdapterPromise = import(/* @vite-ignore */ adapterUrl).then(async (adapter: BrowserAdapter) => {
+      await adapter.default();
+      await restoreBrowserVault(adapter);
+      return adapter;
+    });
+  }
+  return browserAdapterPromise;
+}
+
+async function invokeBrowser<T>(request: NoiseRequest): Promise<T | null> {
+  const operation = async () => {
+    const adapter = await browserAdapter();
+    const response = await adapter.noise_invoke({
+      ...request,
+      mask_relays: rotateMaskRelays(),
+    }) as Envelope<T>;
+    if (!response.ok) throw new Error(response.error ?? "unknown Noise core error");
+    if (!browserConcurrentActions.has(request.action)) {
+      await persistBrowserVault(adapter);
+    }
+    return response.data ?? null;
+  };
+
+  if (browserConcurrentActions.has(request.action)) return operation();
+  const queued = browserMutationQueue.then(operation, operation);
+  browserMutationQueue = queued.then(() => undefined, () => undefined);
+  return queued;
+}
 
 function rotateMaskRelays() {
   if (maskRelays.length < 2) return maskRelays;
@@ -49,9 +105,7 @@ function startRelayDiscovery() {
 
 export async function noise<T>(request: NoiseRequest): Promise<T | null> {
   if (!isTauri) {
-    throw new Error(
-      "The browser protocol adapter is not connected yet. The shared interface is ready for its WASM core.",
-    );
+    return invokeBrowser<T>(request);
   }
   startRelayDiscovery();
   const { invoke } = await import("@tauri-apps/api/core");

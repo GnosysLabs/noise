@@ -2199,9 +2199,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2900,6 +2902,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0242819d153cba4b4b05a5a8f2a7e9bbf97b6055b2a002b395c96b5ff3c0222"
 dependencies = [
  "cfg-if",
+ "js-sys",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
@@ -3555,6 +3560,9 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "blake3",
+ "futures-timer",
+ "futures-util",
+ "getrandom 0.4.3",
  "noise-core",
  "noise-transport",
  "ohttp",
@@ -3574,6 +3582,9 @@ dependencies = [
  "blake3",
  "chacha20poly1305 0.10.1",
  "ed25519-dalek",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "instant",
  "rand 0.9.5",
  "reed-solomon-erasure",
  "serde",
@@ -3656,6 +3667,19 @@ dependencies = [
  "ed25519-dalek",
  "serde",
  "url",
+]
+
+[[package]]
+name = "noise-web"
+version = "0.1.7"
+dependencies = [
+ "getrandom 0.4.3",
+ "noise-client",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]
@@ -5275,6 +5299,17 @@ dependencies = [
  "serde",
  "serde_core",
  "typeid",
+]
+
+[[package]]
+name = "serde-wasm-bindgen"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
+dependencies = [
+ "js-sys",
+ "serde",
+ "wasm-bindgen",
 ]
 
 [[package]]

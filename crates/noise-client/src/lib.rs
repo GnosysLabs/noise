@@ -1,3 +1,5 @@
+#[cfg(target_arch = "wasm32")]
+use std::cell::RefCell;
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -6,16 +8,37 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static WEB_STATE: RefCell<HashMap<String, Vec<u8>>> = RefCell::new(HashMap::new());
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn import_web_state(path: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
+    let _: ClientState =
+        serde_json::from_slice(&bytes).context("encrypted browser state is invalid")?;
+    WEB_STATE.with(|states| states.borrow_mut().insert(path.to_owned(), bytes));
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[must_use]
+pub fn export_web_state(path: &str) -> Option<Vec<u8>> {
+    WEB_STATE.with(|states| states.borrow().get(path).cloned())
+}
+
 use anyhow::{Context, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use futures_timer::Delay;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use noise_core::{
     AccountCredentials, AccountVault, EncryptedBlob, GroupDeletion, GroupEventPayload,
     GroupMembership, GroupPresence, GroupProfile, GroupState, Identity, InviteRecord,
     InviteRotation, Profile, SignedEvent, StorageManifest, StorageShard,
     derive_account_credentials, direct_mailbox_id, direct_message_id, display_frequency,
     display_noise_id, encode_blob_for_storage, frequency_locator, generate_frequency,
-    generate_noise_id, media_preview_is_valid, normalize_frequency,
-    reconstruct_blob_from_storage, valid_reaction_emoji,
+    generate_noise_id, media_preview_is_valid, normalize_frequency, reconstruct_blob_from_storage,
+    valid_reaction_emoji,
 };
 pub use noise_core::{MediaAttachment, MediaChunk, ProfileImage};
 use noise_transport::{
@@ -25,10 +48,13 @@ use noise_transport::{
 use ohttp::ClientRequest;
 use serde::{Deserialize, Serialize};
 
+#[cfg(not(target_arch = "wasm32"))]
 mod relay_pool;
 
 const GROUP_PRESENCE_TTL_MILLIS: u64 = 50_000;
 const RECENT_GROUP_PRESENCE_MILLIS: u64 = 5 * 60_000;
+const EVENT_REPLICA_SETTLE_MILLIS: u64 = 500;
+const RELAY_REQUEST_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Clone)]
 pub struct NoiseClient {
@@ -38,12 +64,18 @@ pub struct NoiseClient {
 
 impl Default for NoiseClient {
     fn default() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(40))
+            .build()
+            .expect("Noise HTTP configuration is valid");
+        #[cfg(target_arch = "wasm32")]
+        let http = reqwest::Client::builder()
+            .build()
+            .expect("Noise HTTP configuration is valid");
         Self {
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(40))
-                .build()
-                .expect("Noise HTTP configuration is valid"),
+            http,
             mask_relays: Vec::new(),
         }
     }
@@ -636,7 +668,15 @@ impl NoiseClient {
         cache_path: impl AsRef<Path>,
         relays: Vec<String>,
     ) -> anyhow::Result<Vec<String>> {
-        relay_pool::discover(cache_path.as_ref(), relays).await
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            relay_pool::discover(cache_path.as_ref(), relays).await
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = cache_path;
+            Ok(relays)
+        }
     }
 
     pub async fn initialize(
@@ -649,7 +689,7 @@ impl NoiseClient {
         relays: Vec<String>,
     ) -> anyhow::Result<LocalSummary> {
         let path = path.as_ref();
-        if path.exists() {
+        if state_exists(path) {
             bail!("{} already exists", path.display());
         }
         let username = username.into().trim().to_owned();
@@ -727,7 +767,7 @@ impl NoiseClient {
         relays: Vec<String>,
     ) -> anyhow::Result<LocalSummary> {
         let path = path.as_ref();
-        if path.exists() {
+        if state_exists(path) {
             bail!("an identity is already active on this device")
         }
         let password = password.into();
@@ -810,15 +850,17 @@ impl NoiseClient {
                 .with_context(|| format!("could not erase {}", media_directory.display()))?;
         }
         purge_profile_image_cache(cache_path)?;
-        if path.exists() {
-            fs::remove_file(path)
-                .with_context(|| format!("could not erase local identity {}", path.display()))?;
-        }
+        remove_state(path)?;
         Ok(())
     }
 
     pub fn local_summary(&self, path: impl AsRef<Path>) -> anyhow::Result<LocalSummary> {
         load_state(path.as_ref())?.summary()
+    }
+
+    #[must_use]
+    pub fn has_local_state(&self, path: impl AsRef<Path>) -> bool {
+        state_exists(path.as_ref())
     }
 
     pub fn select_group(
@@ -1410,10 +1452,13 @@ impl NoiseClient {
         }
         let cache_directory = cache_path.as_ref().join("profile-blobs");
         let file_path = cache_directory.join(format!("{}.json", image.blob_id));
+        #[cfg(not(target_arch = "wasm32"))]
         let cached_blob = fs::read(&file_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<EncryptedBlob>(&bytes).ok())
             .filter(|blob| blob.blob_id == image.blob_id && blob.verify().is_ok());
+        #[cfg(target_arch = "wasm32")]
+        let cached_blob: Option<EncryptedBlob> = None;
         let blob = if let Some(blob) = cached_blob {
             blob
         } else {
@@ -1422,17 +1467,20 @@ impl NoiseClient {
                 .as_ref()
                 .context("this image predates constellation storage and is no longer available")?;
             let blob = self.reconstruct_blob(storage, &image.key_base64).await?;
-            fs::create_dir_all(&cache_directory)
-                .context("could not create the profile image cache")?;
-            let temporary = file_path.with_extension("json.part");
-            fs::write(&temporary, serde_json::to_vec(&blob)?)
-                .context("could not write the profile image cache")?;
-            if file_path.exists() {
-                fs::remove_file(&file_path)
-                    .context("could not replace an invalid profile image cache entry")?;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                fs::create_dir_all(&cache_directory)
+                    .context("could not create the profile image cache")?;
+                let temporary = file_path.with_extension("json.part");
+                fs::write(&temporary, serde_json::to_vec(&blob)?)
+                    .context("could not write the profile image cache")?;
+                if file_path.exists() {
+                    fs::remove_file(&file_path)
+                        .context("could not replace an invalid profile image cache entry")?;
+                }
+                fs::rename(&temporary, &file_path)
+                    .context("could not finish the profile image cache entry")?;
             }
-            fs::rename(&temporary, &file_path)
-                .context("could not finish the profile image cache entry")?;
             blob
         };
         let data = blob.open(&image.key_base64)?;
@@ -1473,58 +1521,89 @@ impl NoiseClient {
             state.active_group()?.group_id.clone()
         };
         let _relays = relay_list(relays)?;
-        let cache_directory = cache_path.as_ref().join("media").join(&scope_id);
-        fs::create_dir_all(&cache_directory).context("could not create the media cache")?;
-        let extension = media_extension(&attachment.mime_type);
-        let file_path =
-            cache_directory.join(format!("{}.{}", attachment.chunks[0].blob_id, extension));
-        if file_path
-            .metadata()
-            .is_ok_and(|metadata| metadata.len() == attachment.byte_length)
+        #[cfg(target_arch = "wasm32")]
         {
+            let mut output = Vec::with_capacity(attachment.byte_length as usize);
+            for chunk in &attachment.chunks {
+                let storage = chunk.storage.as_ref().context(
+                    "this media predates constellation storage and is no longer available",
+                )?;
+                let blob = self.reconstruct_blob(storage, &chunk.key_base64).await?;
+                if blob.group_id.as_deref() != Some(scope_id.as_str()) {
+                    bail!("media chunk belongs to a different conversation")
+                }
+                let plaintext = blob.open(&chunk.key_base64)?;
+                if plaintext.len() != chunk.byte_length as usize {
+                    bail!("media chunk does not match its manifest")
+                }
+                output.extend_from_slice(&plaintext);
+            }
+            if output.len() as u64 != attachment.byte_length {
+                bail!("media does not match its manifest")
+            }
             return Ok(AttachmentData {
                 mime_type: attachment.mime_type.clone(),
-                file_path: file_path.to_string_lossy().into_owned(),
+                file_path: format!(
+                    "data:{};base64,{}",
+                    attachment.mime_type,
+                    STANDARD.encode(output)
+                ),
             });
         }
-        let temporary = file_path.with_extension(format!("{extension}.part"));
-        let mut output =
-            fs::File::create(&temporary).context("could not create media cache file")?;
-        for chunk in &attachment.chunks {
-            let storage = chunk
-                .storage
-                .as_ref()
-                .context("this media predates constellation storage and is no longer available")?;
-            let blob = self.reconstruct_blob(storage, &chunk.key_base64).await?;
-            if blob.group_id.as_deref() != Some(scope_id.as_str()) {
-                bail!("media chunk belongs to a different conversation")
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let cache_directory = cache_path.as_ref().join("media").join(&scope_id);
+            fs::create_dir_all(&cache_directory).context("could not create the media cache")?;
+            let extension = media_extension(&attachment.mime_type);
+            let file_path =
+                cache_directory.join(format!("{}.{}", attachment.chunks[0].blob_id, extension));
+            if file_path
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() == attachment.byte_length)
+            {
+                return Ok(AttachmentData {
+                    mime_type: attachment.mime_type.clone(),
+                    file_path: file_path.to_string_lossy().into_owned(),
+                });
             }
-            let plaintext = blob.open(&chunk.key_base64)?;
-            if plaintext.len() != chunk.byte_length as usize {
-                bail!("media chunk does not match its manifest")
+            let temporary = file_path.with_extension(format!("{extension}.part"));
+            let mut output =
+                fs::File::create(&temporary).context("could not create media cache file")?;
+            for chunk in &attachment.chunks {
+                let storage = chunk.storage.as_ref().context(
+                    "this media predates constellation storage and is no longer available",
+                )?;
+                let blob = self.reconstruct_blob(storage, &chunk.key_base64).await?;
+                if blob.group_id.as_deref() != Some(scope_id.as_str()) {
+                    bail!("media chunk belongs to a different conversation")
+                }
+                let plaintext = blob.open(&chunk.key_base64)?;
+                if plaintext.len() != chunk.byte_length as usize {
+                    bail!("media chunk does not match its manifest")
+                }
+                output
+                    .write_all(&plaintext)
+                    .context("could not write media cache file")?;
             }
             output
-                .write_all(&plaintext)
-                .context("could not write media cache file")?;
+                .flush()
+                .context("could not finish media cache file")?;
+            drop(output);
+            if temporary.metadata()?.len() != attachment.byte_length {
+                let _ = fs::remove_file(&temporary);
+                bail!("media does not match its manifest")
+            }
+            fs::rename(&temporary, &file_path).context("could not finish media cache file")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&file_path, fs::Permissions::from_mode(0o600))?;
+            }
+            Ok(AttachmentData {
+                mime_type: attachment.mime_type.clone(),
+                file_path: file_path.to_string_lossy().into_owned(),
+            })
         }
-        output
-            .flush()
-            .context("could not finish media cache file")?;
-        drop(output);
-        if temporary.metadata()?.len() != attachment.byte_length {
-            let _ = fs::remove_file(&temporary);
-            bail!("media does not match its manifest")
-        }
-        fs::rename(&temporary, &file_path).context("could not finish media cache file")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&file_path, fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(AttachmentData {
-            mime_type: attachment.mime_type.clone(),
-            file_path: file_path.to_string_lossy().into_owned(),
-        })
     }
 
     pub async fn upload_media_chunk(
@@ -2587,8 +2666,7 @@ impl NoiseClient {
                 .with_context(|| format!("could not erase {}", media_directory.display()))?;
         }
         purge_profile_image_cache(cache_path)?;
-        fs::remove_file(path)
-            .with_context(|| format!("could not erase local identity {}", path.display()))?;
+        remove_state(path)?;
         Ok(())
     }
 
@@ -3121,20 +3199,22 @@ impl NoiseClient {
         event: &SignedEvent,
     ) -> anyhow::Result<()> {
         let body = serde_json::to_vec(event)?;
-        let mut accepted = 0usize;
+        let mut publications = FuturesUnordered::new();
         for index in 0..relays.len() {
-            if let Ok(response) = self
-                .relay_request(relays, index, "POST", "/v1/events", &body)
-                .await
-                && (200..300).contains(&response.status)
-            {
-                accepted += 1;
+            let body = body.as_slice();
+            publications.push(async move {
+                self.relay_request(relays, index, "POST", "/v1/events", body)
+                    .await
+            });
+        }
+        while let Some(result) = publications.next().await {
+            if result.is_ok_and(|response| (200..300).contains(&response.status)) {
+                // Events are idempotent and relays replicate accepted events to
+                // their peers. A lagging replica must not hold the sender UI.
+                return Ok(());
             }
         }
-        if accepted == 0 {
-            bail!("no relay accepted the event")
-        }
-        Ok(())
+        bail!("no relay accepted the event")
     }
 
     fn storage_relays(
@@ -3174,7 +3254,7 @@ impl NoiseClient {
         references: Vec<(StorageManifest, String)>,
         require_all: bool,
     ) -> anyhow::Result<()> {
-        let mut deletions = tokio::task::JoinSet::new();
+        let mut deletions = FuturesUnordered::new();
         let mut seen = HashSet::new();
         for (manifest, key_base64) in references {
             for placement in manifest.placements {
@@ -3183,7 +3263,7 @@ impl NoiseClient {
                 }
                 let deletion = noise_core::shard_deletion(&key_base64, &placement.shard_id)?;
                 let client = self.clone();
-                deletions.spawn(async move {
+                deletions.push(async move {
                     let relay = RelayDescriptor::parse(&placement.relay)?;
                     let body = serde_json::to_vec(&deletion)?;
                     let response = client
@@ -3205,8 +3285,8 @@ impl NoiseClient {
             }
         }
         let mut failed = 0usize;
-        while let Some(result) = deletions.join_next().await {
-            if !matches!(result, Ok(Ok(()))) {
+        while let Some(result) = deletions.next().await {
+            if result.is_err() {
                 failed += 1;
             }
         }
@@ -3226,10 +3306,10 @@ impl NoiseClient {
         let relay_addresses = storage_relays.iter().map(relay_address).collect::<Vec<_>>();
         let (manifest, shards) = encode_blob_for_storage(blob, key_base64, &relay_addresses)?;
         let required = usize::from(manifest.data_shards);
-        let mut uploads = tokio::task::JoinSet::new();
+        let mut uploads = FuturesUnordered::new();
         for (relay, shard) in storage_relays.into_iter().zip(shards) {
             let client = self.clone();
-            uploads.spawn(async move {
+            uploads.push(async move {
                 let body = serde_json::to_vec(&shard)?;
                 let response = client
                     .relay_request(std::slice::from_ref(&relay), 0, "POST", "/v3/shards", &body)
@@ -3243,8 +3323,8 @@ impl NoiseClient {
             });
         }
         let mut accepted = HashSet::new();
-        while let Some(result) = uploads.join_next().await {
-            if let Ok(Ok(shard_id)) = result {
+        while let Some(result) = uploads.next().await {
+            if let Ok(shard_id) = result {
                 accepted.insert(shard_id);
             }
         }
@@ -3292,10 +3372,10 @@ impl NoiseClient {
     ) -> anyhow::Result<EncryptedBlob> {
         manifest.verify(&manifest.object_id)?;
         let required = usize::from(manifest.data_shards);
-        let mut downloads = tokio::task::JoinSet::new();
+        let mut downloads = FuturesUnordered::new();
         for placement in manifest.placements.clone() {
             let client = self.clone();
-            downloads.spawn(async move {
+            downloads.push(async move {
                 let relay = RelayDescriptor::parse(&placement.relay)?;
                 let response = client
                     .relay_request(
@@ -3325,18 +3405,18 @@ impl NoiseClient {
         }
         let mut shards = Vec::with_capacity(required);
         let mut healthy_shard_ids = HashSet::new();
-        while let Some(result) = downloads.join_next().await {
-            if let Ok(Ok(shard)) = result {
+        while let Some(result) = downloads.next().await {
+            if let Ok(shard) = result {
                 healthy_shard_ids.insert(shard.shard_id.clone());
                 shards.push(shard);
                 if shards.len() >= required {
-                    downloads.abort_all();
                     break;
                 }
             }
         }
         let blob = reconstruct_blob_from_storage(manifest, &shards)
             .context("encrypted media does not have enough healthy storage shards")?;
+        #[cfg(not(target_arch = "wasm32"))]
         if healthy_shard_ids.len() < manifest.placements.len() {
             let client = self.clone();
             let manifest = manifest.clone();
@@ -3442,19 +3522,37 @@ impl NoiseClient {
         id: &str,
         relays: Vec<RelayDescriptor>,
     ) -> anyhow::Result<Vec<SignedEvent>> {
+        let endpoint = format!("/v1/groups/{id}/events");
+        let mut requests = FuturesUnordered::new();
+        for index in 0..relays.len() {
+            let endpoint = endpoint.clone();
+            let relays = &relays;
+            requests.push(async move {
+                self.relay_request(&relays, index, "GET", &endpoint, &[])
+                    .await
+            });
+        }
+
         let mut merged = HashMap::<String, SignedEvent>::new();
         let mut reachable = 0usize;
-        for index in 0..relays.len() {
-            let Ok(response) = self
-                .relay_request(
-                    &relays,
-                    index,
-                    "GET",
-                    &format!("/v1/groups/{id}/events"),
-                    &[],
+        while !requests.is_empty() {
+            let response = if reachable == 0 {
+                requests.next().await
+            } else {
+                use futures_util::future::{Either, select};
+                match select(
+                    Box::pin(requests.next()),
+                    Box::pin(Delay::new(std::time::Duration::from_millis(
+                        EVENT_REPLICA_SETTLE_MILLIS,
+                    ))),
                 )
                 .await
-            else {
+                {
+                    Either::Left((response, _)) => response,
+                    Either::Right(_) => break,
+                }
+            };
+            let Some(Ok(response)) = response else {
                 continue;
             };
             if !(200..300).contains(&response.status) {
@@ -3533,6 +3631,7 @@ impl NoiseClient {
             .encapsulate(&request)
             .context("could not seal private relay request")?;
         let endpoint = format!("{}{OHTTP_RELAY_PATH}", mask.base_url);
+        #[cfg(not(target_arch = "wasm32"))]
         let http = if self
             .mask_relays
             .iter()
@@ -3542,11 +3641,14 @@ impl NoiseClient {
         } else {
             self.http.clone()
         };
+        #[cfg(target_arch = "wasm32")]
+        let http = self.http.clone();
         let response = http
             .post(endpoint)
             .header(reqwest::header::CONTENT_TYPE, OHTTP_REQUEST_MEDIA_TYPE)
             .header(GATEWAY_HEADER, &storage.base_url)
             .body(encrypted_request)
+            .timeout(std::time::Duration::from_secs(RELAY_REQUEST_TIMEOUT_SECS))
             .send()
             .await
             .context("privacy mask is unreachable")?;
@@ -3597,7 +3699,10 @@ impl NoiseClient {
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(body.to_vec());
         }
-        let response = request.send().await?;
+        let response = request
+            .timeout(std::time::Duration::from_secs(RELAY_REQUEST_TIMEOUT_SECS))
+            .send()
+            .await?;
         let status = response.status().as_u16();
         if response
             .content_length()
@@ -4012,6 +4117,7 @@ fn purge_group_cache(cache_path: &Path, group_id: &str) -> anyhow::Result<()> {
     purge_scope_cache(cache_path, group_id)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn purge_profile_image_cache(cache_path: &Path) -> anyhow::Result<()> {
     let directory = cache_path.join("profile-blobs");
     if directory.exists() {
@@ -4021,6 +4127,12 @@ fn purge_profile_image_cache(cache_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_arch = "wasm32")]
+fn purge_profile_image_cache(_cache_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn purge_scope_cache(cache_path: &Path, scope_id: &str) -> anyhow::Result<()> {
     if scope_id.len() != 64 || !scope_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("conversation has an invalid local cache identifier")
@@ -4033,6 +4145,14 @@ fn purge_scope_cache(cache_path: &Path, scope_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_arch = "wasm32")]
+fn purge_scope_cache(_cache_path: &Path, scope_id: &str) -> anyhow::Result<()> {
+    if scope_id.len() != 64 || !scope_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("conversation has an invalid local cache identifier")
+    }
+    Ok(())
+}
+
 fn current_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4040,11 +4160,36 @@ fn current_millis() -> u64 {
         .as_millis() as u64
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn state_exists(path: &Path) -> bool {
+    path.exists()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn state_exists(path: &Path) -> bool {
+    WEB_STATE.with(|states| {
+        states
+            .borrow()
+            .contains_key(&path.to_string_lossy().into_owned())
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn load_state(path: &Path) -> anyhow::Result<ClientState> {
     let bytes = fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
     serde_json::from_slice(&bytes).context("local state is invalid")
 }
 
+#[cfg(target_arch = "wasm32")]
+fn load_state(path: &Path) -> anyhow::Result<ClientState> {
+    let key = path.to_string_lossy().into_owned();
+    let bytes = WEB_STATE
+        .with(|states| states.borrow().get(&key).cloned())
+        .with_context(|| format!("could not read {}", path.display()))?;
+    serde_json::from_slice(&bytes).context("local state is invalid")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn save_state(path: &Path, state: &ClientState) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -4064,6 +4209,34 @@ fn save_state(path: &Path, state: &ClientState) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_arch = "wasm32")]
+fn save_state(path: &Path, state: &ClientState) -> anyhow::Result<()> {
+    let key = path.to_string_lossy().into_owned();
+    let bytes = serde_json::to_vec(state)?;
+    WEB_STATE.with(|states| states.borrow_mut().insert(key, bytes));
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn remove_state(path: &Path) -> anyhow::Result<()> {
+    if path.exists() {
+        fs::remove_file(path)
+            .with_context(|| format!("could not erase local identity {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn remove_state(path: &Path) -> anyhow::Result<()> {
+    WEB_STATE.with(|states| {
+        states
+            .borrow_mut()
+            .remove(&path.to_string_lossy().into_owned())
+    });
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn temporary_path(path: &Path) -> PathBuf {
     path.with_extension("tmp")
 }

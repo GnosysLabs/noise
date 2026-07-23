@@ -61,10 +61,7 @@ async fn execute_noise_request(app: &tauri::AppHandle, mut request: Value) -> Va
     }
 }
 
-async fn noise_request_data(
-    app: &tauri::AppHandle,
-    request: Value,
-) -> Result<Value, String> {
+async fn noise_request_data(app: &tauri::AppHandle, request: Value) -> Result<Value, String> {
     let response = execute_noise_request(app, request).await;
     if response.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(response.get("data").cloned().unwrap_or(Value::Null))
@@ -132,13 +129,7 @@ fn show_native_notification(_app: &tauri::AppHandle, title: &str, body: &str) {
 
     #[cfg(not(target_os = "macos"))]
     {
-        if let Err(error) = _app
-            .notification()
-            .builder()
-            .title(title)
-            .body(body)
-            .show()
-        {
+        if let Err(error) = _app.notification().builder().title(title).body(body).show() {
             eprintln!("Noise could not deliver a desktop notification: {error}");
         }
     }
@@ -164,7 +155,10 @@ fn incoming_direct_notifications(inbox: &Value) -> Option<(String, Vec<PendingNo
             let Some(event_id) = message.get("event_id").and_then(Value::as_str) else {
                 continue;
             };
-            let text = message.get("text").and_then(Value::as_str).unwrap_or_default();
+            let text = message
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let mime_type = message
                 .pointer("/attachment/mime_type")
                 .and_then(Value::as_str);
@@ -197,10 +191,11 @@ fn reply_notifications(snapshot: &Value) -> Vec<PendingNotification> {
             let event_id = reply.get("event_id")?.as_str()?.to_owned();
             let group_name = reply.get("group_name")?.as_str().unwrap_or("Noise");
             let username = reply.get("username")?.as_str().unwrap_or("someone");
-            let text = reply.get("text").and_then(Value::as_str).unwrap_or_default();
-            let mime_type = reply
-                .get("attachment_mime_type")
-                .and_then(Value::as_str);
+            let text = reply
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let mime_type = reply.get("attachment_mime_type").and_then(Value::as_str);
             Some(PendingNotification {
                 event_id,
                 title: format!("{group_name} · {username} replied"),
@@ -269,10 +264,7 @@ async fn direct_notification_loop(
                 "watch_direct",
                 &relays,
                 &mask_relays,
-                [(
-                    "since",
-                    revision.map(Value::from).unwrap_or(Value::Null),
-                )],
+                [("since", revision.map(Value::from).unwrap_or(Value::Null))],
             ),
         )
         .await;
@@ -369,10 +361,7 @@ async fn group_reply_notification_loop(
                 &mask_relays,
                 [
                     ("group_id", Value::String(group_id.clone())),
-                    (
-                        "since",
-                        revision.map(Value::from).unwrap_or(Value::Null),
-                    ),
+                    ("since", revision.map(Value::from).unwrap_or(Value::Null)),
                 ],
             ),
         )
@@ -475,11 +464,7 @@ fn start_notification_watchers(app: tauri::AppHandle, relays: Vec<String>) {
             relays.clone(),
             mask_relays.clone(),
         ));
-        tauri::async_runtime::spawn(group_notification_supervisor(
-            app,
-            relays,
-            mask_relays,
-        ));
+        tauri::async_runtime::spawn(group_notification_supervisor(app, relays, mask_relays));
     });
 }
 

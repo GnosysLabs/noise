@@ -8,7 +8,6 @@ import {
   ChevronRight,
   Copy,
   Crown,
-  Globe2,
   Images,
   Info,
   LoaderCircle,
@@ -592,7 +591,7 @@ export default function App() {
   }, [identityPublicKey]);
 
   useEffect(() => {
-    if (!isTauri || !identityPublicKey) return;
+    if (!identityPublicKey) return;
     let stopped = false;
     let timer: number | null = null;
     const heartbeat = async () => {
@@ -834,10 +833,6 @@ export default function App() {
   }, [sidebarMode, syncDirectInbox]);
 
   useEffect(() => {
-    if (!isTauri) {
-      setLoading(false);
-      return;
-    }
     void refresh()
       .catch((cause) => setError(message(cause)))
       .finally(() => setLoading(false));
@@ -855,7 +850,7 @@ export default function App() {
   const activeAccentStyle = accentStyle(sidebarMode === "groups" ? activeGroup?.accent_color : null);
   const appBackgroundSource = useProfileImageSource(activeGroupBackground);
   useEffect(() => {
-    if (!isTauri || sidebarMode !== "groups" || !activeGroupId) return;
+    if (sidebarMode !== "groups" || !activeGroupId) return;
     let stopped = false;
     const watch = async () => {
       let revision: number | null = null;
@@ -891,7 +886,7 @@ export default function App() {
   }, [activeGroupId, identityPublicKey, refresh, sidebarMode]);
 
   useEffect(() => {
-    if (!isTauri || !identityPublicKey) return;
+    if (!identityPublicKey) return;
     let stopped = false;
     const watch = async () => {
       let revision: number | null = null;
@@ -924,7 +919,7 @@ export default function App() {
   }, [identityPublicKey, syncDirectInbox]);
 
   useEffect(() => {
-    if (!isTauri || !identityPublicKey || !summary?.identity.noise_id) return;
+    if (!identityPublicKey || !summary?.identity.noise_id) return;
     let stopped = false;
     const watch = async () => {
       let revision: number | null = null;
@@ -956,7 +951,7 @@ export default function App() {
       if (syncAccount) await noise({ action: "sync_account", relays });
       return true;
     } catch (cause) {
-      setError(message(cause));
+      if (message(cause) !== "media upload cancelled") setError(message(cause));
       return false;
     } finally {
       setBusy(false);
@@ -1088,7 +1083,6 @@ export default function App() {
     setSidebarMode("directs");
   }
 
-  if (!isTauri) return <BrowserFoundation />;
   if (loading) return <><Loading /><UpdateBanner {...updater} /></>;
   if (!summary) {
     return (
@@ -1234,14 +1228,15 @@ export default function App() {
               }
               onBan={(member) => setDialog({ type: "ban_member", member })}
               onReport={(message) => setDialog({ type: "report_message", message })}
-              onSend={async (text, pending, onProgress, replyToMessageId) => {
+              onSend={async (text, pending, onProgress, replyToMessageId, signal) => {
                 const groupId = selectedConversation.group.group_id;
                 const optimistic = optimisticMessage(summary.identity, text, pending, replyToMessageId);
                 if (!pending) addOptimisticGroupMessage(groupId, optimistic);
                 let attachment: MediaAttachment | null = null;
                 let result: SentMessageResult | null = null;
                 const sent = await perform(async () => {
-                  attachment = await uploadPendingMedia(pending, "upload_media_chunk", onProgress);
+                  attachment = await uploadPendingMedia(pending, "upload_media_chunk", onProgress, signal);
+                  if (signal.aborted) throw new Error("media upload cancelled");
                   result = await noise<SentMessageResult>({
                     action: "say",
                     text,
@@ -1285,14 +1280,15 @@ export default function App() {
               contactPresence={directPresenceStatuses.get(selectedDirectConversation.contact.public_key) ?? "offline"}
               onPerson={(person) => setDialog({ type: "person", person })}
               onDelete={() => setDialog({ type: "delete_direct", direct: selectedDirectConversation.contact })}
-              onSend={async (text, pending, onProgress, replyToMessageId) => {
+              onSend={async (text, pending, onProgress, replyToMessageId, signal) => {
                 const publicKey = selectedDirectConversation.contact.public_key;
                 const optimistic = optimisticMessage(summary.identity, text, pending, replyToMessageId);
                 if (!pending) addOptimisticDirectMessage(publicKey, optimistic);
                 let attachment: MediaAttachment | null = null;
                 let result: SentMessageResult | null = null;
                 const sent = await perform(async () => {
-                  attachment = await uploadPendingMedia(pending, "upload_direct_media_chunk", onProgress);
+                  attachment = await uploadPendingMedia(pending, "upload_direct_media_chunk", onProgress, signal);
+                  if (signal.aborted) throw new Error("media upload cancelled");
                   result = await noise<SentMessageResult>({
                     action: "say_direct",
                     text,
@@ -1999,7 +1995,7 @@ function ConversationPanel({
   onSetModerator: (member: MemberSummary, enabled: boolean) => Promise<boolean>;
   onBan: (member: MemberSummary) => void;
   onReport: (message: MessageSummary) => void;
-  onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null) => Promise<boolean>;
+  onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null, signal: AbortSignal) => Promise<boolean>;
 }) {
   const [draft, setDraft] = useState("");
   const [attachment, setAttachment] = useState<PendingMedia | null>(null);
@@ -2011,6 +2007,7 @@ function ConversationPanel({
   const [replyingTo, setReplyingTo] = useState<MessageSummary | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
+  const uploadController = useRef<AbortController | null>(null);
   useAutosizeComposer(composerInput, draft);
   const messageList = useChunkedMessageList(
     conversation.group.group_id,
@@ -2067,7 +2064,10 @@ function ConversationPanel({
     setDraft("");
     setReplyingTo(null);
     if (pendingAttachment) setUploadProgress(0);
-    const sent = await onSend(text, pendingAttachment, setUploadProgress, submittedReply?.message_id ?? null);
+    const controller = new AbortController();
+    uploadController.current = controller;
+    const sent = await onSend(text, pendingAttachment, setUploadProgress, submittedReply?.message_id ?? null, controller.signal);
+    if (uploadController.current === controller) uploadController.current = null;
     setUploadProgress(null);
     if (sent) {
       setAttachment(null);
@@ -2099,7 +2099,7 @@ function ConversationPanel({
       </div>
       {selfMember && (canSendMessages || canSendMedia) ? <div className="composer">
         {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.group.group_id} onClose={() => setReplyingTo(null)} />}
-        {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => { const video = event.currentTarget; if (Number.isFinite(video.duration) && video.duration > 0) video.currentTime = Math.min(0.25, video.duration / 2); }} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}{uploadProgress !== null && <div className="attachment-progress"><i style={{ width: `${uploadProgress}%` }} /><span>{uploadProgress}%</span></div>}<button disabled={busy} onClick={() => setAttachment(null)} aria-label="remove attachment"><X size={14} /></button></div>}
+        {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => { const video = event.currentTarget; if (Number.isFinite(video.duration) && video.duration > 0) video.currentTime = Math.min(0.25, video.duration / 2); }} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}{uploadProgress !== null && <div className="attachment-progress"><i style={{ width: `${uploadProgress}%` }} /><span>{uploadProgress}%</span></div>}<button onClick={() => { uploadController.current?.abort(); setAttachment(null); setUploadProgress(null); }} aria-label={uploadProgress !== null ? "cancel upload" : "remove attachment"}><X size={14} /></button></div>}
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
         <button className="attach-button" disabled={busy || !canSendMedia} onClick={() => fileInput.current?.click()} aria-label="attach media" title={canSendMedia ? "attach media" : "members cannot send media"}><Paperclip size={17} /></button>
         <input ref={fileInput} hidden type="file" accept="image/*,video/*,audio/*" onChange={(event) => void chooseMedia(event.target.files?.[0])} />
@@ -2200,7 +2200,7 @@ function ConversationPanel({
   );
 }
 
-function DirectConversationPanel({ conversation, busy, selfPublicKey, contactPresence, onPerson, onDelete, onSend }: { conversation: DirectConversation; busy: boolean; selfPublicKey: string; contactPresence: PresenceStatus; onPerson: (person: PersonSummary) => void; onDelete: () => void; onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null) => Promise<boolean> }) {
+function DirectConversationPanel({ conversation, busy, selfPublicKey, contactPresence, onPerson, onDelete, onSend }: { conversation: DirectConversation; busy: boolean; selfPublicKey: string; contactPresence: PresenceStatus; onPerson: (person: PersonSummary) => void; onDelete: () => void; onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null, signal: AbortSignal) => Promise<boolean> }) {
   const [draft, setDraft] = useState("");
   const [attachment, setAttachment] = useState<PendingMedia | null>(null);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
@@ -2209,6 +2209,7 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, contactPre
   const [replyingTo, setReplyingTo] = useState<MessageSummary | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
+  const uploadController = useRef<AbortController | null>(null);
   useAutosizeComposer(composerInput, draft);
   const messageList = useChunkedMessageList(
     conversation.contact.public_key,
@@ -2255,7 +2256,10 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, contactPre
     setDraft("");
     setReplyingTo(null);
     if (pendingAttachment) setUploadProgress(0);
-    const sent = await onSend(text, pendingAttachment, setUploadProgress, submittedReply?.message_id ?? null);
+    const controller = new AbortController();
+    uploadController.current = controller;
+    const sent = await onSend(text, pendingAttachment, setUploadProgress, submittedReply?.message_id ?? null, controller.signal);
+    if (uploadController.current === controller) uploadController.current = null;
     setUploadProgress(null);
     if (sent) {
       setAttachment(null);
@@ -2280,7 +2284,7 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, contactPre
       </div>
       {conversation.contact.accepts_direct_messages ? <div className="composer">
         {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.media_scope_id} onClose={() => setReplyingTo(null)} />}
-        {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => primeVideoFrame(event.currentTarget)} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}{uploadProgress !== null && <div className="attachment-progress"><i style={{ width: `${uploadProgress}%` }} /><span>{uploadProgress}%</span></div>}<button disabled={busy} onClick={() => setAttachment(null)} aria-label="remove attachment"><X size={14} /></button></div>}
+        {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => primeVideoFrame(event.currentTarget)} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}{uploadProgress !== null && <div className="attachment-progress"><i style={{ width: `${uploadProgress}%` }} /><span>{uploadProgress}%</span></div>}<button onClick={() => { uploadController.current?.abort(); setAttachment(null); setUploadProgress(null); }} aria-label={uploadProgress !== null ? "cancel upload" : "remove attachment"}><X size={14} /></button></div>}
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
         <button className="attach-button" disabled={busy} onClick={() => fileInput.current?.click()} aria-label="attach media"><Paperclip size={17} /></button>
         <input ref={fileInput} hidden type="file" accept="image/*,video/*,audio/*" onChange={(event) => void chooseMedia(event.target.files?.[0])} />
@@ -2529,8 +2533,9 @@ function requestMediaSource(attachment: MediaAttachment, scopeId?: string) {
             relays,
           });
           if (!data) throw new Error("media is not available yet");
-          const { convertFileSrc } = await import("@tauri-apps/api/core");
-          const next = convertFileSrc(data.file_path);
+          const next = isTauri
+            ? (await import("@tauri-apps/api/core")).convertFileSrc(data.file_path)
+            : data.file_path;
           if (generation === mediaCacheGeneration) mediaCache.set(cacheKey, next);
           return next;
         } catch {
@@ -3746,10 +3751,6 @@ function UpdateBanner({ status, retry, restart, dismiss }: ReturnType<typeof use
 
 function Loading() { return <div className="loading"><LoaderCircle className="spinner" /></div>; }
 
-function BrowserFoundation() {
-  return <div className="browser-foundation"><Globe2 size={42} /><h1>noise for the browser</h1><p>The shared interface is running. The browser still needs the Rust cryptography compiled to WASM and IndexedDB identity storage before it can safely enter a live group.</p><small>desktop uses this exact React build through Tauri</small></div>;
-}
-
 function formatTime(millis: number) {
   return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(millis));
 }
@@ -3827,22 +3828,26 @@ function imageIsNearBlack(source: string) {
   });
 }
 
-async function uploadPendingMedia(pending: PendingMedia | null, action: "upload_media_chunk" | "upload_direct_media_chunk", onProgress: (progress: number) => void): Promise<MediaAttachment | null> {
+async function uploadPendingMedia(pending: PendingMedia | null, action: "upload_media_chunk" | "upload_direct_media_chunk", onProgress: (progress: number) => void, signal: AbortSignal): Promise<MediaAttachment | null> {
   if (!pending) return null;
   const mediaPreview = pending.mediaPreview;
   const chunks: MediaChunk[] = [];
   const chunkSize = 1024 * 1024;
   for (let offset = 0; offset < pending.file.size; offset += chunkSize) {
+    if (signal.aborted) throw new Error("media upload cancelled");
     const chunk = await noise<MediaChunk>({
       action,
       data_base64: await fileBase64(pending.file.slice(offset, offset + chunkSize)),
       relays,
     });
+    if (signal.aborted) throw new Error("media upload cancelled");
     if (!chunk) throw new Error("relay did not return a media chunk reference");
     chunks.push(chunk);
-    onProgress(Math.min(100, Math.round(((offset + chunk.byte_length) / pending.file.size) * 100)));
+    onProgress(Math.min(95, Math.round(((offset + chunk.byte_length) / pending.file.size) * 95)));
   }
+  if (signal.aborted) throw new Error("media upload cancelled");
   const preview = mediaPreview ? await mediaPreview : null;
+  if (signal.aborted) throw new Error("media upload cancelled");
   return {
     file_name: pending.name,
     mime_type: pending.mimeType,

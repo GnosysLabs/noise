@@ -5,6 +5,7 @@ members = [
     "crates/noise-client",
     "crates/noise-transport",
     "crates/noise-ffi",
+    "crates/noise-web",
     "crates/noise-relay",
     "crates/noise-cli",
     "crates/noise-sim",
@@ -25,6 +26,8 @@ blake3 = "1"
 chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "2"
+futures-util = "0.3"
+futures-timer = "3"
 ohttp = { version = "0.8", default-features = false, features = ["client", "server", "rust-hpke"] }
 object_store = { version = "0.14.1", features = ["aws"] }
 rand = "0.9"
