@@ -418,6 +418,30 @@ export default function App() {
     return () => { stopped = true; };
   }, [identityPublicKey, syncDirectSummary]);
 
+  useEffect(() => {
+    if (!isTauri || !identityPublicKey || !summary?.identity.noise_id) return;
+    let stopped = false;
+    const watch = async () => {
+      let revision: number | null = null;
+      while (!stopped) {
+        try {
+          const initial = revision === null;
+          const change: GroupWatch | null = await noise<GroupWatch>({ action: "watch_account", since: revision, relays });
+          if (stopped || !change) return;
+          revision = change.revision;
+          if (initial || change.changed) {
+            const reconciled = await noise<LocalSummary>({ action: "sync_read_state", relays });
+            if (!stopped && reconciled) setSummary(reconciled);
+          }
+        } catch {
+          await new Promise((resolve) => window.setTimeout(resolve, 1500));
+        }
+      }
+    };
+    void watch();
+    return () => { stopped = true; };
+  }, [identityPublicKey, summary?.identity.noise_id]);
+
   async function perform(operation: () => Promise<void>, syncAccount = true) {
     if (busy) return false;
     setBusy(true);

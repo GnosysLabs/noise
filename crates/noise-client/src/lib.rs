@@ -255,6 +255,8 @@ struct AccountVaultContents {
     active_direct_public_key: Option<String>,
     direct_deleted_before: HashMap<String, u64>,
     direct_closed_periods: Vec<DirectClosedPeriod>,
+    #[serde(default)]
+    direct_read_through: HashMap<String, DirectMessageMarker>,
     group_frequencies: HashMap<String, String>,
     next_author_sequence: u64,
 }
@@ -281,6 +283,20 @@ struct DirectClosedPeriod {
 struct DirectMessageMarker {
     created_at_millis: u64,
     event_id: String,
+}
+
+fn merge_read_markers(
+    current: &mut HashMap<String, DirectMessageMarker>,
+    incoming: &HashMap<String, DirectMessageMarker>,
+) -> bool {
+    let before = current.clone();
+    for (public_key, marker) in incoming {
+        current
+            .entry(public_key.clone())
+            .and_modify(|existing| *existing = existing.clone().max(marker.clone()))
+            .or_insert_with(|| marker.clone());
+    }
+    *current != before
 }
 
 fn default_true() -> bool {
@@ -344,6 +360,7 @@ impl ClientState {
             active_direct_public_key: self.active_direct_public_key.clone(),
             direct_deleted_before: self.direct_deleted_before.clone(),
             direct_closed_periods: self.direct_closed_periods.clone(),
+            direct_read_through: self.direct_read_through.clone(),
             group_frequencies: self.group_frequencies.clone(),
             next_author_sequence: self.next_author_sequence,
         }
@@ -365,7 +382,7 @@ impl ClientState {
             direct_deleted_before: contents.direct_deleted_before,
             direct_closed_periods: contents.direct_closed_periods,
             direct_latest_incoming: HashMap::new(),
-            direct_read_through: HashMap::new(),
+            direct_read_through: contents.direct_read_through,
             group_frequencies: contents.group_frequencies,
             next_author_sequence: contents.next_author_sequence,
             account: Some(account),
@@ -391,6 +408,13 @@ impl ClientState {
                     .get(public_key)
                     .is_none_or(|read| latest > read)
             })
+    }
+
+    fn merge_direct_read_through(
+        &mut self,
+        incoming: &HashMap<String, DirectMessageMarker>,
+    ) -> bool {
+        merge_read_markers(&mut self.direct_read_through, incoming)
     }
 
     fn upsert_known_person(&mut self, contact: DirectContact) {
@@ -642,6 +666,28 @@ impl NoiseClient {
         state.summary()
     }
 
+    pub async fn sync_read_state(
+        &self,
+        path: impl AsRef<Path>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<LocalSummary> {
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        if state.account.is_none() {
+            return state.summary();
+        }
+        let relays = relay_list(relays)?;
+        let credentials = state.account_credentials()?;
+        let remote = self
+            .fetch_account_vault(&relays, &credentials.locator)
+            .await?;
+        let changed = Self::merge_remote_read_state(&mut state, &credentials, &remote)?;
+        if changed {
+            save_state(path, &state)?;
+        }
+        state.summary()
+    }
+
     pub fn logout(
         &self,
         path: impl AsRef<Path>,
@@ -691,6 +737,42 @@ impl NoiseClient {
         let group = state.active_group()?;
         self.watch_id(&group.group_id, since, relay_list(relays)?)
             .await
+    }
+
+    pub async fn watch_account(
+        &self,
+        path: impl AsRef<Path>,
+        since: Option<u64>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<GroupWatch> {
+        let state = load_state(path.as_ref())?;
+        let account = state
+            .account
+            .as_ref()
+            .context("this identity has no Noise ID")?;
+        let revision = since
+            .map(|revision| revision.to_string())
+            .unwrap_or_else(|| "initial".to_owned());
+        let endpoint = format!("/v1/accounts/{}/watch/{revision}", account.locator);
+        let relays = relay_list(relays)?;
+
+        for index in 0..relays.len() {
+            let Ok(response) = self
+                .relay_request(&relays, index, "GET", &endpoint, &[])
+                .await
+            else {
+                continue;
+            };
+            if response.status == 410 {
+                bail!("this Noise account has been deleted")
+            }
+            if (200..300).contains(&response.status)
+                && let Ok(change) = serde_json::from_slice::<GroupWatch>(&response.body)
+            {
+                return Ok(change);
+            }
+        }
+        bail!("no relay could hold the private account watch")
     }
 
     async fn watch_id(
@@ -1320,12 +1402,13 @@ impl NoiseClient {
         relays: Vec<String>,
     ) -> anyhow::Result<DirectConversation> {
         let path = path.as_ref();
+        let relays = relay_list(relays)?;
         let (mut state, messages) = self
-            .sync_direct_inbox(path, cache_path.as_ref(), relay_list(relays)?)
+            .sync_direct_inbox(path, cache_path.as_ref(), relays.clone())
             .await?;
         let public_key = state
             .active_direct_public_key
-            .as_deref()
+            .clone()
             .context("choose a direct conversation first")?;
         let contact = state
             .direct_contacts
@@ -1333,12 +1416,13 @@ impl NoiseClient {
             .find(|contact| contact.public_key == public_key)
             .cloned()
             .context("active direct conversation is missing")?;
-        if let Some(latest) = state.direct_latest_incoming.get(public_key).cloned()
-            && state.direct_read_through.get(public_key) != Some(&latest)
+        if let Some(latest) = state.direct_latest_incoming.get(&public_key).cloned()
+            && state.direct_read_through.get(&public_key) != Some(&latest)
         {
-            state
-                .direct_read_through
-                .insert(public_key.to_owned(), latest);
+            state.direct_read_through.insert(public_key.clone(), latest);
+            if state.account.is_some() {
+                self.publish_account_state(&mut state, &relays).await?;
+            }
             save_state(path, &state)?;
         }
         Ok(DirectConversation {
@@ -2306,46 +2390,73 @@ impl NoiseClient {
     ) -> anyhow::Result<()> {
         let credentials = state.account_credentials()?;
         let identity = state.identity()?;
-        let plaintext = serde_json::to_vec(&state.vault_contents())?;
-        let mut revision = state
-            .account
-            .as_ref()
-            .context("this identity has no Noise ID")?
-            .revision
-            .checked_add(1)
-            .context("account vault revision is exhausted")?;
-        let mut vault = AccountVault::seal(&identity, &credentials, revision, &plaintext)?;
-        if let Err(first_error) = self.publish_account_vault(relays, &vault).await {
-            let Ok(remote) = self.fetch_account_vault(relays, &credentials.locator).await else {
-                return Err(first_error);
-            };
-            if remote.identity_public_key != identity.public_key_base64()
-                || remote.revision < revision
-            {
-                return Err(first_error);
-            }
-            revision = remote
+        if let Ok(remote) = self.fetch_account_vault(relays, &credentials.locator).await {
+            Self::merge_remote_read_state(state, &credentials, &remote)?;
+        }
+
+        let mut last_error = None;
+        for _ in 0..4 {
+            let revision = state
+                .account
+                .as_ref()
+                .context("this identity has no Noise ID")?
                 .revision
                 .checked_add(1)
                 .context("account vault revision is exhausted")?;
-            vault = AccountVault::seal(&identity, &credentials, revision, &plaintext)?;
-            self.publish_account_vault(relays, &vault).await?;
+            let plaintext = serde_json::to_vec(&state.vault_contents())?;
+            let vault = AccountVault::seal(&identity, &credentials, revision, &plaintext)?;
+            let publish_error = self.publish_account_vault(relays, &vault).await.err();
+
+            let remote = match self.fetch_account_vault(relays, &credentials.locator).await {
+                Ok(remote) => remote,
+                Err(error) => {
+                    last_error = Some(publish_error.unwrap_or(error));
+                    continue;
+                }
+            };
+            if remote.identity_public_key != identity.public_key_base64() {
+                bail!("account identity does not match the encrypted vault")
+            }
+            if remote.revision == revision && remote.signature_base64 == vault.signature_base64 {
+                state
+                    .account
+                    .as_mut()
+                    .context("this identity has no Noise ID")?
+                    .revision = revision;
+                return Ok(());
+            }
+
+            Self::merge_remote_read_state(state, &credentials, &remote)?;
+            last_error = Some(publish_error.unwrap_or_else(|| {
+                anyhow::anyhow!("another device updated the encrypted account vault")
+            }));
         }
-        let remote = self
-            .fetch_account_vault(relays, &credentials.locator)
-            .await
-            .context("no relay accepted the encrypted account vault")?;
-        if remote.revision < revision || remote.identity_public_key != identity.public_key_base64()
-        {
-            bail!("no relay accepted the encrypted account vault")
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("account sync did not complete")))
+    }
+
+    fn merge_remote_read_state(
+        state: &mut ClientState,
+        credentials: &AccountCredentials,
+        remote: &AccountVault,
+    ) -> anyhow::Result<bool> {
+        if remote.identity_public_key != state.identity()?.public_key_base64() {
+            bail!("account identity does not match the encrypted vault")
         }
-        revision = revision.max(remote.revision);
-        state
+        let plaintext = remote.open(credentials)?;
+        let contents: AccountVaultContents =
+            serde_json::from_slice(&plaintext).context("encrypted account vault is invalid")?;
+        if contents.version != 1 {
+            bail!("this account vault was created by an unsupported Noise version")
+        }
+        let reads_changed = state.merge_direct_read_through(&contents.direct_read_through);
+        let account = state
             .account
             .as_mut()
-            .context("this identity has no Noise ID")?
-            .revision = revision;
-        Ok(())
+            .context("this identity has no Noise ID")?;
+        let revision_changed = remote.revision > account.revision;
+        account.revision = account.revision.max(remote.revision);
+        Ok(reads_changed || revision_changed)
     }
 
     async fn publish_account_vault(
@@ -3076,4 +3187,34 @@ fn save_state(path: &Path, state: &ClientState) -> anyhow::Result<()> {
 
 fn temporary_path(path: &Path) -> PathBuf {
     path.with_extension("tmp")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn marker(created_at_millis: u64, event_id: &str) -> DirectMessageMarker {
+        DirectMessageMarker {
+            created_at_millis,
+            event_id: event_id.to_owned(),
+        }
+    }
+
+    #[test]
+    fn read_cursor_merge_only_moves_forward() {
+        let mut current = HashMap::from([("alice".to_owned(), marker(200, "event-b"))]);
+        let incoming = HashMap::from([
+            ("alice".to_owned(), marker(100, "event-a")),
+            ("bob".to_owned(), marker(150, "event-c")),
+        ]);
+
+        assert!(merge_read_markers(&mut current, &incoming));
+        assert_eq!(current.get("alice"), Some(&marker(200, "event-b")));
+        assert_eq!(current.get("bob"), Some(&marker(150, "event-c")));
+
+        let newer = HashMap::from([("alice".to_owned(), marker(300, "event-d"))]);
+        assert!(merge_read_markers(&mut current, &newer));
+        assert_eq!(current.get("alice"), Some(&marker(300, "event-d")));
+        assert!(!merge_read_markers(&mut current, &newer));
+    }
 }

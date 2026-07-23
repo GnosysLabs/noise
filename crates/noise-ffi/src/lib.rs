@@ -34,6 +34,15 @@ enum Request {
         state_path: String,
         relays: Vec<String>,
     },
+    SyncReadState {
+        state_path: String,
+        relays: Vec<String>,
+    },
+    WatchAccount {
+        state_path: String,
+        since: Option<u64>,
+        relays: Vec<String>,
+    },
     Logout {
         state_path: String,
         cache_path: String,
@@ -252,6 +261,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         &request,
         Request::WatchGroup { .. }
             | Request::WatchDirect { .. }
+            | Request::WatchAccount { .. }
             | Request::FetchAvatar { .. }
             | Request::FetchAttachment { .. }
             | Request::UploadMediaChunk { .. }
@@ -313,6 +323,22 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         Request::SyncAccount { state_path, relays } => serde_json::to_value(
             runtime()?
                 .block_on(client.sync_account(state_path, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::SyncReadState { state_path, relays } => serde_json::to_value(
+            runtime()?
+                .block_on(client.sync_read_state(state_path, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::WatchAccount {
+            state_path,
+            since,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.watch_account(state_path, since, relays))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),

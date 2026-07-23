@@ -62,6 +62,7 @@ struct AppState {
     blobs: Arc<RwLock<HashMap<String, EncryptedBlob>>>,
     deletions: Arc<RwLock<HashMap<String, GroupDeletion>>>,
     group_changes: Arc<RwLock<HashMap<String, watch::Sender<u64>>>>,
+    account_changes: Arc<RwLock<HashMap<String, watch::Sender<u64>>>>,
     mutations: Arc<Mutex<()>>,
     peers: Arc<Vec<String>>,
     client: reqwest::Client,
@@ -150,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
         blobs: Arc::new(RwLock::new(recovered.blobs)),
         deletions: Arc::new(RwLock::new(recovered.deletions)),
         group_changes: Arc::new(RwLock::new(HashMap::new())),
+        account_changes: Arc::new(RwLock::new(HashMap::new())),
         mutations: Arc::new(Mutex::new(())),
         peers: Arc::new(peers),
         client,
@@ -165,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/v1/accounts", post(publish_account))
         .route("/v1/accounts/{locator}", get(get_account))
+        .route("/v1/accounts/{locator}/watch/{since}", get(account_watch))
         .route("/v1/invites", post(publish_invite))
         .route("/v1/invites/{locator}", get(get_invite))
         .route("/v1/invite-rotations", post(publish_invite_rotation))
@@ -372,6 +375,16 @@ async fn group_watch(
         .map(Json)
 }
 
+async fn account_watch(
+    State(state): State<AppState>,
+    Path((locator, since)): Path<(String, String)>,
+) -> Result<Json<GroupWatchResponse>, StatusCode> {
+    let since = parse_watch_revision(&since).ok_or(StatusCode::BAD_REQUEST)?;
+    wait_for_account_change(&state, &locator, since)
+        .await
+        .map(Json)
+}
+
 async fn publish_blob(
     State(state): State<AppState>,
     Json(blob): Json<EncryptedBlob>,
@@ -539,6 +552,19 @@ async fn dispatch_private_request(
     state: &AppState,
     request: PlainRequest,
 ) -> (StatusCode, Vec<u8>) {
+    if request.method == "GET"
+        && let Some((locator, revision)) = parse_private_account_watch_path(&request.path)
+    {
+        let Some(since) = parse_watch_revision(revision) else {
+            return private_error(StatusCode::BAD_REQUEST, "invalid account revision");
+        };
+        return match wait_for_account_change(state, locator, since).await {
+            Ok(response) => private_json(StatusCode::OK, &response),
+            Err(StatusCode::GONE) => private_error(StatusCode::GONE, "account was deleted"),
+            Err(StatusCode::NOT_FOUND) => private_error(StatusCode::NOT_FOUND, "nothing here"),
+            Err(status) => private_error(status, "account watch failed"),
+        };
+    }
     if request.method == "GET"
         && let Some((group_id, revision)) = parse_private_watch_path(&request.path)
     {
@@ -753,6 +779,15 @@ fn parse_private_watch_path(path: &str) -> Option<(&str, &str)> {
     Some((group_id, revision))
 }
 
+fn parse_private_account_watch_path(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("/v1/accounts/")?;
+    let (locator, revision) = rest.split_once("/watch/")?;
+    if locator.contains('/') || revision.contains('/') {
+        return None;
+    }
+    Some((locator, revision))
+}
+
 fn parse_watch_revision(value: &str) -> Option<Option<u64>> {
     if value == "initial" {
         Some(None)
@@ -828,6 +863,71 @@ async fn wait_for_group_change(
     })
 }
 
+async fn wait_for_account_change(
+    state: &AppState,
+    locator: &str,
+    since: Option<u64>,
+) -> Result<GroupWatchResponse, StatusCode> {
+    if locator.len() != 64 || !locator.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let (current, mut changes) = {
+        let _guard = state.mutations.lock().await;
+        let current = match state.accounts.read().await.get(locator) {
+            Some(vault) if vault.deleted => return Err(StatusCode::GONE),
+            Some(vault) => vault.revision,
+            None => return Err(StatusCode::NOT_FOUND),
+        };
+        let sender = state
+            .account_changes
+            .write()
+            .await
+            .entry(locator.to_owned())
+            .or_insert_with(|| watch::channel(current).0)
+            .clone();
+        (current, sender.subscribe())
+    };
+
+    let Some(since) = since else {
+        return Ok(GroupWatchResponse {
+            revision: current,
+            changed: false,
+        });
+    };
+    if current != since {
+        return Ok(GroupWatchResponse {
+            revision: current,
+            changed: true,
+        });
+    }
+
+    if timeout(Duration::from_secs(20), changes.changed())
+        .await
+        .is_ok_and(|result| result.is_ok())
+    {
+        if state
+            .accounts
+            .read()
+            .await
+            .get(locator)
+            .is_none_or(|vault| vault.deleted)
+        {
+            return Err(StatusCode::GONE);
+        }
+        let revision = *changes.borrow_and_update();
+        return Ok(GroupWatchResponse {
+            revision,
+            changed: revision != since,
+        });
+    }
+
+    Ok(GroupWatchResponse {
+        revision: since,
+        changed: false,
+    })
+}
+
 fn has_media_type(headers: &HeaderMap, expected: &str) -> bool {
     headers
         .get(CONTENT_TYPE)
@@ -887,12 +987,18 @@ async fn apply_account_vault(
             bail!("deleted accounts cannot be restored")
         }
     }
+    let locator = vault.locator.clone();
+    let revision = vault.revision;
     state.store.upsert_account(&vault).await?;
-    state
-        .accounts
+    state.accounts.write().await.insert(locator.clone(), vault);
+    let sender = state
+        .account_changes
         .write()
         .await
-        .insert(vault.locator.clone(), vault);
+        .entry(locator)
+        .or_insert_with(|| watch::channel(revision).0)
+        .clone();
+    sender.send_replace(revision);
     Ok(InsertResult::Inserted)
 }
 
