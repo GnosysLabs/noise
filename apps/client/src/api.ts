@@ -60,3 +60,32 @@ export async function prepareImage(file: File): Promise<string> {
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary);
 }
+
+export async function prepareGroupBackground(file: File): Promise<string> {
+  if (!file.type.startsWith("image/")) throw new Error("choose an image file");
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, 1920 / bitmap.width, 1080 / bitmap.height);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  const context = canvas.getContext("2d");
+  if (!context) {
+    bitmap.close();
+    throw new Error("this browser cannot prepare images");
+  }
+  context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+
+  let blob: Blob | null = null;
+  for (const quality of [0.82, 0.72, 0.62]) {
+    blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+    if (blob && blob.size <= 1536 * 1024) break;
+  }
+  if (!blob || !blob.size || blob.size > 1536 * 1024) {
+    throw new Error("this image could not be prepared under the 1.5 MB encrypted background limit");
+  }
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}

@@ -61,6 +61,14 @@ enum Request {
         avatar_data_base64: Option<String>,
         avatar_mime_type: Option<String>,
         remove_avatar: bool,
+        #[serde(default)]
+        background_data_base64: Option<String>,
+        #[serde(default)]
+        background_mime_type: Option<String>,
+        #[serde(default)]
+        remove_background: bool,
+        #[serde(default)]
+        accent_color: Option<String>,
         members_can_send_messages: Option<bool>,
         members_can_send_media: Option<bool>,
         relays: Vec<String>,
@@ -71,6 +79,7 @@ enum Request {
         relays: Vec<String>,
     },
     FetchAvatar {
+        cache_path: String,
         image: ProfileImage,
         relays: Vec<String>,
     },
@@ -162,6 +171,17 @@ enum Request {
     DeleteMessage {
         state_path: String,
         message_event_id: String,
+        relays: Vec<String>,
+    },
+    ReportMessage {
+        state_path: String,
+        message_event_id: String,
+        reason: String,
+        relays: Vec<String>,
+    },
+    ResolveReport {
+        state_path: String,
+        report_event_id: String,
         relays: Vec<String>,
     },
     BanMember {
@@ -346,6 +366,10 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             avatar_data_base64,
             avatar_mime_type,
             remove_avatar,
+            background_data_base64,
+            background_mime_type,
+            remove_background,
+            accent_color,
             members_can_send_messages,
             members_can_send_media,
             relays,
@@ -359,6 +383,10 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                     avatar_data_base64,
                     avatar_mime_type,
                     remove_avatar,
+                    background_data_base64,
+                    background_mime_type,
+                    remove_background,
+                    accent_color,
                     members_can_send_messages,
                     members_can_send_media,
                     relays,
@@ -376,9 +404,13 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
-        Request::FetchAvatar { image, relays } => serde_json::to_value(
+        Request::FetchAvatar {
+            cache_path,
+            image,
+            relays,
+        } => serde_json::to_value(
             runtime()?
-                .block_on(client.fetch_avatar(&image, relays))
+                .block_on(client.fetch_avatar(cache_path, &image, relays))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
@@ -584,6 +616,27 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         } => {
             runtime()?
                 .block_on(client.delete_message(state_path, &message_event_id, relays))
+                .map_err(|error| error.to_string())?;
+            Ok(Value::Null)
+        }
+        Request::ReportMessage {
+            state_path,
+            message_event_id,
+            reason,
+            relays,
+        } => {
+            runtime()?
+                .block_on(client.report_message(state_path, &message_event_id, reason, relays))
+                .map_err(|error| error.to_string())?;
+            Ok(Value::Null)
+        }
+        Request::ResolveReport {
+            state_path,
+            report_event_id,
+            relays,
+        } => {
+            runtime()?
+                .block_on(client.resolve_report(state_path, &report_event_id, relays))
                 .map_err(|error| error.to_string())?;
             Ok(Value::Null)
         }

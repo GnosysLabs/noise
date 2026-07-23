@@ -20,6 +20,8 @@ export type GroupSummary = {
   description: string;
   rules: string;
   avatar: ProfileImage | null;
+  background: ProfileImage | null;
+  accent_color: string;
   members_can_send_messages: boolean;
   members_can_send_media: boolean;
   frequency: string | null;
@@ -42,6 +44,7 @@ export type DirectSummary = {
   avatar: ProfileImage | null;
   accepts_direct_messages: boolean;
   is_active: boolean;
+  has_unread: boolean;
 };
 
 export type MemberSummary = {
@@ -85,7 +88,19 @@ export type Conversation = {
   members: MemberSummary[];
   banned_members: BannedMemberSummary[];
   messages: MessageSummary[];
+  reports: ReportSummary[];
+  reported_message_event_ids: string[];
   rejected_events: number;
+};
+
+export type ReportSummary = {
+  report_event_id: string;
+  reporter_public_key: string;
+  reporter_username: string;
+  reporter_avatar: ProfileImage | null;
+  reason: string;
+  created_at_millis: number;
+  message: MessageSummary;
 };
 
 export type BannedMemberSummary = {

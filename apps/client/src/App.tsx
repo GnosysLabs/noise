@@ -22,14 +22,16 @@ import {
   Shield,
   ShieldOff,
   Trash2,
+  TriangleAlert,
   UserRoundX,
   UsersRound,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
-import { isTauri, noise, prepareImage, relays } from "./api";
+import { isTauri, noise, prepareGroupBackground, prepareImage, relays } from "./api";
 import { generateGroupAvatar, generateUserAvatar } from "./groupAvatar";
 import type {
   AttachmentData,
@@ -48,6 +50,7 @@ import type {
   MemberSummary,
   MessageSummary,
   ProfileImage,
+  ReportSummary,
 } from "./types";
 
 type Dialog =
@@ -59,6 +62,8 @@ type Dialog =
   | { type: "group"; group: GroupSummary }
   | { type: "rules"; group: GroupSummary }
   | { type: "media" }
+  | { type: "reports" }
+  | { type: "report_message"; message: MessageSummary }
   | { type: "ban_member"; member: MemberSummary }
   | { type: "leave_group"; group: GroupSummary }
   | { type: "delete_group"; group: GroupSummary }
@@ -69,6 +74,25 @@ type Dialog =
 
 type PersonSummary = Pick<MemberSummary, "public_key" | "username" | "bio" | "avatar" | "accepts_direct_messages">;
 type SidebarMode = "groups" | "directs";
+const DEFAULT_ACCENT_COLOR = "#7758ED";
+const ACCENT_PRESETS = ["#7758ED", "#E84D8A", "#F06A3C", "#E0A82E", "#43B581", "#24A6A6", "#4D82F0", "#A45EE5"];
+
+function accentStyle(value?: string | null): CSSProperties {
+  const accent = /^#[0-9a-f]{6}$/i.test(value ?? "") ? value!.toUpperCase() : DEFAULT_ACCENT_COLOR;
+  const red = Number.parseInt(accent.slice(1, 3), 16);
+  const green = Number.parseInt(accent.slice(3, 5), 16);
+  const blue = Number.parseInt(accent.slice(5, 7), 16);
+  const contrast = (red * 299 + green * 587 + blue * 114) / 1000 > 158 ? "#171519" : "#FFFFFF";
+  const light = [red, green, blue].map((channel) => Math.round(channel * 0.64 + 255 * 0.36));
+  const dark = [red, green, blue].map((channel) => Math.round(channel * 0.78));
+  return {
+    "--accent": accent,
+    "--accent-rgb": `${red}, ${green}, ${blue}`,
+    "--accent-contrast": contrast,
+    "--accent-light": `rgb(${light.join(", ")})`,
+    "--accent-dark": `rgb(${dark.join(", ")})`,
+  } as CSSProperties;
+}
 
 function NoiseMark({ size, className }: { size: number; className?: string }) {
   return (
@@ -83,8 +107,8 @@ function NoiseMark({ size, className }: { size: number; className?: string }) {
     >
       <defs>
         <linearGradient id="noise-mark-gradient" x1="214" y1="512" x2="810" y2="512" gradientUnits="userSpaceOnUse">
-          <stop stopColor="#9B82FF" />
-          <stop offset="1" stopColor="#6E4FE8" />
+          <stop stopColor="var(--accent-light)" />
+          <stop offset="1" stopColor="var(--accent-dark)" />
         </linearGradient>
       </defs>
       <path
@@ -142,7 +166,39 @@ function CopyButton({
 }
 
 const avatarCache = new Map<string, string>();
+const profileImageRequests = new Map<string, Promise<string>>();
+let profileImageCacheGeneration = 0;
 const mediaCache = new Map<string, string>();
+
+function clearProfileImageMemoryCache() {
+  profileImageCacheGeneration += 1;
+  avatarCache.clear();
+  profileImageRequests.clear();
+}
+
+function loadProfileImageSource(image: ProfileImage) {
+  const cached = avatarCache.get(image.blob_id);
+  if (cached) return Promise.resolve(cached);
+  const pending = profileImageRequests.get(image.blob_id);
+  if (pending) return pending;
+
+  const generation = profileImageCacheGeneration;
+  let request: Promise<string>;
+  request = noise<AvatarData>({ action: "fetch_avatar", image, relays })
+    .then((data) => {
+      if (!data) throw new Error("the image could not be loaded");
+      const source = `data:${data.mime_type};base64,${data.data_base64}`;
+      if (generation === profileImageCacheGeneration) avatarCache.set(image.blob_id, source);
+      return source;
+    })
+    .finally(() => {
+      if (profileImageRequests.get(image.blob_id) === request) {
+        profileImageRequests.delete(image.blob_id);
+      }
+    });
+  profileImageRequests.set(image.blob_id, request);
+  return request;
+}
 
 type PendingMedia = {
   name: string;
@@ -219,6 +275,8 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const updater = useAutoUpdater();
   const refreshGeneration = useRef(0);
+  const groupConversationCache = useRef(new Map<string, Conversation>());
+  const directConversationCache = useRef(new Map<string, DirectConversation>());
   const [groupMenu, setGroupMenu] = useState<{
     group: GroupSummary;
     x: number;
@@ -229,24 +287,66 @@ export default function App() {
   const refresh = useCallback(async () => {
     const generation = ++refreshGeneration.current;
     const local = await noise<LocalSummary>({ action: "status" });
-    let nextConversation: Conversation | null = null;
-    let nextDirectConversation: DirectConversation | null = null;
-    let reconciled = local;
-    if (local) {
-      reconciled = await noise<LocalSummary>({ action: "sync_directs", relays });
-    }
-    if (sidebarMode === "groups" && reconciled?.groups.some((group) => group.is_active)) {
-      nextConversation = await noise<Conversation>({ action: "conversation", relays });
-      reconciled = await noise<LocalSummary>({ action: "status" });
-    } else if (sidebarMode === "directs" && reconciled?.directs.some((direct) => direct.is_active)) {
-      nextDirectConversation = await noise<DirectConversation>({ action: "direct_conversation", relays });
-      reconciled = await noise<LocalSummary>({ action: "status" });
-    }
     if (generation !== refreshGeneration.current) return;
+    setSummary(local);
+    if (!local) return;
+
+    if (sidebarMode === "groups") {
+      const activeGroup = local.groups.find((group) => group.is_active);
+      if (!activeGroup) {
+        setConversation(null);
+        return;
+      }
+      const cached = groupConversationCache.current.get(activeGroup.group_id);
+      if (cached) setConversation(cached);
+      const nextConversation = await noise<Conversation>({ action: "conversation", relays });
+      const reconciled = await noise<LocalSummary>({ action: "status" });
+      if (generation !== refreshGeneration.current) return;
+      if (nextConversation) {
+        groupConversationCache.current.set(nextConversation.group.group_id, nextConversation);
+        setConversation(nextConversation);
+      }
+      setSummary(reconciled);
+      return;
+    }
+
+    const activeDirect = local.directs.find((direct) => direct.is_active);
+    if (!activeDirect) {
+      const reconciled = await noise<LocalSummary>({ action: "sync_directs", relays });
+      if (generation === refreshGeneration.current) {
+        setSummary(reconciled);
+        setDirectConversation(null);
+      }
+      return;
+    }
+    const cached = directConversationCache.current.get(activeDirect.public_key);
+    if (cached) setDirectConversation(cached);
+    const nextDirectConversation = await noise<DirectConversation>({ action: "direct_conversation", relays });
+    const reconciled = await noise<LocalSummary>({ action: "status" });
+    if (generation !== refreshGeneration.current) return;
+    if (nextDirectConversation) {
+      directConversationCache.current.set(nextDirectConversation.contact.public_key, nextDirectConversation);
+      setDirectConversation(nextDirectConversation);
+    }
     setSummary(reconciled);
-    setConversation(nextConversation);
-    setDirectConversation(nextDirectConversation);
   }, [sidebarMode]);
+
+  const syncDirectSummary = useCallback(async () => {
+    const reconciled = await noise<LocalSummary>({ action: "sync_directs", relays });
+    if (reconciled) {
+      setSummary((current) => current ? {
+        ...current,
+        directs: reconciled.directs,
+        known_people: reconciled.known_people,
+      } : reconciled);
+    }
+  }, []);
+  const sidebarModeRef = useRef(sidebarMode);
+  const refreshRef = useRef(refresh);
+  useEffect(() => {
+    sidebarModeRef.current = sidebarMode;
+    refreshRef.current = refresh;
+  }, [refresh, sidebarMode]);
 
   useEffect(() => {
     if (!isTauri) {
@@ -258,9 +358,14 @@ export default function App() {
       .finally(() => setLoading(false));
   }, [refresh]);
 
-  const activeGroupId = summary?.groups.find((group) => group.is_active)?.group_id ?? null;
+  const activeGroup = summary?.groups.find((group) => group.is_active) ?? null;
+  const activeGroupId = activeGroup?.group_id ?? null;
+  const activeDirectPublicKey = summary?.directs.find((direct) => direct.is_active)?.public_key ?? null;
+  const activeGroupBackground = sidebarMode === "groups" ? activeGroup?.background ?? null : null;
+  const activeAccentStyle = accentStyle(sidebarMode === "groups" ? activeGroup?.accent_color : null);
+  const appBackgroundSource = useProfileImageSource(activeGroupBackground);
   useEffect(() => {
-    if (!isTauri || !activeGroupId) return;
+    if (!isTauri || sidebarMode !== "groups" || !activeGroupId) return;
     let stopped = false;
     const watch = async () => {
       let revision: number | null = null;
@@ -274,7 +379,7 @@ export default function App() {
           });
           if (stopped || !change) return;
           revision = change.revision;
-          if (initial || change.changed) await refresh();
+          if (!initial && change.changed) await refresh();
         } catch {
           await new Promise((resolve) => window.setTimeout(resolve, 1500));
         }
@@ -284,7 +389,7 @@ export default function App() {
     return () => {
       stopped = true;
     };
-  }, [activeGroupId, refresh]);
+  }, [activeGroupId, refresh, sidebarMode]);
 
   const identityPublicKey = summary?.identity.public_key ?? null;
   useEffect(() => {
@@ -298,7 +403,12 @@ export default function App() {
           const change: GroupWatch | null = await noise<GroupWatch>({ action: "watch_direct", since: revision, relays });
           if (stopped || !change) return;
           revision = change.revision;
-          if (initial || change.changed) await refresh();
+          if (initial) {
+            if (sidebarModeRef.current === "groups") await syncDirectSummary();
+          } else if (change.changed) {
+            if (sidebarModeRef.current === "directs") await refreshRef.current();
+            else await syncDirectSummary();
+          }
         } catch {
           await new Promise((resolve) => window.setTimeout(resolve, 1500));
         }
@@ -306,7 +416,7 @@ export default function App() {
     };
     void watch();
     return () => { stopped = true; };
-  }, [identityPublicKey, refresh]);
+  }, [identityPublicKey, syncDirectSummary]);
 
   async function perform(operation: () => Promise<void>, syncAccount = true) {
     if (busy) return false;
@@ -321,6 +431,68 @@ export default function App() {
       return false;
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function selectGroup(group: GroupSummary) {
+    if (group.is_active) return;
+    const generation = ++refreshGeneration.current;
+    setError(null);
+    const cached = groupConversationCache.current.get(group.group_id);
+    if (cached) setConversation(cached);
+    setSummary((current) => current ? {
+      ...current,
+      groups: current.groups.map((candidate) => ({
+        ...candidate,
+        is_active: candidate.group_id === group.group_id,
+      })),
+    } : current);
+
+    try {
+      const local = await noise<LocalSummary>({ action: "select_group", group_id: group.group_id });
+      if (generation !== refreshGeneration.current) return;
+      setSummary(local);
+      const fresh = await noise<Conversation>({ action: "conversation", relays });
+      const reconciled = await noise<LocalSummary>({ action: "status" });
+      if (generation !== refreshGeneration.current) return;
+      if (fresh) {
+        groupConversationCache.current.set(fresh.group.group_id, fresh);
+        setConversation(fresh);
+      }
+      setSummary(reconciled);
+    } catch (cause) {
+      if (generation === refreshGeneration.current) setError(message(cause));
+    }
+  }
+
+  async function selectDirect(direct: DirectSummary) {
+    if (direct.is_active) return;
+    const generation = ++refreshGeneration.current;
+    setError(null);
+    const cached = directConversationCache.current.get(direct.public_key);
+    if (cached) setDirectConversation(cached);
+    setSummary((current) => current ? {
+      ...current,
+      directs: current.directs.map((candidate) => ({
+        ...candidate,
+        is_active: candidate.public_key === direct.public_key,
+      })),
+    } : current);
+
+    try {
+      const local = await noise<LocalSummary>({ action: "select_direct", public_key: direct.public_key });
+      if (generation !== refreshGeneration.current) return;
+      setSummary(local);
+      const fresh = await noise<DirectConversation>({ action: "direct_conversation", relays });
+      const reconciled = await noise<LocalSummary>({ action: "status" });
+      if (generation !== refreshGeneration.current) return;
+      if (fresh) {
+        directConversationCache.current.set(fresh.contact.public_key, fresh);
+        setDirectConversation(fresh);
+      }
+      setSummary(reconciled);
+    } catch (cause) {
+      if (generation === refreshGeneration.current) setError(message(cause));
     }
   }
 
@@ -375,8 +547,14 @@ export default function App() {
     );
   }
 
+  const selectedConversation = conversation?.group.group_id === activeGroupId ? conversation : null;
+  const selectedDirectConversation = directConversation?.contact.public_key === activeDirectPublicKey
+    ? directConversation
+    : null;
+
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${appBackgroundSource ? "group-background-active" : ""}`} style={activeAccentStyle}>
+      {appBackgroundSource && <div className="group-app-background" style={{ backgroundImage: `url(${JSON.stringify(appBackgroundSource)})` }} aria-hidden="true" />}
       <Sidebar
         summary={summary}
         mode={sidebarMode}
@@ -388,105 +566,98 @@ export default function App() {
           setGroupMenu({ group, x, y });
         }}
         onDirectContextMenu={(direct, x, y) => setDirectMenu({ direct, x, y })}
-        onSelect={(group) => {
-          if (group.is_active) return;
-          void perform(async () => {
-            const local = await noise<LocalSummary>({
-              action: "select_group",
-              group_id: group.group_id,
-            });
-            setSummary(local);
-            await refresh();
-          });
-        }}
-        onSelectDirect={(direct) => {
-          if (direct.is_active) return;
-          void perform(async () => {
-            const local = await noise<LocalSummary>({ action: "select_direct", public_key: direct.public_key });
-            setSummary(local);
-            await refresh();
-          });
-        }}
+        onSelect={(group) => void selectGroup(group)}
+        onSelectDirect={(direct) => void selectDirect(direct)}
       />
 
       <main className="conversation-pane">
-        {sidebarMode === "groups" ? conversation ? (
-          <ConversationPanel
-            conversation={conversation}
-            busy={busy}
-            canEditGroup={conversation.group.owner_public_key === summary.identity.public_key}
-            selfPublicKey={summary.identity.public_key}
-            onGroupSettings={() => setDialog({ type: "group", group: conversation.group })}
-            onMedia={() => setDialog({ type: "media" })}
-            onRules={() => setDialog({ type: "rules", group: conversation.group })}
-            onPerson={(person) => setDialog({ type: "person", person })}
-            onMessage={(person) => void startDirect(person)}
-            onDeleteMessage={(messageEventId) =>
-              perform(async () => {
-                await noise({ action: "delete_message", message_event_id: messageEventId, relays });
-                await refresh();
-              })
-            }
-            onSetModerator={(member, enabled) =>
-              perform(async () => {
-                await noise({ action: "set_moderator", member_public_key: member.public_key, enabled, relays });
-                await refresh();
-              })
-            }
-            onBan={(member) => setDialog({ type: "ban_member", member })}
-            onSend={(text, pending, onProgress, replyToMessageId) =>
-              perform(async () => {
-                let attachment: MediaAttachment | null = null;
-                if (pending) {
-                  const chunks: MediaChunk[] = [];
-                  const chunkSize = 1024 * 1024;
-                  for (let offset = 0; offset < pending.file.size; offset += chunkSize) {
-                    const chunk = await noise<MediaChunk>({
-                      action: "upload_media_chunk",
-                      data_base64: await fileBase64(pending.file.slice(offset, offset + chunkSize)),
-                      relays,
-                    });
-                    if (!chunk) throw new Error("relay did not return a media chunk reference");
-                    chunks.push(chunk);
-                    onProgress(Math.min(100, Math.round(((offset + chunk.byte_length) / pending.file.size) * 100)));
+        <section className={`mode-pane ${sidebarMode === "groups" ? "active" : "inactive"}`} aria-hidden={sidebarMode !== "groups"}>
+          {selectedConversation ? (
+            <ConversationPanel
+              key={selectedConversation.group.group_id}
+              conversation={selectedConversation}
+              busy={busy}
+              hasBackground={Boolean(appBackgroundSource)}
+              canEditGroup={selectedConversation.group.owner_public_key === summary.identity.public_key}
+              selfPublicKey={summary.identity.public_key}
+              onGroupSettings={() => setDialog({ type: "group", group: selectedConversation.group })}
+              onReports={() => setDialog({ type: "reports" })}
+              onMedia={() => setDialog({ type: "media" })}
+              onRules={() => setDialog({ type: "rules", group: selectedConversation.group })}
+              onPerson={(person) => setDialog({ type: "person", person })}
+              onMessage={(person) => void startDirect(person)}
+              onDeleteMessage={(messageEventId) =>
+                perform(async () => {
+                  await noise({ action: "delete_message", message_event_id: messageEventId, relays });
+                  await refresh();
+                })
+              }
+              onSetModerator={(member, enabled) =>
+                perform(async () => {
+                  await noise({ action: "set_moderator", member_public_key: member.public_key, enabled, relays });
+                  await refresh();
+                })
+              }
+              onBan={(member) => setDialog({ type: "ban_member", member })}
+              onReport={(message) => setDialog({ type: "report_message", message })}
+              onSend={(text, pending, onProgress, replyToMessageId) =>
+                perform(async () => {
+                  let attachment: MediaAttachment | null = null;
+                  if (pending) {
+                    const chunks: MediaChunk[] = [];
+                    const chunkSize = 1024 * 1024;
+                    for (let offset = 0; offset < pending.file.size; offset += chunkSize) {
+                      const chunk = await noise<MediaChunk>({
+                        action: "upload_media_chunk",
+                        data_base64: await fileBase64(pending.file.slice(offset, offset + chunkSize)),
+                        relays,
+                      });
+                      if (!chunk) throw new Error("relay did not return a media chunk reference");
+                      chunks.push(chunk);
+                      onProgress(Math.min(100, Math.round(((offset + chunk.byte_length) / pending.file.size) * 100)));
+                    }
+                    attachment = {
+                      file_name: pending.name,
+                      mime_type: pending.mimeType,
+                      byte_length: pending.byteLength,
+                      chunks,
+                    };
                   }
-                  attachment = {
-                    file_name: pending.name,
-                    mime_type: pending.mimeType,
-                    byte_length: pending.byteLength,
-                    chunks,
-                  };
-                }
-                await noise<null>({
-                  action: "say",
-                  text,
-                  attachment,
-                  reply_to_message_id: replyToMessageId,
-                  relays,
-                });
+                  await noise<null>({
+                    action: "say",
+                    text,
+                    attachment,
+                    reply_to_message_id: replyToMessageId,
+                    relays,
+                  });
+                  await refresh();
+                })
+              }
+            />
+          ) : activeGroupId ? <Loading /> : (
+            <EmptyGroup
+              onMake={() => setDialog({ type: "make" })}
+              onJoin={() => setDialog({ type: "join" })}
+            />
+          )}
+        </section>
+        <section className={`mode-pane ${sidebarMode === "directs" ? "active" : "inactive"}`} aria-hidden={sidebarMode !== "directs"}>
+          {selectedDirectConversation ? (
+            <DirectConversationPanel
+              key={selectedDirectConversation.contact.public_key}
+              conversation={selectedDirectConversation}
+              busy={busy}
+              selfPublicKey={summary.identity.public_key}
+              onPerson={(person) => setDialog({ type: "person", person })}
+              onDelete={() => setDialog({ type: "delete_direct", direct: selectedDirectConversation.contact })}
+              onSend={(text, pending, onProgress, replyToMessageId) => perform(async () => {
+                const attachment = await uploadPendingMedia(pending, "upload_direct_media_chunk", onProgress);
+                await noise({ action: "say_direct", text, attachment, reply_to_message_id: replyToMessageId, relays });
                 await refresh();
-              })
-            }
-          />
-        ) : (
-          <EmptyGroup
-            onMake={() => setDialog({ type: "make" })}
-            onJoin={() => setDialog({ type: "join" })}
-          />
-        ) : directConversation ? (
-          <DirectConversationPanel
-            conversation={directConversation}
-            busy={busy}
-            selfPublicKey={summary.identity.public_key}
-            onPerson={(person) => setDialog({ type: "person", person })}
-            onDelete={() => setDialog({ type: "delete_direct", direct: directConversation.contact })}
-            onSend={(text, pending, onProgress, replyToMessageId) => perform(async () => {
-              const attachment = await uploadPendingMedia(pending, "upload_direct_media_chunk", onProgress);
-              await noise({ action: "say_direct", text, attachment, reply_to_message_id: replyToMessageId, relays });
-              await refresh();
-            })}
-          />
-        ) : <EmptyDirects />}
+              })}
+            />
+          ) : activeDirectPublicKey ? <Loading /> : <EmptyDirects />}
+        </section>
       </main>
 
       {dialog?.type === "make" && (
@@ -579,16 +750,20 @@ export default function App() {
             const updatedGroup = local.groups.find((group) => group.group_id === dialog.group.group_id);
             if (updatedGroup) setDialog({ type: "group", group: updatedGroup });
           })}
-          onSave={(name, description, avatar, removeAvatar, membersCanSendMessages, membersCanSendMedia) =>
+          onSave={(name, description, accentColor, avatar, removeAvatar, background, removeBackground, membersCanSendMessages, membersCanSendMedia) =>
             perform(async () => {
               const local = await noise<LocalSummary>({
                 action: "update_group_profile",
                 name,
                 description,
                 rules: dialog.group.rules,
+                accent_color: accentColor,
                 avatar_data_base64: avatar,
                 avatar_mime_type: avatar ? "image/jpeg" : null,
                 remove_avatar: removeAvatar,
+                background_data_base64: background,
+                background_mime_type: background ? "image/jpeg" : null,
+                remove_background: removeBackground,
                 members_can_send_messages: membersCanSendMessages,
                 members_can_send_media: membersCanSendMedia,
                 relays,
@@ -632,6 +807,33 @@ export default function App() {
           onClose={() => setDialog(null)}
         />
       )}
+      {dialog?.type === "report_message" && (
+        <ReportMessageDialog
+          message={dialog.message}
+          busy={busy}
+          onClose={() => setDialog(null)}
+          onReport={(reason) => perform(async () => {
+            await noise({ action: "report_message", message_event_id: dialog.message.event_id, reason, relays });
+            await refresh();
+            setDialog(null);
+          })}
+        />
+      )}
+      {dialog?.type === "reports" && conversation && (
+        <ReportsDialog
+          reports={conversation.reports}
+          busy={busy}
+          onClose={() => setDialog(null)}
+          onDismiss={(report) => perform(async () => {
+            await noise({ action: "resolve_report", report_event_id: report.report_event_id, relays });
+            await refresh();
+          })}
+          onDelete={(report) => perform(async () => {
+            await noise({ action: "delete_message", message_event_id: report.message.event_id, relays });
+            await refresh();
+          })}
+        />
+      )}
       {dialog?.type === "ban_member" && (
         <BanMemberDialog
           member={dialog.member}
@@ -661,8 +863,9 @@ export default function App() {
               const local = await noise<LocalSummary>({ action: "leave", relays });
               setSummary(local);
               setConversation(null);
+              groupConversationCache.current.delete(dialog.group.group_id);
               mediaCache.clear();
-              avatarCache.clear();
+              clearProfileImageMemoryCache();
               await refresh();
               setDialog(null);
             })
@@ -682,7 +885,9 @@ export default function App() {
                 relays,
               });
               setSummary(local);
-              avatarCache.clear();
+              groupConversationCache.current.delete(dialog.group.group_id);
+              mediaCache.clear();
+              clearProfileImageMemoryCache();
               await refresh();
               setDialog(null);
             })
@@ -698,6 +903,7 @@ export default function App() {
             const local = await noise<LocalSummary>({ action: "delete_direct", public_key: dialog.direct.public_key, for_both: forBoth, relays });
             setSummary(local);
             setDirectConversation(null);
+            directConversationCache.current.delete(dialog.direct.public_key);
             mediaCache.clear();
             await refresh();
             setDialog(null);
@@ -718,7 +924,9 @@ export default function App() {
             });
             refreshGeneration.current += 1;
             mediaCache.clear();
-            avatarCache.clear();
+            clearProfileImageMemoryCache();
+            groupConversationCache.current.clear();
+            directConversationCache.current.clear();
             setConversation(null);
             setDirectConversation(null);
             setDialog(null);
@@ -734,7 +942,9 @@ export default function App() {
             await noise({ action: "logout" });
             refreshGeneration.current += 1;
             mediaCache.clear();
-            avatarCache.clear();
+            clearProfileImageMemoryCache();
+            groupConversationCache.current.clear();
+            directConversationCache.current.clear();
             setConversation(null);
             setDirectConversation(null);
             setDialog(null);
@@ -796,13 +1006,14 @@ function Sidebar({
   onSelect: (group: GroupSummary) => void;
   onSelectDirect: (direct: DirectSummary) => void;
 }) {
+  const hasUnreadDirects = summary.directs.some((direct) => direct.has_unread);
   return (
     <aside className="sidebar">
       <div className="sidebar-drag" data-tauri-drag-region />
       <div className="brand"><NoiseMark size={22} /><strong>noise</strong></div>
       <div className="sidebar-tabs">
         <button className={mode === "groups" ? "active" : ""} onClick={() => onMode("groups")}><UsersRound size={14} /> groups</button>
-        <button className={mode === "directs" ? "active" : ""} onClick={() => onMode("directs")}><MessagesSquare size={14} /> dms</button>
+        <button className={mode === "directs" ? "active" : ""} onClick={() => onMode("directs")}><MessagesSquare size={14} /> dms{hasUnreadDirects && <span className="tab-unread-dot" aria-label="unread direct messages" />}</button>
       </div>
       {mode === "groups" && <div className="sidebar-actions">
         <button className="wide-button" onClick={onMake}><Plus size={15} /> create group</button>
@@ -821,7 +1032,6 @@ function Sidebar({
           >
             <Avatar name={group.name} image={group.avatar} size={27} square />
             <span>{group.name}</span>
-            {group.is_active && <i />}
           </button>
         )) : summary.directs.map((direct) => (
           <button
@@ -832,7 +1042,7 @@ function Sidebar({
           >
             <Avatar name={direct.username} image={direct.avatar} size={27} />
             <span>@{direct.username}</span>
-            {direct.is_active && <i />}
+            {direct.has_unread && <span className="direct-unread-dot" aria-label={`unread messages from ${direct.username}`} />}
           </button>
         ))}
         {mode === "directs" && summary.directs.length === 0 && <div className="empty-direct-list">message someone from a shared group</div>}
@@ -904,7 +1114,7 @@ function DirectContextMenu({ x, y, onClose, onDelete }: { x: number; y: number; 
   return <div className="group-context-menu" style={{ left: Math.min(x, window.innerWidth - 190), top: Math.min(y, window.innerHeight - 58) }} onMouseDown={(event) => event.stopPropagation()}><button onClick={onDelete}><Trash2 size={14} /> delete conversation</button></div>;
 }
 
-function MessageContextMenu({ x, y, busy, onClose, onReply, onDelete, onBan }: { x: number; y: number; busy: boolean; onClose: () => void; onReply: () => void; onDelete?: () => void; onBan?: () => void }) {
+function MessageContextMenu({ x, y, busy, onClose, onReply, onReport, onDelete, onBan }: { x: number; y: number; busy: boolean; onClose: () => void; onReply: () => void; onReport?: () => void; onDelete?: () => void; onBan?: () => void }) {
   useEffect(() => {
     const close = () => onClose();
     const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
@@ -917,8 +1127,8 @@ function MessageContextMenu({ x, y, busy, onClose, onReply, onDelete, onBan }: {
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [onClose]);
-  const menuHeight = 50 + (onDelete ? 42 : 0) + (onBan ? 42 : 0);
-  return <div className="member-context-menu" style={{ left: Math.min(x, window.innerWidth - 200), top: Math.min(y, window.innerHeight - menuHeight) }} onMouseDown={(event) => event.stopPropagation()}><button disabled={busy} onClick={onReply}><Reply size={14} /> reply</button>{onDelete && <button className="danger" disabled={busy} onClick={onDelete}><Trash2 size={14} /> delete message</button>}{onBan && <button className="danger" disabled={busy} onClick={onBan}><UserRoundX size={14} /> ban member</button>}</div>;
+  const menuHeight = 50 + (onReport ? 42 : 0) + (onDelete ? 42 : 0) + (onBan ? 42 : 0);
+  return <div className="member-context-menu" style={{ left: Math.min(x, window.innerWidth - 200), top: Math.min(y, window.innerHeight - menuHeight) }} onMouseDown={(event) => event.stopPropagation()}><button disabled={busy} onClick={onReply}><Reply size={14} /> reply</button>{onReport && <button className="report-action" disabled={busy} onClick={onReport}><TriangleAlert size={14} /> report message</button>}{onDelete && <button className="danger" disabled={busy} onClick={onDelete}><Trash2 size={14} /> delete message</button>}{onBan && <button className="danger" disabled={busy} onClick={onBan}><UserRoundX size={14} /> ban member</button>}</div>;
 }
 
 function MemberContextMenu({ member, x, y, canDesignate, canBan, onClose, onMessage, onSetModerator, onBan }: { member: MemberSummary; x: number; y: number; canDesignate: boolean; canBan: boolean; onClose: () => void; onMessage: () => void; onSetModerator: (enabled: boolean) => void; onBan: () => void }) {
@@ -945,12 +1155,45 @@ function MemberContextMenu({ member, x, y, canDesignate, canBan, onClose, onMess
   );
 }
 
+function useMessageListPosition(conversationKey: string, messageCount: number) {
+  const ref = useRef<HTMLDivElement>(null);
+  const positionedConversation = useRef<string | null>(null);
+  const previousMessageCount = useRef(messageCount);
+  const shouldFollowNewMessages = useRef(true);
+
+  useLayoutEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+    if (positionedConversation.current !== conversationKey) {
+      element.scrollTop = element.scrollHeight;
+      positionedConversation.current = conversationKey;
+      previousMessageCount.current = messageCount;
+      shouldFollowNewMessages.current = true;
+      return;
+    }
+    if (messageCount > previousMessageCount.current && shouldFollowNewMessages.current) {
+      element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
+    }
+    previousMessageCount.current = messageCount;
+  }, [conversationKey, messageCount]);
+
+  const onScroll = useCallback(() => {
+    const element = ref.current;
+    if (!element) return;
+    shouldFollowNewMessages.current = element.scrollHeight - element.scrollTop - element.clientHeight < 96;
+  }, []);
+
+  return { ref, onScroll };
+}
+
 function ConversationPanel({
   conversation,
   busy,
+  hasBackground,
   canEditGroup,
   selfPublicKey,
   onGroupSettings,
+  onReports,
   onMedia,
   onRules,
   onPerson,
@@ -958,13 +1201,16 @@ function ConversationPanel({
   onDeleteMessage,
   onSetModerator,
   onBan,
+  onReport,
   onSend,
 }: {
   conversation: Conversation;
   busy: boolean;
+  hasBackground: boolean;
   canEditGroup: boolean;
   selfPublicKey: string;
   onGroupSettings: () => void;
+  onReports: () => void;
   onMedia: () => void;
   onRules: () => void;
   onPerson: (person: PersonSummary) => void;
@@ -972,6 +1218,7 @@ function ConversationPanel({
   onDeleteMessage: (messageEventId: string) => Promise<boolean>;
   onSetModerator: (member: MemberSummary, enabled: boolean) => Promise<boolean>;
   onBan: (member: MemberSummary) => void;
+  onReport: (message: MessageSummary) => void;
   onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null) => Promise<boolean>;
 }) {
   const [draft, setDraft] = useState("");
@@ -983,12 +1230,15 @@ function ConversationPanel({
   const [replyingTo, setReplyingTo] = useState<MessageSummary | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
-  const bottom = useRef<HTMLDivElement>(null);
+  const messageList = useMessageListPosition(conversation.group.group_id, conversation.messages.length);
   const selfMember = conversation.members.find((member) => member.public_key === selfPublicKey);
   const canModerate = canEditGroup || selfMember?.is_moderator === true;
   const canSendMessages = canModerate || conversation.group.members_can_send_messages;
   const canSendMedia = canModerate || conversation.group.members_can_send_media;
-  useEffect(() => bottom.current?.scrollIntoView(), [conversation.messages.length]);
+  const sortedMembers = [...conversation.members].sort((left, right) => {
+    const rank = (member: MemberSummary) => member.public_key === conversation.group.owner_public_key ? 0 : member.is_moderator ? 1 : 2;
+    return rank(left) - rank(right);
+  });
   const attachmentPreview = attachment?.previewUrl;
   useEffect(() => () => {
     if (attachmentPreview) URL.revokeObjectURL(attachmentPreview);
@@ -1027,25 +1277,25 @@ function ConversationPanel({
     }
   }
   return (
-    <div className="conversation">
+    <div className={`conversation group-conversation ${hasBackground ? "has-background" : ""}`}>
       <header className="chat-header" data-tauri-drag-region>
-        <div className="group-identity static">
+        <div className="group-identity static" data-tauri-drag-region>
           <Avatar name={conversation.group.name} image={conversation.group.avatar} size={36} square />
           <span><strong>{conversation.group.name}</strong><small>{conversation.group.description || "group"}</small></span>
         </div>
         <div className="chat-header-actions">
+          {canModerate && <button className={`icon-button media-button reports-button ${conversation.reports.length ? "has-reports" : ""}`} onClick={onReports} aria-label="moderation reports" title="moderation reports"><TriangleAlert size={17} />{conversation.reports.length > 0 && <i />}</button>}
           {canEditGroup && <button className="icon-button media-button" onClick={onGroupSettings} aria-label="group settings" title="group settings"><Settings2 size={17} /></button>}
           <button className="icon-button media-button" onClick={onMedia} aria-label="group media" title="group media"><Images size={17} /></button>
           <button className="rules-button" onClick={onRules}>Rules</button>
           {busy && <LoaderCircle className="spinner" size={14} />}
         </div>
       </header>
-      <div className="messages">
+      <div className="messages" ref={messageList.ref} onScroll={messageList.onScroll}>
         {conversation.messages.length === 0 && <div className="quiet">the group is quiet</div>}
         {conversation.messages.map((item) => (
           <MessageRow key={item.event_id} message={item} own={item.author_public_key === selfPublicKey} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={(event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} />
         ))}
-        <div ref={bottom} />
       </div>
       {selfMember && (canSendMessages || canSendMedia) ? <div className="composer">
         {replyingTo && <ReplyTarget message={replyingTo} onClose={() => setReplyingTo(null)} />}
@@ -1071,11 +1321,11 @@ function ConversationPanel({
       </div> : selfMember ? <div className="membership-revoked"><ShieldOff size={16} /> only moderators can post right now</div> : <div className="membership-revoked"><UserRoundX size={16} /> you no longer have access to this group</div>}
       <aside className="member-sidebar">
         <div className="member-sidebar-heading">
-          <strong>signals</strong>
+          <strong>members</strong>
           <span>{conversation.members.length}</span>
         </div>
         <div className="member-sidebar-list">
-          {conversation.members.map((member) => (
+          {sortedMembers.map((member) => (
             <div key={member.public_key} className="member-sidebar-row">
               <button className="member-sidebar-main" onClick={() => onPerson(member)}>
                 <Avatar name={member.username} image={member.avatar} size={30} />
@@ -1109,6 +1359,7 @@ function ConversationPanel({
         busy={busy}
         onClose={() => setMessageMenu(null)}
         onReply={() => { setReplyingTo(messageMenu.message); setMessageMenu(null); window.setTimeout(() => composerInput.current?.focus(), 0); }}
+        onReport={!canModerate && messageMenu.message.author_public_key !== selfPublicKey && !conversation.reported_message_event_ids.includes(messageMenu.message.event_id) ? () => { onReport(messageMenu.message); setMessageMenu(null); } : undefined}
         onDelete={(canModerate || messageMenu.message.author_public_key === selfPublicKey) ? () => { void onDeleteMessage(messageMenu.message.event_id); setMessageMenu(null); } : undefined}
         onBan={(() => {
           const member = conversation.members.find((candidate) => candidate.public_key === messageMenu.message.author_public_key);
@@ -1132,8 +1383,7 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, onPerson, 
   const [replyingTo, setReplyingTo] = useState<MessageSummary | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
-  const bottom = useRef<HTMLDivElement>(null);
-  useEffect(() => bottom.current?.scrollIntoView(), [conversation.messages.length]);
+  const messageList = useMessageListPosition(conversation.contact.public_key, conversation.messages.length);
   const attachmentPreview = attachment?.previewUrl;
   useEffect(() => () => { if (attachmentPreview) URL.revokeObjectURL(attachmentPreview); }, [attachmentPreview]);
   async function chooseMedia(file?: File) {
@@ -1167,16 +1417,15 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, onPerson, 
   return (
     <div className="conversation direct-conversation">
       <header className="chat-header" data-tauri-drag-region>
-        <button className="group-identity" onClick={() => onPerson(person)}>
+        <div className="group-identity static" data-tauri-drag-region>
           <Avatar name={conversation.contact.username} image={conversation.contact.avatar} size={36} />
           <span><strong>@{conversation.contact.username}</strong><small>{conversation.contact.bio || "encrypted direct message"}</small></span>
-        </button>
-        <div className="chat-header-actions"><button className="icon-button media-button" onClick={onDelete} aria-label="conversation options" title="conversation options"><MoreHorizontal size={17} /></button>{busy && <LoaderCircle className="spinner" size={14} />}</div>
+        </div>
+        <div className="chat-header-actions"><button className="icon-button media-button delete-direct-button" onClick={onDelete} aria-label="delete conversation" title="delete conversation"><Trash2 size={16} /></button>{busy && <LoaderCircle className="spinner" size={14} />}</div>
       </header>
-      <div className="messages">
+      <div className="messages" ref={messageList.ref} onScroll={messageList.onScroll}>
         {conversation.messages.length === 0 && <div className="quiet">start the conversation</div>}
         {conversation.messages.map((item) => <MessageRow key={item.event_id} message={item} own={item.author_public_key === selfPublicKey} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={(event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} mediaScopeId={conversation.media_scope_id} />)}
-        <div ref={bottom} />
       </div>
       {conversation.contact.accepts_direct_messages ? <div className="composer">
         {replyingTo && <ReplyTarget message={replyingTo} onClose={() => setReplyingTo(null)} />}
@@ -1187,6 +1436,15 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, onPerson, 
         <textarea ref={composerInput} rows={1} value={draft} placeholder={`message @${conversation.contact.username}`} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); } }} />
         <button className="send-button" disabled={(!draft.trim() && !attachment) || busy} onClick={() => void submit()}><ArrowUp size={17} /></button>
       </div> : <div className="membership-revoked"><MessageCircle size={16} /> @{conversation.contact.username} isn’t accepting DMs</div>}
+      <aside className="member-sidebar direct-profile-sidebar">
+        <button className="direct-profile-identity" onClick={() => onPerson(person)}>
+          <Avatar name={conversation.contact.username} image={conversation.contact.avatar} size={72} />
+          <strong>@{conversation.contact.username}</strong>
+        </button>
+        <div className="noise-signature"><small>Noise Signature</small><strong>{noiseSignature(conversation.contact.public_key)}</strong></div>
+        <p>{conversation.contact.bio || "no bio yet"}</p>
+        <span className={`direct-profile-status ${conversation.contact.accepts_direct_messages ? "open" : "closed"}`}><i />{conversation.contact.accepts_direct_messages ? "accepting DMs" : "DMs closed"}</span>
+      </aside>
       {messageMenu && <MessageContextMenu x={messageMenu.x} y={messageMenu.y} busy={busy} onClose={() => setMessageMenu(null)} onReply={() => { setReplyingTo(messageMenu.message); setMessageMenu(null); window.setTimeout(() => composerInput.current?.focus(), 0); }} />}
     </div>
   );
@@ -1317,7 +1575,7 @@ function GalleryTile({ message, onOpen }: { message: MediaMessage; onOpen: () =>
   );
 }
 
-function Avatar({ name, image, size, square = false }: { name: string; image: ProfileImage | null; size: number; square?: boolean }) {
+function useProfileImageSource(image: ProfileImage | null) {
   const [loaded, setLoaded] = useState<{ blobId: string; source: string } | null>(() => {
     if (!image) return null;
     const source = avatarCache.get(image.blob_id);
@@ -1341,14 +1599,18 @@ function Avatar({ name, image, size, square = false }: { name: string; image: Pr
     }
     setLoaded(null);
     let active = true;
-    void noise<AvatarData>({ action: "fetch_avatar", image: target, relays }).then((data) => {
-      if (!data || !active) return;
-      const value = `data:${data.mime_type};base64,${data.data_base64}`;
-      avatarCache.set(target.blob_id, value);
-      setLoaded({ blobId: target.blob_id, source: value });
-    }).catch(() => undefined);
+    void loadProfileImageSource(target)
+      .then((source) => {
+        if (active) setLoaded({ blobId: target.blob_id, source });
+      })
+      .catch(() => undefined);
     return () => { active = false; };
-  }, [image]);
+  }, [image?.blob_id, image?.key_base64, image?.mime_type, image?.byte_length]);
+  return source;
+}
+
+function Avatar({ name, image, size, square = false }: { name: string; image: ProfileImage | null; size: number; square?: boolean }) {
+  const source = useProfileImageSource(image);
   return (
     <span className={`avatar ${square ? "square" : ""}`} style={{ width: size, height: size }}>
       {source ? <img src={source} alt="" /> : <b>{name.slice(0, 1).toUpperCase()}</b>}
@@ -1459,33 +1721,61 @@ function SettingsDialog({ profile, busy, onClose, onSave, onLogout, onDeleteAcco
   );
 }
 
-function GroupSettingsDialog({ group, bannedMembers, busy, onClose, onSave, onUnban, onRotateFrequency }: { group: GroupSummary; bannedMembers: BannedMemberSummary[]; busy: boolean; onClose: () => void; onSave: (name: string, description: string, avatar: string | null, remove: boolean, membersCanSendMessages: boolean, membersCanSendMedia: boolean) => Promise<boolean>; onUnban: (member: BannedMemberSummary) => Promise<boolean>; onRotateFrequency: (revokeOnly: boolean) => Promise<boolean> }) {
-  const [tab, setTab] = useState<"identity" | "general" | "banned">("identity");
+function GroupSettingsDialog({ group, bannedMembers, busy, onClose, onSave, onUnban, onRotateFrequency }: { group: GroupSummary; bannedMembers: BannedMemberSummary[]; busy: boolean; onClose: () => void; onSave: (name: string, description: string, accentColor: string, avatar: string | null, removeAvatar: boolean, background: string | null, removeBackground: boolean, membersCanSendMessages: boolean, membersCanSendMedia: boolean) => Promise<boolean>; onUnban: (member: BannedMemberSummary) => Promise<boolean>; onRotateFrequency: (revokeOnly: boolean) => Promise<boolean> }) {
+  const [tab, setTab] = useState<"identity" | "appearance" | "general" | "banned">("identity");
   const [revokeArmed, setRevokeArmed] = useState(false);
   const [name, setName] = useState(group.name);
   const [description, setDescription] = useState(group.description);
+  const [accentColor, setAccentColor] = useState(group.accent_color || DEFAULT_ACCENT_COLOR);
   const [membersCanSendMessages, setMembersCanSendMessages] = useState(group.members_can_send_messages);
   const [membersCanSendMedia, setMembersCanSendMedia] = useState(group.members_can_send_media);
   const image = useImageSelection();
+  const background = useBackgroundSelection();
+  const hasGroupIcon = Boolean(image.preview || (!image.removed && group.avatar));
   const settingsChanged = name.trim() !== group.name
     || description !== group.description
+    || accentColor !== group.accent_color
     || membersCanSendMessages !== group.members_can_send_messages
     || membersCanSendMedia !== group.members_can_send_media
     || image.base64 !== null
-    || image.removed;
+    || image.removed
+    || background.base64 !== null
+    || background.removed;
   return (
-    <Modal onClose={onClose}>
+    <Modal onClose={onClose} className="group-settings-modal">
       <DialogHeading icon={<Settings2 />} title="group settings" detail={group.name} />
-      <div className="group-settings-tabs" role="tablist" aria-label="group settings sections">
+      <div className="group-settings-tabs group-tabs" role="tablist" aria-label="group settings sections">
         <button className={tab === "identity" ? "active" : ""} role="tab" aria-selected={tab === "identity"} onClick={() => setTab("identity")}>Identity</button>
+        <button className={tab === "appearance" ? "active" : ""} role="tab" aria-selected={tab === "appearance"} onClick={() => setTab("appearance")}>Appearance</button>
         <button className={tab === "general" ? "active" : ""} role="tab" aria-selected={tab === "general"} onClick={() => setTab("general")}>General</button>
         <button className={tab === "banned" ? "active" : ""} role="tab" aria-selected={tab === "banned"} onClick={() => setTab("banned")}>Banned{bannedMembers.length > 0 && <i>{bannedMembers.length}</i>}</button>
       </div>
       <div className="group-settings-panel" role="tabpanel">
         {tab === "identity" && <div className="group-settings-identity">
-          <div className="identity-editor"><ImagePicker name={group.name} existing={group.avatar} selection={image} square /><small>group identity</small></div>
+          <div className="group-identity-images">
+            <div className="identity-editor">
+              <div className="identity-image-control">
+                <ImagePicker name={group.name} existing={group.avatar} selection={image} square />
+                {hasGroupIcon && <button className="identity-image-remove" disabled={busy} onClick={image.remove} aria-label="remove group icon" title="remove group icon"><X size={11} /></button>}
+              </div>
+              <small>group icon</small>
+            </div>
+          </div>
           <LabeledArea label="name"><input value={name} onChange={(event) => setName(event.target.value)} /></LabeledArea>
           <LabeledArea label="description" count={`${description.length}/200`}><textarea value={description} onChange={(event) => setDescription(event.target.value)} /></LabeledArea>
+        </div>}
+        {tab === "appearance" && <div className="group-settings-appearance">
+          <BackgroundPicker existing={group.background} selection={background} disabled={busy} />
+          <div className="group-accent-setting">
+            <div className="group-accent-heading"><span><strong>accent color</strong><small>group-wide theme</small></span><code>{accentColor}</code></div>
+            <div className="accent-color-controls">
+              {ACCENT_PRESETS.map((color) => <button key={color} type="button" className={accentColor === color ? "selected" : ""} style={{ backgroundColor: color }} aria-label={`use accent ${color}`} aria-pressed={accentColor === color} onClick={() => setAccentColor(color)} />)}
+              <label className="custom-accent-color" title="choose a custom color" style={{ backgroundColor: accentColor }}>
+                <input type="color" value={accentColor} onChange={(event) => setAccentColor(event.target.value.toUpperCase())} />
+                <span>+</span>
+              </label>
+            </div>
+          </div>
         </div>}
         {tab === "general" && <section className="settings-section group-general-settings">
           <h3>what can members do?</h3>
@@ -1509,8 +1799,7 @@ function GroupSettingsDialog({ group, bannedMembers, busy, onClose, onSave, onUn
         </section>}
       </div>
       <DialogButtons onClose={onClose} closeLabel={settingsChanged ? "cancel" : "close"}>
-        {tab === "identity" && (group.avatar || image.preview) && <button className="danger" onClick={image.remove}>remove icon</button>}
-        {settingsChanged && <button className="primary" disabled={!name.trim() || name.length > 80 || description.length > 200 || busy} onClick={() => void onSave(name.trim(), description, image.base64, image.removed, membersCanSendMessages, membersCanSendMedia)}>save settings</button>}
+        {settingsChanged && <button className="primary" disabled={!name.trim() || name.length > 80 || description.length > 200 || background.busy || busy} onClick={() => void onSave(name.trim(), description, accentColor, image.base64, image.removed, background.base64, background.removed, membersCanSendMessages, membersCanSendMedia)}>save settings</button>}
       </DialogButtons>
     </Modal>
   );
@@ -1533,6 +1822,43 @@ function RulesDialog({ group, canEdit, busy, onClose, onSave }: { group: GroupSu
 
 function ruleItems(value: string) {
   return value.split(/\r?\n/).map((rule) => rule.trim()).filter(Boolean).slice(0, 20);
+}
+
+function ReportMessageDialog({ message, busy, onClose, onReport }: { message: MessageSummary; busy: boolean; onClose: () => void; onReport: (reason: string) => Promise<boolean> }) {
+  const [reason, setReason] = useState("");
+  return (
+    <Modal onClose={onClose} compact>
+      <DialogHeading icon={<TriangleAlert />} title="report message?" detail="send this to the group’s moderation queue" />
+      <div className="report-target-preview"><strong>@{message.username}</strong><p>{reportMessagePreview(message)}</p></div>
+      <LabeledArea label="details (optional)" count={`${reason.length}/280`}><textarea autoFocus maxLength={280} value={reason} placeholder="what should moderators know?" onChange={(event) => setReason(event.target.value)} /></LabeledArea>
+      <DialogButtons onClose={onClose}><button className="report-confirm" disabled={busy} onClick={() => void onReport(reason.trim())}>{busy && <LoaderCircle className="spinner" size={13} />} report message</button></DialogButtons>
+    </Modal>
+  );
+}
+
+function ReportsDialog({ reports, busy, onClose, onDismiss, onDelete }: { reports: ReportSummary[]; busy: boolean; onClose: () => void; onDismiss: (report: ReportSummary) => Promise<boolean>; onDelete: (report: ReportSummary) => Promise<boolean> }) {
+  return (
+    <Modal onClose={onClose} wide>
+      <DialogHeading icon={<TriangleAlert />} title="reports" detail={reports.length === 1 ? "1 report needs review" : `${reports.length} reports need review`} />
+      {reports.length ? <div className="reports-queue">{reports.map((report) => (
+        <article className="report-card" key={report.report_event_id}>
+          <div className="reported-message-author"><Avatar name={report.message.username} image={report.message.avatar} size={34} /><span><strong>@{report.message.username}</strong><small>posted {formatGalleryDate(report.message.created_at_millis)}</small></span></div>
+          <p className="reported-message-copy">{reportMessagePreview(report.message)}</p>
+          <div className="reporter-context"><Avatar name={report.reporter_username} image={report.reporter_avatar} size={24} /><span><small>reported by @{report.reporter_username} · {formatGalleryDate(report.created_at_millis)}</small><strong>{report.reason || "no additional details"}</strong></span></div>
+          <div className="report-actions"><button disabled={busy} onClick={() => void onDismiss(report)}>dismiss</button><button className="danger" disabled={busy} onClick={() => void onDelete(report)}><Trash2 size={13} /> delete message</button></div>
+        </article>
+      ))}</div> : <div className="empty-reports"><Check size={25} /><strong>all clear</strong><span>there are no reports waiting for review</span></div>}
+      <DialogButtons onClose={onClose} closeLabel="close">{busy && <LoaderCircle className="spinner" size={14} />}</DialogButtons>
+    </Modal>
+  );
+}
+
+function reportMessagePreview(message: MessageSummary) {
+  if (message.text.trim()) return message.text;
+  if (message.attachment?.mime_type.startsWith("image/")) return "image attachment";
+  if (message.attachment?.mime_type.startsWith("video/")) return "video attachment";
+  if (message.attachment?.mime_type.startsWith("audio/")) return "audio attachment";
+  return "media attachment";
 }
 
 function BanMemberDialog({ member, busy, onClose, onBan }: { member: MemberSummary; busy: boolean; onClose: () => void; onBan: (deleteMessages: boolean) => Promise<boolean> }) {
@@ -1590,8 +1916,8 @@ function noiseSignature(publicKey: string) {
   }
 }
 
-function Modal({ children, onClose, compact = false, wide = false }: { children: React.ReactNode; onClose: () => void; compact?: boolean; wide?: boolean }) {
-  return <div className="modal-backdrop" onMouseDown={onClose}><section className={`modal ${compact ? "compact" : ""} ${wide ? "wide" : ""}`} onMouseDown={(event) => event.stopPropagation()}><button className="modal-close" onClick={onClose}><X size={15} /></button>{children}</section></div>;
+function Modal({ children, onClose, compact = false, wide = false, className = "" }: { children: React.ReactNode; onClose: () => void; compact?: boolean; wide?: boolean; className?: string }) {
+  return <div className="modal-backdrop" onMouseDown={onClose}><section className={`modal ${compact ? "compact" : ""} ${wide ? "wide" : ""} ${className}`.trim()} onMouseDown={(event) => event.stopPropagation()}><button className="modal-close" onClick={onClose}><X size={15} /></button>{children}</section></div>;
 }
 
 function DialogHeading({ icon, title, detail }: { icon: React.ReactNode; title: string; detail: string }) {
@@ -1609,6 +1935,68 @@ function LabeledArea({ label, count, children }: { label: string; count?: string
 function ImagePicker({ name, existing, selection, square = false, disabled = false }: { name: string; existing: ProfileImage | null; selection: ReturnType<typeof useImageSelection>; square?: boolean; disabled?: boolean }) {
   const input = useRef<HTMLInputElement>(null);
   return <button className="image-picker" disabled={disabled} onClick={() => input.current?.click()}><span className={`avatar ${square ? "square" : ""}`} style={{ width: 96, height: 96 }}>{selection.preview ? <img src={selection.preview} alt="" /> : <Avatar name={name} image={selection.removed ? null : existing} size={96} square={square} />}</span>{!disabled && <i><Camera size={13} /></i>}<input ref={input} hidden type="file" accept="image/*" onChange={(event) => void selection.choose(event.target.files?.[0])} /></button>;
+}
+
+function BackgroundPicker({ existing, selection, disabled = false }: { existing: ProfileImage | null; selection: ReturnType<typeof useBackgroundSelection>; disabled?: boolean }) {
+  const input = useRef<HTMLInputElement>(null);
+  const existingSource = useProfileImageSource(selection.removed ? null : existing);
+  const source = selection.preview ?? existingSource;
+  const hasBackground = Boolean(selection.preview || (!selection.removed && existing));
+  return (
+    <div className="background-picker">
+      <div className="background-picker-control">
+        <button className="background-picker-preview" disabled={disabled || selection.busy} onClick={() => input.current?.click()}>
+          {source
+            ? <img src={source} alt="selected group chat background" />
+            : hasBackground
+              ? <span><LoaderCircle className="spinner" size={16} /></span>
+              : <span><Camera size={17} /> add background</span>}
+          {source && <i><Camera size={12} /></i>}
+        </button>
+        {hasBackground && <button className="background-picker-remove" disabled={disabled || selection.busy} onClick={selection.remove} aria-label="remove chat background" title="remove chat background"><X size={11} /></button>}
+      </div>
+      <input ref={input} hidden type="file" accept="image/*" onChange={(event) => { const target = event.currentTarget; void selection.choose(target.files?.[0]).finally(() => { target.value = ""; }); }} />
+      <small>chat background</small>
+      <em>1920 × 1080 recommended</em>
+      {selection.error && <p>{selection.error}</p>}
+    </div>
+  );
+}
+
+function useBackgroundSelection() {
+  const [base64, setBase64] = useState<string | null>(null);
+  const [preview, setPreview] = useState<string | null>(null);
+  const [removed, setRemoved] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  return {
+    base64,
+    preview,
+    removed,
+    busy,
+    error,
+    async choose(file?: File) {
+      if (!file) return;
+      setBusy(true);
+      setError(null);
+      try {
+        const data = await prepareGroupBackground(file);
+        setBase64(data);
+        setPreview(`data:image/jpeg;base64,${data}`);
+        setRemoved(false);
+      } catch (cause) {
+        setError(message(cause));
+      } finally {
+        setBusy(false);
+      }
+    },
+    remove() {
+      setBase64(null);
+      setPreview(null);
+      setRemoved(true);
+      setError(null);
+    },
+  };
 }
 
 function useImageSelection() {

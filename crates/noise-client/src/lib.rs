@@ -56,6 +56,8 @@ pub struct GroupSummary {
     pub description: String,
     pub rules: String,
     pub avatar: Option<ProfileImage>,
+    pub background: Option<ProfileImage>,
+    pub accent_color: String,
     pub members_can_send_messages: bool,
     pub members_can_send_media: bool,
     pub frequency: Option<String>,
@@ -80,6 +82,7 @@ pub struct DirectSummary {
     pub avatar: Option<ProfileImage>,
     pub accepts_direct_messages: bool,
     pub is_active: bool,
+    pub has_unread: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -125,7 +128,20 @@ pub struct Conversation {
     pub members: Vec<MemberSummary>,
     pub banned_members: Vec<BannedMemberSummary>,
     pub messages: Vec<MessageSummary>,
+    pub reports: Vec<ReportSummary>,
+    pub reported_message_event_ids: Vec<String>,
     pub rejected_events: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReportSummary {
+    pub report_event_id: String,
+    pub reporter_public_key: String,
+    pub reporter_username: String,
+    pub reporter_avatar: Option<ProfileImage>,
+    pub reason: String,
+    pub created_at_millis: u64,
+    pub message: MessageSummary,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -208,6 +224,10 @@ struct ClientState {
     #[serde(default)]
     direct_closed_periods: Vec<DirectClosedPeriod>,
     #[serde(default)]
+    direct_latest_incoming: HashMap<String, DirectMessageMarker>,
+    #[serde(default)]
+    direct_read_through: HashMap<String, DirectMessageMarker>,
+    #[serde(default)]
     group_frequencies: HashMap<String, String>,
     #[serde(default)]
     next_author_sequence: u64,
@@ -255,6 +275,12 @@ struct DirectContact {
 struct DirectClosedPeriod {
     closed_at_millis: u64,
     reopened_at_millis: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct DirectMessageMarker {
+    created_at_millis: u64,
+    event_id: String,
 }
 
 fn default_true() -> bool {
@@ -338,6 +364,8 @@ impl ClientState {
             active_direct_public_key: contents.active_direct_public_key,
             direct_deleted_before: contents.direct_deleted_before,
             direct_closed_periods: contents.direct_closed_periods,
+            direct_latest_incoming: HashMap::new(),
+            direct_read_through: HashMap::new(),
             group_frequencies: contents.group_frequencies,
             next_author_sequence: contents.next_author_sequence,
             account: Some(account),
@@ -353,6 +381,16 @@ impl ClientState {
                     .reopened_at_millis
                     .is_none_or(|reopened| created_at_millis < reopened)
         })
+    }
+
+    fn direct_has_unread(&self, public_key: &str) -> bool {
+        self.direct_latest_incoming
+            .get(public_key)
+            .is_some_and(|latest| {
+                self.direct_read_through
+                    .get(public_key)
+                    .is_none_or(|read| latest > read)
+            })
     }
 
     fn upsert_known_person(&mut self, contact: DirectContact) {
@@ -425,6 +463,8 @@ impl ClientState {
                     description: group.description.clone(),
                     rules: group.rules.clone(),
                     avatar: group.avatar.clone(),
+                    background: group.background.clone(),
+                    accent_color: group.accent_color.clone(),
                     members_can_send_messages: group.members_can_send_messages,
                     members_can_send_media: group.members_can_send_media,
                     frequency: self
@@ -447,6 +487,7 @@ impl ClientState {
                     accepts_direct_messages: contact.accepts_direct_messages,
                     is_active: self.active_direct_public_key.as_deref()
                         == Some(&contact.public_key),
+                    has_unread: self.direct_has_unread(&contact.public_key),
                 })
                 .collect(),
             known_people: self
@@ -459,6 +500,7 @@ impl ClientState {
                     avatar: contact.avatar.clone(),
                     accepts_direct_messages: contact.accepts_direct_messages,
                     is_active: false,
+                    has_unread: false,
                 })
                 .collect(),
         })
@@ -528,6 +570,8 @@ impl NoiseClient {
             active_direct_public_key: None,
             direct_deleted_before: HashMap::new(),
             direct_closed_periods: Vec::new(),
+            direct_latest_incoming: HashMap::new(),
+            direct_read_through: HashMap::new(),
             group_frequencies: HashMap::new(),
             next_author_sequence: 0,
             account: Some(AccountSession {
@@ -604,11 +648,13 @@ impl NoiseClient {
         cache_path: impl AsRef<Path>,
     ) -> anyhow::Result<()> {
         let path = path.as_ref();
-        let media_directory = cache_path.as_ref().join("media");
+        let cache_path = cache_path.as_ref();
+        let media_directory = cache_path.join("media");
         if media_directory.exists() {
             fs::remove_dir_all(&media_directory)
                 .with_context(|| format!("could not erase {}", media_directory.display()))?;
         }
+        purge_profile_image_cache(cache_path)?;
         if path.exists() {
             fs::remove_file(path)
                 .with_context(|| format!("could not erase local identity {}", path.display()))?;
@@ -763,6 +809,10 @@ impl NoiseClient {
         avatar_data_base64: Option<String>,
         avatar_mime_type: Option<String>,
         remove_avatar: bool,
+        background_data_base64: Option<String>,
+        background_mime_type: Option<String>,
+        remove_background: bool,
+        accent_color: Option<String>,
         members_can_send_messages: Option<bool>,
         members_can_send_media: Option<bool>,
         relays: Vec<String>,
@@ -796,6 +846,9 @@ impl NoiseClient {
             members_can_send_messages.unwrap_or(view.profile.members_can_send_messages);
         let members_can_send_media =
             members_can_send_media.unwrap_or(view.profile.members_can_send_media);
+        let accent_color = normalize_group_accent_color(
+            accent_color.unwrap_or_else(|| view.profile.accent_color.clone()),
+        )?;
 
         let avatar = if remove_avatar {
             None
@@ -826,10 +879,42 @@ impl NoiseClient {
             current_group.avatar.clone()
         };
 
+        let background = if remove_background {
+            None
+        } else if let Some(encoded) = background_data_base64 {
+            let mime_type =
+                background_mime_type.context("group background media type is missing")?;
+            if !matches!(
+                mime_type.as_str(),
+                "image/jpeg" | "image/png" | "image/webp"
+            ) {
+                bail!("group backgrounds must be JPEG, PNG, or WebP images")
+            }
+            let data = STANDARD
+                .decode(encoded)
+                .context("group background encoding is invalid")?;
+            if data.is_empty() || data.len() > 1536 * 1024 {
+                bail!("group backgrounds must contain between 1 byte and 1.5 MiB")
+            }
+            let (blob, key_base64) =
+                EncryptedBlob::create_for_group(&data, current_group.group_id.clone())?;
+            self.publish_blob(&relays, &blob).await?;
+            Some(ProfileImage {
+                blob_id: blob.blob_id,
+                key_base64,
+                mime_type,
+                byte_length: data.len() as u32,
+            })
+        } else {
+            current_group.background.clone()
+        };
+
         state.groups[group_index].name = name.clone();
         state.groups[group_index].description = description.clone();
         state.groups[group_index].rules = rules.clone();
         state.groups[group_index].avatar = avatar.clone();
+        state.groups[group_index].background = background.clone();
+        state.groups[group_index].accent_color = accent_color.clone();
         state.groups[group_index].members_can_send_messages = members_can_send_messages;
         state.groups[group_index].members_can_send_media = members_can_send_media;
         if state.groups[group_index].owner_public_key.is_empty()
@@ -847,6 +932,8 @@ impl NoiseClient {
                 description,
                 rules,
                 avatar,
+                background,
+                accent_color,
                 members_can_send_messages,
                 members_can_send_media,
             },
@@ -895,15 +982,42 @@ impl NoiseClient {
 
     pub async fn fetch_avatar(
         &self,
+        cache_path: impl AsRef<Path>,
         image: &ProfileImage,
         relays: Vec<String>,
     ) -> anyhow::Result<AvatarData> {
-        if image.byte_length == 0 || image.byte_length > 256 * 1024 {
-            bail!("avatar reference has an invalid size")
+        if image.byte_length == 0 || image.byte_length > 1536 * 1024 {
+            bail!("image reference has an invalid size")
         }
-        let blob = self
-            .fetch_blob(&relay_list(relays)?, &image.blob_id)
-            .await?;
+        if image.blob_id.len() != 64 || !image.blob_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("image reference has an invalid blob identifier")
+        }
+        let cache_directory = cache_path.as_ref().join("profile-blobs");
+        let file_path = cache_directory.join(format!("{}.json", image.blob_id));
+        let cached_blob = fs::read(&file_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<EncryptedBlob>(&bytes).ok())
+            .filter(|blob| blob.blob_id == image.blob_id && blob.verify().is_ok());
+        let blob = if let Some(blob) = cached_blob {
+            blob
+        } else {
+            let blob = self
+                .fetch_blob(&relay_list(relays)?, &image.blob_id)
+                .await?;
+            fs::create_dir_all(&cache_directory)
+                .context("could not create the profile image cache")?;
+            let temporary = file_path.with_extension("json.part");
+            fs::write(&temporary, serde_json::to_vec(&blob)?)
+                .context("could not write the profile image cache")?;
+            if file_path.exists() {
+                fs::remove_file(&file_path)
+                    .context("could not replace an invalid profile image cache entry")?;
+            }
+            fs::rename(&temporary, &file_path)
+                .context("could not finish the profile image cache entry")?;
+            blob
+        };
         let data = blob.open(&image.key_base64)?;
         if data.len() != image.byte_length as usize {
             bail!("avatar data does not match its profile reference")
@@ -1076,6 +1190,8 @@ impl NoiseClient {
                 description: group.description,
                 rules: group.rules,
                 avatar: group.avatar,
+                background: group.background,
+                accent_color: group.accent_color,
                 members_can_send_messages: group.members_can_send_messages,
                 members_can_send_media: group.members_can_send_media,
                 frequency: Some(display_frequency(&frequency)?),
@@ -1117,6 +1233,8 @@ impl NoiseClient {
                 description: group.description,
                 rules: group.rules,
                 avatar: group.avatar,
+                background: group.background,
+                accent_color: group.accent_color,
                 members_can_send_messages: group.members_can_send_messages,
                 members_can_send_media: group.members_can_send_media,
                 frequency: None,
@@ -1202,7 +1320,7 @@ impl NoiseClient {
         relays: Vec<String>,
     ) -> anyhow::Result<DirectConversation> {
         let path = path.as_ref();
-        let (state, messages) = self
+        let (mut state, messages) = self
             .sync_direct_inbox(path, cache_path.as_ref(), relay_list(relays)?)
             .await?;
         let public_key = state
@@ -1213,9 +1331,18 @@ impl NoiseClient {
             .direct_contacts
             .iter()
             .find(|contact| contact.public_key == public_key)
+            .cloned()
             .context("active direct conversation is missing")?;
+        if let Some(latest) = state.direct_latest_incoming.get(public_key).cloned()
+            && state.direct_read_through.get(public_key) != Some(&latest)
+        {
+            state
+                .direct_read_through
+                .insert(public_key.to_owned(), latest);
+            save_state(path, &state)?;
+        }
         Ok(DirectConversation {
-            contact: direct_summary(contact, true),
+            contact: direct_summary(&contact, true, false),
             media_scope_id: state.identity()?.direct_scope_id(&contact.public_key)?,
             messages: messages
                 .into_iter()
@@ -1390,6 +1517,8 @@ impl NoiseClient {
         state
             .direct_contacts
             .retain(|candidate| candidate.public_key != contact.public_key);
+        state.direct_latest_incoming.remove(&contact.public_key);
+        state.direct_read_through.remove(&contact.public_key);
         state.active_direct_public_key = state
             .direct_contacts
             .first()
@@ -1556,6 +1685,81 @@ impl NoiseClient {
         Ok(())
     }
 
+    pub async fn report_message(
+        &self,
+        path: impl AsRef<Path>,
+        message_event_id: &str,
+        reason: impl Into<String>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        let relays = relay_list(relays)?;
+        let group = state.active_group()?.clone();
+        let identity = state.identity()?;
+        let actor_public_key = identity.public_key_base64();
+        let view = GroupState::rebuild(&group, &self.fetch_events(&group, relays.clone()).await?);
+        let target = view
+            .messages
+            .iter()
+            .find(|message| message.event_id == message_event_id)
+            .context("that message no longer exists")?;
+        if !view.members.contains_key(&actor_public_key) {
+            bail!("you are no longer a member of this group")
+        }
+        if target.author_public_key == actor_public_key {
+            bail!("you cannot report your own message")
+        }
+        if view.reports.iter().any(|report| {
+            report.message_event_id == message_event_id
+                && report.reporter_public_key == actor_public_key
+        }) {
+            bail!("you already reported this message")
+        }
+        let reason = reason.into();
+        if reason.chars().count() > 280 {
+            bail!("report details can contain at most 280 characters")
+        }
+        let sequence = state.take_sequence();
+        let event =
+            SignedEvent::message_reported(&identity, &group, message_event_id, reason, sequence)?;
+        self.publish_event(&relays, &event).await?;
+        save_state(path, &state)?;
+        Ok(())
+    }
+
+    pub async fn resolve_report(
+        &self,
+        path: impl AsRef<Path>,
+        report_event_id: &str,
+        relays: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        let relays = relay_list(relays)?;
+        let group = state.active_group()?.clone();
+        let identity = state.identity()?;
+        let actor_public_key = identity.public_key_base64();
+        let view = GroupState::rebuild(&group, &self.fetch_events(&group, relays.clone()).await?);
+        let is_owner = view.owner_public_key.as_deref() == Some(actor_public_key.as_str());
+        let is_moderator = view.moderators.contains(&actor_public_key);
+        if (!is_owner && !is_moderator) || !view.members.contains_key(&actor_public_key) {
+            bail!("only the founder or a moderator can resolve reports")
+        }
+        if !view
+            .reports
+            .iter()
+            .any(|report| report.event_id == report_event_id)
+        {
+            bail!("that report has already been actioned")
+        }
+        let sequence = state.take_sequence();
+        let event = SignedEvent::report_resolved(&identity, &group, report_event_id, sequence)?;
+        self.publish_event(&relays, &event).await?;
+        save_state(path, &state)?;
+        Ok(())
+    }
+
     pub async fn ban_member(
         &self,
         path: impl AsRef<Path>,
@@ -1641,6 +1845,7 @@ impl NoiseClient {
         let event = SignedEvent::member_left(&state.identity()?, &group, sequence)?;
         self.publish_event(&relay_list(relays)?, &event).await?;
         purge_group_cache(cache_path.as_ref(), &group.group_id)?;
+        purge_profile_image_cache(cache_path.as_ref())?;
         state
             .groups
             .retain(|candidate| candidate.group_id != group.group_id);
@@ -1682,6 +1887,7 @@ impl NoiseClient {
         }
 
         purge_group_cache(cache_path.as_ref(), group_id)?;
+        purge_profile_image_cache(cache_path.as_ref())?;
         state.groups.remove(group_index);
         state.group_frequencies.remove(group_id);
         if state.active_group_id.as_deref() == Some(group_id) {
@@ -1763,6 +1969,7 @@ impl NoiseClient {
             fs::remove_dir_all(&media_directory)
                 .with_context(|| format!("could not erase {}", media_directory.display()))?;
         }
+        purge_profile_image_cache(cache_path)?;
         fs::remove_file(path)
             .with_context(|| format!("could not erase local identity {}", path.display()))?;
         Ok(())
@@ -1830,6 +2037,8 @@ impl NoiseClient {
             || state.groups[group_index].description != resolved_profile.description
             || state.groups[group_index].rules != resolved_profile.rules
             || state.groups[group_index].avatar != resolved_profile.avatar
+            || state.groups[group_index].background != resolved_profile.background
+            || state.groups[group_index].accent_color != resolved_profile.accent_color
             || state.groups[group_index].members_can_send_messages
                 != resolved_profile.members_can_send_messages
             || state.groups[group_index].members_can_send_media
@@ -1840,6 +2049,8 @@ impl NoiseClient {
             state.groups[group_index].description = resolved_profile.description.clone();
             state.groups[group_index].rules = resolved_profile.rules.clone();
             state.groups[group_index].avatar = resolved_profile.avatar.clone();
+            state.groups[group_index].background = resolved_profile.background.clone();
+            state.groups[group_index].accent_color = resolved_profile.accent_color.clone();
             state.groups[group_index].members_can_send_messages =
                 resolved_profile.members_can_send_messages;
             state.groups[group_index].members_can_send_media =
@@ -1850,6 +2061,46 @@ impl NoiseClient {
         if state.known_people != known_people_before {
             save_state(path, &state)?;
         }
+        let can_view_reports =
+            resolved_owner == identity_public_key || moderators.contains(&identity_public_key);
+        let reported_message_event_ids = view
+            .reports
+            .iter()
+            .filter(|report| report.reporter_public_key == identity_public_key)
+            .map(|report| report.message_event_id.clone())
+            .collect::<Vec<_>>();
+        let reports = view
+            .reports
+            .iter()
+            .filter(|_| can_view_reports)
+            .filter_map(|report| {
+                let message = view
+                    .messages
+                    .iter()
+                    .find(|message| message.event_id == report.message_event_id)?;
+                Some(ReportSummary {
+                    report_event_id: report.event_id.clone(),
+                    reporter_public_key: report.reporter_public_key.clone(),
+                    reporter_username: report.reporter_username.clone(),
+                    reporter_avatar: report.reporter_avatar.clone(),
+                    reason: report.reason.clone(),
+                    created_at_millis: report.created_at_millis,
+                    message: MessageSummary {
+                        event_id: message.event_id.clone(),
+                        message_id: message.message_id.clone(),
+                        author_public_key: message.author_public_key.clone(),
+                        username: message.username.clone(),
+                        bio: message.bio.clone(),
+                        avatar: message.avatar.clone(),
+                        accepts_direct_messages: message.accepts_direct_messages,
+                        text: message.text.clone(),
+                        attachment: message.attachment.clone(),
+                        reply_to_message_id: message.reply_to_message_id.clone(),
+                        created_at_millis: message.created_at_millis,
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
         let mut members = view
             .members
             .into_values()
@@ -1870,6 +2121,8 @@ impl NoiseClient {
                 description: resolved_profile.description,
                 rules: resolved_profile.rules,
                 avatar: resolved_profile.avatar,
+                background: resolved_profile.background,
+                accent_color: resolved_profile.accent_color,
                 members_can_send_messages: resolved_profile.members_can_send_messages,
                 members_can_send_media: resolved_profile.members_can_send_media,
                 frequency: state
@@ -1899,6 +2152,8 @@ impl NoiseClient {
                     created_at_millis: message.created_at_millis,
                 })
                 .collect(),
+            reports,
+            reported_message_event_ids,
             rejected_events: view.rejected_events,
         })
     }
@@ -1917,6 +2172,7 @@ impl NoiseClient {
         let contacts_before = state.direct_contacts.clone();
         let active_before = state.active_direct_public_key.clone();
         let deletions_before = state.direct_deleted_before.clone();
+        let latest_incoming_before = state.direct_latest_incoming.clone();
         let decoded = events
             .iter()
             .filter_map(|event| decrypt_direct_event(&identity, &state, event))
@@ -1948,6 +2204,8 @@ impl NoiseClient {
             .collect::<Vec<_>>();
         for public_key in &newly_deleted {
             purge_scope_cache(cache_path, &identity.direct_scope_id(public_key)?)?;
+            state.direct_latest_incoming.remove(public_key);
+            state.direct_read_through.remove(public_key);
         }
         state
             .direct_contacts
@@ -1979,6 +2237,17 @@ impl NoiseClient {
         });
         for message in &messages {
             state.remember_direct(message.contact.clone());
+            if message.message.author_public_key != self_public_key {
+                let marker = DirectMessageMarker {
+                    created_at_millis: message.message.created_at_millis,
+                    event_id: message.message.event_id.clone(),
+                };
+                state
+                    .direct_latest_incoming
+                    .entry(message.counterparty_public_key.clone())
+                    .and_modify(|latest| *latest = latest.clone().max(marker.clone()))
+                    .or_insert(marker);
+            }
         }
         if state
             .active_direct_public_key
@@ -2001,6 +2270,7 @@ impl NoiseClient {
         if state.direct_contacts != contacts_before
             || state.active_direct_public_key != active_before
             || state.direct_deleted_before != deletions_before
+            || state.direct_latest_incoming != latest_incoming_before
         {
             save_state(path, &state)?;
         }
@@ -2569,7 +2839,7 @@ fn valid_direct_content(text: &str, attachment: Option<&MediaAttachment>) -> boo
         && attachment.is_none_or(|attachment| validate_media_reference(attachment).is_ok())
 }
 
-fn direct_summary(contact: &DirectContact, is_active: bool) -> DirectSummary {
+fn direct_summary(contact: &DirectContact, is_active: bool, has_unread: bool) -> DirectSummary {
     DirectSummary {
         public_key: contact.public_key.clone(),
         username: contact.username.clone(),
@@ -2577,6 +2847,7 @@ fn direct_summary(contact: &DirectContact, is_active: bool) -> DirectSummary {
         avatar: contact.avatar.clone(),
         accepts_direct_messages: contact.accepts_direct_messages,
         is_active,
+        has_unread,
     }
 }
 
@@ -2668,6 +2939,17 @@ fn normalize_group_rules(rules: String) -> anyhow::Result<String> {
     Ok(rules)
 }
 
+fn normalize_group_accent_color(color: String) -> anyhow::Result<String> {
+    let color = color.trim();
+    if color.len() != 7
+        || !color.starts_with('#')
+        || !color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("group accent colors must use six hexadecimal digits")
+    }
+    Ok(color.to_ascii_uppercase())
+}
+
 fn supported_media_type(mime_type: &str) -> bool {
     mime_type.len() <= 100
         && (mime_type.starts_with("image/")
@@ -2738,6 +3020,15 @@ fn validate_reply_reference(reply_to_message_id: Option<&str>) -> anyhow::Result
 
 fn purge_group_cache(cache_path: &Path, group_id: &str) -> anyhow::Result<()> {
     purge_scope_cache(cache_path, group_id)
+}
+
+fn purge_profile_image_cache(cache_path: &Path) -> anyhow::Result<()> {
+    let directory = cache_path.join("profile-blobs");
+    if directory.exists() {
+        fs::remove_dir_all(&directory)
+            .with_context(|| format!("could not erase {}", directory.display()))?;
+    }
+    Ok(())
 }
 
 fn purge_scope_cache(cache_path: &Path, scope_id: &str) -> anyhow::Result<()> {

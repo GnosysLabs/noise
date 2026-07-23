@@ -20,6 +20,11 @@ const INVITE_KDF_CONTEXT: &str = "xyz.gnosyslabs.noise.frequency-invite.v1";
 const DIRECT_KEY_CONTEXT: &str = "xyz.gnosyslabs.noise.direct-key.v1";
 const DIRECT_MAILBOX_CONTEXT: &str = "xyz.gnosyslabs.noise.direct-mailbox.v1";
 const DIRECT_SCOPE_CONTEXT: &str = "xyz.gnosyslabs.noise.direct-scope.v1";
+pub const DEFAULT_GROUP_ACCENT_COLOR: &str = "#7758ED";
+
+fn default_group_accent_color() -> String {
+    DEFAULT_GROUP_ACCENT_COLOR.to_owned()
+}
 
 #[derive(Debug, Error)]
 pub enum NoiseError {
@@ -114,6 +119,8 @@ impl Identity {
             description: String::new(),
             rules: String::new(),
             avatar: None,
+            background: None,
+            accent_color: default_group_accent_color(),
             members_can_send_messages: true,
             members_can_send_media: true,
             owner_public_key: String::new(),
@@ -474,6 +481,10 @@ pub struct GroupProfile {
     pub rules: String,
     #[serde(default)]
     pub avatar: Option<ProfileImage>,
+    #[serde(default)]
+    pub background: Option<ProfileImage>,
+    #[serde(default = "default_group_accent_color")]
+    pub accent_color: String,
     #[serde(default = "default_true")]
     pub members_can_send_messages: bool,
     #[serde(default = "default_true")]
@@ -490,6 +501,10 @@ pub struct GroupMembership {
     pub rules: String,
     #[serde(default)]
     pub avatar: Option<ProfileImage>,
+    #[serde(default)]
+    pub background: Option<ProfileImage>,
+    #[serde(default = "default_group_accent_color")]
+    pub accent_color: String,
     #[serde(default = "default_true")]
     pub members_can_send_messages: bool,
     #[serde(default = "default_true")]
@@ -511,6 +526,8 @@ impl GroupMembership {
             description: String::new(),
             rules: String::new(),
             avatar: None,
+            background: None,
+            accent_color: default_group_accent_color(),
             members_can_send_messages: true,
             members_can_send_media: true,
             owner_public_key: String::new(),
@@ -529,6 +546,8 @@ impl GroupMembership {
             description: String::new(),
             rules: String::new(),
             avatar: None,
+            background: None,
+            accent_color: default_group_accent_color(),
             members_can_send_messages: true,
             members_can_send_media: true,
             owner_public_key,
@@ -543,6 +562,8 @@ impl GroupMembership {
             description: self.description.clone(),
             rules: self.rules.clone(),
             avatar: self.avatar.clone(),
+            background: self.background.clone(),
+            accent_color: self.accent_color.clone(),
             members_can_send_messages: self.members_can_send_messages,
             members_can_send_media: self.members_can_send_media,
         }
@@ -868,6 +889,14 @@ pub enum GroupEventPayload {
     MessageDeleted {
         message_event_id: String,
     },
+    MessageReported {
+        message_event_id: String,
+        #[serde(default)]
+        reason: String,
+    },
+    ReportResolved {
+        report_event_id: String,
+    },
     OwnMessagesDeleted,
     MemberBanned {
         member_public_key: String,
@@ -1028,6 +1057,40 @@ impl SignedEvent {
             identity,
             group,
             GroupEventPayload::OwnMessagesDeleted,
+            author_sequence,
+        )
+    }
+
+    pub fn message_reported(
+        identity: &Identity,
+        group: &GroupMembership,
+        message_event_id: impl Into<String>,
+        reason: impl Into<String>,
+        author_sequence: u64,
+    ) -> Result<Self, NoiseError> {
+        Self::create(
+            identity,
+            group,
+            GroupEventPayload::MessageReported {
+                message_event_id: message_event_id.into(),
+                reason: reason.into(),
+            },
+            author_sequence,
+        )
+    }
+
+    pub fn report_resolved(
+        identity: &Identity,
+        group: &GroupMembership,
+        report_event_id: impl Into<String>,
+        author_sequence: u64,
+    ) -> Result<Self, NoiseError> {
+        Self::create(
+            identity,
+            group,
+            GroupEventPayload::ReportResolved {
+                report_event_id: report_event_id.into(),
+            },
             author_sequence,
         )
     }
@@ -1278,6 +1341,17 @@ pub struct AcceptedMessage {
     pub created_at_millis: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct AcceptedReport {
+    pub event_id: String,
+    pub message_event_id: String,
+    pub reporter_public_key: String,
+    pub reporter_username: String,
+    pub reporter_avatar: Option<ProfileImage>,
+    pub reason: String,
+    pub created_at_millis: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct GroupState {
     pub profile: GroupProfile,
@@ -1287,6 +1361,7 @@ pub struct GroupState {
     pub banned_members: HashSet<String>,
     pub banned_profiles: HashMap<String, MemberState>,
     pub messages: Vec<AcceptedMessage>,
+    pub reports: Vec<AcceptedReport>,
     pub rejected_events: usize,
 }
 
@@ -1423,6 +1498,65 @@ impl GroupState {
                         .retain(|message| message.event_id != message_event_id);
                     if state.messages.len() == previous_length {
                         state.rejected_events += 1;
+                    } else {
+                        state
+                            .reports
+                            .retain(|report| report.message_event_id != message_event_id);
+                    }
+                }
+                GroupEventPayload::MessageReported {
+                    message_event_id,
+                    reason,
+                } => {
+                    let Some(reporter) = state.members.get(&event.author_public_key) else {
+                        state.rejected_events += 1;
+                        continue;
+                    };
+                    let Some(message) = state
+                        .messages
+                        .iter()
+                        .find(|message| message.event_id == message_event_id)
+                    else {
+                        state.rejected_events += 1;
+                        continue;
+                    };
+                    let duplicate = state.reports.iter().any(|report| {
+                        report.message_event_id == message_event_id
+                            && report.reporter_public_key == event.author_public_key
+                    });
+                    if message.author_public_key == event.author_public_key
+                        || reason.chars().count() > 280
+                        || duplicate
+                    {
+                        state.rejected_events += 1;
+                        continue;
+                    }
+                    state.reports.push(AcceptedReport {
+                        event_id: event.event_id.clone(),
+                        message_event_id,
+                        reporter_public_key: event.author_public_key.clone(),
+                        reporter_username: reporter.username.clone(),
+                        reporter_avatar: reporter.avatar.clone(),
+                        reason,
+                        created_at_millis: event.created_at_millis,
+                    });
+                }
+                GroupEventPayload::ReportResolved { report_event_id } => {
+                    let is_owner =
+                        state.owner_public_key.as_deref() == Some(event.author_public_key.as_str());
+                    let can_moderate =
+                        is_owner || state.moderators.contains(&event.author_public_key);
+                    let is_active = state.members.contains_key(&event.author_public_key);
+                    let previous_length = state.reports.len();
+                    if !can_moderate || !is_active {
+                        state.rejected_events += 1;
+                        continue;
+                    }
+                    state
+                        .reports
+                        .retain(|report| report.event_id != report_event_id);
+                    if state.reports.len() == previous_length {
+                        state.rejected_events += 1;
                     }
                 }
                 GroupEventPayload::OwnMessagesDeleted => {
@@ -1433,6 +1567,7 @@ impl GroupState {
                     state
                         .messages
                         .retain(|message| message.author_public_key != event.author_public_key);
+                    retain_reports_for_existing_messages(&mut state);
                 }
                 GroupEventPayload::MemberBanned {
                     member_public_key,
@@ -1468,6 +1603,7 @@ impl GroupState {
                         state
                             .messages
                             .retain(|message| message.author_public_key != member_public_key);
+                        retain_reports_for_existing_messages(&mut state);
                     }
                 }
                 GroupEventPayload::MemberUnbanned { member_public_key } => {
@@ -1547,6 +1683,17 @@ impl GroupState {
     }
 }
 
+fn retain_reports_for_existing_messages(state: &mut GroupState) {
+    let message_ids = state
+        .messages
+        .iter()
+        .map(|message| message.event_id.as_str())
+        .collect::<HashSet<_>>();
+    state
+        .reports
+        .retain(|report| message_ids.contains(report.message_event_id.as_str()));
+}
+
 fn valid_media(media: &MediaAttachment) -> bool {
     const MAX_MEDIA_BYTES: u64 = 500 * 1024 * 1024;
     const MAX_CHUNK_BYTES: u32 = 1024 * 1024;
@@ -1592,6 +1739,16 @@ fn valid_group_profile(profile: &GroupProfile) -> bool {
             .avatar
             .as_ref()
             .is_none_or(|avatar| avatar.byte_length > 0 && avatar.byte_length <= 256 * 1024)
+        && profile.background.as_ref().is_none_or(|background| {
+            background.byte_length > 0 && background.byte_length <= 1536 * 1024
+        })
+        && valid_group_accent_color(&profile.accent_color)
+}
+
+fn valid_group_accent_color(color: &str) -> bool {
+    color.len() == 7
+        && color.starts_with('#')
+        && color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn valid_group_rules(rules: &str) -> bool {
@@ -1833,6 +1990,44 @@ mod tests {
     }
 
     #[test]
+    fn member_reports_a_message_and_only_moderation_can_resolve_it() {
+        let founder = Identity::generate();
+        let member = Identity::generate();
+        let group = GroupMembership::create_owned("reports", founder.public_key_base64());
+        let profile = |username: &str| Profile {
+            username: username.into(),
+            bio: String::new(),
+            avatar: None,
+            accepts_direct_messages: true,
+        };
+        let mut events =
+            vec![SignedEvent::member_joined(&founder, &group, &profile("founder"), 0).unwrap()];
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        events.push(SignedEvent::member_joined(&member, &group, &profile("member"), 0).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let message = SignedEvent::chat(&founder, &group, "reported message", 1).unwrap();
+        events.push(message.clone());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let report =
+            SignedEvent::message_reported(&member, &group, message.event_id, "breaks the rules", 1)
+                .unwrap();
+        events.push(report.clone());
+
+        let pending = GroupState::rebuild(&group, &events);
+        assert_eq!(pending.reports.len(), 1);
+        assert_eq!(pending.reports[0].reason, "breaks the rules");
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        events.push(SignedEvent::report_resolved(&member, &group, &report.event_id, 2).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        events.push(SignedEvent::report_resolved(&founder, &group, report.event_id, 2).unwrap());
+
+        let resolved = GroupState::rebuild(&group, &events);
+        assert!(resolved.reports.is_empty());
+        assert_eq!(resolved.rejected_events, 1);
+    }
+
+    #[test]
     fn member_can_reply_and_delete_only_their_own_message() {
         let founder = Identity::generate();
         let member = Identity::generate();
@@ -1902,6 +2097,8 @@ mod tests {
                     description: String::new(),
                     rules: String::new(),
                     avatar: None,
+                    background: None,
+                    accent_color: default_group_accent_color(),
                     members_can_send_messages: false,
                     members_can_send_media: true,
                 },
