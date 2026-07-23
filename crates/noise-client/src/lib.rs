@@ -30,7 +30,6 @@ pub fn export_web_state(path: &str) -> Option<Vec<u8>> {
 
 use anyhow::{Context, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use futures_timer::Delay;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use noise_core::{
     AccountCredentials, AccountVault, EncryptedBlob, GroupDeletion, GroupEventPayload,
@@ -3537,14 +3536,7 @@ impl NoiseClient {
                 requests.next().await
             } else {
                 use futures_util::future::{Either, select};
-                match select(
-                    Box::pin(requests.next()),
-                    Box::pin(Delay::new(std::time::Duration::from_millis(
-                        EVENT_REPLICA_SETTLE_MILLIS,
-                    ))),
-                )
-                .await
-                {
+                match select(Box::pin(requests.next()), Box::pin(replica_settle_delay())).await {
                     Either::Left((response, _)) => response,
                     Either::Right(_) => break,
                 }
@@ -4175,6 +4167,19 @@ fn current_nanos() -> u64 {
 #[cfg(target_arch = "wasm32")]
 fn current_nanos() -> u64 {
     current_millis().saturating_mul(1_000_000)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn replica_settle_delay() {
+    tokio::time::sleep(std::time::Duration::from_millis(
+        EVENT_REPLICA_SETTLE_MILLIS,
+    ))
+    .await;
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn replica_settle_delay() {
+    gloo_timers::future::TimeoutFuture::new(EVENT_REPLICA_SETTLE_MILLIS as u32).await;
 }
 
 #[cfg(not(target_arch = "wasm32"))]

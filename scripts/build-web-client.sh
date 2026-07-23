@@ -15,6 +15,7 @@ cargo build \
   --target wasm32-unknown-unknown \
   --release
 
+rm -rf "$wasm_output"
 mkdir -p "$wasm_output"
 wasm-bindgen \
   --target web \
@@ -23,8 +24,20 @@ wasm-bindgen \
   "$repo_root/target/wasm32-unknown-unknown/release/noise_web.wasm"
 rm -f "$wasm_output/noise_web.d.ts" "$wasm_output/noise_web_bg.wasm.d.ts"
 
+if command -v shasum >/dev/null 2>&1; then
+  wasm_version="$(shasum -a 256 "$wasm_output/noise_web_bg.wasm" | cut -c1-16)"
+else
+  wasm_version="$(sha256sum "$wasm_output/noise_web_bg.wasm" | cut -c1-16)"
+fi
+hashed_wasm="noise_web_bg-$wasm_version.wasm"
+hashed_wrapper="noise_web-$wasm_version.js"
+sed "s/noise_web_bg\\.wasm/$hashed_wasm/g" \
+  "$wasm_output/noise_web.js" > "$wasm_output/$hashed_wrapper"
+mv "$wasm_output/noise_web_bg.wasm" "$wasm_output/$hashed_wasm"
+rm "$wasm_output/noise_web.js"
+
 (
   cd "$repo_root/apps/client"
   pnpm exec tsc
-  pnpm exec vite build
+  VITE_NOISE_WASM_VERSION="$wasm_version" pnpm exec vite build
 )

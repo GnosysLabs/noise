@@ -51,7 +51,9 @@ const browserConcurrentActions = new Set([
 
 async function browserAdapter() {
   if (!browserAdapterPromise) {
-    const adapterUrl = "/wasm/noise_web.js";
+    const wasmVersion = import.meta.env.VITE_NOISE_WASM_VERSION;
+    if (!wasmVersion) throw new Error("this Noise web build is missing its WASM version");
+    const adapterUrl = `/wasm/noise_web-${wasmVersion}.js`;
     browserAdapterPromise = import(/* @vite-ignore */ adapterUrl).then(async (adapter: BrowserAdapter) => {
       await adapter.default();
       await restoreBrowserVault(adapter);
