@@ -1030,7 +1030,7 @@ export default function App() {
   }
 
   async function startDirect(person: PersonSummary) {
-    await perform(async () => {
+    const started = await perform(async () => {
       const local = await noise<LocalSummary>({
         action: "start_direct",
         public_key: person.public_key,
@@ -1039,9 +1039,38 @@ export default function App() {
         avatar: person.avatar,
         accepts_direct_messages: person.accepts_direct_messages,
       });
+      if (!local) throw new Error("the direct conversation could not be started");
+      const contact = local.directs.find((direct) => direct.public_key === person.public_key);
+      if (!contact) throw new Error("the direct conversation is missing");
+      const immediateConversation: DirectConversation = {
+        contact,
+        media_scope_id: "",
+        messages: [],
+      };
+      directConversationCache.current.set(person.public_key, immediateConversation);
+      desiredDirectPublicKeyRef.current = person.public_key;
+      setDirectConversation(immediateConversation);
       setSummary(local);
       setDialog(null);
       setSidebarMode("directs");
+    }, false);
+    if (!started) return;
+
+    void (async () => {
+      try {
+        const fresh = await noise<DirectConversation>({ action: "direct_conversation", relays });
+        if (fresh) {
+          directConversationCache.current.set(fresh.contact.public_key, fresh);
+          if (desiredDirectPublicKeyRef.current === fresh.contact.public_key) {
+            setDirectConversation(fresh);
+          }
+        }
+      } catch (cause) {
+        setError(message(cause));
+      }
+    })();
+    void noise({ action: "sync_account", relays }).catch(() => {
+      // The DM is already available locally; encrypted account sync retries normally.
     });
   }
 

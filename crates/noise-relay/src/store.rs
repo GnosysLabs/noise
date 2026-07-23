@@ -12,6 +12,7 @@ use noise_core::{
 };
 use noise_transport::SignedRelayDescriptor;
 use serde::Serialize;
+use tokio::sync::Mutex;
 use turso::{Builder, Connection, params};
 
 #[derive(Clone, Debug)]
@@ -44,7 +45,7 @@ pub struct RecoveredState {
 
 #[derive(Clone)]
 pub struct DurableStore {
-    connection: Connection,
+    connection: Arc<Mutex<Connection>>,
     path: Arc<PathBuf>,
 }
 
@@ -97,7 +98,7 @@ impl DurableStore {
         recovered.relay_descriptors = recover_relay_descriptors(&connection).await?;
         Ok((
             Self {
-                connection,
+                connection: Arc::new(Mutex::new(connection)),
                 path: Arc::new(path),
             },
             recovered,
@@ -115,8 +116,8 @@ impl DurableStore {
         object: &T,
     ) -> anyhow::Result<bool> {
         let payload = serde_json::to_string(object)?;
-        let changed = self
-            .connection
+        let connection = self.connection.lock().await;
+        let changed = connection
             .execute(
                 "INSERT OR IGNORE INTO relay_objects (kind, object_id, payload)
                  VALUES (?1, ?2, ?3)",
@@ -127,8 +128,8 @@ impl DurableStore {
     }
 
     pub async fn shard_metadata(&self, shard_id: &str) -> anyhow::Result<Option<ShardMetadata>> {
-        let mut rows = self
-            .connection
+        let connection = self.connection.lock().await;
+        let mut rows = connection
             .query(
                 "SELECT payload_hash, delete_token_hash, byte_length
                  FROM relay_shards WHERE shard_id = ?1 LIMIT 1",
@@ -149,8 +150,8 @@ impl DurableStore {
     }
 
     pub async fn shard_was_deleted(&self, shard_id: &str) -> anyhow::Result<bool> {
-        let mut rows = self
-            .connection
+        let connection = self.connection.lock().await;
+        let mut rows = connection
             .query(
                 "SELECT 1 FROM relay_shard_tombstones
                  WHERE shard_id = ?1 LIMIT 1",
@@ -165,8 +166,8 @@ impl DurableStore {
         shard: &StorageShard,
         byte_length: u64,
     ) -> anyhow::Result<bool> {
-        let changed = self
-            .connection
+        let connection = self.connection.lock().await;
+        let changed = connection
             .execute(
                 "INSERT OR IGNORE INTO relay_shards
                  (shard_id, payload_hash, delete_token_hash, byte_length)
@@ -183,24 +184,24 @@ impl DurableStore {
     }
 
     pub async fn queue_shard_deletion(&self, shard_id: &str) -> anyhow::Result<bool> {
-        self.connection.execute_batch("BEGIN IMMEDIATE;").await?;
+        let connection = self.connection.lock().await;
+        connection.execute_batch("BEGIN IMMEDIATE;").await?;
         let result = async {
-            let changed = self
-                .connection
+            let changed = connection
                 .execute(
                     "DELETE FROM relay_shards WHERE shard_id = ?1",
                     params![shard_id],
                 )
                 .await?;
             if changed == 1 {
-                self.connection
+                connection
                     .execute(
                         "INSERT OR IGNORE INTO relay_shard_tombstones (shard_id)
                          VALUES (?1)",
                         params![shard_id],
                     )
                     .await?;
-                self.connection
+                connection
                     .execute(
                         "INSERT OR IGNORE INTO relay_shard_delete_queue (shard_id)
                          VALUES (?1)",
@@ -213,11 +214,11 @@ impl DurableStore {
         .await;
         match result {
             Ok(changed) => {
-                self.connection.execute_batch("COMMIT;").await?;
+                connection.execute_batch("COMMIT;").await?;
                 Ok(changed)
             }
             Err(error) => {
-                let _ = self.connection.execute_batch("ROLLBACK;").await;
+                let _ = connection.execute_batch("ROLLBACK;").await;
                 Err(error)
             }
         }
@@ -225,8 +226,8 @@ impl DurableStore {
 
     pub async fn pending_shard_deletions(&self) -> anyhow::Result<Vec<String>> {
         let mut pending = Vec::new();
-        let mut rows = self
-            .connection
+        let connection = self.connection.lock().await;
+        let mut rows = connection
             .query(
                 "SELECT shard_id FROM relay_shard_delete_queue ORDER BY shard_id",
                 (),
@@ -239,7 +240,8 @@ impl DurableStore {
     }
 
     pub async fn complete_shard_deletion(&self, shard_id: &str) -> anyhow::Result<()> {
-        self.connection
+        let connection = self.connection.lock().await;
+        connection
             .execute(
                 "DELETE FROM relay_shard_delete_queue WHERE shard_id = ?1",
                 params![shard_id],
@@ -249,17 +251,18 @@ impl DurableStore {
     }
 
     pub async fn discard_all_legacy_blobs(&self, blob_ids: &[String]) -> anyhow::Result<()> {
-        self.connection.execute_batch("BEGIN IMMEDIATE;").await?;
+        let connection = self.connection.lock().await;
+        connection.execute_batch("BEGIN IMMEDIATE;").await?;
         let result = async {
             for blob_id in blob_ids {
-                self.connection
+                connection
                     .execute(
                         "DELETE FROM relay_objects WHERE kind = 'blob' AND object_id = ?1",
                         params![blob_id.clone()],
                     )
                     .await?;
             }
-            self.connection
+            connection
                 .execute_batch(
                     "DROP TABLE IF EXISTS relay_blob_delete_queue;
                      DROP TABLE IF EXISTS relay_blobs;",
@@ -269,22 +272,24 @@ impl DurableStore {
         }
         .await;
         if let Err(error) = result {
-            let _ = self.connection.execute_batch("ROLLBACK;").await;
+            let _ = connection.execute_batch("ROLLBACK;").await;
             return Err(error);
         }
-        self.connection.execute_batch("COMMIT;").await?;
+        connection.execute_batch("COMMIT;").await?;
         Ok(())
     }
 
     pub async fn reclaim_inline_blob_space(&self) -> anyhow::Result<()> {
-        self.connection
+        let connection = self.connection.lock().await;
+        connection
             .execute_batch("VACUUM;")
             .await
             .context("could not compact relay database after encrypted media migration")
     }
 
     pub async fn upsert_account(&self, vault: &AccountVault) -> anyhow::Result<()> {
-        self.connection
+        let connection = self.connection.lock().await;
+        connection
             .execute(
                 "INSERT INTO relay_objects (kind, object_id, payload)
                  VALUES (?1, ?2, ?3)
@@ -303,7 +308,8 @@ impl DurableStore {
         &self,
         descriptor: &SignedRelayDescriptor,
     ) -> anyhow::Result<()> {
-        self.connection
+        let connection = self.connection.lock().await;
+        connection
             .execute(
                 "INSERT INTO relay_directory (relay_id, descriptor)
                  VALUES (?1, ?2)
@@ -324,16 +330,17 @@ impl DurableStore {
         event_ids: &[String],
     ) -> anyhow::Result<()> {
         let payload = serde_json::to_string(deletion)?;
-        self.connection.execute_batch("BEGIN IMMEDIATE;").await?;
+        let connection = self.connection.lock().await;
+        connection.execute_batch("BEGIN IMMEDIATE;").await?;
         let result = async {
-            self.connection
+            connection
                 .execute(
                     "INSERT OR IGNORE INTO relay_objects (kind, object_id, payload)
                      VALUES (?1, ?2, ?3)",
                     params!["deletion", deletion.group_id.clone(), payload],
                 )
                 .await?;
-            self.connection
+            connection
                 .execute(
                     "DELETE FROM relay_objects WHERE kind = ?1 AND object_id = ?2",
                     params!["invite_rotation", deletion.group_id.clone()],
@@ -341,7 +348,7 @@ impl DurableStore {
                 .await?;
             for (kind, object_ids) in [("invite", invite_ids), ("event", event_ids)] {
                 for object_id in object_ids {
-                    self.connection
+                    connection
                         .execute(
                             "DELETE FROM relay_objects WHERE kind = ?1 AND object_id = ?2",
                             params![kind, object_id.clone()],
@@ -353,10 +360,10 @@ impl DurableStore {
         }
         .await;
         if let Err(error) = result {
-            let _ = self.connection.execute_batch("ROLLBACK;").await;
+            let _ = connection.execute_batch("ROLLBACK;").await;
             return Err(error);
         }
-        self.connection.execute_batch("COMMIT;").await?;
+        connection.execute_batch("COMMIT;").await?;
         Ok(())
     }
 
@@ -366,9 +373,10 @@ impl DurableStore {
         invite_ids: &[String],
     ) -> anyhow::Result<()> {
         let payload = serde_json::to_string(rotation)?;
-        self.connection.execute_batch("BEGIN IMMEDIATE;").await?;
+        let connection = self.connection.lock().await;
+        connection.execute_batch("BEGIN IMMEDIATE;").await?;
         let result = async {
-            self.connection
+            connection
                 .execute(
                     "INSERT INTO relay_objects (kind, object_id, payload)
                      VALUES (?1, ?2, ?3)
@@ -377,7 +385,7 @@ impl DurableStore {
                 )
                 .await?;
             for object_id in invite_ids {
-                self.connection
+                connection
                     .execute(
                         "DELETE FROM relay_objects WHERE kind = ?1 AND object_id = ?2",
                         params!["invite", object_id.clone()],
@@ -385,7 +393,7 @@ impl DurableStore {
                     .await?;
             }
             if let Some(invite) = rotation.new_invite.as_ref() {
-                self.connection
+                connection
                     .execute(
                         "INSERT OR REPLACE INTO relay_objects (kind, object_id, payload)
                          VALUES (?1, ?2, ?3)",
@@ -401,10 +409,10 @@ impl DurableStore {
         }
         .await;
         if let Err(error) = result {
-            let _ = self.connection.execute_batch("ROLLBACK;").await;
+            let _ = connection.execute_batch("ROLLBACK;").await;
             return Err(error);
         }
-        self.connection.execute_batch("COMMIT;").await?;
+        connection.execute_batch("COMMIT;").await?;
         Ok(())
     }
 }

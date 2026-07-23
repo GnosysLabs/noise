@@ -937,12 +937,14 @@ async fn get_shard(
     State(state): State<AppState>,
     Path(shard_id): Path<String>,
 ) -> Result<Json<StorageShard>, StatusCode> {
-    let metadata = state
-        .store
-        .shard_metadata(&shard_id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let metadata = match state.store.shard_metadata(&shard_id).await {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => return Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            eprintln!("could not read storage shard metadata for {shard_id}: {error:#}");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     match state
         .shard_store
         .get_shard(
