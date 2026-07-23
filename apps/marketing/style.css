@@ -175,12 +175,10 @@ button { border: 0; font: inherit; color: inherit; cursor: pointer; }
 .download-button b { color: rgba(10,9,12,.35); font-size: 14px; }
 .windows-download b { color: var(--faint); }
 .platform-mark {
-  display: grid;
+  display: block;
   width: 25px;
   height: 25px;
-  place-items: center;
-  font-size: 21px;
-  line-height: 1;
+  object-fit: contain;
 }
 .windows-mark { width: 24px; height: 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 2px; }
 .windows-mark i { display: block; background: currentColor; }
