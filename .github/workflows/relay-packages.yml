@@ -38,6 +38,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes musl-tools
 
+      - name: Restore relay build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/${{ matrix.rust_target }}
+          key: relay-${{ runner.os }}-${{ matrix.rust_target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            relay-${{ runner.os }}-${{ matrix.rust_target }}-
+
       - name: Confirm release version
         if: startsWith(github.ref, 'refs/tags/')
         run: |
