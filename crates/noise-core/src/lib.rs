@@ -1,7 +1,6 @@
-use std::{
-    collections::{HashMap, HashSet},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::collections::{HashMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
@@ -2345,11 +2344,17 @@ fn decode_array<const N: usize>(value: &str, field: &'static str) -> Result<[u8;
         .map_err(|_| NoiseError::InvalidLength(field))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock is before Unix epoch")
         .as_millis() as u64
+}
+
+#[cfg(target_arch = "wasm32")]
+fn now_millis() -> u64 {
+    js_sys::Date::now().max(0.0) as u64
 }
 
 #[cfg(test)]

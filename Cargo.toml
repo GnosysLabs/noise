@@ -28,6 +28,7 @@ clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "2"
 futures-util = "0.3"
 futures-timer = "3"
+js-sys = "0.3"
 ohttp = { version = "0.8", default-features = false, features = ["client", "server", "rust-hpke"] }
 object_store = { version = "0.14.1", features = ["aws"] }
 rand = "0.9"

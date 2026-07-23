@@ -1,11 +1,12 @@
 #[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     collections::{HashMap, HashSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -432,11 +433,7 @@ impl ClientState {
         // counter can therefore fall behind another device and make otherwise
         // valid events look like replays. Use wall-clock nanoseconds as a
         // shared ordering floor while preserving monotonicity on this device.
-        let wall_clock_sequence = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
-            .unwrap_or_default();
+        let wall_clock_sequence = current_nanos();
         let sequence = self.next_author_sequence.max(wall_clock_sequence);
         self.next_author_sequence = sequence.saturating_add(1);
         sequence
@@ -4153,11 +4150,31 @@ fn purge_scope_cache(_cache_path: &Path, scope_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn current_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock is before Unix epoch")
         .as_millis() as u64
+}
+
+#[cfg(target_arch = "wasm32")]
+fn current_millis() -> u64 {
+    js_sys::Date::now().max(0.0) as u64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn current_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+        .unwrap_or_default()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn current_nanos() -> u64 {
+    current_millis().saturating_mul(1_000_000)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
