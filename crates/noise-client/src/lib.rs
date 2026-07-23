@@ -3,6 +3,7 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, bail};
@@ -394,8 +395,17 @@ impl ClientState {
     }
 
     fn take_sequence(&mut self) -> u64 {
-        let sequence = self.next_author_sequence;
-        self.next_author_sequence += 1;
+        // One Noise identity can be active on several devices. A purely local
+        // counter can therefore fall behind another device and make otherwise
+        // valid events look like replays. Use wall-clock nanoseconds as a
+        // shared ordering floor while preserving monotonicity on this device.
+        let wall_clock_sequence = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+            .unwrap_or_default();
+        let sequence = self.next_author_sequence.max(wall_clock_sequence);
+        self.next_author_sequence = sequence.saturating_add(1);
         sequence
     }
 
