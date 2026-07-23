@@ -13,7 +13,6 @@ use ed25519_dalek::{Signer, SigningKey};
 use noise_transport::{RELAY_PROTOCOL_VERSION, SignedRelayDescriptor, relay_id_from_public_key};
 
 const KEY_BYTES: usize = 32;
-const DESCRIPTOR_REFRESH_SECONDS: u64 = 60 * 60;
 const DESCRIPTOR_LIFETIME_SECONDS: u64 = 48 * 60 * 60;
 
 #[derive(Clone)]
@@ -39,9 +38,11 @@ impl RelayIdentity {
         &self,
         base_url: &str,
         ohttp_config: &[u8],
+        storage_capacity_bytes: u64,
+        storage_available_bytes: u64,
         now: u64,
     ) -> anyhow::Result<SignedRelayDescriptor> {
-        let issued_at_unix_seconds = now - (now % DESCRIPTOR_REFRESH_SECONDS);
+        let issued_at_unix_seconds = now;
         let expires_at_unix_seconds = issued_at_unix_seconds
             .checked_add(DESCRIPTOR_LIFETIME_SECONDS)
             .context("relay descriptor expiration overflowed")?;
@@ -51,6 +52,8 @@ impl RelayIdentity {
             public_key_base64: STANDARD_NO_PAD.encode(self.signing_key.verifying_key().to_bytes()),
             base_url: base_url.to_owned(),
             ohttp_config_base64: URL_SAFE_NO_PAD.encode(ohttp_config),
+            storage_capacity_bytes,
+            storage_available_bytes,
             issued_at_unix_seconds,
             expires_at_unix_seconds,
             signature_base64: String::new(),
@@ -122,7 +125,13 @@ mod tests {
         let first = RelayIdentity::open(&directory).unwrap();
         let first_id = first.relay_id();
         let descriptor = first
-            .signed_descriptor("https://relay.example", &[1, 2, 3, 4], 1_800_000_000)
+            .signed_descriptor(
+                "https://relay.example",
+                &[1, 2, 3, 4],
+                10_000,
+                8_000,
+                1_800_000_000,
+            )
             .unwrap();
         descriptor.verify_at(1_800_000_000).unwrap();
 

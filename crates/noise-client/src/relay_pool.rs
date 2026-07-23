@@ -19,9 +19,10 @@ const CACHE_VERSION: u32 = 1;
 const MAX_DIRECTORY_ENTRIES: usize = 512;
 const MAX_DISCOVERY_SOURCES: usize = 10;
 const MAX_CANDIDATES_TO_VERIFY: usize = 24;
-const MAX_MASK_RELAYS: usize = 8;
+const MAX_MASK_RELAYS: usize = 12;
 const MAX_DESCRIPTOR_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_DIRECTORY_RESPONSE_BYTES: usize = 1024 * 1024;
+const MIN_STORAGE_AVAILABLE_BYTES: u64 = 2_000_000;
 const RELAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Default, Serialize, Deserialize)]
@@ -113,7 +114,15 @@ pub async fn discover(cache_path: &Path, seeds: Vec<String>) -> anyhow::Result<V
     );
     Ok(verified
         .into_iter()
-        .map(|descriptor| descriptor.base_url)
+        // Keep the discovered relay's pinned OHTTP key. These relays are masks
+        // and eligible shard stores; dropping the key here would force direct,
+        // IP-revealing storage requests.
+        .map(|descriptor| {
+            format!(
+                "{}#ohttp={}",
+                descriptor.base_url, descriptor.ohttp_config_base64
+            )
+        })
         .collect())
 }
 
@@ -123,6 +132,9 @@ fn consider_descriptor(
     now: u64,
 ) {
     if descriptor.verify_at(now).is_err() {
+        return;
+    }
+    if descriptor.storage_available_bytes < MIN_STORAGE_AVAILABLE_BYTES {
         return;
     }
     let replace = candidates.get(&descriptor.relay_id).is_none_or(|current| {
@@ -218,7 +230,7 @@ async fn client_for_relay(base_url: &str, allow_local: bool) -> anyhow::Result<C
     let mut builder = Client::builder()
         .redirect(Policy::none())
         .timeout(RELAY_REQUEST_TIMEOUT)
-        .user_agent("noise-client/2");
+        .user_agent("noise-client/3");
     match host {
         Host::Domain(domain) => {
             let addresses = lookup_host((domain, port))

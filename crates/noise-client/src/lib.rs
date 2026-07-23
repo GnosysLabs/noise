@@ -10,10 +10,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use noise_core::{
     AccountCredentials, AccountVault, EncryptedBlob, GroupDeletion, GroupEventPayload,
     GroupMembership, GroupPresence, GroupProfile, GroupState, Identity, InviteRecord,
-    InviteRotation, Profile, SignedEvent, derive_account_credentials, direct_mailbox_id,
-    direct_message_id,
-    display_frequency, display_noise_id, frequency_locator, generate_frequency, generate_noise_id,
-    normalize_frequency, valid_reaction_emoji,
+    InviteRotation, Profile, SignedEvent, StorageManifest, StorageShard,
+    derive_account_credentials, direct_mailbox_id, direct_message_id, display_frequency,
+    display_noise_id, encode_blob_for_storage, frequency_locator, generate_frequency,
+    generate_noise_id, normalize_frequency, reconstruct_blob_from_storage, valid_reaction_emoji,
 };
 pub use noise_core::{MediaAttachment, MediaChunk, ProfileImage};
 use noise_transport::{
@@ -664,12 +664,13 @@ impl NoiseClient {
                 bail!("avatar images must contain between 1 byte and 256 KiB")
             }
             let (blob, key_base64) = EncryptedBlob::create(&data)?;
-            self.publish_blob(&relays, &blob).await?;
+            let storage = self.store_blob_shards(&relays, &blob, &key_base64).await?;
             Some(ProfileImage {
                 blob_id: blob.blob_id,
                 key_base64,
                 mime_type,
                 byte_length: data.len() as u32,
+                storage: Some(storage),
             })
         } else {
             None
@@ -865,13 +866,10 @@ impl NoiseClient {
         let relays = relay_list(relays)?;
         let mut accepted = 0usize;
         for group in &state.groups {
-            accepted += self
-                .publish_group_presence(group, &identity, &relays)
-                .await;
+            accepted += self.publish_group_presence(group, &identity, &relays).await;
         }
         for contact in &state.direct_contacts {
-            let Ok(mailbox) =
-                identity.direct_mailbox(&contact.public_key, &contact.public_key)
+            let Ok(mailbox) = identity.direct_mailbox(&contact.public_key, &contact.public_key)
             else {
                 continue;
             };
@@ -1088,14 +1086,16 @@ impl NoiseClient {
                 let mut online_public_keys = Vec::new();
                 let mut recently_active_public_keys = Vec::new();
                 for presence in change.presences {
-                    let Some(public_key) = direct_mailboxes.iter().find_map(
-                        |(expected_public_key, mailbox)| {
-                            presence
-                                .open(mailbox)
-                                .ok()
-                                .filter(|opened| opened == expected_public_key)
-                        },
-                    ) else {
+                    let Some(public_key) =
+                        direct_mailboxes
+                            .iter()
+                            .find_map(|(expected_public_key, mailbox)| {
+                                presence
+                                    .open(mailbox)
+                                    .ok()
+                                    .filter(|opened| opened == expected_public_key)
+                            })
+                    else {
                         continue;
                     };
                     if presence.expires_at_millis > now {
@@ -1160,12 +1160,13 @@ impl NoiseClient {
                 bail!("avatar images must contain between 1 byte and 256 KiB")
             }
             let (blob, key_base64) = EncryptedBlob::create(&data)?;
-            self.publish_blob(&relays, &blob).await?;
+            let storage = self.store_blob_shards(&relays, &blob, &key_base64).await?;
             Some(ProfileImage {
                 blob_id: blob.blob_id,
                 key_base64,
                 mime_type,
                 byte_length: data.len() as u32,
+                storage: Some(storage),
             })
         } else {
             state.profile.avatar.clone()
@@ -1268,12 +1269,13 @@ impl NoiseClient {
             }
             let (blob, key_base64) =
                 EncryptedBlob::create_for_group(&data, current_group.group_id.clone())?;
-            self.publish_blob(&relays, &blob).await?;
+            let storage = self.store_blob_shards(&relays, &blob, &key_base64).await?;
             Some(ProfileImage {
                 blob_id: blob.blob_id,
                 key_base64,
                 mime_type,
                 byte_length: data.len() as u32,
+                storage: Some(storage),
             })
         } else {
             current_group.avatar.clone()
@@ -1298,12 +1300,13 @@ impl NoiseClient {
             }
             let (blob, key_base64) =
                 EncryptedBlob::create_for_group(&data, current_group.group_id.clone())?;
-            self.publish_blob(&relays, &blob).await?;
+            let storage = self.store_blob_shards(&relays, &blob, &key_base64).await?;
             Some(ProfileImage {
                 blob_id: blob.blob_id,
                 key_base64,
                 mime_type,
                 byte_length: data.len() as u32,
+                storage: Some(storage),
             })
         } else {
             current_group.background.clone()
@@ -1386,6 +1389,7 @@ impl NoiseClient {
         image: &ProfileImage,
         relays: Vec<String>,
     ) -> anyhow::Result<AvatarData> {
+        let _relays = relay_list(relays)?;
         if image.byte_length == 0 || image.byte_length > 1536 * 1024 {
             bail!("image reference has an invalid size")
         }
@@ -1402,9 +1406,11 @@ impl NoiseClient {
         let blob = if let Some(blob) = cached_blob {
             blob
         } else {
-            let blob = self
-                .fetch_blob(&relay_list(relays)?, &image.blob_id)
-                .await?;
+            let storage = image
+                .storage
+                .as_ref()
+                .context("this image predates constellation storage and is no longer available")?;
+            let blob = self.reconstruct_blob(storage, &image.key_base64).await?;
             fs::create_dir_all(&cache_directory)
                 .context("could not create the profile image cache")?;
             let temporary = file_path.with_extension("json.part");
@@ -1455,7 +1461,7 @@ impl NoiseClient {
         } else {
             state.active_group()?.group_id.clone()
         };
-        let relays = relay_list(relays)?;
+        let _relays = relay_list(relays)?;
         let cache_directory = cache_path.as_ref().join("media").join(&scope_id);
         fs::create_dir_all(&cache_directory).context("could not create the media cache")?;
         let extension = media_extension(&attachment.mime_type);
@@ -1474,7 +1480,11 @@ impl NoiseClient {
         let mut output =
             fs::File::create(&temporary).context("could not create media cache file")?;
         for chunk in &attachment.chunks {
-            let blob = self.fetch_blob(&relays, &chunk.blob_id).await?;
+            let storage = chunk
+                .storage
+                .as_ref()
+                .context("this media predates constellation storage and is no longer available")?;
+            let blob = self.reconstruct_blob(storage, &chunk.key_base64).await?;
             if blob.group_id.as_deref() != Some(scope_id.as_str()) {
                 bail!("media chunk belongs to a different conversation")
             }
@@ -1521,11 +1531,14 @@ impl NoiseClient {
             bail!("media chunks must contain between 1 byte and 1 MiB")
         }
         let (blob, key_base64) = EncryptedBlob::create_for_group(&data, group_id)?;
-        self.publish_blob(&relay_list(relays)?, &blob).await?;
+        let storage = self
+            .store_blob_shards(&relay_list(relays)?, &blob, &key_base64)
+            .await?;
         Ok(MediaChunk {
             blob_id: blob.blob_id,
             key_base64,
             byte_length: data.len() as u32,
+            storage: Some(storage),
         })
     }
 
@@ -1563,12 +1576,13 @@ impl NoiseClient {
             }
             let (blob, key_base64) =
                 EncryptedBlob::create_for_group(&data, group.group_id.clone())?;
-            self.publish_blob(&relays, &blob).await?;
+            let storage = self.store_blob_shards(&relays, &blob, &key_base64).await?;
             group.avatar = Some(ProfileImage {
                 blob_id: blob.blob_id,
                 key_base64,
                 mime_type,
                 byte_length: data.len() as u32,
+                storage: Some(storage),
             });
         }
         let frequency = generate_frequency();
@@ -1837,12 +1851,7 @@ impl NoiseClient {
                     .map(|mailbox| (contact.public_key.clone(), mailbox))
             })
             .collect::<Vec<_>>();
-        self.watch_direct_id(
-            &mailbox_id,
-            &direct_mailboxes,
-            since,
-            relay_list(relays)?,
-        )
+        self.watch_direct_id(&mailbox_id, &direct_mailboxes, since, relay_list(relays)?)
             .await
     }
 
@@ -1953,11 +1962,14 @@ impl NoiseClient {
             bail!("media chunks must contain between 1 byte and 1 MiB")
         }
         let (blob, key_base64) = EncryptedBlob::create_for_group(&data, scope_id)?;
-        self.publish_blob(&relay_list(relays)?, &blob).await?;
+        let storage = self
+            .store_blob_shards(&relay_list(relays)?, &blob, &key_base64)
+            .await?;
         Ok(MediaChunk {
             blob_id: blob.blob_id,
             key_base64,
             byte_length: data.len() as u32,
+            storage: Some(storage),
         })
     }
 
@@ -1998,8 +2010,19 @@ impl NoiseClient {
                 sequence,
             )?;
             let relays = relay_list(relays)?;
+            let mut storage = direct_storage_references(
+                &recipient_mailbox,
+                &self
+                    .fetch_events(&recipient_mailbox, relays.clone())
+                    .await?,
+            );
+            storage.extend(direct_storage_references(
+                &sender_mailbox,
+                &self.fetch_events(&sender_mailbox, relays.clone()).await?,
+            ));
             self.publish_event(&relays, &recipient_event).await?;
             self.publish_event(&relays, &sender_event).await?;
+            self.erase_storage_references(storage, true).await?;
             deleted_at_millis = deleted_at_millis
                 .max(recipient_event.created_at_millis)
                 .max(sender_event.created_at_millis);
@@ -2181,9 +2204,15 @@ impl NoiseClient {
         {
             bail!("you can only delete your own messages")
         }
+        let storage = target
+            .attachment
+            .as_ref()
+            .map(attachment_storage_references)
+            .unwrap_or_default();
         let sequence = state.take_sequence();
         let event = SignedEvent::message_deleted(&identity, &group, message_event_id, sequence)?;
         self.publish_event(&relays, &event).await?;
+        let _ = self.erase_storage_references(storage, false).await;
         save_state(path, &state)?;
         Ok(())
     }
@@ -2327,6 +2356,16 @@ impl NoiseClient {
         if !is_owner && view.moderators.contains(member_public_key) {
             bail!("only the founder can ban another moderator")
         }
+        let storage = if delete_messages {
+            view.messages
+                .iter()
+                .filter(|message| message.author_public_key == member_public_key)
+                .filter_map(|message| message.attachment.as_ref())
+                .flat_map(attachment_storage_references)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let sequence = state.take_sequence();
         let event = SignedEvent::member_banned(
             &identity,
@@ -2336,6 +2375,7 @@ impl NoiseClient {
             sequence,
         )?;
         self.publish_event(&relays, &event).await?;
+        let _ = self.erase_storage_references(storage, false).await;
         save_state(path, &state)?;
         Ok(())
     }
@@ -2422,6 +2462,9 @@ impl NoiseClient {
         if !group.authority_nonce_base64.is_empty() {
             let deletion = GroupDeletion::create(&identity, &group)?;
             let relays = relay_list(relays)?;
+            let events = self.fetch_events(&group, relays.clone()).await?;
+            self.erase_storage_references(group_storage_references(&group, &events), true)
+                .await?;
             self.publish_group_deletion(&relays, &deletion).await?;
         }
 
@@ -2457,13 +2500,26 @@ impl NoiseClient {
             if group.owner_public_key == self_public_key && !group.authority_nonce_base64.is_empty()
             {
                 let deletion = GroupDeletion::create(&identity, &group)?;
+                let events = self.fetch_events(&group, relays.clone()).await?;
+                self.erase_storage_references(group_storage_references(&group, &events), true)
+                    .await?;
                 self.publish_group_deletion(&relays, &deletion).await?;
                 continue;
             }
             if delete_group_messages {
+                let events = self.fetch_events(&group, relays.clone()).await?;
+                let view = GroupState::rebuild(&group, &events);
+                let storage = view
+                    .messages
+                    .iter()
+                    .filter(|message| message.author_public_key == self_public_key)
+                    .filter_map(|message| message.attachment.as_ref())
+                    .flat_map(attachment_storage_references)
+                    .collect();
                 let sequence = state.take_sequence();
                 let event = SignedEvent::own_messages_deleted(&identity, &group, sequence)?;
                 self.publish_event(&relays, &event).await?;
+                let _ = self.erase_storage_references(storage, false).await;
             }
             let sequence = state.take_sequence();
             let event = SignedEvent::member_left(&identity, &group, sequence)?;
@@ -2489,8 +2545,19 @@ impl NoiseClient {
                     &contact.public_key,
                     sequence,
                 )?;
+                let mut storage = direct_storage_references(
+                    &recipient_mailbox,
+                    &self
+                        .fetch_events(&recipient_mailbox, relays.clone())
+                        .await?,
+                );
+                storage.extend(direct_storage_references(
+                    &sender_mailbox,
+                    &self.fetch_events(&sender_mailbox, relays.clone()).await?,
+                ));
                 self.publish_event(&relays, &recipient_event).await?;
                 self.publish_event(&relays, &sender_event).await?;
+                self.erase_storage_references(storage, true).await?;
             }
         }
 
@@ -3059,26 +3126,130 @@ impl NoiseClient {
         Ok(())
     }
 
-    async fn publish_blob(
+    fn storage_relays(
+        &self,
+        relays: &[RelayDescriptor],
+        placement_key: &str,
+    ) -> Vec<RelayDescriptor> {
+        let mut unique = HashMap::<String, RelayDescriptor>::new();
+        for relay in relays.iter().chain(self.mask_relays.iter()) {
+            unique
+                .entry(relay.base_url.clone())
+                .and_modify(|current| {
+                    if current.ohttp_config.is_none() && relay.ohttp_config.is_some() {
+                        *current = relay.clone();
+                    }
+                })
+                .or_insert_with(|| relay.clone());
+        }
+        let mut candidates = unique.into_values().collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            storage_relay_score(placement_key, &right.base_url)
+                .cmp(&storage_relay_score(placement_key, &left.base_url))
+                .then_with(|| left.base_url.cmp(&right.base_url))
+        });
+        candidates.truncate(noise_core::MAX_STORAGE_SHARDS);
+        candidates
+    }
+
+    async fn delete_storage_manifest(&self, manifest: &StorageManifest, key_base64: &str) {
+        let _ = self
+            .erase_storage_references(vec![(manifest.clone(), key_base64.to_owned())], false)
+            .await;
+    }
+
+    async fn erase_storage_references(
+        &self,
+        references: Vec<(StorageManifest, String)>,
+        require_all: bool,
+    ) -> anyhow::Result<()> {
+        let mut deletions = tokio::task::JoinSet::new();
+        let mut seen = HashSet::new();
+        for (manifest, key_base64) in references {
+            for placement in manifest.placements {
+                if !seen.insert(placement.shard_id.clone()) {
+                    continue;
+                }
+                let deletion = noise_core::shard_deletion(&key_base64, &placement.shard_id)?;
+                let client = self.clone();
+                deletions.spawn(async move {
+                    let relay = RelayDescriptor::parse(&placement.relay)?;
+                    let body = serde_json::to_vec(&deletion)?;
+                    let response = client
+                        .relay_request(
+                            std::slice::from_ref(&relay),
+                            0,
+                            "DELETE",
+                            &format!("/v3/shards/{}", placement.shard_id),
+                            &body,
+                        )
+                        .await?;
+                    anyhow::ensure!(
+                        (200..300).contains(&response.status) || response.status == 404,
+                        "storage relay rejected shard deletion with status {}",
+                        response.status
+                    );
+                    Ok::<(), anyhow::Error>(())
+                });
+            }
+        }
+        let mut failed = 0usize;
+        while let Some(result) = deletions.join_next().await {
+            if !matches!(result, Ok(Ok(()))) {
+                failed += 1;
+            }
+        }
+        if require_all && failed != 0 {
+            bail!("{failed} encrypted media shards could not be erased; try again")
+        }
+        Ok(())
+    }
+
+    async fn store_blob_shards(
         &self,
         relays: &[RelayDescriptor],
         blob: &EncryptedBlob,
-    ) -> anyhow::Result<()> {
-        let body = serde_json::to_vec(blob)?;
-        let mut accepted = 0usize;
-        for index in 0..relays.len() {
-            if let Ok(response) = self
-                .relay_request(relays, index, "POST", "/v1/blobs", &body)
-                .await
-                && (200..300).contains(&response.status)
-            {
-                accepted += 1;
+        key_base64: &str,
+    ) -> anyhow::Result<StorageManifest> {
+        let storage_relays = self.storage_relays(relays, key_base64);
+        let relay_addresses = storage_relays.iter().map(relay_address).collect::<Vec<_>>();
+        let (manifest, shards) = encode_blob_for_storage(blob, key_base64, &relay_addresses)?;
+        let required = usize::from(manifest.data_shards);
+        let mut uploads = tokio::task::JoinSet::new();
+        for (relay, shard) in storage_relays.into_iter().zip(shards) {
+            let client = self.clone();
+            uploads.spawn(async move {
+                let body = serde_json::to_vec(&shard)?;
+                let response = client
+                    .relay_request(std::slice::from_ref(&relay), 0, "POST", "/v3/shards", &body)
+                    .await?;
+                anyhow::ensure!(
+                    (200..300).contains(&response.status),
+                    "storage relay rejected shard with status {}",
+                    response.status
+                );
+                Ok::<String, anyhow::Error>(shard.shard_id)
+            });
+        }
+        let mut accepted = HashSet::new();
+        while let Some(result) = uploads.join_next().await {
+            if let Ok(Ok(shard_id)) = result {
+                accepted.insert(shard_id);
             }
         }
-        if accepted == 0 {
-            bail!("no relay accepted the encrypted media")
+        if accepted.len() < required {
+            let mut cleanup = manifest.clone();
+            cleanup
+                .placements
+                .retain(|placement| accepted.contains(&placement.shard_id));
+            self.delete_storage_manifest(&cleanup, key_base64).await;
+            bail!(
+                "only {} of {required} required media shards reached storage relays",
+                accepted.len()
+            )
         }
-        Ok(())
+        manifest.verify(&blob.blob_id)?;
+        Ok(manifest)
     }
 
     async fn publish_group_deletion(
@@ -3103,26 +3274,127 @@ impl NoiseClient {
         Ok(())
     }
 
-    async fn fetch_blob(
+    async fn reconstruct_blob(
         &self,
-        relays: &[RelayDescriptor],
-        blob_id: &str,
+        manifest: &StorageManifest,
+        key_base64: &str,
     ) -> anyhow::Result<EncryptedBlob> {
-        for index in 0..relays.len() {
-            let Ok(response) = self
-                .relay_request(relays, index, "GET", &format!("/v1/blobs/{blob_id}"), &[])
-                .await
-            else {
-                continue;
-            };
-            if (200..300).contains(&response.status)
-                && let Ok(blob) = serde_json::from_slice::<EncryptedBlob>(&response.body)
-                && blob.verify().is_ok()
-            {
-                return Ok(blob);
+        manifest.verify(&manifest.object_id)?;
+        let required = usize::from(manifest.data_shards);
+        let mut downloads = tokio::task::JoinSet::new();
+        for placement in manifest.placements.clone() {
+            let client = self.clone();
+            downloads.spawn(async move {
+                let relay = RelayDescriptor::parse(&placement.relay)?;
+                let response = client
+                    .relay_request(
+                        std::slice::from_ref(&relay),
+                        0,
+                        "GET",
+                        &format!("/v3/shards/{}", placement.shard_id),
+                        &[],
+                    )
+                    .await?;
+                anyhow::ensure!(
+                    (200..300).contains(&response.status),
+                    "storage relay does not have shard"
+                );
+                let shard = serde_json::from_slice::<StorageShard>(&response.body)?;
+                shard.verify()?;
+                anyhow::ensure!(
+                    shard.shard_id == placement.shard_id,
+                    "storage relay returned the wrong shard"
+                );
+                anyhow::ensure!(
+                    shard.payload_hash == placement.payload_hash,
+                    "storage relay returned a corrupt shard"
+                );
+                Ok::<StorageShard, anyhow::Error>(shard)
+            });
+        }
+        let mut shards = Vec::with_capacity(required);
+        let mut healthy_shard_ids = HashSet::new();
+        while let Some(result) = downloads.join_next().await {
+            if let Ok(Ok(shard)) = result {
+                healthy_shard_ids.insert(shard.shard_id.clone());
+                shards.push(shard);
+                if shards.len() >= required {
+                    downloads.abort_all();
+                    break;
+                }
             }
         }
-        bail!("encrypted media is not available from any relay")
+        let blob = reconstruct_blob_from_storage(manifest, &shards)
+            .context("encrypted media does not have enough healthy storage shards")?;
+        if healthy_shard_ids.len() < manifest.placements.len() {
+            let client = self.clone();
+            let manifest = manifest.clone();
+            let key_base64 = key_base64.to_owned();
+            let blob_to_repair = blob.clone();
+            tokio::spawn(async move {
+                client
+                    .repair_storage(&blob_to_repair, &key_base64, &manifest, &healthy_shard_ids)
+                    .await;
+            });
+        }
+        Ok(blob)
+    }
+
+    async fn repair_storage(
+        &self,
+        blob: &EncryptedBlob,
+        key_base64: &str,
+        manifest: &StorageManifest,
+        healthy_shard_ids: &HashSet<String>,
+    ) {
+        if manifest.placements.len() != usize::from(manifest.total_shards) {
+            return;
+        }
+        let mut relays = vec![String::new(); usize::from(manifest.total_shards)];
+        for placement in &manifest.placements {
+            relays[usize::from(placement.shard_index)] = placement.relay.clone();
+        }
+        if relays.iter().any(String::is_empty) {
+            return;
+        }
+        let Ok((repair_manifest, shards)) = encode_blob_for_storage(blob, key_base64, &relays)
+        else {
+            return;
+        };
+        for (placement, shard) in repair_manifest.placements.into_iter().zip(shards) {
+            if healthy_shard_ids.contains(&placement.shard_id) {
+                continue;
+            }
+            let Ok(relay) = RelayDescriptor::parse(&placement.relay) else {
+                continue;
+            };
+            let already_healthy = self
+                .relay_request(
+                    std::slice::from_ref(&relay),
+                    0,
+                    "GET",
+                    &format!("/v3/shards/{}", placement.shard_id),
+                    &[],
+                )
+                .await
+                .ok()
+                .filter(|response| (200..300).contains(&response.status))
+                .and_then(|response| serde_json::from_slice::<StorageShard>(&response.body).ok())
+                .is_some_and(|existing| {
+                    existing.verify().is_ok()
+                        && existing.shard_id == placement.shard_id
+                        && existing.payload_hash == placement.payload_hash
+                });
+            if already_healthy {
+                continue;
+            }
+            let Ok(body) = serde_json::to_vec(&shard) else {
+                continue;
+            };
+            let _ = self
+                .relay_request(std::slice::from_ref(&relay), 0, "POST", "/v3/shards", &body)
+                .await;
+        }
     }
 
     async fn fetch_invite(
@@ -3472,6 +3744,75 @@ fn direct_summary(contact: &DirectContact, is_active: bool, has_unread: bool) ->
     }
 }
 
+fn attachment_storage_references(attachment: &MediaAttachment) -> Vec<(StorageManifest, String)> {
+    attachment
+        .chunks
+        .iter()
+        .filter_map(|chunk| {
+            chunk
+                .storage
+                .as_ref()
+                .map(|storage| (storage.clone(), chunk.key_base64.clone()))
+        })
+        .collect()
+}
+
+fn image_storage_reference(image: &ProfileImage) -> Option<(StorageManifest, String)> {
+    image
+        .storage
+        .as_ref()
+        .map(|storage| (storage.clone(), image.key_base64.clone()))
+}
+
+fn group_storage_references(
+    group: &GroupMembership,
+    events: &[SignedEvent],
+) -> Vec<(StorageManifest, String)> {
+    let mut references = Vec::new();
+    references.extend(group.avatar.as_ref().and_then(image_storage_reference));
+    references.extend(group.background.as_ref().and_then(image_storage_reference));
+    for event in events {
+        let Ok(payload) = event.decrypt(group) else {
+            continue;
+        };
+        match payload {
+            GroupEventPayload::GroupProfileUpdated { profile } => {
+                references.extend(profile.avatar.as_ref().and_then(image_storage_reference));
+                references.extend(
+                    profile
+                        .background
+                        .as_ref()
+                        .and_then(image_storage_reference),
+                );
+            }
+            GroupEventPayload::Message {
+                attachment: Some(attachment),
+                ..
+            } => references.extend(attachment_storage_references(&attachment)),
+            _ => {}
+        }
+    }
+    references
+}
+
+fn direct_storage_references(
+    mailbox: &GroupMembership,
+    events: &[SignedEvent],
+) -> Vec<(StorageManifest, String)> {
+    events
+        .iter()
+        .filter_map(|event| event.decrypt(mailbox).ok())
+        .filter_map(|payload| match payload {
+            GroupEventPayload::DirectMessage {
+                attachment: Some(attachment),
+                ..
+            } => Some(attachment),
+            _ => None,
+        })
+        .flat_map(|attachment| attachment_storage_references(&attachment))
+        .collect()
+}
+
 fn relay_list(relays: Vec<String>) -> anyhow::Result<Vec<RelayDescriptor>> {
     let relays = if relays.is_empty() {
         vec![
@@ -3494,6 +3835,20 @@ fn relay_list(relays: Vec<String>) -> anyhow::Result<Vec<RelayDescriptor>> {
         bail!("multi-relay configurations require pinned privacy keys")
     }
     Ok(relays)
+}
+
+fn relay_address(relay: &RelayDescriptor) -> String {
+    relay.ohttp_config.as_deref().map_or_else(
+        || relay.base_url.clone(),
+        |config| RelayDescriptor::shareable(&relay.base_url, config),
+    )
+}
+
+fn storage_relay_score(placement_key: &str, base_url: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key("xyz.gnosyslabs.noise.storage-rendezvous.v1");
+    hasher.update(placement_key.as_bytes());
+    hasher.update(base_url.as_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 fn is_local_relay(base_url: &str) -> bool {

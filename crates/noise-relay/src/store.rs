@@ -8,17 +8,36 @@ use std::{
 use anyhow::{Context, anyhow};
 use noise_core::{
     AccountVault, EncryptedBlob, GroupDeletion, InviteRecord, InviteRotation, SignedEvent,
+    StorageShard,
 };
 use noise_transport::SignedRelayDescriptor;
 use serde::Serialize;
 use turso::{Builder, Connection, params};
+
+#[derive(Clone, Debug)]
+pub struct LegacyBlobMetadata {
+    pub blob_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShardMetadata {
+    pub payload_hash: String,
+    pub delete_token_hash: String,
+    pub byte_length: u64,
+}
 
 pub struct RecoveredState {
     pub accounts: HashMap<String, AccountVault>,
     pub invites: HashMap<String, InviteRecord>,
     pub invite_rotations: HashMap<String, InviteRotation>,
     pub events: HashMap<String, SignedEvent>,
-    pub blobs: HashMap<String, EncryptedBlob>,
+    pub blobs: Vec<String>,
+    pub legacy_blobs: Vec<LegacyBlobMetadata>,
+    pub pending_blob_deletions: Vec<String>,
+    pub legacy_blob_schema: bool,
+    pub pending_shard_deletions: Vec<String>,
+    pub shard_count: u64,
+    pub shard_bytes: u64,
     pub deletions: HashMap<String, GroupDeletion>,
     pub relay_descriptors: HashMap<String, SignedRelayDescriptor>,
 }
@@ -40,6 +59,9 @@ impl DurableStore {
         let path = data_directory.join("relay.db");
         let path_string = path.to_string_lossy().into_owned();
         let database = Builder::new_local(&path_string)
+            // Used only for the one-time rewrite that physically removes
+            // legacy inline media pages after migration.
+            .experimental_vacuum(true)
             .build()
             .await
             .with_context(|| format!("could not open relay database {}", path.display()))?;
@@ -55,6 +77,18 @@ impl DurableStore {
              CREATE TABLE IF NOT EXISTS relay_directory (
                  relay_id TEXT PRIMARY KEY,
                  descriptor TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS relay_shards (
+                 shard_id TEXT PRIMARY KEY,
+                 payload_hash TEXT NOT NULL,
+                 delete_token_hash TEXT NOT NULL,
+                 byte_length INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS relay_shard_delete_queue (
+                 shard_id TEXT PRIMARY KEY
+             );
+             CREATE TABLE IF NOT EXISTS relay_shard_tombstones (
+                 shard_id TEXT PRIMARY KEY
              );",
             )
             .await?;
@@ -90,6 +124,163 @@ impl DurableStore {
             )
             .await?;
         Ok(changed == 1)
+    }
+
+    pub async fn shard_metadata(&self, shard_id: &str) -> anyhow::Result<Option<ShardMetadata>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT payload_hash, delete_token_hash, byte_length
+                 FROM relay_shards WHERE shard_id = ?1 LIMIT 1",
+                params![shard_id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let byte_length: i64 = row.get(2)?;
+        Ok(Some(ShardMetadata {
+            payload_hash: row.get(0)?,
+            delete_token_hash: row.get(1)?,
+            byte_length: byte_length
+                .try_into()
+                .context("stored shard has an invalid byte length")?,
+        }))
+    }
+
+    pub async fn shard_was_deleted(&self, shard_id: &str) -> anyhow::Result<bool> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT 1 FROM relay_shard_tombstones
+                 WHERE shard_id = ?1 LIMIT 1",
+                params![shard_id],
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
+    }
+
+    pub async fn insert_shard(
+        &self,
+        shard: &StorageShard,
+        byte_length: u64,
+    ) -> anyhow::Result<bool> {
+        let changed = self
+            .connection
+            .execute(
+                "INSERT OR IGNORE INTO relay_shards
+                 (shard_id, payload_hash, delete_token_hash, byte_length)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    shard.shard_id.clone(),
+                    shard.payload_hash.clone(),
+                    shard.delete_token_hash.clone(),
+                    i64::try_from(byte_length).context("storage shard is too large")?
+                ],
+            )
+            .await?;
+        Ok(changed == 1)
+    }
+
+    pub async fn queue_shard_deletion(&self, shard_id: &str) -> anyhow::Result<bool> {
+        self.connection.execute_batch("BEGIN IMMEDIATE;").await?;
+        let result = async {
+            let changed = self
+                .connection
+                .execute(
+                    "DELETE FROM relay_shards WHERE shard_id = ?1",
+                    params![shard_id],
+                )
+                .await?;
+            if changed == 1 {
+                self.connection
+                    .execute(
+                        "INSERT OR IGNORE INTO relay_shard_tombstones (shard_id)
+                         VALUES (?1)",
+                        params![shard_id],
+                    )
+                    .await?;
+                self.connection
+                    .execute(
+                        "INSERT OR IGNORE INTO relay_shard_delete_queue (shard_id)
+                         VALUES (?1)",
+                        params![shard_id],
+                    )
+                    .await?;
+            }
+            Ok::<bool, anyhow::Error>(changed == 1)
+        }
+        .await;
+        match result {
+            Ok(changed) => {
+                self.connection.execute_batch("COMMIT;").await?;
+                Ok(changed)
+            }
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK;").await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn pending_shard_deletions(&self) -> anyhow::Result<Vec<String>> {
+        let mut pending = Vec::new();
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT shard_id FROM relay_shard_delete_queue ORDER BY shard_id",
+                (),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            pending.push(row.get(0)?);
+        }
+        Ok(pending)
+    }
+
+    pub async fn complete_shard_deletion(&self, shard_id: &str) -> anyhow::Result<()> {
+        self.connection
+            .execute(
+                "DELETE FROM relay_shard_delete_queue WHERE shard_id = ?1",
+                params![shard_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn discard_all_legacy_blobs(&self, blob_ids: &[String]) -> anyhow::Result<()> {
+        self.connection.execute_batch("BEGIN IMMEDIATE;").await?;
+        let result = async {
+            for blob_id in blob_ids {
+                self.connection
+                    .execute(
+                        "DELETE FROM relay_objects WHERE kind = 'blob' AND object_id = ?1",
+                        params![blob_id.clone()],
+                    )
+                    .await?;
+            }
+            self.connection
+                .execute_batch(
+                    "DROP TABLE IF EXISTS relay_blob_delete_queue;
+                     DROP TABLE IF EXISTS relay_blobs;",
+                )
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = self.connection.execute_batch("ROLLBACK;").await;
+            return Err(error);
+        }
+        self.connection.execute_batch("COMMIT;").await?;
+        Ok(())
+    }
+
+    pub async fn reclaim_inline_blob_space(&self) -> anyhow::Result<()> {
+        self.connection
+            .execute_batch("VACUUM;")
+            .await
+            .context("could not compact relay database after encrypted media migration")
     }
 
     pub async fn upsert_account(&self, vault: &AccountVault) -> anyhow::Result<()> {
@@ -131,7 +322,6 @@ impl DurableStore {
         deletion: &GroupDeletion,
         invite_ids: &[String],
         event_ids: &[String],
-        blob_ids: &[String],
     ) -> anyhow::Result<()> {
         let payload = serde_json::to_string(deletion)?;
         self.connection.execute_batch("BEGIN IMMEDIATE;").await?;
@@ -149,11 +339,7 @@ impl DurableStore {
                     params!["invite_rotation", deletion.group_id.clone()],
                 )
                 .await?;
-            for (kind, object_ids) in [
-                ("invite", invite_ids),
-                ("event", event_ids),
-                ("blob", blob_ids),
-            ] {
+            for (kind, object_ids) in [("invite", invite_ids), ("event", event_ids)] {
                 for object_id in object_ids {
                     self.connection
                         .execute(
@@ -228,8 +414,67 @@ async fn recover(connection: &Connection) -> anyhow::Result<RecoveredState> {
     let mut invites = HashMap::new();
     let mut invite_rotations = HashMap::new();
     let mut events = HashMap::new();
-    let mut blobs = HashMap::new();
+    let mut blobs = Vec::new();
+    let mut legacy_blobs = Vec::new();
+    let mut pending_blob_deletions = Vec::new();
+    let mut pending_shard_deletions = Vec::new();
     let mut deletions = HashMap::new();
+    let (shard_count, shard_bytes) = {
+        let mut rows = connection
+            .query(
+                "SELECT COUNT(*), COALESCE(SUM(byte_length), 0) FROM relay_shards",
+                (),
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .context("shard totals query returned no row")?;
+        let count: i64 = row.get(0)?;
+        let bytes: i64 = row.get(1)?;
+        (
+            count.try_into().context("stored shard count is invalid")?,
+            bytes
+                .try_into()
+                .context("stored shard byte total is invalid")?,
+        )
+    };
+
+    let legacy_blob_table_exists = table_exists(connection, "relay_blobs").await?;
+    let legacy_blob_queue_exists = table_exists(connection, "relay_blob_delete_queue").await?;
+    if legacy_blob_table_exists {
+        let mut blob_rows = connection
+            .query("SELECT blob_id FROM relay_blobs ORDER BY blob_id", ())
+            .await?;
+        while let Some(row) = blob_rows.next().await? {
+            let blob_id: String = row.get(0)?;
+            blobs.push(blob_id);
+        }
+    }
+
+    if legacy_blob_queue_exists {
+        let mut deletion_rows = connection
+            .query(
+                "SELECT blob_id FROM relay_blob_delete_queue ORDER BY blob_id",
+                (),
+            )
+            .await?;
+        while let Some(row) = deletion_rows.next().await? {
+            pending_blob_deletions.push(row.get(0)?);
+        }
+    }
+
+    let mut shard_deletion_rows = connection
+        .query(
+            "SELECT shard_id FROM relay_shard_delete_queue ORDER BY shard_id",
+            (),
+        )
+        .await?;
+    while let Some(row) = shard_deletion_rows.next().await? {
+        pending_shard_deletions.push(row.get(0)?);
+    }
+    drop(shard_deletion_rows);
+
     let mut rows = connection
         .query(
             "SELECT kind, object_id, payload
@@ -300,7 +545,7 @@ async fn recover(connection: &Connection) -> anyhow::Result<RecoveredState> {
                 if blob.blob_id != object_id {
                     return Err(anyhow!("stored blob key does not match its blob id"));
                 }
-                blobs.insert(object_id, blob);
+                legacy_blobs.push(LegacyBlobMetadata { blob_id: object_id });
             }
             "deletion" => {
                 let deletion: GroupDeletion = serde_json::from_str(&payload)
@@ -337,11 +582,6 @@ async fn recover(connection: &Connection) -> anyhow::Result<RecoveredState> {
         }
     }
     events.retain(|_, event| !deletions.contains_key(&event.group_id));
-    blobs.retain(|_, blob| {
-        blob.group_id
-            .as_ref()
-            .is_none_or(|group_id| !deletions.contains_key(group_id))
-    });
 
     Ok(RecoveredState {
         accounts,
@@ -349,6 +589,12 @@ async fn recover(connection: &Connection) -> anyhow::Result<RecoveredState> {
         invite_rotations,
         events,
         blobs,
+        legacy_blobs,
+        pending_blob_deletions,
+        legacy_blob_schema: legacy_blob_table_exists || legacy_blob_queue_exists,
+        pending_shard_deletions,
+        shard_count,
+        shard_bytes,
         deletions,
         relay_descriptors: HashMap::new(),
     })
@@ -379,4 +625,16 @@ async fn recover_relay_descriptors(
         }
     }
     Ok(descriptors)
+}
+
+async fn table_exists(connection: &Connection, table: &str) -> anyhow::Result<bool> {
+    let mut rows = connection
+        .query(
+            "SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = ?1
+             LIMIT 1",
+            params![table],
+        )
+        .await?;
+    Ok(rows.next().await?.is_some())
 }

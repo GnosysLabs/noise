@@ -234,7 +234,7 @@ button:disabled { cursor: default; opacity: 0.48; }
 .avatar img { width: 100%; height: 100%; object-fit: cover; }
 .avatar b { font-size: 38%; }
 .presence-avatar { position: relative; display: inline-grid; flex: none; line-height: 0; }
-.presence-avatar .presence-status { position: absolute; left: -1px; bottom: -1px; width: 26%; min-width: 8px; max-width: 13px; aspect-ratio: 1; border: 2px solid rgba(27,25,30,.96); border-radius: 50%; }
+.presence-avatar .presence-status { position: absolute; left: 14.65%; bottom: 14.65%; width: 26%; min-width: 8px; max-width: 13px; aspect-ratio: 1; transform: translate(-50%, 50%); border: 2px solid rgba(27,25,30,.96); border-radius: 50%; }
 .presence-avatar .presence-status.online { background: #55d58a; box-shadow: 0 0 7px rgba(85,213,138,.52); }
 .presence-avatar .presence-status.recently-active { background: #e4b54b; box-shadow: 0 0 7px rgba(228,181,75,.4); }
 .presence-avatar .presence-status.offline { background: #e45f6d; box-shadow: 0 0 6px rgba(228,95,109,.34); }

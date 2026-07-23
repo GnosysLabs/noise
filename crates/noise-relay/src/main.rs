@@ -1,13 +1,17 @@
 mod discovery;
 mod identity;
 mod privacy;
+mod shard_store;
 mod store;
 
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,10 +24,11 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use clap::Parser;
 use noise_core::{
-    AccountVault, EncryptedBlob, GroupDeletion, GroupPresence, InviteRecord, InviteRotation,
-    SignedEvent,
+    AccountVault, GroupDeletion, GroupPresence, InviteRecord, InviteRotation, ShardDeletion,
+    SignedEvent, StorageShard,
 };
 use noise_transport::{
     GATEWAY_HEADER, OHTTP_GATEWAY_PATH, OHTTP_KEYS_MEDIA_TYPE, OHTTP_KEYS_PATH, OHTTP_RELAY_PATH,
@@ -44,7 +49,8 @@ use discovery::{
 };
 use identity::RelayIdentity;
 use privacy::PrivacyGateway;
-use store::DurableStore;
+use shard_store::ShardStore;
+use store::{DurableStore, ShardMetadata};
 
 const MAX_DISCOVERY_TARGETS_PER_ROUND: usize = 8;
 const MAX_DISCOVERED_RELAYS_PER_TARGET: usize = 16;
@@ -69,6 +75,8 @@ struct Args {
     bootstrap_relay: Vec<String>,
     #[arg(long, default_value_t = 30)]
     discovery_interval_seconds: u64,
+    #[arg(long, env = "NOISE_STORAGE_LIMIT_BYTES", default_value_t = 0)]
+    storage_limit_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -77,7 +85,9 @@ struct AppState {
     invites: Arc<RwLock<HashMap<String, InviteRecord>>>,
     invite_rotations: Arc<RwLock<HashMap<String, InviteRotation>>>,
     events: Arc<RwLock<HashMap<String, SignedEvent>>>,
-    blobs: Arc<RwLock<HashMap<String, EncryptedBlob>>>,
+    shard_count: Arc<AtomicU64>,
+    shard_bytes: Arc<AtomicU64>,
+    storage_limit_bytes: u64,
     deletions: Arc<RwLock<HashMap<String, GroupDeletion>>>,
     group_changes: Arc<RwLock<HashMap<String, watch::Sender<u64>>>>,
     group_presences: Arc<RwLock<HashMap<String, HashMap<String, GroupPresence>>>>,
@@ -86,6 +96,7 @@ struct AppState {
     peers: Arc<Vec<String>>,
     client: reqwest::Client,
     store: DurableStore,
+    shard_store: ShardStore,
     privacy: PrivacyGateway,
     relay_identity: RelayIdentity,
     relay_directory: RelayDirectory,
@@ -106,7 +117,6 @@ struct Snapshot {
     invite_rotations: Vec<InviteRotation>,
     invites: Vec<InviteRecord>,
     events: Vec<SignedEvent>,
-    blob_ids: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -115,7 +125,10 @@ struct Health {
     accounts: usize,
     invitations: usize,
     events: usize,
-    blobs: usize,
+    shards: u64,
+    shard_bytes: u64,
+    storage_limit_bytes: Option<u64>,
+    shard_storage: String,
     deleted_groups: usize,
     peers: usize,
     privacy_gateway: bool,
@@ -137,13 +150,62 @@ enum InsertResult {
     Deleted,
 }
 
+enum ShardInsertError {
+    Full,
+    Deleted,
+    Storage(anyhow::Error),
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let data_directory = args
         .data
         .unwrap_or_else(|| PathBuf::from("relay-data").join(args.listen.port().to_string()));
-    let (store, recovered) = DurableStore::open(&data_directory).await?;
+    let shard_store = ShardStore::open(&data_directory)?;
+    let (mut store, mut recovered) = DurableStore::open(&data_directory).await?;
+    let inline_blob_count = recovered.legacy_blobs.len();
+    let legacy_blob_schema = recovered.legacy_blob_schema;
+    let mut legacy_blob_ids = recovered.blobs.clone();
+    legacy_blob_ids.extend(
+        recovered
+            .legacy_blobs
+            .iter()
+            .map(|metadata| metadata.blob_id.clone()),
+    );
+    legacy_blob_ids.extend(recovered.pending_blob_deletions.iter().cloned());
+    legacy_blob_ids.sort();
+    legacy_blob_ids.dedup();
+    if legacy_blob_schema || !legacy_blob_ids.is_empty() {
+        println!(
+            "discarding {} legacy full media object(s); shard storage is now mandatory",
+            legacy_blob_ids.len()
+        );
+        for blob_id in &legacy_blob_ids {
+            shard_store.delete_legacy_blob(blob_id).await?;
+        }
+        store.discard_all_legacy_blobs(&legacy_blob_ids).await?;
+        store.reclaim_inline_blob_space().await?;
+        drop(recovered);
+        drop(store);
+        (store, recovered) = DurableStore::open(&data_directory).await?;
+        println!(
+            "legacy full media removed{}",
+            if inline_blob_count == 0 {
+                ""
+            } else {
+                "; reclaimed inline Turso pages and cache"
+            }
+        );
+    }
+    recovered.blobs.clear();
+    recovered.legacy_blobs.clear();
+    for shard_id in std::mem::take(&mut recovered.pending_shard_deletions) {
+        match shard_store.delete_shard(&shard_id).await {
+            Ok(()) => store.complete_shard_deletion(&shard_id).await?,
+            Err(error) => eprintln!("will retry deletion of storage shard {shard_id}: {error:#}"),
+        }
+    }
     let privacy = PrivacyGateway::open(&data_directory)?;
     let relay_identity = RelayIdentity::open(&data_directory)?;
     let public_url = args
@@ -192,7 +254,9 @@ async fn main() -> anyhow::Result<()> {
         invites: Arc::new(RwLock::new(recovered.invites)),
         invite_rotations: Arc::new(RwLock::new(recovered.invite_rotations)),
         events: Arc::new(RwLock::new(recovered.events)),
-        blobs: Arc::new(RwLock::new(recovered.blobs)),
+        shard_count: Arc::new(AtomicU64::new(recovered.shard_count)),
+        shard_bytes: Arc::new(AtomicU64::new(recovered.shard_bytes)),
+        storage_limit_bytes: args.storage_limit_bytes,
         deletions: Arc::new(RwLock::new(recovered.deletions)),
         group_changes: Arc::new(RwLock::new(HashMap::new())),
         group_presences: Arc::new(RwLock::new(HashMap::new())),
@@ -201,6 +265,7 @@ async fn main() -> anyhow::Result<()> {
         peers: Arc::new(peers),
         client,
         store,
+        shard_store,
         privacy,
         relay_identity,
         relay_directory,
@@ -213,6 +278,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     tokio::spawn(anti_entropy_loop(state.clone()));
+    tokio::spawn(shard_deletion_loop(state.clone()));
 
     let app = Router::new()
         .route("/health", get(health))
@@ -226,8 +292,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/groups/{group_id}/events", get(group_events))
         .route("/v1/groups/{group_id}/watch/{since}", get(group_watch))
         .route("/v1/groups/{group_id}/presence", post(publish_presence))
-        .route("/v1/blobs", post(publish_blob))
-        .route("/v1/blobs/{blob_id}", get(get_blob))
+        .route("/v3/shards", post(publish_shard))
+        .route("/v3/shards/{shard_id}", get(get_shard).delete(delete_shard))
         .route("/v1/group-deletions", post(publish_group_deletion))
         .route("/v1/snapshot", get(snapshot))
         .route(OHTTP_KEYS_PATH, get(ohttp_keys))
@@ -254,6 +320,10 @@ async fn main() -> anyhow::Result<()> {
         args.listen,
         state.peers.len(),
         state.store.path().display()
+    );
+    println!(
+        "encrypted media storage: {}",
+        state.shard_store.description()
     );
     println!("relay identity: {}", state.relay_identity.relay_id());
     println!(
@@ -282,12 +352,25 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
             .count(),
         invitations: state.invites.read().await.len(),
         events: state.events.read().await.len(),
-        blobs: state.blobs.read().await.len(),
+        shards: state.shard_count.load(Ordering::Relaxed),
+        shard_bytes: state.shard_bytes.load(Ordering::Relaxed),
+        storage_limit_bytes: (state.storage_limit_bytes != 0).then_some(state.storage_limit_bytes),
+        shard_storage: state.shard_store.description().to_owned(),
         deleted_groups: state.deletions.read().await.len(),
         peers: state.peers.len(),
         privacy_gateway: true,
         mask_targets: state.mask_targets.len(),
     })
+}
+
+fn storage_descriptor_values(state: &AppState) -> (u64, u64) {
+    let capacity = state.storage_limit_bytes;
+    let available = if capacity == 0 {
+        u64::MAX
+    } else {
+        capacity.saturating_sub(state.shard_bytes.load(Ordering::Relaxed))
+    };
+    (capacity, available)
 }
 
 async fn publish_account(
@@ -498,9 +581,7 @@ async fn store_group_presence(
             .saturating_add(RECENT_GROUP_PRESENCE_MILLIS)
             > now
     });
-    if group.len() >= MAX_GROUP_PRESENCES
-        && !group.contains_key(&presence.member_tag_base64)
-    {
+    if group.len() >= MAX_GROUP_PRESENCES && !group.contains_key(&presence.member_tag_base64) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     group.insert(presence.member_tag_base64.clone(), presence);
@@ -529,28 +610,25 @@ async fn active_group_presences(state: &AppState, group_id: &str) -> Vec<GroupPr
     active
 }
 
-async fn publish_blob(
+async fn publish_shard(
     State(state): State<AppState>,
-    Json(blob): Json<EncryptedBlob>,
+    Json(shard): Json<StorageShard>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    if blob.ciphertext_base64.len() > 2_000_000 {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, "blob is too large".into()));
-    }
-    blob.verify()
+    shard
+        .verify()
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    match insert_blob(&state, blob.clone())
-        .await
-        .map_err(storage_error)?
-    {
-        InsertResult::Inserted => {
-            tokio::spawn(gossip_blob(state, blob));
+    match insert_shard(&state, shard).await {
+        Ok(true) => Ok(StatusCode::CREATED),
+        Ok(false) => Ok(StatusCode::ACCEPTED),
+        Err(ShardInsertError::Full) => Err((
+            StatusCode::INSUFFICIENT_STORAGE,
+            "relay storage allocation is full".into(),
+        )),
+        Err(ShardInsertError::Deleted) => {
+            Err((StatusCode::GONE, "storage shard was deleted".into()))
         }
-        InsertResult::Deleted => {
-            return Err((StatusCode::GONE, "group has been deleted".into()));
-        }
-        InsertResult::Present => {}
+        Err(ShardInsertError::Storage(error)) => Err(storage_error(error)),
     }
-    Ok(StatusCode::ACCEPTED)
 }
 
 async fn publish_group_deletion(
@@ -569,18 +647,67 @@ async fn publish_group_deletion(
     Ok(StatusCode::ACCEPTED)
 }
 
-async fn get_blob(
+async fn get_shard(
     State(state): State<AppState>,
-    Path(blob_id): Path<String>,
-) -> Result<Json<EncryptedBlob>, StatusCode> {
-    state
-        .blobs
-        .read()
+    Path(shard_id): Path<String>,
+) -> Result<Json<StorageShard>, StatusCode> {
+    let metadata = state
+        .store
+        .shard_metadata(&shard_id)
         .await
-        .get(&blob_id)
-        .cloned()
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    match state
+        .shard_store
+        .get_shard(
+            &shard_id,
+            &metadata.payload_hash,
+            &metadata.delete_token_hash,
+            metadata.byte_length,
+        )
+        .await
+    {
+        Ok(Some(shard)) => Ok(Json(shard)),
+        Ok(None) => {
+            eprintln!("indexed storage shard {shard_id} is missing from object storage");
+            Err(StatusCode::NOT_FOUND)
+        }
+        Err(error) => {
+            eprintln!("could not read storage shard {shard_id}: {error:#}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn delete_shard(
+    State(state): State<AppState>,
+    Path(shard_id): Path<String>,
+    Json(deletion): Json<ShardDeletion>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let metadata = state
+        .store
+        .shard_metadata(&shard_id)
+        .await
+        .map_err(storage_error)?
+        .ok_or((StatusCode::NOT_FOUND, "storage shard is unavailable".into()))?;
+    let token = STANDARD_NO_PAD
+        .decode(&deletion.delete_token_base64)
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid shard deletion token".into(),
+            )
+        })?;
+    if token.len() != 32 || blake3::hash(&token).to_hex().as_str() != metadata.delete_token_hash {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "shard deletion token was rejected".into(),
+        ));
+    }
+    erase_shard(&state, &shard_id, &metadata)
+        .await
+        .map_err(storage_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn ohttp_keys(State(state): State<AppState>) -> Response {
@@ -618,10 +745,14 @@ async fn signed_relay_descriptor(State(state): State<AppState>) -> Response {
                 .into_response();
         }
     };
-    match state
-        .relay_identity
-        .signed_descriptor(public_url, state.privacy.public_config(), now)
-    {
+    let (capacity, available) = storage_descriptor_values(&state);
+    match state.relay_identity.signed_descriptor(
+        public_url,
+        state.privacy.public_config(),
+        capacity,
+        available,
+        now,
+    ) {
         Ok(descriptor) => Json(descriptor).into_response(),
         Err(error) => {
             eprintln!("could not create signed relay descriptor: {error:#}");
@@ -649,21 +780,24 @@ async fn get_relay_directory(State(state): State<AppState>) -> Response {
                 .into_response();
         }
     };
-    let own =
-        match state
-            .relay_identity
-            .signed_descriptor(public_url, state.privacy.public_config(), now)
-        {
-            Ok(descriptor) => descriptor,
-            Err(error) => {
-                eprintln!("could not create signed relay descriptor: {error:#}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "could not create signed relay descriptor",
-                )
-                    .into_response();
-            }
-        };
+    let (capacity, available) = storage_descriptor_values(&state);
+    let own = match state.relay_identity.signed_descriptor(
+        public_url,
+        state.privacy.public_config(),
+        capacity,
+        available,
+        now,
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            eprintln!("could not create signed relay descriptor: {error:#}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not create signed relay descriptor",
+            )
+                .into_response();
+        }
+    };
     let mut descriptors = state.relay_directory.list(now).await;
     descriptors.retain(|descriptor| descriptor.relay_id != own.relay_id);
     descriptors.push(own);
@@ -968,26 +1102,23 @@ async fn dispatch_private_request(
                 }
             }
         }
-        ("POST", "/v1/blobs") => {
-            let Ok(blob) = serde_json::from_slice::<EncryptedBlob>(&request.body) else {
-                return private_error(StatusCode::BAD_REQUEST, "invalid encrypted blob");
+        ("POST", "/v3/shards") => {
+            let Ok(shard) = serde_json::from_slice::<StorageShard>(&request.body) else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid storage shard");
             };
-            if blob.ciphertext_base64.len() > 2_000_000 {
-                return private_error(StatusCode::PAYLOAD_TOO_LARGE, "blob is too large");
-            }
-            if let Err(error) = blob.verify() {
+            if let Err(error) = shard.verify() {
                 return private_error(StatusCode::BAD_REQUEST, &error.to_string());
             }
-            match insert_blob(state, blob.clone()).await {
-                Ok(InsertResult::Inserted) => {
-                    tokio::spawn(gossip_blob(state.clone(), blob));
-                    (StatusCode::ACCEPTED, Vec::new())
+            match insert_shard(state, shard).await {
+                Ok(true) => (StatusCode::CREATED, Vec::new()),
+                Ok(false) => (StatusCode::ACCEPTED, Vec::new()),
+                Err(ShardInsertError::Full) => {
+                    private_error(StatusCode::INSUFFICIENT_STORAGE, "relay storage is full")
                 }
-                Ok(InsertResult::Present) => (StatusCode::ACCEPTED, Vec::new()),
-                Ok(InsertResult::Deleted) => {
-                    private_error(StatusCode::GONE, "group has been deleted")
+                Err(ShardInsertError::Deleted) => {
+                    private_error(StatusCode::GONE, "storage shard was deleted")
                 }
-                Err(error) => {
+                Err(ShardInsertError::Storage(error)) => {
                     eprintln!("relay storage error: {error:#}");
                     private_error(StatusCode::INTERNAL_SERVER_ERROR, "storage failed")
                 }
@@ -1029,11 +1160,80 @@ async fn dispatch_private_request(
                 None => private_error(StatusCode::NOT_FOUND, "nothing here"),
             }
         }
-        ("GET", path) if path.starts_with("/v1/blobs/") => {
-            let blob_id = path.trim_start_matches("/v1/blobs/");
-            match state.blobs.read().await.get(blob_id).cloned() {
-                Some(blob) => private_json(StatusCode::OK, &blob),
-                None => private_error(StatusCode::NOT_FOUND, "blob is unavailable"),
+        ("GET", path) if path.starts_with("/v3/shards/") => {
+            let shard_id = path.trim_start_matches("/v3/shards/");
+            let metadata = match state.store.shard_metadata(shard_id).await {
+                Ok(Some(metadata)) => metadata,
+                Ok(None) => {
+                    return private_error(StatusCode::NOT_FOUND, "shard is unavailable");
+                }
+                Err(error) => {
+                    eprintln!("could not read shard metadata: {error:#}");
+                    return private_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "shard storage is unavailable",
+                    );
+                }
+            };
+            match state
+                .shard_store
+                .get_shard(
+                    shard_id,
+                    &metadata.payload_hash,
+                    &metadata.delete_token_hash,
+                    metadata.byte_length,
+                )
+                .await
+            {
+                Ok(Some(shard)) => private_json(StatusCode::OK, &shard),
+                Ok(None) => {
+                    eprintln!("indexed storage shard {shard_id} is missing from object storage");
+                    private_error(StatusCode::NOT_FOUND, "shard is unavailable")
+                }
+                Err(error) => {
+                    eprintln!("could not read storage shard {shard_id}: {error:#}");
+                    private_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "shard storage is unavailable",
+                    )
+                }
+            }
+        }
+        ("DELETE", path) if path.starts_with("/v3/shards/") => {
+            let shard_id = path.trim_start_matches("/v3/shards/");
+            let Ok(deletion) = serde_json::from_slice::<ShardDeletion>(&request.body) else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid shard deletion");
+            };
+            let metadata = match state.store.shard_metadata(shard_id).await {
+                Ok(Some(metadata)) => metadata,
+                Ok(None) => {
+                    return private_error(StatusCode::NOT_FOUND, "shard is unavailable");
+                }
+                Err(error) => {
+                    eprintln!("could not read shard metadata: {error:#}");
+                    return private_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "shard storage is unavailable",
+                    );
+                }
+            };
+            let Ok(token) = STANDARD_NO_PAD.decode(&deletion.delete_token_base64) else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid shard deletion token");
+            };
+            if token.len() != 32
+                || blake3::hash(&token).to_hex().as_str() != metadata.delete_token_hash
+            {
+                return private_error(StatusCode::FORBIDDEN, "shard deletion token was rejected");
+            }
+            match erase_shard(state, shard_id, &metadata).await {
+                Ok(()) => (StatusCode::NO_CONTENT, Vec::new()),
+                Err(error) => {
+                    eprintln!("could not delete storage shard {shard_id}: {error:#}");
+                    private_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "shard storage is unavailable",
+                    )
+                }
             }
         }
         ("GET", path) if path.starts_with("/v1/groups/") && path.ends_with("/events") => {
@@ -1273,7 +1473,6 @@ async fn current_snapshot(state: &AppState) -> Snapshot {
             .collect(),
         invites: state.invites.read().await.values().cloned().collect(),
         events: state.events.read().await.values().cloned().collect(),
-        blob_ids: state.blobs.read().await.keys().cloned().collect(),
     }
 }
 
@@ -1433,27 +1632,102 @@ async fn insert_event(state: &AppState, event: SignedEvent) -> anyhow::Result<In
     })
 }
 
-async fn insert_blob(state: &AppState, blob: EncryptedBlob) -> anyhow::Result<InsertResult> {
+async fn insert_shard(state: &AppState, shard: StorageShard) -> Result<bool, ShardInsertError> {
     let _guard = state.mutations.lock().await;
-    if let Some(group_id) = blob.group_id.as_ref()
-        && state.deletions.read().await.contains_key(group_id)
+    if state
+        .store
+        .shard_was_deleted(&shard.shard_id)
+        .await
+        .map_err(ShardInsertError::Storage)?
     {
-        return Ok(InsertResult::Deleted);
+        return Err(ShardInsertError::Deleted);
     }
-    let object_id = blob.blob_id.clone();
-    let inserted = state.store.insert("blob", object_id.clone(), &blob).await?;
-    if inserted {
-        state.blobs.write().await.insert(object_id, blob);
+    if let Some(existing) = state
+        .store
+        .shard_metadata(&shard.shard_id)
+        .await
+        .map_err(ShardInsertError::Storage)?
+    {
+        if existing.payload_hash == shard.payload_hash
+            && existing.delete_token_hash == shard.delete_token_hash
+        {
+            return Ok(false);
+        }
+        return Err(ShardInsertError::Storage(anyhow::anyhow!(
+            "storage shard identifier conflicts with existing metadata"
+        )));
     }
-    Ok(if inserted {
-        InsertResult::Inserted
-    } else {
-        InsertResult::Present
-    })
+    let payload_length = STANDARD_NO_PAD
+        .decode(&shard.payload_base64)
+        .map_err(|error| ShardInsertError::Storage(error.into()))?
+        .len() as u64;
+    let current = state.shard_bytes.load(Ordering::Relaxed);
+    if state.storage_limit_bytes != 0
+        && current.saturating_add(payload_length) > state.storage_limit_bytes
+    {
+        return Err(ShardInsertError::Full);
+    }
+    let stored_length = state
+        .shard_store
+        .put_shard(&shard)
+        .await
+        .map_err(ShardInsertError::Storage)?;
+    if let Err(error) = state.store.insert_shard(&shard, stored_length).await {
+        let _ = state.shard_store.delete_shard(&shard.shard_id).await;
+        return Err(ShardInsertError::Storage(error));
+    }
+    state.shard_count.fetch_add(1, Ordering::Relaxed);
+    state
+        .shard_bytes
+        .fetch_add(stored_length, Ordering::Relaxed);
+    Ok(true)
+}
+
+async fn erase_shard(
+    state: &AppState,
+    shard_id: &str,
+    metadata: &ShardMetadata,
+) -> anyhow::Result<()> {
+    let _guard = state.mutations.lock().await;
+    if state.store.queue_shard_deletion(shard_id).await? {
+        state.shard_count.fetch_sub(1, Ordering::Relaxed);
+        state
+            .shard_bytes
+            .fetch_sub(metadata.byte_length, Ordering::Relaxed);
+    }
+    state.shard_store.delete_shard(shard_id).await?;
+    state.store.complete_shard_deletion(shard_id).await?;
+    Ok(())
+}
+
+async fn shard_deletion_loop(state: AppState) {
+    loop {
+        match state.store.pending_shard_deletions().await {
+            Ok(shard_ids) => {
+                for shard_id in shard_ids {
+                    match state.shard_store.delete_shard(&shard_id).await {
+                        Ok(()) => {
+                            if let Err(error) = state.store.complete_shard_deletion(&shard_id).await
+                            {
+                                eprintln!(
+                                    "could not complete storage shard deletion {shard_id}: {error:#}"
+                                );
+                            }
+                        }
+                        Err(error) => eprintln!(
+                            "could not retry storage shard deletion {shard_id}: {error:#}"
+                        ),
+                    }
+                }
+            }
+            Err(error) => eprintln!("could not load queued shard deletions: {error:#}"),
+        }
+        sleep(Duration::from_secs(30)).await;
+    }
 }
 
 async fn apply_group_deletion(state: &AppState, deletion: GroupDeletion) -> anyhow::Result<bool> {
-    let _guard = state.mutations.lock().await;
+    let guard = state.mutations.lock().await;
     if state
         .deletions
         .read()
@@ -1478,17 +1752,9 @@ async fn apply_group_deletion(state: &AppState, deletion: GroupDeletion) -> anyh
         .filter(|(_, event)| event.group_id == deletion.group_id)
         .map(|(object_id, _)| object_id.clone())
         .collect::<Vec<_>>();
-    let blob_ids = state
-        .blobs
-        .read()
-        .await
-        .iter()
-        .filter(|(_, blob)| blob.group_id.as_deref() == Some(deletion.group_id.as_str()))
-        .map(|(object_id, _)| object_id.clone())
-        .collect::<Vec<_>>();
     state
         .store
-        .apply_group_deletion(&deletion, &invite_ids, &event_ids, &blob_ids)
+        .apply_group_deletion(&deletion, &invite_ids, &event_ids)
         .await?;
     state
         .invites
@@ -1506,17 +1772,17 @@ async fn apply_group_deletion(state: &AppState, deletion: GroupDeletion) -> anyh
         .await
         .retain(|_, event| event.group_id != deletion.group_id);
     state
-        .blobs
-        .write()
-        .await
-        .retain(|_, blob| blob.group_id.as_deref() != Some(deletion.group_id.as_str()));
-    state
         .deletions
         .write()
         .await
         .insert(deletion.group_id.clone(), deletion.clone());
     state.group_changes.write().await.remove(&deletion.group_id);
-    state.group_presences.write().await.remove(&deletion.group_id);
+    state
+        .group_presences
+        .write()
+        .await
+        .remove(&deletion.group_id);
+    drop(guard);
     Ok(true)
 }
 
@@ -1564,17 +1830,6 @@ async fn gossip_event(state: AppState, event: SignedEvent) {
     }
 }
 
-async fn gossip_blob(state: AppState, blob: EncryptedBlob) {
-    for peer in state.peers.iter() {
-        let _ = state
-            .client
-            .post(format!("{peer}/v1/blobs"))
-            .json(&blob)
-            .send()
-            .await;
-    }
-}
-
 async fn gossip_group_deletion(state: AppState, deletion: GroupDeletion) {
     for peer in state.peers.iter() {
         let _ = state
@@ -1596,11 +1851,14 @@ async fn relay_discovery_loop(state: AppState) {
             sleep(state.discovery_interval).await;
             continue;
         };
-        let Ok(own) =
-            state
-                .relay_identity
-                .signed_descriptor(public_url, state.privacy.public_config(), now)
-        else {
+        let (capacity, available) = storage_descriptor_values(&state);
+        let Ok(own) = state.relay_identity.signed_descriptor(
+            public_url,
+            state.privacy.public_config(),
+            capacity,
+            available,
+            now,
+        ) else {
             sleep(state.discovery_interval).await;
             continue;
         };
@@ -1708,27 +1966,6 @@ async fn anti_entropy_loop(state: AppState) {
                 if event.verify().is_ok() {
                     if let Err(error) = insert_event(&state, event).await {
                         eprintln!("could not persist gossiped event: {error:#}");
-                    }
-                }
-            }
-            for blob_id in snapshot.blob_ids {
-                if state.blobs.read().await.contains_key(&blob_id) {
-                    continue;
-                }
-                let Ok(response) = state
-                    .client
-                    .get(format!("{peer}/v1/blobs/{blob_id}"))
-                    .send()
-                    .await
-                else {
-                    continue;
-                };
-                let Ok(blob) = response.json::<EncryptedBlob>().await else {
-                    continue;
-                };
-                if blob.verify().is_ok() {
-                    if let Err(error) = insert_blob(&state, blob).await {
-                        eprintln!("could not persist gossiped blob: {error:#}");
                     }
                 }
             }

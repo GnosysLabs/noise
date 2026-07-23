@@ -15,7 +15,7 @@ client directly; the earlier native macOS client remains as a design reference.
 - `noise-client`: reusable profile, group, and conversation operations
 - `noise-transport`: padded Binary HTTP and RFC 9458 oblivious relay transport
 - `noise-ffi`: narrow native bridge into the shared client
-- `noise-relay`: an untrusted store-and-forward relay with peer replication
+- `noise-relay`: one untrusted relay binary for masking, metadata, and shard storage
 - `noise`: a small CLI that exercises the protocol end to end
 - `noise-sim`: a real signed-event membership scale simulator
 - `apps/client`: shared React interface and Tauri desktop shell
@@ -37,10 +37,9 @@ shows a foundation screen until the Rust protocol core, IndexedDB identity
 store, and browser transport adapter are connected; see
 [`docs/CLIENTS.md`](docs/CLIENTS.md).
 
-Clients must point at relays they can both reach. A single relay remains usable
-in direct compatibility mode. Two or more production relays use their pinned
-private relay descriptors so each storage request travels through a different
-mask relay:
+Clients must point at relays they can both reach. Two or more production relays
+use pinned private relay descriptors so each storage request travels through a
+different mask relay:
 
 ```sh
 VITE_NOISE_RELAYS='https://RELAY_ONE#ohttp=KEY,https://RELAY_TWO#ohttp=KEY' \
@@ -93,19 +92,68 @@ decrypted Noise request coming from the mask, not the client connection. Masks
 and storage relays must be operated independently for that separation to mean
 anything.
 
-Each relay persists encrypted account vaults, verified invitations, signed
-events, and encrypted blobs in an embedded, self-hosted Turso database under
-`relay-data/<port>` by default. No Turso Cloud account, remote database, or auth
-token is involved. A server deployment should use an explicit data directory on
-a durable volume:
+There is one relay program and one relay protocol. Every `noise-relay` can mask
+traffic, replicate signed account/group metadata, and contribute media storage.
+“Mask” and “storage” describe a relay's role for one private request; they are
+not different server types or binaries.
+
+Small indexes, signed events, invitations, and deletion records live in an
+embedded, self-hosted Turso database under `relay-data/<port>` by default.
+Media never does. The client encrypts each 1 MiB media chunk, Reed–Solomon
+encodes the encrypted object, and assigns one opaque shard to each relay in a
+keyed rendezvous-ranked constellation. A mature 12-relay constellation is
+8-of-12: any eight shards reconstruct the object, while no relay stores the
+whole network or even the whole object. The coding profile adapts to the
+available network; today's two-relay network is necessarily 1-of-2 so either
+relay can fail. Shard bytes live under `relay-data/<port>/shards` and only small
+hash/size/deletion metadata lives in Turso, so media is never loaded into RAM
+at startup. No Turso Cloud account, remote database, or auth token is involved.
+A server deployment should use an explicit data directory on a durable volume:
 
 ```sh
 noise-relay --listen 127.0.0.1:4301 --data /var/lib/noise-relay \
   --public-url https://relay.example
 ```
 
-The relay commits an object before acknowledging it and cryptographically
-re-verifies every object recovered at startup.
+The same binary can put encrypted media in any S3-compatible object store
+instead. S3 receives only the shards assigned to that relay, never a network
+mirror. Configure its service environment and leave the command unchanged:
+
+```sh
+NOISE_STORAGE_BACKEND=s3
+NOISE_S3_BUCKET=noise-relay-example
+NOISE_S3_PREFIX=relay-1
+NOISE_STORAGE_LIMIT_BYTES=1099511627776
+AWS_DEFAULT_REGION=us-east-1
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+# Optional for R2, MinIO, Backblaze, or another compatible service:
+AWS_ENDPOINT_URL_S3=https://s3.example
+```
+
+`NOISE_S3_PREFIX` is optional and defaults to `noise-relay`. Standard AWS
+session-token, workload-identity, and container credentials are also supported.
+HTTPS is required unless the operator explicitly sets `AWS_ALLOW_HTTP=true`.
+`NOISE_STORAGE_LIMIT_BYTES` is optional; zero or unset means no application
+quota beyond the disk/bucket's own limit. A bounded relay advertises its
+remaining capacity in its signed v3 descriptor and rejects writes beyond the
+allocation.
+Secrets belong in a root-readable service environment file, not on the command
+line. The included systemd units optionally load
+`/etc/noise-relay/storage.env`; local-disk relays do not need that file at all.
+
+The relay writes a shard to its configured destination before acknowledging it.
+Shard IDs, provider locations, and deletion capabilities are carried inside the
+encrypted media manifest. Relays cannot infer the group from a shard. Authorized
+clients erase shards with per-object deletion capabilities; failed object-store
+deletes stay in a durable retry queue.
+
+This is a deliberately breaking storage cutover. Protocol v3 has no full-blob
+upload/download endpoint and relays do not gossip media. On first v3 startup,
+legacy full-blob rows and object files are purged rather than retained as dead
+copies. Existing clients must update before the relays are upgraded; media
+already cached on a device remains local, while uncached pre-v3 media is no
+longer fetchable.
 
 Then create two local identities:
 

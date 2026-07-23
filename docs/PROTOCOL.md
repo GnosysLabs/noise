@@ -26,30 +26,39 @@ These are product constraints, not implementation details.
    self-reported names.
 9. **The scale target is 50,000 members.** No design may require an all-to-all
    connection mesh or one stored copy of each message per recipient.
-10. **Media is stored once, not fanned out per member.** Clients encrypt media
-    locally and group events contain only authenticated references to
-    content-addressed ciphertext. Profile photos are the first consumer of
-    this transport.
+10. **Media is erasure-coded, not globally mirrored or fanned out per member.**
+    Clients encrypt media locally, split each encrypted chunk across a small
+    relay constellation, and put only its encrypted manifest in the group
+    event.
 11. **Groups have signed identities.** A frequency has a name, short
     description, and encrypted icon reference. Updates are events in the same
     replicated history rather than mutable relay-owned records.
 
-## Profiles and encrypted blobs
+## Profiles and constellation storage
 
 A profile is signed by the same locally generated identity that authors group
 events. Username, short bio, and an avatar reference are carried inside the
 encrypted membership log. Profile changes are new events; relays cannot alter
 them or attach a profile to a different public key.
 
-Avatar bytes are encrypted locally with a random key and stored by ciphertext
-hash. The key and content reference exist only inside the encrypted profile
-event. Clients fetch and decrypt avatars lazily, so a 50,000-member group does
-not insert 50,000 images into its event log.
+Avatar, background, image, audio, and video bytes use the same transport.
+Clients encrypt media locally with a random key and split every encrypted
+1 MiB chunk into Reed–Solomon shards. Relays are ranked per object with a keyed
+rendezvous score, so placement is stable but cannot be predicted without the
+encrypted reference. A 12-relay constellation uses 8 data shards and 4 parity
+shards; any eight reconstruct the encrypted object. Smaller networks use the
+same two-thirds threshold, with 1-of-2 as the unavoidable two-relay case.
 
-The same blob primitive is intended to carry group media. Large files will use
-an encrypted manifest referencing fixed-size encrypted chunks, allowing relay
-replication, resumable transfer, progressive playback, and optional peer
-seeding without making any relay authoritative or giving it plaintext.
+The encrypted manifest records the threshold, opaque shard IDs, and providers.
+Downloads race providers in parallel, discard corrupt shards by hash, and stop
+after the reconstruction threshold. Relays store only their assigned raw shard
+in local disk or S3 plus a small Turso metadata row. Shards are not included in
+relay snapshots and are never gossiped relay-to-relay.
+
+Each shard has a deletion capability derived from the media key. The relay
+stores only its hash; an authorized client reveals the capability to erase the
+shard. This keeps group IDs out of storage metadata while allowing message,
+thread, account, and founder group deletion to remove referenced media.
 
 ## Group identity
 
@@ -76,8 +85,9 @@ that all groups must have one owner.
   design.
 - Relay snapshots are intentionally simple and unbounded. They exist to prove
   convergence and recovery before pagination and anti-entropy ranges are added.
-- Blob storage is currently in memory and whole-object. Production media needs
-  durable storage, fixed-size chunks, quotas, garbage collection, and encrypted
-  thumbnail manifests.
+- Relays durably store assigned encrypted media shards on local disk or an
+  operator-selected S3-compatible backend. Operators can bound the allocation;
+  autonomous repair and garbage collection for shards abandoned by interrupted
+  uploads remain future work.
 - Direct relay connections expose network metadata. Onion routing is not yet
   implemented.

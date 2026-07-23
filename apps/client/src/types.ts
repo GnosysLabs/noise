@@ -3,6 +3,7 @@ export type ProfileImage = {
   key_base64: string;
   mime_type: string;
   byte_length: number;
+  storage?: StorageManifest | null;
 };
 
 export type IdentitySummary = {
@@ -60,6 +61,24 @@ export type MediaChunk = {
   blob_id: string;
   key_base64: string;
   byte_length: number;
+  storage?: StorageManifest | null;
+};
+
+export type StorageManifest = {
+  v: number;
+  o: string;
+  l: number;
+  z: number;
+  k: number;
+  n: number;
+  p: ShardPlacement[];
+};
+
+export type ShardPlacement = {
+  i: number;
+  d: string;
+  h: string;
+  r: string;
 };
 
 export type MediaAttachment = {

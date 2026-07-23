@@ -9,6 +9,7 @@ User=noise-relay
 Group=noise-relay
 StateDirectory=noise-relay
 StateDirectoryMode=0700
+EnvironmentFile=-/etc/noise-relay/storage.env
 ExecStart=/opt/noise-relay/noise-relay --listen 127.0.0.1:4301 --data /var/lib/noise-relay --public-url https://noiserelay.irisirc.chat --mask-target https://noiserelay.gnosyslabs.xyz
 Restart=on-failure
 RestartSec=2s

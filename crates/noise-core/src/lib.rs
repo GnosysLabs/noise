@@ -11,6 +11,7 @@ use chacha20poly1305::{
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::random;
+use reed_solomon_erasure::galois_8::ReedSolomon;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
@@ -50,6 +51,12 @@ pub enum NoiseError {
     GroupMismatch,
     #[error("the encrypted blob does not match its identifier")]
     BlobMismatch,
+    #[error("invalid storage manifest")]
+    InvalidStorageManifest,
+    #[error("not enough valid storage shards")]
+    InsufficientStorageShards,
+    #[error("erasure coding failed")]
+    ErasureCoding,
     #[error("invalid group authority")]
     InvalidGroupAuthority,
     #[error("serialization failed: {0}")]
@@ -395,6 +402,8 @@ pub struct ProfileImage {
     pub key_base64: String,
     pub mime_type: String,
     pub byte_length: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageManifest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -402,6 +411,58 @@ pub struct MediaChunk {
     pub blob_id: String,
     pub key_base64: String,
     pub byte_length: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageManifest>,
+}
+
+pub const MAX_STORAGE_SHARDS: usize = 12;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageManifest {
+    #[serde(rename = "v", alias = "version")]
+    pub version: u8,
+    #[serde(rename = "o", alias = "object_id")]
+    pub object_id: String,
+    #[serde(rename = "l", alias = "encoded_byte_length")]
+    pub encoded_byte_length: u32,
+    #[serde(rename = "z", alias = "shard_byte_length")]
+    pub shard_byte_length: u32,
+    #[serde(rename = "k", alias = "data_shards")]
+    pub data_shards: u8,
+    #[serde(rename = "n", alias = "total_shards")]
+    pub total_shards: u8,
+    #[serde(rename = "p", alias = "placements")]
+    pub placements: Vec<ShardPlacement>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardPlacement {
+    #[serde(rename = "i", alias = "shard_index")]
+    pub shard_index: u8,
+    #[serde(rename = "d", alias = "shard_id")]
+    pub shard_id: String,
+    #[serde(rename = "h", alias = "payload_hash")]
+    pub payload_hash: String,
+    #[serde(rename = "r", alias = "relay")]
+    pub relay: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageShard {
+    #[serde(rename = "d", alias = "shard_id")]
+    pub shard_id: String,
+    #[serde(rename = "h", alias = "payload_hash")]
+    pub payload_hash: String,
+    #[serde(rename = "x", alias = "delete_token_hash")]
+    pub delete_token_hash: String,
+    #[serde(rename = "b", alias = "payload_base64")]
+    pub payload_base64: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardDeletion {
+    #[serde(rename = "t", alias = "delete_token_base64")]
+    pub delete_token_base64: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -480,6 +541,210 @@ impl EncryptedBlob {
             .decrypt(XNonce::from_slice(&nonce), ciphertext.as_ref())
             .map_err(|_| NoiseError::Crypto)
     }
+}
+
+impl StorageShard {
+    pub fn verify(&self) -> Result<(), NoiseError> {
+        if !valid_hex_id(&self.shard_id)
+            || !valid_hex_id(&self.payload_hash)
+            || !valid_hex_id(&self.delete_token_hash)
+        {
+            return Err(NoiseError::InvalidStorageManifest);
+        }
+        let payload = decode(&self.payload_base64, "storage shard")?;
+        if payload.is_empty()
+            || payload.len() > 2_000_000
+            || blake3::hash(&payload).to_hex().as_str() != self.payload_hash
+        {
+            return Err(NoiseError::InvalidStorageManifest);
+        }
+        Ok(())
+    }
+}
+
+impl StorageManifest {
+    pub fn verify(&self, object_id: &str) -> Result<(), NoiseError> {
+        let data_shards = usize::from(self.data_shards);
+        let total_shards = usize::from(self.total_shards);
+        if self.version != 1
+            || self.object_id != object_id
+            || !valid_hex_id(&self.object_id)
+            || self.encoded_byte_length == 0
+            || self.shard_byte_length == 0
+            || data_shards == 0
+            || total_shards < data_shards
+            || total_shards > MAX_STORAGE_SHARDS
+            || self.placements.len() < data_shards
+            || self.placements.len() > total_shards
+            || u64::from(self.shard_byte_length) * (data_shards as u64)
+                < u64::from(self.encoded_byte_length)
+        {
+            return Err(NoiseError::InvalidStorageManifest);
+        }
+        let mut indices = HashSet::new();
+        let mut shard_ids = HashSet::new();
+        let mut relays = HashSet::new();
+        for placement in &self.placements {
+            if usize::from(placement.shard_index) >= total_shards
+                || !indices.insert(placement.shard_index)
+                || !valid_hex_id(&placement.shard_id)
+                || !valid_hex_id(&placement.payload_hash)
+                || !shard_ids.insert(placement.shard_id.as_str())
+                || placement.relay.is_empty()
+                || placement.relay.len() > 4_096
+                || !relays.insert(placement.relay.as_str())
+            {
+                return Err(NoiseError::InvalidStorageManifest);
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn encode_blob_for_storage(
+    blob: &EncryptedBlob,
+    key_base64: &str,
+    relays: &[String],
+) -> Result<(StorageManifest, Vec<StorageShard>), NoiseError> {
+    blob.verify()?;
+    if relays.is_empty() || relays.len() > MAX_STORAGE_SHARDS {
+        return Err(NoiseError::InvalidStorageManifest);
+    }
+    let key = decode_array::<32>(key_base64, "blob key")?;
+    let total_shards = relays.len();
+    // Two thirds of the selected relays are sufficient. With today's two-relay
+    // network this intentionally becomes 1-of-2; as the network grows it
+    // converges on the target 8-of-12 profile without changing the protocol.
+    let data_shards = (total_shards * 2 / 3).max(1);
+    let parity_shards = total_shards - data_shards;
+    let encoded = serde_json::to_vec(blob)?;
+    let shard_byte_length = encoded.len().div_ceil(data_shards);
+    let mut shards = vec![vec![0_u8; shard_byte_length]; total_shards];
+    for (index, chunk) in encoded.chunks(shard_byte_length).enumerate() {
+        shards[index][..chunk.len()].copy_from_slice(chunk);
+    }
+    if parity_shards != 0 {
+        ReedSolomon::new(data_shards, parity_shards)
+            .map_err(|_| NoiseError::ErasureCoding)?
+            .encode(&mut shards)
+            .map_err(|_| NoiseError::ErasureCoding)?;
+    }
+
+    let mut placements = Vec::with_capacity(total_shards);
+    let mut stored = Vec::with_capacity(total_shards);
+    for (index, (relay, payload)) in relays.iter().zip(shards).enumerate() {
+        let shard_id = storage_shard_id(&key, &blob.blob_id, index as u8);
+        let delete_token = storage_delete_token(&key, &shard_id);
+        let payload_hash = blake3::hash(&payload).to_hex().to_string();
+        placements.push(ShardPlacement {
+            shard_index: index as u8,
+            shard_id: shard_id.clone(),
+            payload_hash: payload_hash.clone(),
+            relay: relay.clone(),
+        });
+        stored.push(StorageShard {
+            shard_id,
+            payload_hash,
+            delete_token_hash: blake3::hash(&delete_token).to_hex().to_string(),
+            payload_base64: STANDARD_NO_PAD.encode(payload),
+        });
+    }
+    let manifest = StorageManifest {
+        version: 1,
+        object_id: blob.blob_id.clone(),
+        encoded_byte_length: encoded
+            .len()
+            .try_into()
+            .map_err(|_| NoiseError::InvalidStorageManifest)?,
+        shard_byte_length: shard_byte_length
+            .try_into()
+            .map_err(|_| NoiseError::InvalidStorageManifest)?,
+        data_shards: data_shards as u8,
+        total_shards: total_shards as u8,
+        placements,
+    };
+    manifest.verify(&blob.blob_id)?;
+    Ok((manifest, stored))
+}
+
+pub fn reconstruct_blob_from_storage(
+    manifest: &StorageManifest,
+    shards: &[StorageShard],
+) -> Result<EncryptedBlob, NoiseError> {
+    manifest.verify(&manifest.object_id)?;
+    let data_shards = usize::from(manifest.data_shards);
+    let total_shards = usize::from(manifest.total_shards);
+    let mut available = vec![None; total_shards];
+    for shard in shards {
+        let Some(placement) = manifest
+            .placements
+            .iter()
+            .find(|placement| placement.shard_id == shard.shard_id)
+        else {
+            continue;
+        };
+        if shard.verify().is_err() || shard.payload_hash != placement.payload_hash {
+            continue;
+        }
+        let payload = decode(&shard.payload_base64, "storage shard")?;
+        if payload.len() != manifest.shard_byte_length as usize {
+            continue;
+        }
+        available[usize::from(placement.shard_index)] = Some(payload);
+    }
+    if available.iter().filter(|shard| shard.is_some()).count() < data_shards {
+        return Err(NoiseError::InsufficientStorageShards);
+    }
+    if total_shards != data_shards {
+        ReedSolomon::new(data_shards, total_shards - data_shards)
+            .map_err(|_| NoiseError::ErasureCoding)?
+            .reconstruct(&mut available)
+            .map_err(|_| NoiseError::ErasureCoding)?;
+    }
+    let mut encoded = Vec::with_capacity(manifest.encoded_byte_length as usize);
+    for shard in available.into_iter().take(data_shards) {
+        encoded.extend_from_slice(
+            shard
+                .as_deref()
+                .ok_or(NoiseError::InsufficientStorageShards)?,
+        );
+    }
+    encoded.truncate(manifest.encoded_byte_length as usize);
+    let blob: EncryptedBlob = serde_json::from_slice(&encoded)?;
+    blob.verify()?;
+    if blob.blob_id != manifest.object_id {
+        return Err(NoiseError::BlobMismatch);
+    }
+    Ok(blob)
+}
+
+pub fn shard_deletion(key_base64: &str, shard_id: &str) -> Result<ShardDeletion, NoiseError> {
+    if !valid_hex_id(shard_id) {
+        return Err(NoiseError::InvalidStorageManifest);
+    }
+    let key = decode_array::<32>(key_base64, "blob key")?;
+    Ok(ShardDeletion {
+        delete_token_base64: STANDARD_NO_PAD.encode(storage_delete_token(&key, shard_id)),
+    })
+}
+
+fn storage_shard_id(key: &[u8; 32], object_id: &str, shard_index: u8) -> String {
+    let mut hasher = blake3::Hasher::new_keyed(key);
+    hasher.update(b"noise-storage-shard-v1");
+    hasher.update(object_id.as_bytes());
+    hasher.update(&[shard_index]);
+    hasher.finalize().to_hex().to_string()
+}
+
+fn storage_delete_token(key: &[u8; 32], shard_id: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_keyed(key);
+    hasher.update(b"noise-storage-delete-v1");
+    hasher.update(shard_id.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn valid_hex_id(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -645,8 +910,8 @@ impl GroupPresence {
                 },
             )
             .map_err(|_| NoiseError::Crypto)?;
-        let public_key =
-            String::from_utf8(plaintext).map_err(|_| NoiseError::InvalidEncoding("presence member"))?;
+        let public_key = String::from_utf8(plaintext)
+            .map_err(|_| NoiseError::InvalidEncoding("presence member"))?;
         if group_presence_tag(group, &public_key)? != self.member_tag_base64 {
             return Err(NoiseError::IdentityMismatch);
         }
@@ -679,15 +944,9 @@ fn group_presence_tag(
     Ok(STANDARD_NO_PAD.encode(blake3::keyed_hash(&secret, input.as_bytes()).as_bytes()))
 }
 
-fn group_presence_aad(
-    group_id: &str,
-    member_tag_base64: &str,
-    expires_at_millis: u64,
-) -> Vec<u8> {
-    format!(
-        "{GROUP_PRESENCE_CONTEXT}:{group_id}:{member_tag_base64}:{expires_at_millis}"
-    )
-    .into_bytes()
+fn group_presence_aad(group_id: &str, member_tag_base64: &str, expires_at_millis: u64) -> Vec<u8> {
+    format!("{GROUP_PRESENCE_CONTEXT}:{group_id}:{member_tag_base64}:{expires_at_millis}")
+        .into_bytes()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1900,6 +2159,10 @@ fn valid_media(media: &MediaAttachment) -> bool {
                 && chunk.key_base64.len() <= 64
                 && chunk.byte_length > 0
                 && chunk.byte_length <= MAX_CHUNK_BYTES
+                && chunk
+                    .storage
+                    .as_ref()
+                    .is_none_or(|storage| storage.verify(&chunk.blob_id).is_ok())
         })
         && media
             .chunks
@@ -1948,12 +2211,21 @@ fn valid_group_profile(profile: &GroupProfile) -> bool {
         && name_length <= 80
         && profile.description.chars().count() <= 200
         && valid_group_rules(&profile.rules)
-        && profile
-            .avatar
-            .as_ref()
-            .is_none_or(|avatar| avatar.byte_length > 0 && avatar.byte_length <= 256 * 1024)
+        && profile.avatar.as_ref().is_none_or(|avatar| {
+            avatar.byte_length > 0
+                && avatar.byte_length <= 256 * 1024
+                && avatar
+                    .storage
+                    .as_ref()
+                    .is_none_or(|storage| storage.verify(&avatar.blob_id).is_ok())
+        })
         && profile.background.as_ref().is_none_or(|background| {
-            background.byte_length > 0 && background.byte_length <= 1536 * 1024
+            background.byte_length > 0
+                && background.byte_length <= 1536 * 1024
+                && background
+                    .storage
+                    .as_ref()
+                    .is_none_or(|storage| storage.verify(&background.blob_id).is_ok())
         })
         && valid_group_accent_color(&profile.accent_color)
 }
@@ -2082,6 +2354,21 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn twelve_shard_storage_reconstructs_from_any_eight() {
+        let plaintext = (0..=255).cycle().take(1024 * 1024).collect::<Vec<_>>();
+        let (blob, key) =
+            EncryptedBlob::create_for_group(&plaintext, "constellation-test").unwrap();
+        let relays = (0..12)
+            .map(|index| format!("https://relay-{index}.example"))
+            .collect::<Vec<_>>();
+        let (manifest, shards) = encode_blob_for_storage(&blob, &key, &relays).unwrap();
+        assert_eq!(manifest.data_shards, 8);
+        assert_eq!(manifest.total_shards, 12);
+        let recovered = reconstruct_blob_from_storage(&manifest, &shards[4..]).unwrap();
+        assert_eq!(recovered.open(&key).unwrap(), plaintext);
+    }
 
     #[test]
     fn invitation_and_message_round_trip() {

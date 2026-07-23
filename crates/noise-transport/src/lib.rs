@@ -17,9 +17,9 @@ pub const GATEWAY_HEADER: &str = "noise-gateway";
 pub const OHTTP_GATEWAY_PATH: &str = "/v1/ohttp/gateway";
 pub const OHTTP_KEYS_PATH: &str = "/v1/ohttp-keys";
 pub const OHTTP_RELAY_PATH: &str = "/v1/ohttp/relay";
-pub const RELAY_DIRECTORY_PATH: &str = "/v2/relays";
-pub const SIGNED_RELAY_DESCRIPTOR_PATH: &str = "/v2/relay-descriptor";
-pub const RELAY_PROTOCOL_VERSION: u16 = 2;
+pub const RELAY_DIRECTORY_PATH: &str = "/v3/relays";
+pub const SIGNED_RELAY_DESCRIPTOR_PATH: &str = "/v3/relay-descriptor";
+pub const RELAY_PROTOCOL_VERSION: u16 = 3;
 
 const PAD_BUCKETS: &[usize] = &[
     1024,
@@ -32,7 +32,7 @@ const PAD_BUCKETS: &[usize] = &[
     2_500_000,
 ];
 const RELAY_ID_CONTEXT: &str = "xyz.gnosyslabs.noise.relay-id.v1";
-const RELAY_DESCRIPTOR_CONTEXT: &[u8] = b"xyz.gnosyslabs.noise.relay-descriptor.v2\0";
+const RELAY_DESCRIPTOR_CONTEXT: &[u8] = b"xyz.gnosyslabs.noise.relay-descriptor.v3\0";
 const RELAY_DESCRIPTOR_CLOCK_SKEW_SECONDS: u64 = 5 * 60;
 const RELAY_DESCRIPTOR_MAX_LIFETIME_SECONDS: u64 = 48 * 60 * 60;
 const RELAY_DESCRIPTOR_MAX_URL_BYTES: usize = 2_048;
@@ -115,6 +115,8 @@ pub struct SignedRelayDescriptor {
     pub public_key_base64: String,
     pub base_url: String,
     pub ohttp_config_base64: String,
+    pub storage_capacity_bytes: u64,
+    pub storage_available_bytes: u64,
     pub issued_at_unix_seconds: u64,
     pub expires_at_unix_seconds: u64,
     pub signature_base64: String,
@@ -137,6 +139,8 @@ impl SignedRelayDescriptor {
         append_field(&mut bytes, &self.public_key_base64)?;
         append_field(&mut bytes, &self.base_url)?;
         append_field(&mut bytes, &self.ohttp_config_base64)?;
+        bytes.extend_from_slice(&self.storage_capacity_bytes.to_be_bytes());
+        bytes.extend_from_slice(&self.storage_available_bytes.to_be_bytes());
         bytes.extend_from_slice(&self.issued_at_unix_seconds.to_be_bytes());
         bytes.extend_from_slice(&self.expires_at_unix_seconds.to_be_bytes());
         Ok(bytes)
@@ -200,6 +204,11 @@ impl SignedRelayDescriptor {
         }
         if self.ohttp_config_base64.len() > RELAY_DESCRIPTOR_MAX_OHTTP_CONFIG_BYTES {
             bail!("relay OHTTP key is too large")
+        }
+        if self.storage_capacity_bytes != 0
+            && self.storage_available_bytes > self.storage_capacity_bytes
+        {
+            bail!("relay storage availability exceeds its capacity")
         }
         let ohttp_config = URL_SAFE_NO_PAD
             .decode(&self.ohttp_config_base64)
