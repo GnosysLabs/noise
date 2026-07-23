@@ -199,7 +199,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("no messages yet");
             }
             for message in conversation.messages {
-                println!("@{}  {}", message.username, message.text);
+                println!("{}  {}", message.username, message.text);
             }
             if conversation.rejected_events > 0 {
                 eprintln!(
@@ -220,7 +220,7 @@ async fn main() -> anyhow::Result<()> {
             let conversation = client.conversation(state, relay).await?;
             println!("{}", member_count(conversation.members.len()));
             for member in conversation.members {
-                println!("@{}  {}", member.username, member.public_key);
+                println!("{}  {}", member.username, member.public_key);
             }
             if conversation.rejected_events > 0 {
                 eprintln!(

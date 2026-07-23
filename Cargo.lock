@@ -3390,7 +3390,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "noise-cli"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -3400,7 +3400,7 @@ dependencies = [
 
 [[package]]
 name = "noise-client"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3416,7 +3416,7 @@ dependencies = [
 
 [[package]]
 name = "noise-core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -3427,11 +3427,12 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.19",
+ "unicode-segmentation",
 ]
 
 [[package]]
 name = "noise-desktop"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "dirs",
  "noise-ffi",
@@ -3447,7 +3448,7 @@ dependencies = [
 
 [[package]]
 name = "noise-ffi"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "noise-client",
  "serde",
@@ -3457,7 +3458,7 @@ dependencies = [
 
 [[package]]
 name = "noise-relay"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -3479,7 +3480,7 @@ dependencies = [
 
 [[package]]
 name = "noise-sim"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -3489,7 +3490,7 @@ dependencies = [
 
 [[package]]
 name = "noise-transport"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

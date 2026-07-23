@@ -22,7 +22,8 @@ use axum::{
 };
 use clap::Parser;
 use noise_core::{
-    AccountVault, EncryptedBlob, GroupDeletion, InviteRecord, InviteRotation, SignedEvent,
+    AccountVault, EncryptedBlob, GroupDeletion, GroupPresence, InviteRecord, InviteRotation,
+    SignedEvent,
 };
 use noise_transport::{
     GATEWAY_HEADER, OHTTP_GATEWAY_PATH, OHTTP_KEYS_MEDIA_TYPE, OHTTP_KEYS_PATH, OHTTP_RELAY_PATH,
@@ -47,6 +48,9 @@ use store::DurableStore;
 
 const MAX_DISCOVERY_TARGETS_PER_ROUND: usize = 8;
 const MAX_DISCOVERED_RELAYS_PER_TARGET: usize = 16;
+const MAX_GROUP_PRESENCE_MILLIS: u64 = 60_000;
+const RECENT_GROUP_PRESENCE_MILLIS: u64 = 5 * 60_000;
+const MAX_GROUP_PRESENCES: usize = 100_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "noise-relay", about = "An untrusted Noise protocol relay")]
@@ -76,6 +80,7 @@ struct AppState {
     blobs: Arc<RwLock<HashMap<String, EncryptedBlob>>>,
     deletions: Arc<RwLock<HashMap<String, GroupDeletion>>>,
     group_changes: Arc<RwLock<HashMap<String, watch::Sender<u64>>>>,
+    group_presences: Arc<RwLock<HashMap<String, HashMap<String, GroupPresence>>>>,
     account_changes: Arc<RwLock<HashMap<String, watch::Sender<u64>>>>,
     mutations: Arc<Mutex<()>>,
     peers: Arc<Vec<String>>,
@@ -117,10 +122,12 @@ struct Health {
     mask_targets: usize,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct GroupWatchResponse {
     revision: u64,
     changed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    presences: Vec<GroupPresence>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
         blobs: Arc::new(RwLock::new(recovered.blobs)),
         deletions: Arc::new(RwLock::new(recovered.deletions)),
         group_changes: Arc::new(RwLock::new(HashMap::new())),
+        group_presences: Arc::new(RwLock::new(HashMap::new())),
         account_changes: Arc::new(RwLock::new(HashMap::new())),
         mutations: Arc::new(Mutex::new(())),
         peers: Arc::new(peers),
@@ -217,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/events", post(publish_event))
         .route("/v1/groups/{group_id}/events", get(group_events))
         .route("/v1/groups/{group_id}/watch/{since}", get(group_watch))
+        .route("/v1/groups/{group_id}/presence", post(publish_presence))
         .route("/v1/blobs", post(publish_blob))
         .route("/v1/blobs/{blob_id}", get(get_blob))
         .route("/v1/group-deletions", post(publish_group_deletion))
@@ -429,6 +438,15 @@ async fn group_watch(
         .map(Json)
 }
 
+async fn publish_presence(
+    State(state): State<AppState>,
+    Path(group_id): Path<String>,
+    Json(presence): Json<GroupPresence>,
+) -> Result<StatusCode, StatusCode> {
+    store_group_presence(&state, &group_id, presence).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn account_watch(
     State(state): State<AppState>,
     Path((locator, since)): Path<(String, String)>,
@@ -437,6 +455,78 @@ async fn account_watch(
     wait_for_account_change(&state, &locator, since)
         .await
         .map(Json)
+}
+
+async fn store_group_presence(
+    state: &AppState,
+    group_id: &str,
+    presence: GroupPresence,
+) -> Result<(), StatusCode> {
+    if group_id.len() != 64
+        || !group_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || presence.group_id != group_id
+        || presence.member_tag_base64.len() != 43
+        || presence.member_nonce_base64.len() != 32
+        || presence.member_ciphertext_base64.len() > 128
+        || presence.signature_base64.len() != 86
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if state.deletions.read().await.contains_key(group_id) {
+        return Err(StatusCode::GONE);
+    }
+    if !state
+        .events
+        .read()
+        .await
+        .values()
+        .any(|event| event.group_id == group_id)
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let now = unix_millis().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if presence.expires_at_millis <= now
+        || presence.expires_at_millis > now.saturating_add(MAX_GROUP_PRESENCE_MILLIS)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut groups = state.group_presences.write().await;
+    let group = groups.entry(group_id.to_owned()).or_default();
+    group.retain(|_, current| {
+        current
+            .expires_at_millis
+            .saturating_add(RECENT_GROUP_PRESENCE_MILLIS)
+            > now
+    });
+    if group.len() >= MAX_GROUP_PRESENCES
+        && !group.contains_key(&presence.member_tag_base64)
+    {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    group.insert(presence.member_tag_base64.clone(), presence);
+    Ok(())
+}
+
+async fn active_group_presences(state: &AppState, group_id: &str) -> Vec<GroupPresence> {
+    let Ok(now) = unix_millis() else {
+        return Vec::new();
+    };
+    let mut groups = state.group_presences.write().await;
+    let Some(group) = groups.get_mut(group_id) else {
+        return Vec::new();
+    };
+    group.retain(|_, presence| {
+        presence
+            .expires_at_millis
+            .saturating_add(RECENT_GROUP_PRESENCE_MILLIS)
+            > now
+    });
+    let mut active = group.values().cloned().collect::<Vec<_>>();
+    active.sort_by(|left, right| left.member_tag_base64.cmp(&right.member_tag_base64));
+    if group.is_empty() {
+        groups.remove(group_id);
+    }
+    active
 }
 
 async fn publish_blob(
@@ -774,6 +864,22 @@ async fn dispatch_private_request(
             Err(status) => private_error(status, "group watch failed"),
         };
     }
+    if request.method == "POST"
+        && let Some(group_id) = parse_private_presence_path(&request.path)
+    {
+        let Ok(presence) = serde_json::from_slice::<GroupPresence>(&request.body) else {
+            return private_error(StatusCode::BAD_REQUEST, "invalid group presence");
+        };
+        return match store_group_presence(state, group_id, presence).await {
+            Ok(()) => (StatusCode::NO_CONTENT, Vec::new()),
+            Err(StatusCode::GONE) => private_error(StatusCode::GONE, "group has been deleted"),
+            Err(StatusCode::NOT_FOUND) => private_error(StatusCode::NOT_FOUND, "nothing here"),
+            Err(StatusCode::TOO_MANY_REQUESTS) => {
+                private_error(StatusCode::TOO_MANY_REQUESTS, "group presence is full")
+            }
+            Err(status) => private_error(status, "group presence was rejected"),
+        };
+    }
 
     match (request.method.as_str(), request.path.as_str()) {
         ("POST", "/v1/accounts") => {
@@ -975,6 +1081,16 @@ fn parse_private_watch_path(path: &str) -> Option<(&str, &str)> {
     Some((group_id, revision))
 }
 
+fn parse_private_presence_path(path: &str) -> Option<&str> {
+    let group_id = path
+        .strip_prefix("/v1/groups/")?
+        .strip_suffix("/presence")?;
+    if group_id.contains('/') {
+        return None;
+    }
+    Some(group_id)
+}
+
 fn parse_private_account_watch_path(path: &str) -> Option<(&str, &str)> {
     let rest = path.strip_prefix("/v1/accounts/")?;
     let (locator, revision) = rest.split_once("/watch/")?;
@@ -1030,12 +1146,14 @@ async fn wait_for_group_change(
         return Ok(GroupWatchResponse {
             revision: current,
             changed: false,
+            presences: active_group_presences(state, group_id).await,
         });
     };
     if current != since {
         return Ok(GroupWatchResponse {
             revision: current,
             changed: true,
+            presences: active_group_presences(state, group_id).await,
         });
     }
 
@@ -1050,12 +1168,14 @@ async fn wait_for_group_change(
         return Ok(GroupWatchResponse {
             revision,
             changed: revision != since,
+            presences: active_group_presences(state, group_id).await,
         });
     }
 
     Ok(GroupWatchResponse {
         revision: since,
         changed: false,
+        presences: active_group_presences(state, group_id).await,
     })
 }
 
@@ -1089,12 +1209,14 @@ async fn wait_for_account_change(
         return Ok(GroupWatchResponse {
             revision: current,
             changed: false,
+            presences: Vec::new(),
         });
     };
     if current != since {
         return Ok(GroupWatchResponse {
             revision: current,
             changed: true,
+            presences: Vec::new(),
         });
     }
 
@@ -1115,12 +1237,14 @@ async fn wait_for_account_change(
         return Ok(GroupWatchResponse {
             revision,
             changed: revision != since,
+            presences: Vec::new(),
         });
     }
 
     Ok(GroupWatchResponse {
         revision: since,
         changed: false,
+        presences: Vec::new(),
     })
 }
 
@@ -1392,6 +1516,7 @@ async fn apply_group_deletion(state: &AppState, deletion: GroupDeletion) -> anyh
         .await
         .insert(deletion.group_id.clone(), deletion.clone());
     state.group_changes.write().await.remove(&deletion.group_id);
+    state.group_presences.write().await.remove(&deletion.group_id);
     Ok(true)
 }
 
@@ -1617,4 +1742,11 @@ fn unix_seconds() -> anyhow::Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the Unix epoch")?
         .as_secs())
+}
+
+fn unix_millis() -> anyhow::Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_millis() as u64)
 }

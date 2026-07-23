@@ -195,6 +195,13 @@ enum Request {
         message_event_id: String,
         relays: Vec<String>,
     },
+    SetReaction {
+        state_path: String,
+        message_event_id: String,
+        emoji: String,
+        enabled: bool,
+        relays: Vec<String>,
+    },
     ReportMessage {
         state_path: String,
         message_event_id: String,
@@ -230,6 +237,10 @@ enum Request {
         state_path: String,
         group_id: String,
         since: Option<u64>,
+        relays: Vec<String>,
+    },
+    HeartbeatPresence {
+        state_path: String,
         relays: Vec<String>,
     },
     ReplyNotificationSnapshot {
@@ -299,6 +310,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         Request::DiscoverRelayMasks { .. }
             | Request::WatchGroup { .. }
             | Request::WatchGroupId { .. }
+            | Request::HeartbeatPresence { .. }
             | Request::ReplyNotificationSnapshot { .. }
             | Request::WatchDirect { .. }
             | Request::WatchAccount { .. }
@@ -710,6 +722,24 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?;
             Ok(Value::Null)
         }
+        Request::SetReaction {
+            state_path,
+            message_event_id,
+            emoji,
+            enabled,
+            relays,
+        } => {
+            runtime()?
+                .block_on(client.set_reaction(
+                    state_path,
+                    &message_event_id,
+                    &emoji,
+                    enabled,
+                    relays,
+                ))
+                .map_err(|error| error.to_string())?;
+            Ok(Value::Null)
+        }
         Request::ReportMessage {
             state_path,
             message_event_id,
@@ -781,6 +811,12 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         } => serde_json::to_value(
             runtime()?
                 .block_on(client.watch_group_id(state_path, &group_id, since, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::HeartbeatPresence { state_path, relays } => serde_json::to_value(
+            runtime()?
+                .block_on(client.heartbeat_presence(state_path, relays))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),

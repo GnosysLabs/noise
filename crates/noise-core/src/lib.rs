@@ -13,6 +13,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::random;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use unicode_segmentation::UnicodeSegmentation;
 
 const FREQUENCY_SPACE: u64 = 1_000_000_000_000;
 const NOISE_ID_SPACE: u64 = 1_000_000_000_000;
@@ -20,6 +21,7 @@ const INVITE_KDF_CONTEXT: &str = "xyz.gnosyslabs.noise.frequency-invite.v1";
 const DIRECT_KEY_CONTEXT: &str = "xyz.gnosyslabs.noise.direct-key.v1";
 const DIRECT_MAILBOX_CONTEXT: &str = "xyz.gnosyslabs.noise.direct-mailbox.v1";
 const DIRECT_SCOPE_CONTEXT: &str = "xyz.gnosyslabs.noise.direct-scope.v1";
+const GROUP_PRESENCE_CONTEXT: &str = "xyz.gnosyslabs.noise.group-presence.v1";
 pub const DEFAULT_GROUP_ACCENT_COLOR: &str = "#7758ED";
 
 fn default_group_accent_color() -> String {
@@ -578,6 +580,116 @@ impl GroupMembership {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupPresence {
+    pub group_id: String,
+    pub member_tag_base64: String,
+    pub member_nonce_base64: String,
+    pub member_ciphertext_base64: String,
+    pub expires_at_millis: u64,
+    pub signature_base64: String,
+}
+
+impl GroupPresence {
+    pub fn create(
+        identity: &Identity,
+        group: &GroupMembership,
+        expires_at_millis: u64,
+    ) -> Result<Self, NoiseError> {
+        let public_key = identity.public_key_base64();
+        let member_tag_base64 = group_presence_tag(group, &public_key)?;
+        let nonce: [u8; 24] = random();
+        let secret = decode_array::<32>(&group.secret_base64, "group secret")?;
+        let member_ciphertext = XChaCha20Poly1305::new((&secret).into())
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: public_key.as_bytes(),
+                    aad: &group_presence_aad(
+                        &group.group_id,
+                        &member_tag_base64,
+                        expires_at_millis,
+                    ),
+                },
+            )
+            .map_err(|_| NoiseError::Crypto)?;
+        let mut presence = Self {
+            group_id: group.group_id.clone(),
+            member_tag_base64,
+            member_nonce_base64: STANDARD_NO_PAD.encode(nonce),
+            member_ciphertext_base64: STANDARD_NO_PAD.encode(member_ciphertext),
+            expires_at_millis,
+            signature_base64: String::new(),
+        };
+        presence.signature_base64 = identity.sign(&presence.signing_bytes());
+        Ok(presence)
+    }
+
+    pub fn open(&self, group: &GroupMembership) -> Result<String, NoiseError> {
+        if self.group_id != group.group_id {
+            return Err(NoiseError::GroupMismatch);
+        }
+        let nonce = decode_array::<24>(&self.member_nonce_base64, "presence nonce")?;
+        let ciphertext = decode(&self.member_ciphertext_base64, "presence member")?;
+        let secret = decode_array::<32>(&group.secret_base64, "group secret")?;
+        let plaintext = XChaCha20Poly1305::new((&secret).into())
+            .decrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: ciphertext.as_ref(),
+                    aad: &group_presence_aad(
+                        &self.group_id,
+                        &self.member_tag_base64,
+                        self.expires_at_millis,
+                    ),
+                },
+            )
+            .map_err(|_| NoiseError::Crypto)?;
+        let public_key =
+            String::from_utf8(plaintext).map_err(|_| NoiseError::InvalidEncoding("presence member"))?;
+        if group_presence_tag(group, &public_key)? != self.member_tag_base64 {
+            return Err(NoiseError::IdentityMismatch);
+        }
+        verify_signature(&public_key, &self.signature_base64, &self.signing_bytes())?;
+        Ok(public_key)
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        format!(
+            "{GROUP_PRESENCE_CONTEXT}:{}:{}:{}:{}:{}",
+            self.group_id,
+            self.member_tag_base64,
+            self.member_nonce_base64,
+            self.member_ciphertext_base64,
+            self.expires_at_millis,
+        )
+        .into_bytes()
+    }
+}
+
+fn group_presence_tag(
+    group: &GroupMembership,
+    member_public_key: &str,
+) -> Result<String, NoiseError> {
+    let secret = decode_array::<32>(&group.secret_base64, "group secret")?;
+    let input = format!(
+        "{GROUP_PRESENCE_CONTEXT}:{}:{member_public_key}",
+        group.group_id
+    );
+    Ok(STANDARD_NO_PAD.encode(blake3::keyed_hash(&secret, input.as_bytes()).as_bytes()))
+}
+
+fn group_presence_aad(
+    group_id: &str,
+    member_tag_base64: &str,
+    expires_at_millis: u64,
+) -> Vec<u8> {
+    format!(
+        "{GROUP_PRESENCE_CONTEXT}:{group_id}:{member_tag_base64}:{expires_at_millis}"
+    )
+    .into_bytes()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InvitePayload {
     pub group: GroupMembership,
@@ -897,6 +1009,11 @@ pub enum GroupEventPayload {
     MessageDeleted {
         message_event_id: String,
     },
+    ReactionSet {
+        message_event_id: String,
+        emoji: String,
+        enabled: bool,
+    },
     MessageReported {
         message_event_id: String,
         #[serde(default)]
@@ -1051,6 +1168,26 @@ impl SignedEvent {
             group,
             GroupEventPayload::MessageDeleted {
                 message_event_id: message_event_id.into(),
+            },
+            author_sequence,
+        )
+    }
+
+    pub fn reaction_set(
+        identity: &Identity,
+        group: &GroupMembership,
+        message_event_id: impl Into<String>,
+        emoji: impl Into<String>,
+        enabled: bool,
+        author_sequence: u64,
+    ) -> Result<Self, NoiseError> {
+        Self::create(
+            identity,
+            group,
+            GroupEventPayload::ReactionSet {
+                message_event_id: message_event_id.into(),
+                emoji: emoji.into(),
+                enabled,
             },
             author_sequence,
         )
@@ -1360,6 +1497,14 @@ pub struct AcceptedReport {
     pub created_at_millis: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct AcceptedReaction {
+    pub message_event_id: String,
+    pub reactor_public_key: String,
+    pub emoji: String,
+    pub created_at_millis: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct GroupState {
     pub profile: GroupProfile,
@@ -1369,6 +1514,7 @@ pub struct GroupState {
     pub banned_members: HashSet<String>,
     pub banned_profiles: HashMap<String, MemberState>,
     pub messages: Vec<AcceptedMessage>,
+    pub reactions: Vec<AcceptedReaction>,
     pub reports: Vec<AcceptedReport>,
     pub rejected_events: usize,
 }
@@ -1507,9 +1653,36 @@ impl GroupState {
                     if state.messages.len() == previous_length {
                         state.rejected_events += 1;
                     } else {
-                        state
-                            .reports
-                            .retain(|report| report.message_event_id != message_event_id);
+                        retain_related_for_existing_messages(&mut state);
+                    }
+                }
+                GroupEventPayload::ReactionSet {
+                    message_event_id,
+                    emoji,
+                    enabled,
+                } => {
+                    if !state.members.contains_key(&event.author_public_key)
+                        || !valid_reaction_emoji(&emoji)
+                        || !state
+                            .messages
+                            .iter()
+                            .any(|message| message.event_id == message_event_id)
+                    {
+                        state.rejected_events += 1;
+                        continue;
+                    }
+                    state.reactions.retain(|reaction| {
+                        reaction.message_event_id != message_event_id
+                            || reaction.reactor_public_key != event.author_public_key
+                            || reaction.emoji != emoji
+                    });
+                    if enabled {
+                        state.reactions.push(AcceptedReaction {
+                            message_event_id,
+                            reactor_public_key: event.author_public_key.clone(),
+                            emoji,
+                            created_at_millis: event.created_at_millis,
+                        });
                     }
                 }
                 GroupEventPayload::MessageReported {
@@ -1575,7 +1748,7 @@ impl GroupState {
                     state
                         .messages
                         .retain(|message| message.author_public_key != event.author_public_key);
-                    retain_reports_for_existing_messages(&mut state);
+                    retain_related_for_existing_messages(&mut state);
                 }
                 GroupEventPayload::MemberBanned {
                     member_public_key,
@@ -1611,7 +1784,7 @@ impl GroupState {
                         state
                             .messages
                             .retain(|message| message.author_public_key != member_public_key);
-                        retain_reports_for_existing_messages(&mut state);
+                        retain_related_for_existing_messages(&mut state);
                     }
                 }
                 GroupEventPayload::MemberUnbanned { member_public_key } => {
@@ -1691,7 +1864,7 @@ impl GroupState {
     }
 }
 
-fn retain_reports_for_existing_messages(state: &mut GroupState) {
+fn retain_related_for_existing_messages(state: &mut GroupState) {
     let message_ids = state
         .messages
         .iter()
@@ -1700,6 +1873,9 @@ fn retain_reports_for_existing_messages(state: &mut GroupState) {
     state
         .reports
         .retain(|report| message_ids.contains(report.message_event_id.as_str()));
+    state
+        .reactions
+        .retain(|reaction| message_ids.contains(reaction.message_event_id.as_str()));
 }
 
 fn valid_media(media: &MediaAttachment) -> bool {
@@ -1757,6 +1933,13 @@ fn valid_media_preview(media: &MediaAttachment) -> bool {
 
 fn valid_message_id(message_id: &str) -> bool {
     message_id.len() == 64 && message_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub fn valid_reaction_emoji(emoji: &str) -> bool {
+    emoji.trim() == emoji
+        && emoji.chars().count() <= 32
+        && !emoji.chars().any(|character| character.is_control())
+        && UnicodeSegmentation::graphemes(emoji, true).count() == 1
 }
 
 fn valid_group_profile(profile: &GroupProfile) -> bool {
@@ -2055,6 +2238,54 @@ mod tests {
         let resolved = GroupState::rebuild(&group, &events);
         assert!(resolved.reports.is_empty());
         assert_eq!(resolved.rejected_events, 1);
+    }
+
+    #[test]
+    fn members_can_toggle_reactions_and_message_deletion_removes_them() {
+        let founder = Identity::generate();
+        let member = Identity::generate();
+        let group = GroupMembership::create_owned("reactions", founder.public_key_base64());
+        let profile = |username: &str| Profile {
+            username: username.into(),
+            bio: String::new(),
+            avatar: None,
+            accepts_direct_messages: true,
+        };
+        let mut events =
+            vec![SignedEvent::member_joined(&founder, &group, &profile("founder"), 0).unwrap()];
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        events.push(SignedEvent::member_joined(&member, &group, &profile("member"), 0).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let message = SignedEvent::chat(&founder, &group, "react to me", 1).unwrap();
+        events.push(message.clone());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        events.push(
+            SignedEvent::reaction_set(&member, &group, &message.event_id, "🔥", true, 1).unwrap(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        events.push(
+            SignedEvent::reaction_set(&founder, &group, &message.event_id, "🔥", true, 2).unwrap(),
+        );
+
+        let reacted = GroupState::rebuild(&group, &events);
+        assert_eq!(reacted.reactions.len(), 2);
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        events.push(
+            SignedEvent::reaction_set(&member, &group, &message.event_id, "🔥", false, 2).unwrap(),
+        );
+        let toggled = GroupState::rebuild(&group, &events);
+        assert_eq!(toggled.reactions.len(), 1);
+        assert_eq!(
+            toggled.reactions[0].reactor_public_key,
+            founder.public_key_base64()
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        events.push(SignedEvent::message_deleted(&founder, &group, &message.event_id, 3).unwrap());
+        let deleted = GroupState::rebuild(&group, &events);
+        assert!(deleted.messages.is_empty());
+        assert!(deleted.reactions.is_empty());
     }
 
     #[test]

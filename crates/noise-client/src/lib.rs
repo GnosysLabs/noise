@@ -9,10 +9,11 @@ use anyhow::{Context, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use noise_core::{
     AccountCredentials, AccountVault, EncryptedBlob, GroupDeletion, GroupEventPayload,
-    GroupMembership, GroupProfile, GroupState, Identity, InviteRecord, InviteRotation, Profile,
-    SignedEvent, derive_account_credentials, direct_mailbox_id, direct_message_id,
+    GroupMembership, GroupPresence, GroupProfile, GroupState, Identity, InviteRecord,
+    InviteRotation, Profile, SignedEvent, derive_account_credentials, direct_mailbox_id,
+    direct_message_id,
     display_frequency, display_noise_id, frequency_locator, generate_frequency, generate_noise_id,
-    normalize_frequency,
+    normalize_frequency, valid_reaction_emoji,
 };
 pub use noise_core::{MediaAttachment, MediaChunk, ProfileImage};
 use noise_transport::{
@@ -23,6 +24,9 @@ use ohttp::ClientRequest;
 use serde::{Deserialize, Serialize};
 
 mod relay_pool;
+
+const GROUP_PRESENCE_TTL_MILLIS: u64 = 50_000;
+const RECENT_GROUP_PRESENCE_MILLIS: u64 = 5 * 60_000;
 
 #[derive(Clone)]
 pub struct NoiseClient {
@@ -124,6 +128,15 @@ pub struct MessageSummary {
     pub attachment: Option<MediaAttachment>,
     pub reply_to_message_id: Option<String>,
     pub created_at_millis: u64,
+    pub reactions: Vec<ReactionSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReactionSummary {
+    pub emoji: String,
+    pub count: usize,
+    pub reactor_public_keys: Vec<String>,
+    pub reacted_by_self: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -191,10 +204,22 @@ pub struct DirectInbox {
     pub conversations: Vec<DirectConversation>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GroupWatch {
     pub revision: u64,
     pub changed: bool,
+    #[serde(default)]
+    pub online_public_keys: Vec<String>,
+    #[serde(default)]
+    pub recently_active_public_keys: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RelayGroupWatch {
+    revision: u64,
+    changed: bool,
+    #[serde(default)]
+    presences: Vec<GroupPresence>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -807,7 +832,8 @@ impl NoiseClient {
     ) -> anyhow::Result<GroupWatch> {
         let state = load_state(path.as_ref())?;
         let group = state.active_group()?;
-        self.watch_id(&group.group_id, since, relay_list(relays)?)
+        let identity = state.identity()?;
+        self.watch_id(group, &identity, since, relay_list(relays)?)
             .await
     }
 
@@ -824,8 +850,36 @@ impl NoiseClient {
             .iter()
             .find(|group| group.group_id == group_id)
             .context("unknown group")?;
-        self.watch_id(&group.group_id, since, relay_list(relays)?)
+        let identity = state.identity()?;
+        self.watch_id(group, &identity, since, relay_list(relays)?)
             .await
+    }
+
+    pub async fn heartbeat_presence(
+        &self,
+        path: impl AsRef<Path>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<usize> {
+        let state = load_state(path.as_ref())?;
+        let identity = state.identity()?;
+        let relays = relay_list(relays)?;
+        let mut accepted = 0usize;
+        for group in &state.groups {
+            accepted += self
+                .publish_group_presence(group, &identity, &relays)
+                .await;
+        }
+        for contact in &state.direct_contacts {
+            let Ok(mailbox) =
+                identity.direct_mailbox(&contact.public_key, &contact.public_key)
+            else {
+                continue;
+            };
+            accepted += self
+                .publish_group_presence(&mailbox, &identity, &relays)
+                .await;
+        }
+        Ok(accepted)
     }
 
     pub async fn reply_notification_snapshot(
@@ -923,14 +977,16 @@ impl NoiseClient {
 
     async fn watch_id(
         &self,
-        id: &str,
+        group: &GroupMembership,
+        identity: &Identity,
         since: Option<u64>,
         relays: Vec<RelayDescriptor>,
     ) -> anyhow::Result<GroupWatch> {
+        self.publish_group_presence(group, identity, &relays).await;
         let revision = since
             .map(|revision| revision.to_string())
             .unwrap_or_else(|| "initial".to_owned());
-        let endpoint = format!("/v1/groups/{id}/watch/{revision}");
+        let endpoint = format!("/v1/groups/{}/watch/{revision}", group.group_id);
 
         for index in 0..relays.len() {
             let Ok(response) = self
@@ -943,9 +999,125 @@ impl NoiseClient {
                 bail!("group has been deleted")
             }
             if (200..300).contains(&response.status)
-                && let Ok(change) = serde_json::from_slice::<GroupWatch>(&response.body)
+                && let Ok(change) = serde_json::from_slice::<RelayGroupWatch>(&response.body)
             {
-                return Ok(change);
+                let now = current_millis();
+                let mut online_public_keys = Vec::new();
+                let mut recently_active_public_keys = Vec::new();
+                for presence in change.presences {
+                    let Ok(public_key) = presence.open(group) else {
+                        continue;
+                    };
+                    if presence.expires_at_millis > now {
+                        online_public_keys.push(public_key);
+                    } else if presence
+                        .expires_at_millis
+                        .saturating_add(RECENT_GROUP_PRESENCE_MILLIS)
+                        > now
+                    {
+                        recently_active_public_keys.push(public_key);
+                    }
+                }
+                online_public_keys.sort();
+                online_public_keys.dedup();
+                recently_active_public_keys.sort();
+                recently_active_public_keys.dedup();
+                return Ok(GroupWatch {
+                    revision: change.revision,
+                    changed: change.changed,
+                    online_public_keys,
+                    recently_active_public_keys,
+                });
+            }
+        }
+        bail!("no relay could hold the conversation watch")
+    }
+
+    async fn publish_group_presence(
+        &self,
+        group: &GroupMembership,
+        identity: &Identity,
+        relays: &[RelayDescriptor],
+    ) -> usize {
+        let Ok(presence) = GroupPresence::create(
+            identity,
+            group,
+            current_millis().saturating_add(GROUP_PRESENCE_TTL_MILLIS),
+        ) else {
+            return 0;
+        };
+        let Ok(body) = serde_json::to_vec(&presence) else {
+            return 0;
+        };
+        let endpoint = format!("/v1/groups/{}/presence", group.group_id);
+        let mut accepted = 0usize;
+        for index in 0..relays.len() {
+            if let Ok(response) = self
+                .relay_request(relays, index, "POST", &endpoint, &body)
+                .await
+                && (200..300).contains(&response.status)
+            {
+                accepted += 1;
+            }
+        }
+        accepted
+    }
+
+    async fn watch_direct_id(
+        &self,
+        id: &str,
+        direct_mailboxes: &[(String, GroupMembership)],
+        since: Option<u64>,
+        relays: Vec<RelayDescriptor>,
+    ) -> anyhow::Result<GroupWatch> {
+        let revision = since
+            .map(|revision| revision.to_string())
+            .unwrap_or_else(|| "initial".to_owned());
+        let endpoint = format!("/v1/groups/{id}/watch/{revision}");
+        for index in 0..relays.len() {
+            let Ok(response) = self
+                .relay_request(&relays, index, "GET", &endpoint, &[])
+                .await
+            else {
+                continue;
+            };
+            if (200..300).contains(&response.status)
+                && let Ok(change) = serde_json::from_slice::<RelayGroupWatch>(&response.body)
+            {
+                let now = current_millis();
+                let mut online_public_keys = Vec::new();
+                let mut recently_active_public_keys = Vec::new();
+                for presence in change.presences {
+                    let Some(public_key) = direct_mailboxes.iter().find_map(
+                        |(expected_public_key, mailbox)| {
+                            presence
+                                .open(mailbox)
+                                .ok()
+                                .filter(|opened| opened == expected_public_key)
+                        },
+                    ) else {
+                        continue;
+                    };
+                    if presence.expires_at_millis > now {
+                        online_public_keys.push(public_key);
+                    } else if presence
+                        .expires_at_millis
+                        .saturating_add(RECENT_GROUP_PRESENCE_MILLIS)
+                        > now
+                    {
+                        recently_active_public_keys.push(public_key);
+                    }
+                }
+                online_public_keys.sort();
+                online_public_keys.dedup();
+                recently_active_public_keys.sort();
+                recently_active_public_keys.dedup();
+                return Ok(GroupWatch {
+                    revision: change.revision,
+                    changed: change.changed,
+                    online_public_keys,
+                    recently_active_public_keys,
+                });
             }
         }
         bail!("no relay could hold the conversation watch")
@@ -1652,8 +1824,26 @@ impl NoiseClient {
         relays: Vec<String>,
     ) -> anyhow::Result<GroupWatch> {
         let state = load_state(path.as_ref())?;
-        let mailbox_id = direct_mailbox_id(&state.identity()?.public_key_base64())?;
-        self.watch_id(&mailbox_id, since, relay_list(relays)?).await
+        let identity = state.identity()?;
+        let self_public_key = identity.public_key_base64();
+        let mailbox_id = direct_mailbox_id(&self_public_key)?;
+        let direct_mailboxes = state
+            .direct_contacts
+            .iter()
+            .filter_map(|contact| {
+                identity
+                    .direct_mailbox(&contact.public_key, &self_public_key)
+                    .ok()
+                    .map(|mailbox| (contact.public_key.clone(), mailbox))
+            })
+            .collect::<Vec<_>>();
+        self.watch_direct_id(
+            &mailbox_id,
+            &direct_mailboxes,
+            since,
+            relay_list(relays)?,
+        )
+            .await
     }
 
     pub async fn say_direct(
@@ -1993,6 +2183,42 @@ impl NoiseClient {
         }
         let sequence = state.take_sequence();
         let event = SignedEvent::message_deleted(&identity, &group, message_event_id, sequence)?;
+        self.publish_event(&relays, &event).await?;
+        save_state(path, &state)?;
+        Ok(())
+    }
+
+    pub async fn set_reaction(
+        &self,
+        path: impl AsRef<Path>,
+        message_event_id: &str,
+        emoji: &str,
+        enabled: bool,
+        relays: Vec<String>,
+    ) -> anyhow::Result<()> {
+        if message_event_id.len() != 64
+            || !message_event_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("reaction target is invalid")
+        }
+        if !valid_reaction_emoji(emoji) {
+            bail!("choose a single emoji reaction")
+        }
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        let relays = relay_list(relays)?;
+        let group = state.active_group()?.clone();
+        let sequence = state.take_sequence();
+        let event = SignedEvent::reaction_set(
+            &state.identity()?,
+            &group,
+            message_event_id,
+            emoji,
+            enabled,
+            sequence,
+        )?;
         self.publish_event(&relays, &event).await?;
         save_state(path, &state)?;
         Ok(())
@@ -2376,6 +2602,29 @@ impl NoiseClient {
         }
         let can_view_reports =
             resolved_owner == identity_public_key || moderators.contains(&identity_public_key);
+        let mut reactions_by_message = HashMap::<String, Vec<ReactionSummary>>::new();
+        for reaction in &view.reactions {
+            let summaries = reactions_by_message
+                .entry(reaction.message_event_id.clone())
+                .or_default();
+            if let Some(summary) = summaries
+                .iter_mut()
+                .find(|summary| summary.emoji == reaction.emoji)
+            {
+                summary.count += 1;
+                summary
+                    .reactor_public_keys
+                    .push(reaction.reactor_public_key.clone());
+                summary.reacted_by_self |= reaction.reactor_public_key == identity_public_key;
+            } else {
+                summaries.push(ReactionSummary {
+                    emoji: reaction.emoji.clone(),
+                    count: 1,
+                    reactor_public_keys: vec![reaction.reactor_public_key.clone()],
+                    reacted_by_self: reaction.reactor_public_key == identity_public_key,
+                });
+            }
+        }
         let reported_message_event_ids = view
             .reports
             .iter()
@@ -2410,6 +2659,10 @@ impl NoiseClient {
                         attachment: message.attachment.clone(),
                         reply_to_message_id: message.reply_to_message_id.clone(),
                         created_at_millis: message.created_at_millis,
+                        reactions: reactions_by_message
+                            .get(&message.event_id)
+                            .cloned()
+                            .unwrap_or_default(),
                     },
                 })
             })
@@ -2451,18 +2704,24 @@ impl NoiseClient {
             messages: view
                 .messages
                 .into_iter()
-                .map(|message| MessageSummary {
-                    event_id: message.event_id,
-                    message_id: message.message_id,
-                    author_public_key: message.author_public_key,
-                    username: message.username,
-                    bio: message.bio,
-                    avatar: message.avatar,
-                    accepts_direct_messages: message.accepts_direct_messages,
-                    text: message.text,
-                    attachment: message.attachment,
-                    reply_to_message_id: message.reply_to_message_id,
-                    created_at_millis: message.created_at_millis,
+                .map(|message| {
+                    let reactions = reactions_by_message
+                        .remove(&message.event_id)
+                        .unwrap_or_default();
+                    MessageSummary {
+                        event_id: message.event_id,
+                        message_id: message.message_id,
+                        author_public_key: message.author_public_key,
+                        username: message.username,
+                        bio: message.bio,
+                        avatar: message.avatar,
+                        accepts_direct_messages: message.accepts_direct_messages,
+                        text: message.text,
+                        attachment: message.attachment,
+                        reply_to_message_id: message.reply_to_message_id,
+                        created_at_millis: message.created_at_millis,
+                        reactions,
+                    }
                 })
                 .collect(),
             reports,

@@ -170,7 +170,7 @@ fn incoming_direct_notifications(inbox: &Value) -> Option<(String, Vec<PendingNo
                 .and_then(Value::as_str);
             incoming.push(PendingNotification {
                 event_id: event_id.to_owned(),
-                title: format!("@{contact_username}"),
+                title: contact_username.to_owned(),
                 body: notification_preview(text, mime_type),
                 created_at_millis: message
                     .get("created_at_millis")
@@ -203,7 +203,7 @@ fn reply_notifications(snapshot: &Value) -> Vec<PendingNotification> {
                 .and_then(Value::as_str);
             Some(PendingNotification {
                 event_id,
-                title: format!("{group_name} · @{username} replied"),
+                title: format!("{group_name} · {username} replied"),
                 body: notification_preview(text, mime_type),
                 created_at_millis: reply
                     .get("created_at_millis")

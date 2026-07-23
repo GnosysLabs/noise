@@ -85,11 +85,19 @@ export type MessageSummary = {
   attachment: MediaAttachment | null;
   reply_to_message_id: string | null;
   created_at_millis: number;
+  reactions?: ReactionSummary[];
   optimistic?: boolean;
   local_attachment?: {
     preview_url: string;
     mime_type: string;
   };
+};
+
+export type ReactionSummary = {
+  emoji: string;
+  count: number;
+  reactor_public_keys: string[];
+  reacted_by_self: boolean;
 };
 
 export type Conversation = {
@@ -158,6 +166,8 @@ export type DirectInbox = {
 export type GroupWatch = {
   revision: number;
   changed: boolean;
+  online_public_keys: string[];
+  recently_active_public_keys: string[];
 };
 
 export type ReplyNotificationSummary = {

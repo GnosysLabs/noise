@@ -4,10 +4,13 @@ import {
   AudioWaveform,
   Camera,
   Check,
+  ChevronLeft,
+  ChevronRight,
   Copy,
   Crown,
   Globe2,
   Images,
+  Info,
   LoaderCircle,
   LogOut,
   MessageCircle,
@@ -23,6 +26,7 @@ import {
   Settings2,
   Shield,
   ShieldOff,
+  SmilePlus,
   Trash2,
   TriangleAlert,
   UserRoundX,
@@ -37,6 +41,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 import { isTauri, noise, prepareGroupBackground, prepareImage, relays } from "./api";
 import { generateGroupAvatar, generateUserAvatar } from "./groupAvatar";
+import { ReactionPicker } from "./ReactionPicker";
 import type {
   AttachmentData,
   AvatarData,
@@ -55,6 +60,7 @@ import type {
   MemberSummary,
   MessageSummary,
   ProfileImage,
+  ReactionSummary,
   ReportSummary,
   SentMessageResult,
 } from "./types";
@@ -70,6 +76,7 @@ type Dialog =
   | { type: "media" }
   | { type: "reports" }
   | { type: "report_message"; message: MessageSummary }
+  | { type: "delete_message"; message: MessageSummary; scopeId: string }
   | { type: "ban_member"; member: MemberSummary }
   | { type: "leave_group"; group: GroupSummary }
   | { type: "delete_group"; group: GroupSummary }
@@ -78,8 +85,11 @@ type Dialog =
   | { type: "logout" }
   | { type: "person"; person: PersonSummary };
 
-type PersonSummary = Pick<MemberSummary, "public_key" | "username" | "bio" | "avatar" | "accepts_direct_messages">;
+type PersonSummary = Pick<MemberSummary, "public_key" | "username" | "bio" | "avatar" | "accepts_direct_messages"> & {
+  presence_status?: PresenceStatus;
+};
 type SidebarMode = "groups" | "directs";
+type PresenceStatus = "online" | "recently-active" | "offline";
 const DEFAULT_ACCENT_COLOR = "#7758ED";
 const ACCENT_PRESETS = ["#7758ED", "#E84D8A", "#F06A3C", "#E0A82E", "#43B581", "#24A6A6", "#4D82F0", "#A45EE5"];
 const UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
@@ -190,20 +200,42 @@ const avatarCache = new Map<string, string>();
 const profileImageRequests = new Map<string, Promise<string>>();
 let profileImageCacheGeneration = 0;
 const mediaCache = new Map<string, string>();
+const mediaLoadPromises = new Map<string, Promise<string>>();
+const mediaPreparationPromises = new Map<string, Promise<void>>();
+const decodedImageCache = new Set<string>();
+const MEDIA_DIMENSIONS_STORAGE_KEY = "noise.media-dimensions.v1";
+const mediaDimensionCache = loadStoredMediaDimensions();
 const sentMediaPreviewCache = new Map<string, NonNullable<MessageSummary["local_attachment"]>>();
+const imagePosterCache = new Map<string, string>();
 const videoPosterCache = new Map<string, string>();
+const renderedMessageCounts = new Map<string, number>();
+let mediaCacheGeneration = 0;
+
+const INITIAL_MESSAGE_COUNT = 24;
+const MESSAGE_PAGE_SIZE = 40;
 
 function mediaCacheKey(attachment: MediaAttachment) {
   return attachment.chunks.map((chunk) => chunk.blob_id).join(":");
 }
 
 function clearMediaMemoryCache() {
+  mediaCacheGeneration += 1;
   const previews = new Set(
     [...sentMediaPreviewCache.values()].map((attachment) => attachment.preview_url),
   );
   for (const preview of previews) URL.revokeObjectURL(preview);
   sentMediaPreviewCache.clear();
+  imagePosterCache.clear();
   videoPosterCache.clear();
+  decodedImageCache.clear();
+  mediaDimensionCache.clear();
+  try {
+    window.localStorage.removeItem(MEDIA_DIMENSIONS_STORAGE_KEY);
+  } catch {
+    // The in-memory cache is still cleared when storage is unavailable.
+  }
+  mediaLoadPromises.clear();
+  mediaPreparationPromises.clear();
   mediaCache.clear();
 }
 
@@ -243,17 +275,65 @@ type PendingMedia = {
   byteLength: number;
   file: File;
   previewUrl: string;
-  videoPreview: Promise<VideoPreview | null> | null;
+  mediaPreview: Promise<MediaPreview | null> | null;
 };
 
-type VideoPreview = {
+type MediaPreview = {
   dataBase64: string;
   mimeType: "image/jpeg";
   pixelWidth: number;
   pixelHeight: number;
 };
 
-function prepareVideoPreview(file: File): Promise<VideoPreview | null> {
+function prepareImagePreview(file: File): Promise<MediaPreview | null> {
+  const source = URL.createObjectURL(file);
+  const image = new Image();
+  return new Promise((resolve) => {
+    const finish = (value: MediaPreview | null) => {
+      URL.revokeObjectURL(source);
+      resolve(value);
+    };
+    image.onload = async () => {
+      try {
+        const pixelWidth = image.naturalWidth;
+        const pixelHeight = image.naturalHeight;
+        if (!pixelWidth || !pixelHeight) return finish(null);
+        const scale = Math.min(1, 360 / Math.max(pixelWidth, pixelHeight));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(pixelWidth * scale));
+        canvas.height = Math.max(1, Math.round(pixelHeight * scale));
+        const context = canvas.getContext("2d");
+        if (!context) return finish(null);
+        context.fillStyle = "#17161a";
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        let preview = await new Promise<Blob | null>((done) =>
+          canvas.toBlob(done, "image/jpeg", 0.62)
+        );
+        if (preview && preview.size > 58_000) {
+          preview = await new Promise<Blob | null>((done) =>
+            canvas.toBlob(done, "image/jpeg", 0.42)
+          );
+        }
+        if (!preview) return finish(null);
+        const dataBase64 = await fileBase64(preview);
+        if (dataBase64.length > 80_000) return finish(null);
+        finish({
+          dataBase64,
+          mimeType: "image/jpeg",
+          pixelWidth,
+          pixelHeight,
+        });
+      } catch {
+        finish(null);
+      }
+    };
+    image.onerror = () => finish(null);
+    image.src = source;
+  });
+}
+
+function prepareVideoPreview(file: File): Promise<MediaPreview | null> {
   const source = URL.createObjectURL(file);
   const video = document.createElement("video");
   video.muted = true;
@@ -265,7 +345,7 @@ function prepareVideoPreview(file: File): Promise<VideoPreview | null> {
     let previewTimes: number[] = [];
     let previewIndex = 0;
     const timeout = window.setTimeout(() => finish(null), 15_000);
-    const finish = (value: VideoPreview | null) => {
+    const finish = (value: MediaPreview | null) => {
       if (settled) return;
       settled = true;
       window.clearTimeout(timeout);
@@ -346,6 +426,49 @@ function optimisticMessage(
       preview_url: URL.createObjectURL(attachment.file),
       mime_type: attachment.mimeType,
     } : undefined,
+  };
+}
+
+function withReaction(
+  message: MessageSummary,
+  emoji: string,
+  selfPublicKey: string,
+  enabled: boolean,
+): MessageSummary {
+  const reactions = message.reactions ?? [];
+  const existing = reactions.find((reaction) => reaction.emoji === emoji);
+  if (enabled) {
+    if (existing?.reacted_by_self) return message;
+    const reactorPublicKeys = existing
+      ? [...new Set([...existing.reactor_public_keys, selfPublicKey])]
+      : [selfPublicKey];
+    const next: ReactionSummary = {
+      emoji,
+      count: reactorPublicKeys.length,
+      reactor_public_keys: reactorPublicKeys,
+      reacted_by_self: true,
+    };
+    return {
+      ...message,
+      reactions: existing
+        ? reactions.map((reaction) => reaction.emoji === emoji ? next : reaction)
+        : [...reactions, next],
+    };
+  }
+  if (!existing?.reacted_by_self) return message;
+  const reactorPublicKeys = existing.reactor_public_keys.filter(
+    (publicKey) => publicKey !== selfPublicKey,
+  );
+  return {
+    ...message,
+    reactions: reactorPublicKeys.length
+      ? reactions.map((reaction) => reaction.emoji === emoji ? {
+        ...reaction,
+        count: reactorPublicKeys.length,
+        reactor_public_keys: reactorPublicKeys,
+        reacted_by_self: false,
+      } : reaction)
+      : reactions.filter((reaction) => reaction.emoji !== emoji),
   };
 }
 
@@ -432,6 +555,13 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [onlinePresence, setOnlinePresence] = useState<{
+    groupId: string | null;
+    statuses: Map<string, PresenceStatus>;
+  }>({ groupId: null, statuses: new Map() });
+  const [directPresenceStatuses, setDirectPresenceStatuses] = useState<Map<string, PresenceStatus>>(
+    () => new Map(),
+  );
   const updater = useAutoUpdater();
   const refreshGeneration = useRef(0);
   const groupConversationCache = useRef(new Map<string, Conversation>());
@@ -461,10 +591,51 @@ export default function App() {
     if (identityPublicKey) void ensureNotificationPermission();
   }, [identityPublicKey]);
 
+  useEffect(() => {
+    if (!isTauri || !identityPublicKey) return;
+    let stopped = false;
+    let timer: number | null = null;
+    const heartbeat = async () => {
+      try {
+        await noise({ action: "heartbeat_presence", relays });
+      } catch {
+        // Presence is best-effort and retries without interrupting chat.
+      }
+      if (!stopped) timer = window.setTimeout(() => void heartbeat(), 20_000);
+    };
+    void heartbeat();
+    return () => {
+      stopped = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [identityPublicKey]);
+
   function addOptimisticGroupMessage(groupId: string, item: MessageSummary) {
     setOptimisticGroupMessages((current) => {
       const next = new Map(current);
       next.set(groupId, [...(current.get(groupId) ?? []), item]);
+      return next;
+    });
+  }
+
+  function updateVisibleGroupReaction(
+    groupId: string,
+    messageEventId: string,
+    emoji: string,
+    enabled: boolean,
+    selfPublicKey: string,
+  ) {
+    setConversation((current) => {
+      if (current?.group.group_id !== groupId) return current;
+      const next = {
+        ...current,
+        messages: current.messages.map((item) =>
+          item.event_id === messageEventId
+            ? withReaction(item, emoji, selfPublicKey, enabled)
+            : item
+        ),
+      };
+      groupConversationCache.current.set(groupId, next);
       return next;
     });
   }
@@ -698,6 +869,15 @@ export default function App() {
           });
           if (stopped || !change) return;
           revision = change.revision;
+          const statuses = new Map<string, PresenceStatus>();
+          for (const publicKey of change.recently_active_public_keys ?? []) {
+            statuses.set(publicKey, "recently-active");
+          }
+          for (const publicKey of change.online_public_keys ?? []) {
+            statuses.set(publicKey, "online");
+          }
+          if (identityPublicKey) statuses.set(identityPublicKey, "online");
+          setOnlinePresence({ groupId: activeGroupId, statuses });
           if (!initial && change.changed) await refresh();
         } catch {
           await new Promise((resolve) => window.setTimeout(resolve, 1500));
@@ -708,7 +888,7 @@ export default function App() {
     return () => {
       stopped = true;
     };
-  }, [activeGroupId, refresh, sidebarMode]);
+  }, [activeGroupId, identityPublicKey, refresh, sidebarMode]);
 
   useEffect(() => {
     if (!isTauri || !identityPublicKey) return;
@@ -721,6 +901,14 @@ export default function App() {
           const change: GroupWatch | null = await noise<GroupWatch>({ action: "watch_direct", since: revision, relays });
           if (stopped || !change) return;
           revision = change.revision;
+          const statuses = new Map<string, PresenceStatus>();
+          for (const publicKey of change.recently_active_public_keys ?? []) {
+            statuses.set(publicKey, "recently-active");
+          }
+          for (const publicKey of change.online_public_keys ?? []) {
+            statuses.set(publicKey, "online");
+          }
+          setDirectPresenceStatuses(statuses);
           if (initial) {
             await syncDirectInbox(sidebarModeRef.current === "directs");
           } else if (change.changed) {
@@ -961,6 +1149,9 @@ export default function App() {
       ),
     ],
   } : null;
+  const selectedPresenceStatuses = onlinePresence.groupId === activeGroupId
+    ? onlinePresence.statuses
+    : new Map([[summary.identity.public_key, "online" as PresenceStatus]]);
 
   return (
     <div className={`app-shell ${appBackgroundSource ? "group-background-active" : ""}`} style={activeAccentStyle}>
@@ -968,6 +1159,7 @@ export default function App() {
         <Sidebar
         summary={summary}
         mode={sidebarMode}
+        directPresenceStatuses={directPresenceStatuses}
         onMode={(mode) => void switchSidebarMode(mode)}
         onMake={() => setDialog({ type: "make" })}
         onJoin={() => setDialog({ type: "join" })}
@@ -990,18 +1182,50 @@ export default function App() {
               hasBackground={Boolean(appBackgroundSource)}
               canEditGroup={selectedConversation.group.owner_public_key === summary.identity.public_key}
               selfPublicKey={summary.identity.public_key}
+              presenceStatuses={selectedPresenceStatuses}
               onGroupSettings={() => setDialog({ type: "group", group: selectedConversation.group })}
               onReports={() => setDialog({ type: "reports" })}
               onMedia={() => setDialog({ type: "media" })}
               onRules={() => setDialog({ type: "rules", group: selectedConversation.group })}
               onPerson={(person) => setDialog({ type: "person", person })}
               onMessage={(person) => void startDirect(person)}
-              onDeleteMessage={(messageEventId) =>
-                perform(async () => {
-                  await noise({ action: "delete_message", message_event_id: messageEventId, relays });
+              onDeleteMessage={(item) => setDialog({
+                type: "delete_message",
+                message: item,
+                scopeId: selectedConversation.group.group_id,
+              })}
+              onReaction={async (item, emoji) => {
+                const groupId = selectedConversation.group.group_id;
+                const enabled = !item.reactions?.some(
+                  (reaction) => reaction.emoji === emoji && reaction.reacted_by_self,
+                );
+                updateVisibleGroupReaction(
+                  groupId,
+                  item.event_id,
+                  emoji,
+                  enabled,
+                  summary.identity.public_key,
+                );
+                try {
+                  await noise({
+                    action: "set_reaction",
+                    message_event_id: item.event_id,
+                    emoji,
+                    enabled,
+                    relays,
+                  });
                   await refresh();
-                })
-              }
+                } catch (cause) {
+                  updateVisibleGroupReaction(
+                    groupId,
+                    item.event_id,
+                    emoji,
+                    !enabled,
+                    summary.identity.public_key,
+                  );
+                  setError(message(cause));
+                }
+              }}
               onSetModerator={(member, enabled) =>
                 perform(async () => {
                   await noise({ action: "set_moderator", member_public_key: member.public_key, enabled, relays });
@@ -1058,6 +1282,7 @@ export default function App() {
               conversation={selectedDirectConversation}
               busy={busy}
               selfPublicKey={summary.identity.public_key}
+              contactPresence={directPresenceStatuses.get(selectedDirectConversation.contact.public_key) ?? "offline"}
               onPerson={(person) => setDialog({ type: "person", person })}
               onDelete={() => setDialog({ type: "delete_direct", direct: selectedDirectConversation.contact })}
               onSend={async (text, pending, onProgress, replyToMessageId) => {
@@ -1174,6 +1399,7 @@ export default function App() {
         <GroupSettingsDialog
           group={dialog.group}
           bannedMembers={conversation?.group.group_id === dialog.group.group_id ? conversation.banned_members : []}
+          presenceStatuses={selectedPresenceStatuses}
           busy={busy}
           onClose={() => setDialog(null)}
           onUnban={(member) => perform(async () => {
@@ -1257,19 +1483,41 @@ export default function App() {
           })}
         />
       )}
+      {dialog?.type === "delete_message" && (
+        <DeleteMessageDialog
+          message={dialog.message}
+          scopeId={dialog.scopeId}
+          busy={busy}
+          onClose={() => setDialog(null)}
+          onDelete={() => perform(async () => {
+            await noise({
+              action: "delete_message",
+              message_event_id: dialog.message.event_id,
+              relays,
+            });
+            await refresh();
+            setDialog(null);
+          })}
+        />
+      )}
       {dialog?.type === "reports" && conversation && (
         <ReportsDialog
           reports={conversation.reports}
+          presenceStatuses={selectedPresenceStatuses}
           busy={busy}
           onClose={() => setDialog(null)}
           onDismiss={(report) => perform(async () => {
             await noise({ action: "resolve_report", report_event_id: report.report_event_id, relays });
             await refresh();
           })}
-          onDelete={(report) => perform(async () => {
-            await noise({ action: "delete_message", message_event_id: report.message.event_id, relays });
-            await refresh();
-          })}
+          onDelete={async (report) => {
+            setDialog({
+              type: "delete_message",
+              message: report.message,
+              scopeId: conversation.group.group_id,
+            });
+            return true;
+          }}
         />
       )}
       {dialog?.type === "ban_member" && (
@@ -1424,6 +1672,7 @@ export default function App() {
 function Sidebar({
   summary,
   mode,
+  directPresenceStatuses,
   onMode,
   onMake,
   onJoin,
@@ -1435,6 +1684,7 @@ function Sidebar({
 }: {
   summary: LocalSummary;
   mode: SidebarMode;
+  directPresenceStatuses: Map<string, PresenceStatus>;
   onMode: (mode: SidebarMode) => void;
   onMake: () => void;
   onJoin: () => void;
@@ -1479,16 +1729,16 @@ function Sidebar({
             onClick={() => onSelectDirect(direct)}
             onContextMenu={(event) => { event.preventDefault(); onDirectContextMenu(direct, event.clientX, event.clientY); }}
           >
-            <Avatar name={direct.username} image={direct.avatar} size={27} />
-            <span>@{direct.username}</span>
+            <PresenceAvatar name={direct.username} image={direct.avatar} size={27} status={directPresenceStatuses.get(direct.public_key) ?? "offline"} />
+            <span>{direct.username}</span>
             {direct.has_unread && <span className="direct-unread-dot" aria-label={`unread messages from ${direct.username}`} />}
           </button>
         ))}
         {mode === "directs" && summary.directs.length === 0 && <div className="empty-direct-list">message someone from a shared group</div>}
       </div>
       <button className="self-profile" onClick={onProfile}>
-        <Avatar name={summary.identity.username} image={summary.identity.avatar} size={32} />
-        <span><strong>@{summary.identity.username}</strong><small>{summary.identity.bio || "build your identity"}</small></span>
+        <PresenceAvatar name={summary.identity.username} image={summary.identity.avatar} size={32} status="online" />
+        <span><strong>{summary.identity.username}</strong><small>{summary.identity.bio || "build your identity"}</small></span>
         <Settings2 size={13} />
       </button>
     </aside>
@@ -1553,7 +1803,7 @@ function DirectContextMenu({ x, y, onClose, onDelete }: { x: number; y: number; 
   return <div className="group-context-menu" style={{ left: Math.min(x, window.innerWidth - 190), top: Math.min(y, window.innerHeight - 58) }} onMouseDown={(event) => event.stopPropagation()}><button onClick={onDelete}><Trash2 size={14} /> delete conversation</button></div>;
 }
 
-function MessageContextMenu({ x, y, busy, onClose, onReply, onReport, onDelete, onBan }: { x: number; y: number; busy: boolean; onClose: () => void; onReply: () => void; onReport?: () => void; onDelete?: () => void; onBan?: () => void }) {
+function MessageContextMenu({ x, y, busy, onClose, onReact, onReply, onReport, onDelete, onBan }: { x: number; y: number; busy: boolean; onClose: () => void; onReact?: () => void; onReply: () => void; onReport?: () => void; onDelete?: () => void; onBan?: () => void }) {
   useEffect(() => {
     const close = () => onClose();
     const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
@@ -1566,8 +1816,8 @@ function MessageContextMenu({ x, y, busy, onClose, onReply, onReport, onDelete, 
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [onClose]);
-  const menuHeight = 50 + (onReport ? 42 : 0) + (onDelete ? 42 : 0) + (onBan ? 42 : 0);
-  return <div className="member-context-menu" style={{ left: Math.min(x, window.innerWidth - 200), top: Math.min(y, window.innerHeight - menuHeight) }} onMouseDown={(event) => event.stopPropagation()}><button disabled={busy} onClick={onReply}><Reply size={14} /> reply</button>{onReport && <button className="report-action" disabled={busy} onClick={onReport}><TriangleAlert size={14} /> report message</button>}{onDelete && <button className="danger" disabled={busy} onClick={onDelete}><Trash2 size={14} /> delete message</button>}{onBan && <button className="danger" disabled={busy} onClick={onBan}><UserRoundX size={14} /> ban member</button>}</div>;
+  const menuHeight = 50 + (onReact ? 42 : 0) + (onReport ? 42 : 0) + (onDelete ? 42 : 0) + (onBan ? 42 : 0);
+  return <div className="member-context-menu" style={{ left: Math.min(x, window.innerWidth - 200), top: Math.min(y, window.innerHeight - menuHeight) }} onMouseDown={(event) => event.stopPropagation()}>{onReact && <button disabled={busy} onClick={onReact}><SmilePlus size={14} /> react</button>}<button disabled={busy} onClick={onReply}><Reply size={14} /> reply</button>{onReport && <button className="report-action" disabled={busy} onClick={onReport}><TriangleAlert size={14} /> report message</button>}{onDelete && <button className="danger" disabled={busy} onClick={onDelete}><Trash2 size={14} /> delete message</button>}{onBan && <button className="danger" disabled={busy} onClick={onBan}><UserRoundX size={14} /> ban member</button>}</div>;
 }
 
 function MemberContextMenu({ member, x, y, canDesignate, canBan, onClose, onMessage, onSetModerator, onBan }: { member: MemberSummary; x: number; y: number; canDesignate: boolean; canBan: boolean; onClose: () => void; onMessage: () => void; onSetModerator: (enabled: boolean) => void; onBan: () => void }) {
@@ -1594,11 +1844,52 @@ function MemberContextMenu({ member, x, y, canDesignate, canBan, onClose, onMess
   );
 }
 
-function useMessageListPosition(conversationKey: string, messageCount: number) {
+type SavedMessageScroll =
+  | { stuckAtBottom: true }
+  | { stuckAtBottom: false; trackedMessageId: string; pixelOffset: number };
+
+function useChunkedMessageList<T extends { event_id: string }>(
+  conversationKey: string,
+  messages: T[],
+) {
   const ref = useRef<HTMLDivElement>(null);
   const positionedConversation = useRef<string | null>(null);
-  const previousMessageCount = useRef(messageCount);
-  const shouldFollowNewMessages = useRef(true);
+  const previousMessageCount = useRef(messages.length);
+  const savedScroll = useRef<SavedMessageScroll>({ stuckAtBottom: true });
+  const loadingOlder = useRef(false);
+  const [visibleCount, setVisibleCount] = useState(() =>
+    Math.min(
+      messages.length,
+      Math.max(INITIAL_MESSAGE_COUNT, renderedMessageCounts.get(conversationKey) ?? 0),
+    )
+  );
+  const incomingCount = Math.max(0, messages.length - previousMessageCount.current);
+  const renderedCount = Math.min(messages.length, visibleCount + incomingCount);
+  const visibleMessages = messages.slice(Math.max(0, messages.length - renderedCount));
+  const hasOlder = renderedCount < messages.length;
+
+  const saveScrollPosition = useCallback(() => {
+    const element = ref.current;
+    if (!element) return;
+    const bottomDistance = element.scrollHeight - element.scrollTop - element.clientHeight;
+    if (bottomDistance < 96) {
+      savedScroll.current = { stuckAtBottom: true };
+      return;
+    }
+    const containerTop = element.getBoundingClientRect().top;
+    const rows = element.querySelectorAll<HTMLElement>("[data-message-id]");
+    for (const row of rows) {
+      const bounds = row.getBoundingClientRect();
+      if (bounds.bottom > containerTop + 1) {
+        savedScroll.current = {
+          stuckAtBottom: false,
+          trackedMessageId: row.dataset.messageId ?? "",
+          pixelOffset: bounds.top - containerTop,
+        };
+        return;
+      }
+    }
+  }, []);
 
   useLayoutEffect(() => {
     const element = ref.current;
@@ -1606,23 +1897,55 @@ function useMessageListPosition(conversationKey: string, messageCount: number) {
     if (positionedConversation.current !== conversationKey) {
       element.scrollTop = element.scrollHeight;
       positionedConversation.current = conversationKey;
-      previousMessageCount.current = messageCount;
-      shouldFollowNewMessages.current = true;
-      return;
+      savedScroll.current = { stuckAtBottom: true };
+    } else if (savedScroll.current.stuckAtBottom) {
+      const bottomDistance = element.scrollHeight - element.scrollTop - element.clientHeight;
+      if (bottomDistance > 0) element.scrollBy({ top: bottomDistance, behavior: "auto" });
+    } else {
+      const tracked = element.querySelector<HTMLElement>(
+        `[data-message-id="${CSS.escape(savedScroll.current.trackedMessageId)}"]`,
+      );
+      if (tracked) {
+        const containerTop = element.getBoundingClientRect().top;
+        const currentOffset = tracked.getBoundingClientRect().top - containerTop;
+        const correction = currentOffset - savedScroll.current.pixelOffset;
+        if (Math.abs(correction) > 0.5) {
+          element.scrollBy({ top: correction, behavior: "auto" });
+        }
+      }
     }
-    if (messageCount > previousMessageCount.current && shouldFollowNewMessages.current) {
-      element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
+    if (visibleCount !== renderedCount) {
+      setVisibleCount(renderedCount);
     }
-    previousMessageCount.current = messageCount;
-  }, [conversationKey, messageCount]);
+    renderedMessageCounts.set(conversationKey, renderedCount);
+    previousMessageCount.current = messages.length;
+    loadingOlder.current = false;
+    if (
+      hasOlder
+      && element.scrollHeight <= element.clientHeight + 1
+      && !loadingOlder.current
+    ) {
+      loadingOlder.current = true;
+      setVisibleCount((current) =>
+        Math.min(messages.length, current + MESSAGE_PAGE_SIZE)
+      );
+    }
+  });
 
   const onScroll = useCallback(() => {
     const element = ref.current;
     if (!element) return;
-    shouldFollowNewMessages.current = element.scrollHeight - element.scrollTop - element.clientHeight < 96;
-  }, []);
+    saveScrollPosition();
+    if (!hasOlder || loadingOlder.current || element.scrollTop > element.clientHeight) return;
+    loadingOlder.current = true;
+    setVisibleCount((current) => {
+      const next = Math.min(messages.length, current + MESSAGE_PAGE_SIZE);
+      renderedMessageCounts.set(conversationKey, next);
+      return next;
+    });
+  }, [conversationKey, hasOlder, messages.length, saveScrollPosition]);
 
-  return { ref, onScroll };
+  return { ref, onScroll, visibleMessages, renderedCount };
 }
 
 function useAutosizeComposer(
@@ -1645,6 +1968,7 @@ function ConversationPanel({
   hasBackground,
   canEditGroup,
   selfPublicKey,
+  presenceStatuses,
   onGroupSettings,
   onReports,
   onMedia,
@@ -1652,6 +1976,7 @@ function ConversationPanel({
   onPerson,
   onMessage,
   onDeleteMessage,
+  onReaction,
   onSetModerator,
   onBan,
   onReport,
@@ -1662,13 +1987,15 @@ function ConversationPanel({
   hasBackground: boolean;
   canEditGroup: boolean;
   selfPublicKey: string;
+  presenceStatuses: Map<string, PresenceStatus>;
   onGroupSettings: () => void;
   onReports: () => void;
   onMedia: () => void;
   onRules: () => void;
   onPerson: (person: PersonSummary) => void;
   onMessage: (person: PersonSummary) => void;
-  onDeleteMessage: (messageEventId: string) => Promise<boolean>;
+  onDeleteMessage: (message: MessageSummary) => void;
+  onReaction: (message: MessageSummary, emoji: string) => Promise<void>;
   onSetModerator: (member: MemberSummary, enabled: boolean) => Promise<boolean>;
   onBan: (member: MemberSummary) => void;
   onReport: (message: MessageSummary) => void;
@@ -1680,11 +2007,20 @@ function ConversationPanel({
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [memberMenu, setMemberMenu] = useState<{ member: MemberSummary; x: number; y: number } | null>(null);
   const [messageMenu, setMessageMenu] = useState<{ message: MessageSummary; x: number; y: number } | null>(null);
+  const [reactionPicker, setReactionPicker] = useState<{ message: MessageSummary; x: number; y: number } | null>(null);
   const [replyingTo, setReplyingTo] = useState<MessageSummary | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
   useAutosizeComposer(composerInput, draft);
-  const messageList = useMessageListPosition(conversation.group.group_id, conversation.messages.length);
+  const messageList = useChunkedMessageList(
+    conversation.group.group_id,
+    conversation.messages,
+  );
+  useWarmConversationMedia(
+    conversation.messages,
+    conversation.group.group_id,
+    messageList.renderedCount,
+  );
   const selfMember = conversation.members.find((member) => member.public_key === selfPublicKey);
   const canModerate = canEditGroup || selfMember?.is_moderator === true;
   const canSendMessages = canModerate || conversation.group.members_can_send_messages;
@@ -1714,9 +2050,11 @@ function ConversationPanel({
       byteLength: file.size,
       file,
       previewUrl: URL.createObjectURL(file),
-      videoPreview: file.type.startsWith("video/")
+      mediaPreview: file.type.startsWith("video/")
         ? prepareVideoPreview(file)
-        : null,
+        : file.type.startsWith("image/")
+          ? prepareImagePreview(file)
+          : null,
     });
     if (fileInput.current) fileInput.current.value = "";
   }
@@ -1755,8 +2093,8 @@ function ConversationPanel({
       </header>
       <div className="messages" ref={messageList.ref} onScroll={messageList.onScroll}>
         {conversation.messages.length === 0 && <div className="quiet">the group is quiet</div>}
-        {conversation.messages.map((item) => (
-          <MessageRow key={item.event_id} message={item} own={item.author_public_key === selfPublicKey} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} mediaScopeId={conversation.group.group_id} />
+        {messageList.visibleMessages.map((item) => (
+          <MessageRow key={item.event_id} message={item} own={item.author_public_key === selfPublicKey} presence={presenceStatuses.get(item.author_public_key) ?? "offline"} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onToggleReaction={(emoji) => void onReaction(item, emoji)} onPerson={onPerson} mediaScopeId={conversation.group.group_id} />
         ))}
       </div>
       {selfMember && (canSendMessages || canSendMedia) ? <div className="composer">
@@ -1789,15 +2127,18 @@ function ConversationPanel({
         <div className="member-sidebar-list">
           {sortedMembers.map((member) => (
             <div key={member.public_key} className="member-sidebar-row">
-              <button className="member-sidebar-main" onClick={() => onPerson(member)}>
+              <button className="member-sidebar-main" onClick={() => onPerson({
+                ...member,
+                presence_status: presenceStatuses.get(member.public_key) ?? "offline",
+              })}>
                 <span className="member-avatar-wrap">
-                  <Avatar name={member.username} image={member.avatar} size={30} />
+                  <PresenceAvatar name={member.username} image={member.avatar} size={30} status={presenceStatuses.get(member.public_key) ?? "offline"} />
                   {member.public_key === conversation.group.owner_public_key
                     ? <span className="member-role-mark founder" aria-label="group founder" title="group founder"><Crown size={9} /></span>
                     : member.is_moderator && <span className="member-role-mark moderator" aria-label="group moderator" title="group moderator"><Shield size={8} /></span>}
                 </span>
                 <span className="member-sidebar-copy">
-                  <strong>@{member.username}</strong>
+                  <strong>{member.username}</strong>
                   <span className="member-sidebar-meta">
                     <small>{member.bio || "tuned in"}</small>
                   </span>
@@ -1825,9 +2166,17 @@ function ConversationPanel({
         y={messageMenu.y}
         busy={busy}
         onClose={() => setMessageMenu(null)}
+        onReact={() => {
+          setReactionPicker({
+            message: messageMenu.message,
+            x: messageMenu.x,
+            y: messageMenu.y,
+          });
+          setMessageMenu(null);
+        }}
         onReply={() => { setReplyingTo(messageMenu.message); setMessageMenu(null); window.setTimeout(() => composerInput.current?.focus(), 0); }}
         onReport={!canModerate && messageMenu.message.author_public_key !== selfPublicKey && !conversation.reported_message_event_ids.includes(messageMenu.message.event_id) ? () => { onReport(messageMenu.message); setMessageMenu(null); } : undefined}
-        onDelete={(canModerate || messageMenu.message.author_public_key === selfPublicKey) ? () => { void onDeleteMessage(messageMenu.message.event_id); setMessageMenu(null); } : undefined}
+        onDelete={(canModerate || messageMenu.message.author_public_key === selfPublicKey) ? () => { onDeleteMessage(messageMenu.message); setMessageMenu(null); } : undefined}
         onBan={(() => {
           const member = conversation.members.find((candidate) => candidate.public_key === messageMenu.message.author_public_key);
           const canBanAuthor = member
@@ -1837,11 +2186,21 @@ function ConversationPanel({
           return canBanAuthor ? () => { onBan(member); setMessageMenu(null); } : undefined;
         })()}
       />}
+      {reactionPicker && <ReactionPicker
+        x={reactionPicker.x}
+        y={reactionPicker.y}
+        onClose={() => setReactionPicker(null)}
+        onPick={(emoji) => {
+          const target = reactionPicker.message;
+          setReactionPicker(null);
+          void onReaction(target, emoji);
+        }}
+      />}
     </div>
   );
 }
 
-function DirectConversationPanel({ conversation, busy, selfPublicKey, onPerson, onDelete, onSend }: { conversation: DirectConversation; busy: boolean; selfPublicKey: string; onPerson: (person: PersonSummary) => void; onDelete: () => void; onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null) => Promise<boolean> }) {
+function DirectConversationPanel({ conversation, busy, selfPublicKey, contactPresence, onPerson, onDelete, onSend }: { conversation: DirectConversation; busy: boolean; selfPublicKey: string; contactPresence: PresenceStatus; onPerson: (person: PersonSummary) => void; onDelete: () => void; onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null) => Promise<boolean> }) {
   const [draft, setDraft] = useState("");
   const [attachment, setAttachment] = useState<PendingMedia | null>(null);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
@@ -1851,7 +2210,15 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, onPerson, 
   const fileInput = useRef<HTMLInputElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
   useAutosizeComposer(composerInput, draft);
-  const messageList = useMessageListPosition(conversation.contact.public_key, conversation.messages.length);
+  const messageList = useChunkedMessageList(
+    conversation.contact.public_key,
+    conversation.messages,
+  );
+  useWarmConversationMedia(
+    conversation.messages,
+    conversation.media_scope_id,
+    messageList.renderedCount,
+  );
   const attachmentPreview = attachment?.previewUrl;
   useEffect(() => () => { if (attachmentPreview) URL.revokeObjectURL(attachmentPreview); }, [attachmentPreview]);
   async function chooseMedia(file?: File) {
@@ -1871,9 +2238,11 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, onPerson, 
       byteLength: file.size,
       file,
       previewUrl: URL.createObjectURL(file),
-      videoPreview: file.type.startsWith("video/")
+      mediaPreview: file.type.startsWith("video/")
         ? prepareVideoPreview(file)
-        : null,
+        : file.type.startsWith("image/")
+          ? prepareImagePreview(file)
+          : null,
     });
     if (fileInput.current) fileInput.current.value = "";
   }
@@ -1895,19 +2264,19 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, onPerson, 
       setReplyingTo((current) => current ?? submittedReply);
     }
   }
-  const person = { public_key: conversation.contact.public_key, username: conversation.contact.username, bio: conversation.contact.bio, avatar: conversation.contact.avatar, accepts_direct_messages: conversation.contact.accepts_direct_messages };
+  const person = { public_key: conversation.contact.public_key, username: conversation.contact.username, bio: conversation.contact.bio, avatar: conversation.contact.avatar, accepts_direct_messages: conversation.contact.accepts_direct_messages, presence_status: contactPresence };
   return (
     <div className="conversation direct-conversation">
       <header className="chat-header" data-tauri-drag-region>
         <div className="group-identity static" data-tauri-drag-region>
-          <Avatar name={conversation.contact.username} image={conversation.contact.avatar} size={36} />
-          <span><strong>@{conversation.contact.username}</strong><small>{conversation.contact.bio || "encrypted direct message"}</small></span>
+          <PresenceAvatar name={conversation.contact.username} image={conversation.contact.avatar} size={36} status={contactPresence} />
+          <span><strong>{conversation.contact.username}</strong><small>{conversation.contact.bio || "encrypted direct message"}</small></span>
         </div>
         <div className="chat-header-actions"><button className="icon-button media-button delete-direct-button" onClick={onDelete} aria-label="delete conversation" title="delete conversation"><Trash2 size={16} /></button>{busy && <LoaderCircle className="spinner" size={14} />}</div>
       </header>
       <div className="messages" ref={messageList.ref} onScroll={messageList.onScroll}>
         {conversation.messages.length === 0 && <div className="quiet">start the conversation</div>}
-        {conversation.messages.map((item) => <MessageRow key={item.event_id} message={item} own={item.author_public_key === selfPublicKey} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} mediaScopeId={conversation.media_scope_id} />)}
+        {messageList.visibleMessages.map((item) => <MessageRow key={item.event_id} message={item} own={item.author_public_key === selfPublicKey} presence={item.author_public_key === selfPublicKey ? "online" : contactPresence} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} mediaScopeId={conversation.media_scope_id} />)}
       </div>
       {conversation.contact.accepts_direct_messages ? <div className="composer">
         {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.media_scope_id} onClose={() => setReplyingTo(null)} />}
@@ -1915,13 +2284,13 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, onPerson, 
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
         <button className="attach-button" disabled={busy} onClick={() => fileInput.current?.click()} aria-label="attach media"><Paperclip size={17} /></button>
         <input ref={fileInput} hidden type="file" accept="image/*,video/*,audio/*" onChange={(event) => void chooseMedia(event.target.files?.[0])} />
-        <textarea ref={composerInput} rows={1} value={draft} placeholder={`message @${conversation.contact.username}`} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); } }} />
+        <textarea ref={composerInput} rows={1} value={draft} placeholder={`message ${conversation.contact.username}`} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); } }} />
         <button className="send-button" disabled={(!draft.trim() && !attachment) || busy} onClick={() => void submit()}><ArrowUp size={17} /></button>
-      </div> : <div className="membership-revoked"><MessageCircle size={16} /> @{conversation.contact.username} isn’t accepting DMs</div>}
+      </div> : <div className="membership-revoked"><MessageCircle size={16} /> {conversation.contact.username} isn’t accepting DMs</div>}
       <aside className="member-sidebar direct-profile-sidebar">
         <button className="direct-profile-identity" onClick={() => onPerson(person)}>
-          <Avatar name={conversation.contact.username} image={conversation.contact.avatar} size={72} />
-          <strong>@{conversation.contact.username}</strong>
+          <PresenceAvatar name={conversation.contact.username} image={conversation.contact.avatar} size={72} status={contactPresence} />
+          <strong>{conversation.contact.username}</strong>
         </button>
         <div className="noise-signature"><small>Noise Signature</small><strong>{noiseSignature(conversation.contact.public_key)}</strong></div>
         <p>{conversation.contact.bio || "no bio yet"}</p>
@@ -1934,11 +2303,12 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, onPerson, 
 }
 
 function ReplyTarget({ message, mediaScopeId, onClose }: { message: MessageSummary; mediaScopeId?: string; onClose: () => void }) {
-  return <div className="reply-target"><Reply size={15} />{message.attachment && <ReplyMediaThumbnail message={message as MessageSummary & { attachment: MediaAttachment }} scopeId={mediaScopeId} />}<span><small>replying to @{message.username}</small><strong>{replyPreview(message)}</strong></span><button onClick={onClose} aria-label="cancel reply"><X size={14} /></button></div>;
+  return <div className="reply-target"><Reply size={15} />{message.attachment && <ReplyMediaThumbnail message={message as MessageSummary & { attachment: MediaAttachment }} scopeId={mediaScopeId} />}<span><small>replying to {message.username}</small><strong>{replyPreview(message)}</strong></span><button onClick={onClose} aria-label="cancel reply"><X size={14} /></button></div>;
 }
 
 function AppVersionFooter() {
   const [version, setVersion] = useState(cachedAppVersion);
+  const [showAbout, setShowAbout] = useState(false);
   useEffect(() => {
     if (version || !isTauri) return;
     let active = true;
@@ -1951,29 +2321,74 @@ function AppVersionFooter() {
       .catch(() => undefined);
     return () => { active = false; };
   }, [version]);
-  return <div className="member-sidebar-footer"><span>{version ? `Beta Version ${version}` : "Beta Version"}</span></div>;
+  return <>
+    <div className="member-sidebar-footer">
+      <span>{version ? `Beta V.${version}` : "Beta"}</span>
+      <button onClick={() => setShowAbout(true)} aria-label="about Noise" title="about Noise"><Info size={13} /></button>
+    </div>
+    {showAbout && <AboutNoiseDialog onClose={() => setShowAbout(false)} />}
+  </>;
+}
+
+function AboutNoiseDialog({ onClose }: { onClose: () => void }) {
+  return (
+    <Modal onClose={onClose}>
+      <DialogHeading icon={<NoiseMark size={28} />} title="about Noise" detail="private group communication without personal information" />
+      <div className="about-noise">
+        <section>
+          <strong>your identity belongs to you</strong>
+          <p>Noise creates a cryptographic identity on your device. It does not require a phone number, email address, legal name, contact list, or location. Your Noise ID and password unlock an encrypted account vault so the same identity can be restored on another device.</p>
+        </section>
+        <section>
+          <strong>content is encrypted before it leaves</strong>
+          <p>Messages, profiles, group activity, and media are encrypted locally with XChaCha20-Poly1305. DMs use a pairwise key derived by the two identity keys. Every event is signed with its author’s identity key, so clients can reject forged or modified history before displaying it.</p>
+        </section>
+        <section>
+          <strong>relays provide availability, not authority</strong>
+          <p>Relays replicate opaque encrypted events and media chunks so offline devices can catch up. Groups and identities do not belong to a relay. Noise can use one relay as a privacy mask so the storage relay receives the request without receiving the client connection.</p>
+        </section>
+        <section>
+          <strong>groups are private by design</strong>
+          <p>There is no public group directory or recommendation feed. People join using a group’s 12-digit frequency, and each client independently rebuilds signed membership and moderation history.</p>
+        </section>
+        <section className="about-beta">
+          <strong>what Beta means</strong>
+          <p>Noise has not been independently audited. Groups currently use a shared encrypted group key without forward secrecy or automatic key rotation after removal, and a 12-digit frequency is not a high-entropy secret. Treat this as an evolving private-messaging protocol, not a finished high-risk security tool.</p>
+        </section>
+      </div>
+      <DialogButtons><button className="primary" onClick={onClose}>done</button></DialogButtons>
+    </Modal>
+  );
 }
 
 function MessageRow({
   message,
   own,
+  presence,
   replyTo,
   onContextMenu,
+  onToggleReaction,
   onPerson,
   mediaScopeId,
 }: {
   message: MessageSummary;
   own: boolean;
+  presence?: PresenceStatus;
   replyTo?: MessageSummary;
   onContextMenu?: (event: React.MouseEvent<HTMLElement>) => void;
+  onToggleReaction?: (emoji: string) => void;
   onPerson: (person: PersonSummary) => void;
   mediaScopeId?: string;
 }) {
-  const person = { public_key: message.author_public_key, username: message.username, bio: message.bio, avatar: message.avatar, accepts_direct_messages: message.accepts_direct_messages };
+  const person = { public_key: message.author_public_key, username: message.username, bio: message.bio, avatar: message.avatar, accepts_direct_messages: message.accepts_direct_messages, presence_status: presence };
   const localAttachment = message.local_attachment ?? sentMediaPreviewCache.get(message.event_id);
+  const jumboEmojiCount = !localAttachment && !message.attachment
+    ? emojiOnlyCount(message.text)
+    : null;
   return (
     <article
       className={`message-row ${own ? "own" : ""} ${message.optimistic ? "optimistic" : ""}`}
+      data-message-id={message.event_id}
       onMouseDown={onContextMenu ? (event) => { if (event.button === 2) event.preventDefault(); } : undefined}
       onContextMenu={onContextMenu ? (event) => {
         event.preventDefault();
@@ -1981,9 +2396,35 @@ function MessageRow({
         onContextMenu?.(event);
       } : undefined}
     >
-      <button onClick={() => onPerson(person)}><Avatar name={message.username} image={message.avatar} size={34} /></button>
-      <div className="message-body"><div className="message-meta"><button onClick={() => onPerson(person)}>@{message.username}</button></div>{message.reply_to_message_id && <div className="message-reply-reference">{replyTo ? <>{replyTo.attachment && <ReplyMediaThumbnail message={replyTo as MessageSummary & { attachment: MediaAttachment }} scopeId={mediaScopeId} />}<span className="message-reply-copy"><strong>@{replyTo.username}</strong><span>{replyPreview(replyTo)}</span></span></> : <span>original message unavailable</span>}</div>}{message.text && <p>{message.text}</p>}{localAttachment ? <LocalMessageMedia attachment={localAttachment} manifest={message.attachment} /> : message.attachment && <MessageMedia attachment={message.attachment} scopeId={mediaScopeId} />}<time className="message-time">{formatTime(message.created_at_millis)}</time></div>
+      <button onClick={() => onPerson(person)}><PresenceAvatar name={message.username} image={message.avatar} size={34} status={presence ?? "offline"} /></button>
+      <div className="message-body"><div className="message-meta"><button onClick={() => onPerson(person)}>{message.username}</button></div>{message.reply_to_message_id && <div className="message-reply-reference">{replyTo ? <>{replyTo.attachment && <ReplyMediaThumbnail message={replyTo as MessageSummary & { attachment: MediaAttachment }} scopeId={mediaScopeId} />}<span className="message-reply-copy"><strong>{replyTo.username}</strong><span>{replyPreview(replyTo)}</span></span></> : <span>original message unavailable</span>}</div>}{message.text && <p className={jumboEmojiCount ? `emoji-only emoji-only-${jumboEmojiCount}` : undefined}>{message.text}</p>}{localAttachment ? <LocalMessageMedia attachment={localAttachment} manifest={message.attachment} /> : message.attachment && <MessageMedia attachment={message.attachment} scopeId={mediaScopeId} />}<time className="message-time">{formatTime(message.created_at_millis)}</time>{message.reactions && message.reactions.length > 0 && <MessageReactions reactions={message.reactions} onToggle={onToggleReaction} />}</div>
     </article>
+  );
+}
+
+function MessageReactions({
+  reactions,
+  onToggle,
+}: {
+  reactions: ReactionSummary[];
+  onToggle?: (emoji: string) => void;
+}) {
+  return (
+    <div className="message-reactions">
+      {reactions.map((reaction) => (
+        <button
+          key={reaction.emoji}
+          type="button"
+          className={reaction.reacted_by_self ? "mine" : undefined}
+          disabled={!onToggle}
+          title={reaction.reacted_by_self ? "remove reaction" : `react ${reaction.emoji}`}
+          onClick={() => onToggle?.(reaction.emoji)}
+        >
+          <span>{reaction.emoji}</span>
+          <small>{reaction.count}</small>
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -1999,13 +2440,18 @@ function replyPreview(message: MessageSummary) {
 function ReplyMediaThumbnail({ message, scopeId }: { message: MessageSummary & { attachment: MediaAttachment }; scopeId?: string }) {
   const { attachment } = message;
   const localAttachment = message.local_attachment ?? sentMediaPreviewCache.get(message.event_id);
-  const { source } = useMediaSource(attachment, scopeId);
+  const embeddedPreview = mediaPoster(attachment);
+  const { source } = useMediaSource(
+    attachment,
+    scopeId,
+    !localAttachment && !embeddedPreview,
+  );
   const image = attachment.mime_type.startsWith("image/");
   const video = attachment.mime_type.startsWith("video/");
   const posterCacheKey = mediaCacheKey(attachment);
-  const poster = mediaPoster(attachment) ?? videoPosterCache.get(posterCacheKey);
+  const poster = embeddedPreview ?? videoPosterCache.get(posterCacheKey);
   if (image) {
-    const imageSource = localAttachment?.preview_url ?? source;
+    const imageSource = localAttachment?.preview_url ?? poster ?? source;
     return <span className="reply-media-thumbnail">{imageSource ? <img src={imageSource} alt="" /> : <LoaderCircle className="spinner" size={13} />}</span>;
   }
   if (video) {
@@ -2015,18 +2461,48 @@ function ReplyMediaThumbnail({ message, scopeId }: { message: MessageSummary & {
   return <span className="reply-media-thumbnail audio"><AudioWaveform size={18} /></span>;
 }
 
-function MessageMedia({ attachment, scopeId }: { attachment: MediaAttachment; scopeId?: string }) {
-  const { source, failed } = useMediaSource(attachment, scopeId);
+function MessageMedia({ attachment, scopeId, autoplayVideo = false }: { attachment: MediaAttachment; scopeId?: string; autoplayVideo?: boolean }) {
+  const visibility = useNearViewport<HTMLDivElement>();
+  const { source, failed } = useMediaSource(attachment, scopeId, visibility.near);
   const poster = mediaPoster(attachment);
+  const image = attachment.mime_type.startsWith("image/");
   const video = attachment.mime_type.startsWith("video/");
   const posterCacheKey = mediaCacheKey(attachment);
-  return <div className="message-media">{video && (poster || videoPosterCache.has(posterCacheKey)) ? <ChatVideo source={source ?? undefined} poster={poster} posterCacheKey={posterCacheKey} pixelWidth={attachment.pixel_width} pixelHeight={attachment.pixel_height} /> : source ? attachment.mime_type.startsWith("image/") ? <img src={source} alt="shared media" /> : video ? <ChatVideo source={source} posterCacheKey={posterCacheKey} /> : <audio src={source} controls preload="metadata" /> : <div className="media-loading">{failed ? "media unavailable" : <><LoaderCircle className="spinner" size={15} /> decrypting media</>}</div>}</div>;
+  return (
+    <div className="message-media" ref={visibility.ref}>
+      {image ? (
+        <ChatImage
+          source={source ?? undefined}
+          preview={poster}
+          cacheKey={posterCacheKey}
+          pixelWidth={attachment.pixel_width}
+          pixelHeight={attachment.pixel_height}
+          failed={failed}
+        />
+      ) : video ? (
+        <ChatVideo
+          source={source ?? undefined}
+          poster={poster}
+          posterCacheKey={posterCacheKey}
+          pixelWidth={attachment.pixel_width}
+          pixelHeight={attachment.pixel_height}
+          autoPlay={autoplayVideo}
+        />
+      ) : source ? (
+        <audio src={source} controls preload="metadata" />
+      ) : (
+        <div className="media-loading" aria-label={failed ? "media unavailable" : "loading media"}>
+          {failed ? <X size={16} /> : <LoaderCircle className="spinner" size={15} />}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function LocalMessageMedia({ attachment, manifest }: { attachment: NonNullable<MessageSummary["local_attachment"]>; manifest: MediaAttachment | null }) {
   const poster = manifest ? mediaPoster(manifest) : undefined;
   const posterCacheKey = manifest ? mediaCacheKey(manifest) : undefined;
-  return <div className="message-media">{attachment.mime_type.startsWith("image/") ? <img src={attachment.preview_url} alt="shared media" /> : attachment.mime_type.startsWith("video/") ? <ChatVideo source={attachment.preview_url} poster={poster} posterCacheKey={posterCacheKey} pixelWidth={manifest?.pixel_width} pixelHeight={manifest?.pixel_height} /> : <audio src={attachment.preview_url} controls preload="metadata" />}</div>;
+  return <div className="message-media">{attachment.mime_type.startsWith("image/") ? <ChatImage source={attachment.preview_url} preview={poster ?? attachment.preview_url} cacheKey={posterCacheKey ?? attachment.preview_url} pixelWidth={manifest?.pixel_width} pixelHeight={manifest?.pixel_height} /> : attachment.mime_type.startsWith("video/") ? <ChatVideo source={attachment.preview_url} poster={poster} posterCacheKey={posterCacheKey} pixelWidth={manifest?.pixel_width} pixelHeight={manifest?.pixel_height} /> : <audio src={attachment.preview_url} controls preload="metadata" />}</div>;
 }
 
 function mediaPoster(attachment: MediaAttachment) {
@@ -2035,17 +2511,16 @@ function mediaPoster(attachment: MediaAttachment) {
     : undefined;
 }
 
-function useMediaSource(attachment: MediaAttachment, scopeId?: string) {
+function requestMediaSource(attachment: MediaAttachment, scopeId?: string) {
   const cacheKey = mediaCacheKey(attachment);
-  const [source, setSource] = useState(() => mediaCache.get(cacheKey) ?? null);
-  const [failed, setFailed] = useState(false);
-  useEffect(() => {
-    if (source) return;
-    let active = true;
-    let retryTimer: number | null = null;
-    setFailed(false);
-    const load = async () => {
-      for (let attempt = 0; active && attempt < 12; attempt += 1) {
+  const cached = mediaCache.get(cacheKey);
+  if (cached) return Promise.resolve(cached);
+  const pending = mediaLoadPromises.get(cacheKey);
+  if (pending) return pending;
+  const generation = mediaCacheGeneration;
+  let request: Promise<string>;
+  request = (async () => {
+      for (let attempt = 0; attempt < 12; attempt += 1) {
         try {
           const data = await noise<AttachmentData>({
             action: "fetch_attachment",
@@ -2053,33 +2528,388 @@ function useMediaSource(attachment: MediaAttachment, scopeId?: string) {
             scope_id: scopeId,
             relays,
           });
-          if (!active) return;
           if (!data) throw new Error("media is not available yet");
           const { convertFileSrc } = await import("@tauri-apps/api/core");
           const next = convertFileSrc(data.file_path);
-          mediaCache.set(cacheKey, next);
-          setSource(next);
-          return;
+          if (generation === mediaCacheGeneration) mediaCache.set(cacheKey, next);
+          return next;
         } catch {
-          if (!active) return;
-          if (attempt === 11) {
-            setFailed(true);
-            return;
-          }
+          if (attempt === 11) throw new Error("media is unavailable");
           const delay = Math.min(400 * 1.6 ** attempt, 3000);
-          await new Promise<void>((resolve) => {
-            retryTimer = window.setTimeout(resolve, delay);
-          });
+          await new Promise<void>((resolve) => window.setTimeout(resolve, delay));
+        }
+      }
+      throw new Error("media is unavailable");
+    })().finally(() => {
+      if (mediaLoadPromises.get(cacheKey) === request) mediaLoadPromises.delete(cacheKey);
+    });
+  mediaLoadPromises.set(cacheKey, request);
+  return request;
+}
+
+function prepareMediaSource(attachment: MediaAttachment, source: string) {
+  const cacheKey = mediaCacheKey(attachment);
+  const pending = mediaPreparationPromises.get(cacheKey);
+  if (pending) return pending;
+  let request: Promise<void>;
+  if (attachment.mime_type.startsWith("image/")) {
+    request = prepareImageMediaSource(
+      source,
+      cacheKey,
+      !mediaPoster(attachment),
+    );
+  } else if (
+    attachment.mime_type.startsWith("video/")
+    && !mediaPoster(attachment)
+    && !videoPosterCache.has(cacheKey)
+  ) {
+    request = prepareVideoMediaSource(source, cacheKey);
+  } else {
+    request = Promise.resolve();
+  }
+  request = request.finally(() => {
+    if (mediaPreparationPromises.get(cacheKey) === request) {
+      mediaPreparationPromises.delete(cacheKey);
+    }
+  });
+  mediaPreparationPromises.set(cacheKey, request);
+  return request;
+}
+
+async function prepareImageMediaSource(
+  source: string,
+  cacheKey: string,
+  generatePoster: boolean,
+) {
+  if (
+    decodedImageCache.has(cacheKey)
+    && mediaDimensionCache.has(cacheKey)
+    && (!generatePoster || imagePosterCache.has(cacheKey))
+  ) return;
+  try {
+    const response = await fetch(source);
+    if (!response.ok) throw new Error("cached image could not be read");
+    const bitmap = await createImageBitmap(await response.blob());
+    rememberMediaDimensions(cacheKey, bitmap.width, bitmap.height);
+    decodedImageCache.add(cacheKey);
+    if (generatePoster && !imagePosterCache.has(cacheKey)) {
+      const scale = Math.min(1, 480 / Math.max(bitmap.width, bitmap.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+      canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+      const context = canvas.getContext("2d");
+      if (context) {
+        context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        imagePosterCache.set(cacheKey, canvas.toDataURL("image/jpeg", 0.68));
+      }
+    }
+    bitmap.close();
+    return;
+  } catch {
+    // Some WebViews cannot fetch the custom asset URL. The image element
+    // fallback still measures it and may be able to capture a poster.
+  }
+  await new Promise<void>((resolve) => {
+    const image = new Image();
+    image.decoding = "async";
+    image.onload = () => {
+      rememberMediaDimensions(cacheKey, image.naturalWidth, image.naturalHeight);
+      decodedImageCache.add(cacheKey);
+      if (generatePoster && !imagePosterCache.has(cacheKey)) {
+        try {
+          const scale = Math.min(1, 480 / Math.max(image.naturalWidth, image.naturalHeight));
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+          canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+          const context = canvas.getContext("2d");
+          if (context) {
+            context.drawImage(image, 0, 0, canvas.width, canvas.height);
+            imagePosterCache.set(cacheKey, canvas.toDataURL("image/jpeg", 0.68));
+          }
+        } catch {
+          // The full image can still open even if this format cannot be frozen.
+        }
+      }
+      resolve();
+    };
+    image.onerror = () => resolve();
+    image.src = source;
+  });
+}
+
+function prepareVideoMediaSource(source: string, cacheKey: string) {
+  return new Promise<void>((resolve) => {
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "auto";
+    let previewIndex = 0;
+    let settled = false;
+    let previewTimes: number[] = [];
+    const timeout = window.setTimeout(finish, 12_000);
+    function finish() {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      video.removeAttribute("src");
+      video.load();
+      resolve();
+    }
+    function capture() {
+      if (settled || !video.videoWidth || !video.videoHeight) return;
+      rememberMediaDimensions(cacheKey, video.videoWidth, video.videoHeight);
+      if (videoFrameIsNearBlack(video) && previewIndex < previewTimes.length - 1) {
+        previewIndex += 1;
+        video.currentTime = previewTimes[previewIndex];
+        return;
+      }
+      try {
+        const scale = Math.min(1, 480 / Math.max(video.videoWidth, video.videoHeight));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+        canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+        const context = canvas.getContext("2d");
+        if (context) {
+          context.drawImage(video, 0, 0, canvas.width, canvas.height);
+          videoPosterCache.set(cacheKey, canvas.toDataURL("image/jpeg", 0.68));
+        }
+      } catch {
+        // The locally cached video still opens even when this codec blocks canvas capture.
+      }
+      finish();
+    }
+    video.onloadedmetadata = () => {
+      rememberMediaDimensions(cacheKey, video.videoWidth, video.videoHeight);
+      previewTimes = videoPreviewTimes(video.duration);
+      if (previewTimes.length) video.currentTime = previewTimes[0];
+    };
+    video.onseeked = capture;
+    video.onloadeddata = capture;
+    video.onerror = finish;
+    video.src = source;
+    video.load();
+  });
+}
+
+function useWarmConversationMedia(
+  messages: Array<{ attachment: MediaAttachment | null }>,
+  scopeId: string,
+  renderedCount: number,
+) {
+  const candidates = messages
+    .slice(Math.max(0, messages.length - renderedCount - MESSAGE_PAGE_SIZE))
+    .reverse()
+    .flatMap((message) => message.attachment ? [message.attachment] : []);
+  const signature = candidates.map(mediaCacheKey).join("|");
+  useEffect(() => {
+    if (!candidates.length) return;
+    let stopped = false;
+    let cursor = 0;
+    const warmNext = async () => {
+      while (!stopped) {
+        const attachment = candidates[cursor];
+        cursor += 1;
+        if (!attachment) return;
+        try {
+          const source = await requestMediaSource(attachment, scopeId);
+          await prepareMediaSource(attachment, source);
+        } catch {
+          // The normal renderer can retry media that is still propagating between relays.
         }
       }
     };
-    void load();
-    return () => {
-      active = false;
-      if (retryTimer !== null) window.clearTimeout(retryTimer);
-    };
-  }, [cacheKey, scopeId, source]);
-  return { source, failed };
+    const workerCount = Math.min(4, candidates.length);
+    for (let index = 0; index < workerCount; index += 1) void warmNext();
+    return () => { stopped = true; };
+  }, [scopeId, signature]);
+}
+
+function useMediaSource(
+  attachment: MediaAttachment,
+  scopeId?: string,
+  enabled = true,
+) {
+  const cacheKey = mediaCacheKey(attachment);
+  const [loaded, setLoaded] = useState<{ cacheKey: string; source: string } | null>(() => {
+    const source = mediaCache.get(cacheKey);
+    return source ? { cacheKey, source } : null;
+  });
+  const [failedKey, setFailedKey] = useState<string | null>(null);
+  const source = loaded?.cacheKey === cacheKey
+    ? loaded.source
+    : mediaCache.get(cacheKey) ?? null;
+  useEffect(() => {
+    const cached = mediaCache.get(cacheKey);
+    if (cached) {
+      setLoaded({ cacheKey, source: cached });
+      setFailedKey(null);
+      return;
+    }
+    if (!enabled) return;
+    let active = true;
+    setFailedKey(null);
+    void requestMediaSource(attachment, scopeId)
+      .then((next) => {
+        if (active) setLoaded({ cacheKey, source: next });
+      })
+      .catch(() => {
+        if (active) setFailedKey(cacheKey);
+      });
+    return () => { active = false; };
+  }, [attachment, cacheKey, enabled, scopeId]);
+  return { source, failed: failedKey === cacheKey };
+}
+
+function useNearViewport<T extends HTMLElement>() {
+  const ref = useRef<T>(null);
+  const [near, setNear] = useState(false);
+  useEffect(() => {
+    const element = ref.current;
+    if (!element || near) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        setNear(true);
+        observer.disconnect();
+      }
+    }, { rootMargin: "900px 0px" });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [near]);
+  return { ref, near };
+}
+
+function mediaFrameStyle(
+  pixelWidth?: number | null,
+  pixelHeight?: number | null,
+  fallbackWidth = 320,
+  fallbackHeight = 200,
+): CSSProperties {
+  const naturalWidth = pixelWidth || fallbackWidth;
+  const naturalHeight = pixelHeight || fallbackHeight;
+  const scale = Math.min(1, 420 / naturalWidth, 480 / naturalHeight);
+  const displayWidth = Math.max(1, Math.round(naturalWidth * scale));
+  const displayHeight = Math.max(1, Math.round(naturalHeight * scale));
+  return {
+    width: `${displayWidth}px`,
+    maxWidth: "100%",
+    aspectRatio: `${displayWidth} / ${displayHeight}`,
+  };
+}
+
+function rememberMediaDimensions(cacheKey: string, width: number, height: number) {
+  if (
+    !Number.isFinite(width)
+    || !Number.isFinite(height)
+    || width <= 0
+    || height <= 0
+  ) return;
+  const dimensions = {
+    width: Math.round(width),
+    height: Math.round(height),
+  };
+  const current = mediaDimensionCache.get(cacheKey);
+  if (current?.width === dimensions.width && current.height === dimensions.height) return;
+  mediaDimensionCache.set(cacheKey, dimensions);
+  while (mediaDimensionCache.size > 2_000) {
+    const oldest = mediaDimensionCache.keys().next().value;
+    if (!oldest) break;
+    mediaDimensionCache.delete(oldest);
+  }
+  try {
+    window.localStorage.setItem(
+      MEDIA_DIMENSIONS_STORAGE_KEY,
+      JSON.stringify([...mediaDimensionCache.entries()]),
+    );
+  } catch {
+    // Media still renders correctly for this session if storage is unavailable.
+  }
+}
+
+function loadStoredMediaDimensions() {
+  const dimensions = new Map<string, { width: number; height: number }>();
+  try {
+    const stored = JSON.parse(
+      window.localStorage.getItem(MEDIA_DIMENSIONS_STORAGE_KEY) ?? "[]",
+    ) as Array<[string, { width: number; height: number }]>;
+    for (const [cacheKey, value] of stored) {
+      if (
+        typeof cacheKey === "string"
+        && Number.isFinite(value?.width)
+        && Number.isFinite(value?.height)
+        && value.width > 0
+        && value.height > 0
+      ) {
+        dimensions.set(cacheKey, value);
+      }
+    }
+  } catch {
+    // A corrupt or unavailable cache simply gets rebuilt from media metadata.
+  }
+  return dimensions;
+}
+
+function ChatImage({
+  source,
+  preview,
+  cacheKey,
+  pixelWidth,
+  pixelHeight,
+  failed = false,
+}: {
+  source?: string;
+  preview?: string;
+  cacheKey: string;
+  pixelWidth?: number | null;
+  pixelHeight?: number | null;
+  failed?: boolean;
+}) {
+  const suppliedDimensions = pixelWidth && pixelHeight
+    ? { width: pixelWidth, height: pixelHeight }
+    : null;
+  const [dimensions, setDimensions] = useState(
+    () => suppliedDimensions ?? mediaDimensionCache.get(cacheKey) ?? null,
+  );
+  const [ready, setReady] = useState(
+    () => Boolean(
+      source
+      && decodedImageCache.has(cacheKey)
+      && (suppliedDimensions || mediaDimensionCache.has(cacheKey))
+    ),
+  );
+  useEffect(() => {
+    const knownDimensions = suppliedDimensions ?? mediaDimensionCache.get(cacheKey) ?? null;
+    setDimensions(knownDimensions);
+    setReady(Boolean(source && decodedImageCache.has(cacheKey) && knownDimensions));
+  }, [cacheKey, pixelHeight, pixelWidth, source]);
+  const style = mediaFrameStyle(dimensions?.width, dimensions?.height);
+  return (
+    <span className="chat-image" style={style}>
+      {source && (
+        <img
+          className={ready ? "ready" : ""}
+          src={source}
+          alt="shared media"
+          onLoad={(event) => {
+            const image = event.currentTarget;
+            const measured = {
+              width: image.naturalWidth,
+              height: image.naturalHeight,
+            };
+            rememberMediaDimensions(cacheKey, measured.width, measured.height);
+            setDimensions(measured);
+            decodedImageCache.add(cacheKey);
+            setReady(true);
+          }}
+        />
+      )}
+      {!ready && preview && <img className="media-preview-cover" src={preview} alt="" aria-hidden="true" />}
+      {!ready && !preview && (
+        <span className={`media-skeleton ${failed ? "failed" : ""}`}>
+          {failed && <X size={16} />}
+        </span>
+      )}
+    </span>
+  );
 }
 
 function ChatVideo({
@@ -2088,12 +2918,14 @@ function ChatVideo({
   posterCacheKey,
   pixelWidth,
   pixelHeight,
+  autoPlay = false,
 }: {
   source?: string;
   poster?: string;
   posterCacheKey?: string;
   pixelWidth?: number | null;
   pixelHeight?: number | null;
+  autoPlay?: boolean;
 }) {
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(false);
@@ -2104,11 +2936,33 @@ function ChatVideo({
   const [decodedPoster, setDecodedPoster] = useState(
     () => (posterCacheKey ? videoPosterCache.get(posterCacheKey) : undefined) ?? poster,
   );
+  const [measuredDimensions, setMeasuredDimensions] = useState(() =>
+    posterCacheKey ? mediaDimensionCache.get(posterCacheKey) ?? null : null
+  );
   const video = useRef<HTMLVideoElement>(null);
   useEffect(() => {
     setPlaybackFrameReady(false);
     setHasStarted(false);
   }, [source]);
+  useEffect(() => {
+    const element = video.current;
+    if (!autoPlay || !source || !element) return;
+    element.currentTime = 0;
+    void element.play().catch(() => undefined);
+    return () => {
+      element.pause();
+      element.currentTime = 0;
+    };
+  }, [autoPlay, source]);
+  useEffect(() => {
+    setMeasuredDimensions(
+      pixelWidth && pixelHeight
+        ? { width: pixelWidth, height: pixelHeight }
+        : posterCacheKey
+          ? mediaDimensionCache.get(posterCacheKey) ?? null
+          : null,
+    );
+  }, [pixelHeight, pixelWidth, posterCacheKey]);
   useEffect(() => {
     if (!poster) return;
     let active = true;
@@ -2156,13 +3010,10 @@ function ChatVideo({
       // Some platform codecs disallow canvas capture; the cached file still plays normally.
     }
   };
-  const hasDimensions = Boolean(pixelWidth && pixelHeight);
-  const frameStyle = hasDimensions
-    ? {
-        width: `min(${Math.max(1, Math.round(Math.min(pixelWidth!, 420, 480 * (pixelWidth! / pixelHeight!))))}px, 100%)`,
-        aspectRatio: `${pixelWidth} / ${pixelHeight}`,
-      }
-    : undefined;
+  const frameWidth = pixelWidth ?? measuredDimensions?.width;
+  const frameHeight = pixelHeight ?? measuredDimensions?.height;
+  const hasDimensions = Boolean(frameWidth && frameHeight);
+  const frameStyle = mediaFrameStyle(frameWidth, frameHeight, 288, 176);
   const togglePlayback = () => {
     const element = video.current;
     if (!element || !source) return;
@@ -2195,13 +3046,29 @@ function ChatVideo({
       ref={video}
       src={source}
       poster={decodedPoster}
-      width={pixelWidth ?? undefined}
-      height={pixelHeight ?? undefined}
+      width={frameWidth ?? undefined}
+      height={frameHeight ?? undefined}
       muted={muted}
+      autoPlay={autoPlay}
       playsInline
       preload="auto"
+      onCanPlay={(event) => {
+        if (autoPlay && event.currentTarget.paused) {
+          void event.currentTarget.play().catch(() => undefined);
+        }
+      }}
       onLoadedMetadata={(event) => {
         const element = event.currentTarget;
+        if (element.videoWidth && element.videoHeight) {
+          const measured = {
+            width: element.videoWidth,
+            height: element.videoHeight,
+          };
+          if (posterCacheKey) {
+            rememberMediaDimensions(posterCacheKey, measured.width, measured.height);
+          }
+          setMeasuredDimensions(measured);
+        }
         setDuration(Number.isFinite(element.duration) ? element.duration : 0);
         setCurrentTime(element.currentTime);
         setMuted(element.muted);
@@ -2231,6 +3098,7 @@ function ChatVideo({
       title="play or pause video"
     />
     {decodedPoster && !playbackFrameReady && <img className="chat-video-poster-cover" src={decodedPoster} alt="" aria-hidden="true" />}
+    {!decodedPoster && !playbackFrameReady && <span className="media-skeleton video" aria-hidden="true" />}
     {!hasStarted && source && <button type="button" className="chat-video-start" onClick={togglePlayback} aria-label="play video" title="play video"><Play size={25} fill="currentColor" /></button>}
     <div className="noise-video-controls" aria-label="video controls">
       <button type="button" className="noise-video-control-button" disabled={!source} onClick={togglePlayback} aria-label={playing ? "pause video" : "play video"} title={playing ? "pause" : "play"}>
@@ -2269,14 +3137,37 @@ type MediaMessage = MessageSummary & { attachment: MediaAttachment };
 function MediaGalleryDialog({ group, messages, onClose }: { group: GroupSummary; messages: MessageSummary[]; onClose: () => void }) {
   const media = messages.filter((item): item is MediaMessage => item.attachment !== null);
   const [selected, setSelected] = useState<MediaMessage | null>(null);
+  const selectedIndex = selected
+    ? media.findIndex((item) => item.event_id === selected.event_id)
+    : -1;
+  const showPrevious = selectedIndex > 0;
+  const showNext = selectedIndex >= 0 && selectedIndex < media.length - 1;
+  useEffect(() => {
+    if (!selected) return;
+    const navigate = (event: KeyboardEvent) => {
+      if (event.key === "ArrowLeft" && showPrevious) {
+        event.preventDefault();
+        setSelected(media[selectedIndex - 1]);
+      } else if (event.key === "ArrowRight" && showNext) {
+        event.preventDefault();
+        setSelected(media[selectedIndex + 1]);
+      }
+    };
+    window.addEventListener("keydown", navigate);
+    return () => window.removeEventListener("keydown", navigate);
+  }, [media, selected, selectedIndex, showNext, showPrevious]);
   return (
     <Modal onClose={onClose} wide>
       <DialogHeading icon={<Images />} title="group media" detail={`${media.length} ${media.length === 1 ? "upload" : "uploads"} in ${group.name}`} />
       {selected ? (
         <div className="gallery-view">
           <button className="gallery-back" onClick={() => setSelected(null)}><ArrowLeft size={14} /> all media</button>
-          <div className="gallery-viewer"><MessageMedia key={selected.event_id} attachment={selected.attachment} scopeId={group.group_id} /></div>
-          <small>shared by @{selected.username} · {formatGalleryDate(selected.created_at_millis)}</small>
+          <div className="gallery-viewer">
+            <button className="gallery-nav previous" disabled={!showPrevious} onClick={() => showPrevious && setSelected(media[selectedIndex - 1])} aria-label="previous media"><ChevronLeft size={25} /></button>
+            <MessageMedia key={selected.event_id} attachment={selected.attachment} scopeId={group.group_id} autoplayVideo />
+            <button className="gallery-nav next" disabled={!showNext} onClick={() => showNext && setSelected(media[selectedIndex + 1])} aria-label="next media"><ChevronRight size={25} /></button>
+          </div>
+          <small>{selectedIndex + 1} of {media.length} · shared by {selected.username} · {formatGalleryDate(selected.created_at_millis)}</small>
         </div>
       ) : media.length ? (
         <div className="media-gallery">
@@ -2291,15 +3182,55 @@ function MediaGalleryDialog({ group, messages, onClose }: { group: GroupSummary;
 
 function GalleryTile({ message, scopeId, onOpen }: { message: MediaMessage; scopeId: string; onOpen: () => void }) {
   const { attachment } = message;
-  const { source, failed } = useMediaSource(attachment, scopeId);
+  const visibility = useNearViewport<HTMLButtonElement>();
+  const { source, failed } = useMediaSource(attachment, scopeId, visibility.near);
   const image = attachment.mime_type.startsWith("image/");
   const video = attachment.mime_type.startsWith("video/");
+  const thumbnail = useGalleryThumbnail(attachment, source);
   return (
-    <button className={`gallery-tile ${image ? "image" : video ? "video" : "audio"}`} onClick={onOpen} aria-label={`open media shared by ${message.username}`}>
-      {source ? image ? <img src={source} alt="" /> : video ? <video src={source} muted playsInline preload="auto" onLoadedMetadata={(event) => primeVideoFrame(event.currentTarget)} /> : <span className="gallery-audio"><AudioWaveform size={30} /><small>audio</small></span> : <span className="gallery-loading">{failed ? <X size={16} /> : <LoaderCircle className="spinner" size={16} />}</span>}
-      {video && source && <i className="gallery-play"><Play size={15} fill="currentColor" /></i>}
+    <button ref={visibility.ref} className={`gallery-tile ${image ? "image" : video ? "video" : "audio"}`} onClick={onOpen} aria-label={`open media shared by ${message.username}`}>
+      {image || video
+        ? thumbnail
+          ? <img src={thumbnail} alt="" />
+          : <span className="gallery-loading">{failed ? <X size={16} /> : <LoaderCircle className="spinner" size={16} />}</span>
+        : source
+          ? <span className="gallery-audio"><AudioWaveform size={30} /><small>audio</small></span>
+          : <span className="gallery-loading">{failed ? <X size={16} /> : <LoaderCircle className="spinner" size={16} />}</span>}
+      {video && thumbnail && <i className="gallery-play"><Play size={15} fill="currentColor" /></i>}
     </button>
   );
+}
+
+function useGalleryThumbnail(attachment: MediaAttachment, source: string | null) {
+  const cacheKey = mediaCacheKey(attachment);
+  const embedded = mediaPoster(attachment);
+  const cachedPoster = () => attachment.mime_type.startsWith("video/")
+    ? videoPosterCache.get(cacheKey)
+    : imagePosterCache.get(cacheKey);
+  const [generated, setGenerated] = useState<string | null>(() => cachedPoster() ?? null);
+  useEffect(() => {
+    if (embedded) {
+      setGenerated(null);
+      return;
+    }
+    const cached = cachedPoster();
+    if (cached) {
+      setGenerated(cached);
+      return;
+    }
+    if (!source) return;
+    let active = true;
+    void prepareMediaSource(attachment, source).then(() => {
+      if (active) {
+        setGenerated(
+          cachedPoster()
+          ?? (attachment.mime_type.startsWith("image/") ? source : null),
+        );
+      }
+    });
+    return () => { active = false; };
+  }, [attachment, cacheKey, embedded, source]);
+  return embedded ?? generated;
 }
 
 function useProfileImageSource(image: ProfileImage | null) {
@@ -2341,6 +3272,25 @@ function Avatar({ name, image, size, square = false }: { name: string; image: Pr
   return (
     <span className={`avatar ${square ? "square" : ""}`} style={{ width: size, height: size }}>
       {source ? <img src={source} alt="" /> : <b>{name.slice(0, 1).toUpperCase()}</b>}
+    </span>
+  );
+}
+
+function PresenceAvatar({
+  name,
+  image,
+  size,
+  status,
+}: {
+  name: string;
+  image: ProfileImage | null;
+  size: number;
+  status: PresenceStatus;
+}) {
+  return (
+    <span className="presence-avatar">
+      <Avatar name={name} image={image} size={size} />
+      <i className={`presence-status ${status}`} aria-label={status} title={status.replace("-", " ")} />
     </span>
   );
 }
@@ -2448,7 +3398,7 @@ function SettingsDialog({ profile, busy, onClose, onSave, onLogout, onDeleteAcco
   );
 }
 
-function GroupSettingsDialog({ group, bannedMembers, busy, onClose, onSave, onUnban, onRotateFrequency }: { group: GroupSummary; bannedMembers: BannedMemberSummary[]; busy: boolean; onClose: () => void; onSave: (name: string, description: string, accentColor: string, avatar: string | null, removeAvatar: boolean, background: string | null, removeBackground: boolean, membersCanSendMessages: boolean, membersCanSendMedia: boolean) => Promise<boolean>; onUnban: (member: BannedMemberSummary) => Promise<boolean>; onRotateFrequency: (revokeOnly: boolean) => Promise<boolean> }) {
+function GroupSettingsDialog({ group, bannedMembers, presenceStatuses, busy, onClose, onSave, onUnban, onRotateFrequency }: { group: GroupSummary; bannedMembers: BannedMemberSummary[]; presenceStatuses: Map<string, PresenceStatus>; busy: boolean; onClose: () => void; onSave: (name: string, description: string, accentColor: string, avatar: string | null, removeAvatar: boolean, background: string | null, removeBackground: boolean, membersCanSendMessages: boolean, membersCanSendMedia: boolean) => Promise<boolean>; onUnban: (member: BannedMemberSummary) => Promise<boolean>; onRotateFrequency: (revokeOnly: boolean) => Promise<boolean> }) {
   const [tab, setTab] = useState<"identity" | "appearance" | "general" | "banned">("identity");
   const [revokeArmed, setRevokeArmed] = useState(false);
   const [name, setName] = useState(group.name);
@@ -2522,7 +3472,7 @@ function GroupSettingsDialog({ group, bannedMembers, busy, onClose, onSave, onUn
           </div>
         </section>}
         {tab === "banned" && <section className="settings-section">
-          {bannedMembers.length ? <div className="banned-user-list">{bannedMembers.map((member) => <div className="banned-user-row" key={member.public_key}><Avatar name={member.username} image={member.avatar} size={30} /><span><strong>@{member.username}</strong><small>{member.bio || "banned from this group"}</small></span><button disabled={busy} onClick={() => void onUnban(member)}>unban</button></div>)}</div> : <p className="empty-banned-users">no one is banned</p>}
+          {bannedMembers.length ? <div className="banned-user-list">{bannedMembers.map((member) => <div className="banned-user-row" key={member.public_key}><PresenceAvatar name={member.username} image={member.avatar} size={30} status={presenceStatuses.get(member.public_key) ?? "offline"} /><span><strong>{member.username}</strong><small>{member.bio || "banned from this group"}</small></span><button disabled={busy} onClick={() => void onUnban(member)}>unban</button></div>)}</div> : <p className="empty-banned-users">no one is banned</p>}
         </section>}
       </div>
       <DialogButtons onClose={onClose} closeLabel={settingsChanged ? "cancel" : "close"}>
@@ -2551,27 +3501,43 @@ function ruleItems(value: string) {
   return value.split(/\r?\n/).map((rule) => rule.trim()).filter(Boolean).slice(0, 20);
 }
 
+function emojiOnlyCount(text: string): 1 | 2 | 3 | null {
+  const trimmed = text.trim();
+  if (!trimmed || /[\p{L}\p{N}]/u.test(trimmed)) return null;
+  const Segmenter = (Intl as { Segmenter?: typeof Intl.Segmenter }).Segmenter;
+  if (!Segmenter) return null;
+  const segments = new Segmenter(undefined, { granularity: "grapheme" });
+  let count = 0;
+  for (const { segment } of segments.segment(trimmed)) {
+    if (/^\s+$/.test(segment)) continue;
+    if (!/\p{Extended_Pictographic}/u.test(segment)) return null;
+    count += 1;
+    if (count > 3) return null;
+  }
+  return count === 1 || count === 2 || count === 3 ? count : null;
+}
+
 function ReportMessageDialog({ message, busy, onClose, onReport }: { message: MessageSummary; busy: boolean; onClose: () => void; onReport: (reason: string) => Promise<boolean> }) {
   const [reason, setReason] = useState("");
   return (
     <Modal onClose={onClose} compact>
       <DialogHeading icon={<TriangleAlert />} title="report message?" detail="send this to the group’s moderation queue" />
-      <div className="report-target-preview"><strong>@{message.username}</strong><p>{reportMessagePreview(message)}</p></div>
+      <div className="report-target-preview"><strong>{message.username}</strong><p>{reportMessagePreview(message)}</p></div>
       <LabeledArea label="details (optional)" count={`${reason.length}/280`}><textarea autoFocus maxLength={280} value={reason} placeholder="what should moderators know?" onChange={(event) => setReason(event.target.value)} /></LabeledArea>
       <DialogButtons onClose={onClose}><button className="report-confirm" disabled={busy} onClick={() => void onReport(reason.trim())}>{busy && <LoaderCircle className="spinner" size={13} />} report message</button></DialogButtons>
     </Modal>
   );
 }
 
-function ReportsDialog({ reports, busy, onClose, onDismiss, onDelete }: { reports: ReportSummary[]; busy: boolean; onClose: () => void; onDismiss: (report: ReportSummary) => Promise<boolean>; onDelete: (report: ReportSummary) => Promise<boolean> }) {
+function ReportsDialog({ reports, presenceStatuses, busy, onClose, onDismiss, onDelete }: { reports: ReportSummary[]; presenceStatuses: Map<string, PresenceStatus>; busy: boolean; onClose: () => void; onDismiss: (report: ReportSummary) => Promise<boolean>; onDelete: (report: ReportSummary) => Promise<boolean> }) {
   return (
     <Modal onClose={onClose} wide>
       <DialogHeading icon={<TriangleAlert />} title="reports" detail={reports.length === 1 ? "1 report needs review" : `${reports.length} reports need review`} />
       {reports.length ? <div className="reports-queue">{reports.map((report) => (
         <article className="report-card" key={report.report_event_id}>
-          <div className="reported-message-author"><Avatar name={report.message.username} image={report.message.avatar} size={34} /><span><strong>@{report.message.username}</strong><small>posted {formatGalleryDate(report.message.created_at_millis)}</small></span></div>
+          <div className="reported-message-author"><PresenceAvatar name={report.message.username} image={report.message.avatar} size={34} status={presenceStatuses.get(report.message.author_public_key) ?? "offline"} /><span><strong>{report.message.username}</strong><small>posted {formatGalleryDate(report.message.created_at_millis)}</small></span></div>
           <p className="reported-message-copy">{reportMessagePreview(report.message)}</p>
-          <div className="reporter-context"><Avatar name={report.reporter_username} image={report.reporter_avatar} size={24} /><span><small>reported by @{report.reporter_username} · {formatGalleryDate(report.created_at_millis)}</small><strong>{report.reason || "no additional details"}</strong></span></div>
+          <div className="reporter-context"><PresenceAvatar name={report.reporter_username} image={report.reporter_avatar} size={24} status={presenceStatuses.get(report.reporter_public_key) ?? "offline"} /><span><small>reported by {report.reporter_username} · {formatGalleryDate(report.created_at_millis)}</small><strong>{report.reason || "no additional details"}</strong></span></div>
           <div className="report-actions"><button disabled={busy} onClick={() => void onDismiss(report)}>dismiss</button><button className="danger" disabled={busy} onClick={() => void onDelete(report)}><Trash2 size={13} /> delete message</button></div>
         </article>
       ))}</div> : <div className="empty-reports"><Check size={25} /><strong>all clear</strong><span>there are no reports waiting for review</span></div>}
@@ -2590,7 +3556,7 @@ function reportMessagePreview(message: MessageSummary) {
 
 function BanMemberDialog({ member, busy, onClose, onBan }: { member: MemberSummary; busy: boolean; onClose: () => void; onBan: (deleteMessages: boolean) => Promise<boolean> }) {
   const [deleteMessages, setDeleteMessages] = useState(false);
-  return <Modal onClose={onClose} compact><DialogHeading icon={<UserRoundX />} title={`ban @${member.username}?`} detail="they will be removed from the group" /><label className="ban-history-option"><input type="checkbox" checked={deleteMessages} onChange={(event) => setDeleteMessages(event.target.checked)} /><span><strong>delete all their messages</strong><small>also removes their media from the group history and gallery</small></span></label><DialogButtons onClose={onClose}><button className="delete-confirm" disabled={busy} onClick={() => void onBan(deleteMessages)}>{busy && <LoaderCircle className="spinner" size={13} />} ban member</button></DialogButtons></Modal>;
+  return <Modal onClose={onClose} compact><DialogHeading icon={<UserRoundX />} title={`ban ${member.username}?`} detail="they will be removed from the group" /><label className="ban-history-option"><input type="checkbox" checked={deleteMessages} onChange={(event) => setDeleteMessages(event.target.checked)} /><span><strong>delete all their messages</strong><small>also removes their media from the group history and gallery</small></span></label><DialogButtons onClose={onClose}><button className="delete-confirm" disabled={busy} onClick={() => void onBan(deleteMessages)}>{busy && <LoaderCircle className="spinner" size={13} />} ban member</button></DialogButtons></Modal>;
 }
 
 function LeaveGroupDialog({ group, busy, onClose, onLeave }: { group: GroupSummary; busy: boolean; onClose: () => void; onLeave: () => Promise<boolean> }) {
@@ -2598,7 +3564,7 @@ function LeaveGroupDialog({ group, busy, onClose, onLeave }: { group: GroupSumma
 }
 
 function DeleteDirectDialog({ direct, busy, onClose, onDelete }: { direct: DirectSummary; busy: boolean; onClose: () => void; onDelete: (forBoth: boolean) => Promise<boolean> }) {
-  return <Modal onClose={onClose}><DialogHeading icon={<Trash2 />} title="delete conversation?" detail={`@${direct.username}`} /><p className="deletion-warning">Choose whether Noise should erase this thread only from this device or send a signed erasure to both users’ Noise clients.</p><div className="direct-delete-options"><button disabled={busy} onClick={() => void onDelete(false)}><strong>just for me</strong><small>erase this device’s history and cached media</small></button><button className="danger" disabled={busy} onClick={() => void onDelete(true)}><strong>for both of us</strong><small>ask all synced Noise clients to erase the thread</small></button></div><DialogButtons onClose={onClose} closeLabel="cancel">{busy && <LoaderCircle className="spinner" size={14} />}</DialogButtons></Modal>;
+  return <Modal onClose={onClose}><DialogHeading icon={<Trash2 />} title="delete conversation?" detail={direct.username} /><p className="deletion-warning">Choose whether Noise should erase this thread only from this device or send a signed erasure to both users’ Noise clients.</p><div className="direct-delete-options"><button disabled={busy} onClick={() => void onDelete(false)}><strong>just for me</strong><small>erase this device’s history and cached media</small></button><button className="danger" disabled={busy} onClick={() => void onDelete(true)}><strong>for both of us</strong><small>ask all synced Noise clients to erase the thread</small></button></div><DialogButtons onClose={onClose} closeLabel="cancel">{busy && <LoaderCircle className="spinner" size={14} />}</DialogButtons></Modal>;
 }
 
 function DeleteAccountDialog({ busy, ownedGroupCount, onClose, onDelete }: { busy: boolean; ownedGroupCount: number; onClose: () => void; onDelete: (deleteGroupMessages: boolean, deleteDirectThreads: boolean) => Promise<boolean> }) {
@@ -2618,8 +3584,29 @@ function DeleteGroupDialog({ group, busy, onClose, onDelete }: { group: GroupSum
   return <Modal onClose={onClose} compact><DialogHeading icon={<Trash2 />} title="delete group?" detail={group.name} /><p className="deletion-warning">{warning}</p><DialogButtons onClose={onClose}><button className="delete-confirm" disabled={busy} onClick={() => void onDelete()}>{busy && <LoaderCircle className="spinner" size={13} />} {group.remote_deletion_supported ? "delete group" : "remove group"}</button></DialogButtons></Modal>;
 }
 
+function DeleteMessageDialog({ message, scopeId, busy, onClose, onDelete }: { message: MessageSummary; scopeId: string; busy: boolean; onClose: () => void; onDelete: () => Promise<boolean> }) {
+  return (
+    <Modal onClose={onClose} compact>
+      <DialogHeading icon={<Trash2 />} title="delete message?" detail={`sent by ${message.username}`} />
+      <div className="delete-message-preview">
+        {message.attachment && <ReplyMediaThumbnail message={message as MessageSummary & { attachment: MediaAttachment }} scopeId={scopeId} />}
+        <span>
+          <strong>{replyPreview(message)}</strong>
+          <small>{formatTime(message.created_at_millis)}</small>
+        </span>
+      </div>
+      <p className="deletion-warning">This removes the message from the group history for everyone. It cannot be undone in Noise.</p>
+      <DialogButtons onClose={onClose}>
+        <button className="delete-confirm" disabled={busy} onClick={() => void onDelete()}>
+          {busy && <LoaderCircle className="spinner" size={13} />} delete message
+        </button>
+      </DialogButtons>
+    </Modal>
+  );
+}
+
 function PersonDialog({ person, canMessage, onMessage, onClose }: { person: PersonSummary; canMessage: boolean; onMessage: () => void; onClose: () => void }) {
-  return <Modal onClose={onClose} compact><div className="person-card"><Avatar name={person.username} image={person.avatar} size={72} /><h2>@{person.username}</h2><div className="noise-signature"><small>Noise Signature</small><strong>{noiseSignature(person.public_key)}</strong></div><p>{person.bio || "no bio yet"}</p>{canMessage && <button className="profile-message" onClick={onMessage}><MessageCircle size={15} /> message</button>}</div></Modal>;
+  return <Modal onClose={onClose} compact><div className="person-card"><PresenceAvatar name={person.username} image={person.avatar} size={72} status={person.presence_status ?? "offline"} /><h2>{person.username}</h2><div className="noise-signature"><small>Noise Signature</small><strong>{noiseSignature(person.public_key)}</strong></div><p>{person.bio || "no bio yet"}</p>{canMessage && <button className="profile-message" onClick={onMessage}><MessageCircle size={15} /> message</button>}</div></Modal>;
 }
 
 function noiseSignature(publicKey: string) {
@@ -2842,7 +3829,7 @@ function imageIsNearBlack(source: string) {
 
 async function uploadPendingMedia(pending: PendingMedia | null, action: "upload_media_chunk" | "upload_direct_media_chunk", onProgress: (progress: number) => void): Promise<MediaAttachment | null> {
   if (!pending) return null;
-  const videoPreview = pending.videoPreview;
+  const mediaPreview = pending.mediaPreview;
   const chunks: MediaChunk[] = [];
   const chunkSize = 1024 * 1024;
   for (let offset = 0; offset < pending.file.size; offset += chunkSize) {
@@ -2855,7 +3842,7 @@ async function uploadPendingMedia(pending: PendingMedia | null, action: "upload_
     chunks.push(chunk);
     onProgress(Math.min(100, Math.round(((offset + chunk.byte_length) / pending.file.size) * 100)));
   }
-  const preview = videoPreview ? await videoPreview : null;
+  const preview = mediaPreview ? await mediaPreview : null;
   return {
     file_name: pending.name,
     mime_type: pending.mimeType,

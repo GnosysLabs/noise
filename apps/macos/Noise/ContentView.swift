@@ -212,7 +212,7 @@ private struct Sidebar: View {
                         size: 30
                     )
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("@\(model.summary?.identity.username ?? "")")
+                        Text(model.summary?.identity.username ?? "")
                             .font(.system(size: 13, weight: .medium))
                             .lineLimit(1)
                         if let bio = model.summary?.identity.bio, !bio.isEmpty {
@@ -407,7 +407,7 @@ private struct MessageRow: View {
             }
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 7) {
-                    Button("@\(message.username)") { showingProfile.toggle() }
+                    Button(message.username) { showingProfile.toggle() }
                         .buttonStyle(.plain)
                         .font(.system(size: 13, weight: .semibold))
                     Text(message.createdAt, style: .time)
@@ -497,7 +497,7 @@ private struct ProfileCard: View {
         VStack(spacing: 13) {
             ProfileAvatar(username: username, image: image, size: 66)
             VStack(spacing: 5) {
-                Text("@\(username)")
+                Text(username)
                     .font(.system(size: 17, weight: .semibold))
                 Text(bio.isEmpty ? "no bio yet" : bio)
                     .font(.system(size: 13))
@@ -530,7 +530,7 @@ private struct MembersPopover: View {
                                 size: 36
                             )
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("@\(member.username)")
+                                Text(member.username)
                                     .font(.system(size: 13, weight: .semibold))
                                 if !member.bio.isEmpty {
                                     Text(member.bio)
@@ -771,7 +771,7 @@ private struct EditProfileSheet: View {
                 .buttonStyle(.plain)
 
                 VStack(spacing: 3) {
-                    Text("@\(profile.username)")
+                    Text(profile.username)
                         .font(.system(size: 20, weight: .semibold))
                     Text("your public identity")
                         .font(.caption)
