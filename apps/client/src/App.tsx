@@ -5,6 +5,7 @@ import {
   Camera,
   Check,
   Copy,
+  Crown,
   Globe2,
   Images,
   LoaderCircle,
@@ -13,6 +14,7 @@ import {
   MessagesSquare,
   MoreHorizontal,
   Paperclip,
+  Pause,
   Play,
   Plus,
   Radio,
@@ -25,10 +27,12 @@ import {
   TriangleAlert,
   UserRoundX,
   UsersRound,
+  Volume2,
+  VolumeX,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { CSSProperties } from "react";
+import type { CSSProperties, RefObject } from "react";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 import { isTauri, noise, prepareGroupBackground, prepareImage, relays } from "./api";
@@ -39,6 +43,7 @@ import type {
   BannedMemberSummary,
   Conversation,
   DirectConversation,
+  DirectInbox,
   DirectSummary,
   GroupSummary,
   GroupWatch,
@@ -51,6 +56,7 @@ import type {
   MessageSummary,
   ProfileImage,
   ReportSummary,
+  SentMessageResult,
 } from "./types";
 
 type Dialog =
@@ -76,6 +82,21 @@ type PersonSummary = Pick<MemberSummary, "public_key" | "username" | "bio" | "av
 type SidebarMode = "groups" | "directs";
 const DEFAULT_ACCENT_COLOR = "#7758ED";
 const ACCENT_PRESETS = ["#7758ED", "#E84D8A", "#F06A3C", "#E0A82E", "#43B581", "#24A6A6", "#4D82F0", "#A45EE5"];
+const UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
+const UPDATE_CHECK_HEARTBEAT_MS = 60 * 1000;
+let cachedAppVersion: string | null = null;
+let notificationPermissionPromise: Promise<boolean> | null = null;
+
+async function ensureNotificationPermission() {
+  if (!isTauri) return false;
+  if (!notificationPermissionPromise) {
+    notificationPermissionPromise = (async () => {
+      const { invoke } = await import("@tauri-apps/api/core");
+      return invoke<boolean>("ensure_native_notification_permission", { relays });
+    })().catch(() => false);
+  }
+  return notificationPermissionPromise;
+}
 
 function accentStyle(value?: string | null): CSSProperties {
   const accent = /^#[0-9a-f]{6}$/i.test(value ?? "") ? value!.toUpperCase() : DEFAULT_ACCENT_COLOR;
@@ -169,6 +190,22 @@ const avatarCache = new Map<string, string>();
 const profileImageRequests = new Map<string, Promise<string>>();
 let profileImageCacheGeneration = 0;
 const mediaCache = new Map<string, string>();
+const sentMediaPreviewCache = new Map<string, NonNullable<MessageSummary["local_attachment"]>>();
+const videoPosterCache = new Map<string, string>();
+
+function mediaCacheKey(attachment: MediaAttachment) {
+  return attachment.chunks.map((chunk) => chunk.blob_id).join(":");
+}
+
+function clearMediaMemoryCache() {
+  const previews = new Set(
+    [...sentMediaPreviewCache.values()].map((attachment) => attachment.preview_url),
+  );
+  for (const preview of previews) URL.revokeObjectURL(preview);
+  sentMediaPreviewCache.clear();
+  videoPosterCache.clear();
+  mediaCache.clear();
+}
 
 function clearProfileImageMemoryCache() {
   profileImageCacheGeneration += 1;
@@ -206,45 +243,167 @@ type PendingMedia = {
   byteLength: number;
   file: File;
   previewUrl: string;
+  videoPreview: Promise<VideoPreview | null> | null;
 };
 
+type VideoPreview = {
+  dataBase64: string;
+  mimeType: "image/jpeg";
+  pixelWidth: number;
+  pixelHeight: number;
+};
+
+function prepareVideoPreview(file: File): Promise<VideoPreview | null> {
+  const source = URL.createObjectURL(file);
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = "auto";
+  return new Promise((resolve) => {
+    let settled = false;
+    let capturing = false;
+    let previewTimes: number[] = [];
+    let previewIndex = 0;
+    const timeout = window.setTimeout(() => finish(null), 15_000);
+    const finish = (value: VideoPreview | null) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      video.removeAttribute("src");
+      video.load();
+      URL.revokeObjectURL(source);
+      resolve(value);
+    };
+    const capture = async () => {
+      if (capturing || settled || !video.videoWidth || !video.videoHeight) return;
+      capturing = true;
+      try {
+        if (videoFrameIsNearBlack(video) && previewIndex < previewTimes.length - 1) {
+          previewIndex += 1;
+          capturing = false;
+          video.currentTime = previewTimes[previewIndex];
+          return;
+        }
+        const scale = Math.min(1, 360 / Math.max(video.videoWidth, video.videoHeight));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+        canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+        const context = canvas.getContext("2d");
+        if (!context) return finish(null);
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        let preview = await new Promise<Blob | null>((done) => canvas.toBlob(done, "image/jpeg", 0.6));
+        if (preview && preview.size > 58_000) {
+          preview = await new Promise<Blob | null>((done) => canvas.toBlob(done, "image/jpeg", 0.4));
+        }
+        if (!preview) return finish(null);
+        const dataBase64 = await fileBase64(preview);
+        if (dataBase64.length > 80_000) return finish(null);
+        finish({
+          dataBase64,
+          mimeType: "image/jpeg",
+          pixelWidth: video.videoWidth,
+          pixelHeight: video.videoHeight,
+        });
+      } catch {
+        finish(null);
+      }
+    };
+    video.addEventListener("loadedmetadata", () => {
+      previewTimes = videoPreviewTimes(video.duration);
+      if (previewTimes.length) video.currentTime = previewTimes[0];
+    }, { once: true });
+    video.addEventListener("loadeddata", () => {
+      if (!previewTimes.length) void capture();
+    }, { once: true });
+    video.addEventListener("seeked", () => void capture());
+    video.addEventListener("error", () => finish(null), { once: true });
+    video.src = source;
+    video.load();
+  });
+}
+
+function optimisticMessage(
+  identity: IdentitySummary,
+  text: string,
+  attachment: PendingMedia | null,
+  replyToMessageId: string | null,
+): MessageSummary {
+  const localId = `local:${crypto.randomUUID()}`;
+  return {
+    event_id: localId,
+    message_id: localId,
+    author_public_key: identity.public_key,
+    username: identity.username,
+    bio: identity.bio,
+    avatar: identity.avatar,
+    accepts_direct_messages: identity.accepts_direct_messages,
+    text,
+    attachment: null,
+    reply_to_message_id: replyToMessageId,
+    created_at_millis: Date.now(),
+    optimistic: true,
+    local_attachment: attachment ? {
+      preview_url: URL.createObjectURL(attachment.file),
+      mime_type: attachment.mimeType,
+    } : undefined,
+  };
+}
+
+function releaseOptimisticPreview(item: MessageSummary) {
+  const source = item.local_attachment?.preview_url;
+  if (source && ![...mediaCache.values()].includes(source)) URL.revokeObjectURL(source);
+}
+
 type UpdateStatus =
-  | { phase: "downloading"; version: string; progress: number | null }
-  | { phase: "ready"; version: string }
+  | { phase: "ready"; version: string; restartFailed?: boolean }
   | { phase: "failed" };
 
 function useAutoUpdater() {
   const [status, setStatus] = useState<UpdateStatus | null>(null);
+  const checkingRef = useRef(false);
+  const readyRef = useRef(false);
+  const lastCheckAtRef = useRef(0);
 
-  const checkForUpdate = useCallback(async () => {
+  const checkForUpdate = useCallback(async (force = false) => {
+    const now = Date.now();
+    if (
+      checkingRef.current
+      || readyRef.current
+      || (!force && now - lastCheckAtRef.current < UPDATE_CHECK_INTERVAL_MS)
+    ) return;
+    checkingRef.current = true;
+    lastCheckAtRef.current = now;
     let updateFound = false;
     try {
       const update = await check();
       if (!update) return;
       updateFound = true;
-      let downloaded = 0;
-      let total = 0;
-      setStatus({ phase: "downloading", version: update.version, progress: null });
-      await update.downloadAndInstall((event) => {
-        if (event.event === "Started") {
-          total = event.data.contentLength ?? 0;
-        } else if (event.event === "Progress") {
-          downloaded += event.data.chunkLength;
-        }
-        const progress = total > 0 ? Math.min(100, Math.round((downloaded / total) * 100)) : null;
-        setStatus({ phase: "downloading", version: update.version, progress });
-      });
+      await update.downloadAndInstall();
+      readyRef.current = true;
       setStatus({ phase: "ready", version: update.version });
     } catch (cause) {
       console.error("Noise update failed", cause);
       if (updateFound) setStatus({ phase: "failed" });
+    } finally {
+      checkingRef.current = false;
     }
   }, []);
 
   useEffect(() => {
     if (!isTauri || import.meta.env.DEV) return;
     const timer = window.setTimeout(() => void checkForUpdate(), 4000);
-    return () => window.clearTimeout(timer);
+    const interval = window.setInterval(() => void checkForUpdate(), UPDATE_CHECK_HEARTBEAT_MS);
+    const checkWhenVisible = () => {
+      if (document.visibilityState === "visible") void checkForUpdate();
+    };
+    document.addEventListener("visibilitychange", checkWhenVisible);
+    window.addEventListener("focus", checkWhenVisible);
+    return () => {
+      window.clearTimeout(timer);
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", checkWhenVisible);
+      window.removeEventListener("focus", checkWhenVisible);
+    };
   }, [checkForUpdate]);
 
   const restart = async () => {
@@ -252,13 +411,13 @@ function useAutoUpdater() {
       await relaunch();
     } catch (cause) {
       console.error("Noise could not restart after updating", cause);
-      setStatus({ phase: "failed" });
+      setStatus((current) => current?.phase === "ready" ? { ...current, restartFailed: true } : current);
     }
   };
 
   return {
     status,
-    retry: () => void checkForUpdate(),
+    retry: () => void checkForUpdate(true),
     restart: () => void restart(),
     dismiss: () => setStatus(null),
   };
@@ -277,12 +436,202 @@ export default function App() {
   const refreshGeneration = useRef(0);
   const groupConversationCache = useRef(new Map<string, Conversation>());
   const directConversationCache = useRef(new Map<string, DirectConversation>());
+  const sidebarModeRef = useRef(sidebarMode);
+  const desiredDirectPublicKeyRef = useRef<string | null>(null);
+  sidebarModeRef.current = sidebarMode;
+  const summaryActiveDirectPublicKey = summary?.directs.find((direct) => direct.is_active)?.public_key ?? null;
+  if (!desiredDirectPublicKeyRef.current && summaryActiveDirectPublicKey) {
+    desiredDirectPublicKeyRef.current = summaryActiveDirectPublicKey;
+  }
+  const [optimisticGroupMessages, setOptimisticGroupMessages] = useState(
+    () => new Map<string, MessageSummary[]>(),
+  );
+  const [optimisticDirectMessages, setOptimisticDirectMessages] = useState(
+    () => new Map<string, MessageSummary[]>(),
+  );
   const [groupMenu, setGroupMenu] = useState<{
     group: GroupSummary;
     x: number;
     y: number;
   } | null>(null);
   const [directMenu, setDirectMenu] = useState<{ direct: DirectSummary; x: number; y: number } | null>(null);
+  const identityPublicKey = summary?.identity.public_key ?? null;
+
+  useEffect(() => {
+    if (identityPublicKey) void ensureNotificationPermission();
+  }, [identityPublicKey]);
+
+  function addOptimisticGroupMessage(groupId: string, item: MessageSummary) {
+    setOptimisticGroupMessages((current) => {
+      const next = new Map(current);
+      next.set(groupId, [...(current.get(groupId) ?? []), item]);
+      return next;
+    });
+  }
+
+  function addOptimisticDirectMessage(publicKey: string, item: MessageSummary) {
+    setOptimisticDirectMessages((current) => {
+      const next = new Map(current);
+      next.set(publicKey, [...(current.get(publicKey) ?? []), item]);
+      return next;
+    });
+  }
+
+  function confirmOptimisticGroupMessage(
+    groupId: string,
+    localId: string,
+    sent: SentMessageResult,
+    attachment: MediaAttachment | null,
+  ) {
+    setOptimisticGroupMessages((current) => {
+      const pending = current.get(groupId);
+      if (!pending) return current;
+      const next = new Map(current);
+      next.set(groupId, pending.map((item) => item.event_id === localId ? {
+        ...item,
+        event_id: sent.event_id,
+        message_id: sent.message_id,
+        created_at_millis: sent.created_at_millis,
+        attachment,
+      } : item));
+      return next;
+    });
+  }
+
+  function confirmOptimisticDirectMessage(
+    publicKey: string,
+    localId: string,
+    sent: SentMessageResult,
+    attachment: MediaAttachment | null,
+  ) {
+    setOptimisticDirectMessages((current) => {
+      const pending = current.get(publicKey);
+      if (!pending) return current;
+      const next = new Map(current);
+      next.set(publicKey, pending.map((item) => item.event_id === localId ? {
+        ...item,
+        event_id: sent.event_id,
+        message_id: sent.message_id,
+        created_at_millis: sent.created_at_millis,
+        attachment,
+      } : item));
+      return next;
+    });
+  }
+
+  function removeOptimisticGroupMessage(groupId: string, eventId: string) {
+    setOptimisticGroupMessages((current) => {
+      const pending = current.get(groupId);
+      if (!pending) return current;
+      const removed = pending.find((item) => item.event_id === eventId);
+      const remaining = pending.filter((item) => item.event_id !== eventId);
+      if (removed) releaseOptimisticPreview(removed);
+      const next = new Map(current);
+      if (remaining.length) next.set(groupId, remaining);
+      else next.delete(groupId);
+      return next;
+    });
+  }
+
+  function removeOptimisticDirectMessage(publicKey: string, eventId: string) {
+    setOptimisticDirectMessages((current) => {
+      const pending = current.get(publicKey);
+      if (!pending) return current;
+      const removed = pending.find((item) => item.event_id === eventId);
+      const remaining = pending.filter((item) => item.event_id !== eventId);
+      if (removed) releaseOptimisticPreview(removed);
+      const next = new Map(current);
+      if (remaining.length) next.set(publicKey, remaining);
+      else next.delete(publicKey);
+      return next;
+    });
+  }
+
+  useEffect(() => {
+    if (!conversation) return;
+    const confirmedIds = new Set(conversation.messages.map((item) => item.event_id));
+    setOptimisticGroupMessages((current) => {
+      const pending = current.get(conversation.group.group_id);
+      if (!pending?.some((item) => confirmedIds.has(item.event_id))) return current;
+      const remaining = pending.filter((item) => {
+        const confirmed = confirmedIds.has(item.event_id);
+        if (confirmed) releaseOptimisticPreview(item);
+        return !confirmed;
+      });
+      const next = new Map(current);
+      if (remaining.length) next.set(conversation.group.group_id, remaining);
+      else next.delete(conversation.group.group_id);
+      return next;
+    });
+  }, [conversation]);
+
+  useEffect(() => {
+    if (!directConversation) return;
+    const confirmedIds = new Set(directConversation.messages.map((item) => item.event_id));
+    setOptimisticDirectMessages((current) => {
+      const pending = current.get(directConversation.contact.public_key);
+      if (!pending?.some((item) => confirmedIds.has(item.event_id))) return current;
+      const remaining = pending.filter((item) => {
+        const confirmed = confirmedIds.has(item.event_id);
+        if (confirmed) releaseOptimisticPreview(item);
+        return !confirmed;
+      });
+      const next = new Map(current);
+      if (remaining.length) next.set(directConversation.contact.public_key, remaining);
+      else next.delete(directConversation.contact.public_key);
+      return next;
+    });
+  }, [directConversation]);
+
+  const applyDirectInbox = useCallback((inbox: DirectInbox) => {
+    for (const item of inbox.conversations) {
+      directConversationCache.current.set(item.contact.public_key, item);
+    }
+    const reportedActivePublicKey = inbox.summary.directs.find((direct) => direct.is_active)?.public_key;
+    const desiredPublicKey = desiredDirectPublicKeyRef.current;
+    const activePublicKey = desiredPublicKey
+      && inbox.summary.directs.some((direct) => direct.public_key === desiredPublicKey)
+      ? desiredPublicKey
+      : reportedActivePublicKey;
+    desiredDirectPublicKeyRef.current = activePublicKey ?? null;
+    const activeConversation = inbox.conversations.find(
+      (item) => item.contact.public_key === activePublicKey,
+    );
+    setSummary({
+      ...inbox.summary,
+      directs: inbox.summary.directs.map((direct) => ({
+        ...direct,
+        is_active: direct.public_key === activePublicKey,
+      })),
+    });
+    setDirectConversation((current) =>
+      activeConversation
+      ?? (current?.contact.public_key === activePublicKey ? current : null)
+    );
+  }, []);
+
+  const markDirectRead = useCallback(async (publicKey: string) => {
+    const marked = await noise<LocalSummary>({
+      action: "mark_direct_read",
+      public_key: publicKey,
+    });
+    if (marked) setSummary(marked);
+    void noise({ action: "sync_account", relays }).catch(() => {
+      // The local read marker is immediate; cross-device sync retries normally.
+    });
+  }, []);
+
+  const syncDirectInbox = useCallback(async (markActiveRead: boolean) => {
+    const generation = refreshGeneration.current;
+    const inbox = await noise<DirectInbox>({ action: "direct_inbox", relays });
+    if (!inbox) return;
+    if (generation !== refreshGeneration.current) return;
+    applyDirectInbox(inbox);
+    const activePublicKey = desiredDirectPublicKeyRef.current
+      ?? inbox.summary.directs.find((direct) => direct.is_active)?.public_key;
+    const active = inbox.summary.directs.find((direct) => direct.public_key === activePublicKey);
+    if (markActiveRead && active?.has_unread) await markDirectRead(active.public_key);
+  }, [applyDirectInbox, markDirectRead]);
 
   const refresh = useCallback(async () => {
     const generation = ++refreshGeneration.current;
@@ -310,43 +659,8 @@ export default function App() {
       return;
     }
 
-    const activeDirect = local.directs.find((direct) => direct.is_active);
-    if (!activeDirect) {
-      const reconciled = await noise<LocalSummary>({ action: "sync_directs", relays });
-      if (generation === refreshGeneration.current) {
-        setSummary(reconciled);
-        setDirectConversation(null);
-      }
-      return;
-    }
-    const cached = directConversationCache.current.get(activeDirect.public_key);
-    if (cached) setDirectConversation(cached);
-    const nextDirectConversation = await noise<DirectConversation>({ action: "direct_conversation", relays });
-    const reconciled = await noise<LocalSummary>({ action: "status" });
-    if (generation !== refreshGeneration.current) return;
-    if (nextDirectConversation) {
-      directConversationCache.current.set(nextDirectConversation.contact.public_key, nextDirectConversation);
-      setDirectConversation(nextDirectConversation);
-    }
-    setSummary(reconciled);
-  }, [sidebarMode]);
-
-  const syncDirectSummary = useCallback(async () => {
-    const reconciled = await noise<LocalSummary>({ action: "sync_directs", relays });
-    if (reconciled) {
-      setSummary((current) => current ? {
-        ...current,
-        directs: reconciled.directs,
-        known_people: reconciled.known_people,
-      } : reconciled);
-    }
-  }, []);
-  const sidebarModeRef = useRef(sidebarMode);
-  const refreshRef = useRef(refresh);
-  useEffect(() => {
-    sidebarModeRef.current = sidebarMode;
-    refreshRef.current = refresh;
-  }, [refresh, sidebarMode]);
+    await syncDirectInbox(true);
+  }, [sidebarMode, syncDirectInbox]);
 
   useEffect(() => {
     if (!isTauri) {
@@ -357,6 +671,11 @@ export default function App() {
       .catch((cause) => setError(message(cause)))
       .finally(() => setLoading(false));
   }, [refresh]);
+
+  useEffect(() => {
+    if (!isTauri || !identityPublicKey) return;
+    void ensureNotificationPermission();
+  }, [identityPublicKey]);
 
   const activeGroup = summary?.groups.find((group) => group.is_active) ?? null;
   const activeGroupId = activeGroup?.group_id ?? null;
@@ -391,7 +710,6 @@ export default function App() {
     };
   }, [activeGroupId, refresh, sidebarMode]);
 
-  const identityPublicKey = summary?.identity.public_key ?? null;
   useEffect(() => {
     if (!isTauri || !identityPublicKey) return;
     let stopped = false;
@@ -404,10 +722,9 @@ export default function App() {
           if (stopped || !change) return;
           revision = change.revision;
           if (initial) {
-            if (sidebarModeRef.current === "groups") await syncDirectSummary();
+            await syncDirectInbox(sidebarModeRef.current === "directs");
           } else if (change.changed) {
-            if (sidebarModeRef.current === "directs") await refreshRef.current();
-            else await syncDirectSummary();
+            await syncDirectInbox(sidebarModeRef.current === "directs");
           }
         } catch {
           await new Promise((resolve) => window.setTimeout(resolve, 1500));
@@ -416,7 +733,7 @@ export default function App() {
     };
     void watch();
     return () => { stopped = true; };
-  }, [identityPublicKey, syncDirectSummary]);
+  }, [identityPublicKey, syncDirectInbox]);
 
   useEffect(() => {
     if (!isTauri || !identityPublicKey || !summary?.identity.noise_id) return;
@@ -490,8 +807,9 @@ export default function App() {
   }
 
   async function selectDirect(direct: DirectSummary) {
-    if (direct.is_active) return;
+    if (desiredDirectPublicKeyRef.current === direct.public_key && direct.is_active) return;
     const generation = ++refreshGeneration.current;
+    desiredDirectPublicKeyRef.current = direct.public_key;
     setError(null);
     const cached = directConversationCache.current.get(direct.public_key);
     if (cached) setDirectConversation(cached);
@@ -500,13 +818,18 @@ export default function App() {
       directs: current.directs.map((candidate) => ({
         ...candidate,
         is_active: candidate.public_key === direct.public_key,
+        has_unread: candidate.public_key === direct.public_key ? false : candidate.has_unread,
       })),
     } : current);
 
     try {
       const local = await noise<LocalSummary>({ action: "select_direct", public_key: direct.public_key });
       if (generation !== refreshGeneration.current) return;
-      setSummary(local);
+      const marked = direct.has_unread
+        ? await noise<LocalSummary>({ action: "mark_direct_read", public_key: direct.public_key })
+        : local;
+      if (generation !== refreshGeneration.current) return;
+      setSummary(marked);
       const fresh = await noise<DirectConversation>({ action: "direct_conversation", relays });
       const reconciled = await noise<LocalSummary>({ action: "status" });
       if (generation !== refreshGeneration.current) return;
@@ -515,6 +838,9 @@ export default function App() {
         setDirectConversation(fresh);
       }
       setSummary(reconciled);
+      void noise({ action: "sync_account", relays }).catch(() => {
+        // The thread is already read locally; cross-device sync retries normally.
+      });
     } catch (cause) {
       if (generation === refreshGeneration.current) setError(message(cause));
     }
@@ -534,6 +860,44 @@ export default function App() {
       setDialog(null);
       setSidebarMode("directs");
     });
+  }
+
+  async function switchSidebarMode(nextMode: SidebarMode) {
+    if (nextMode === sidebarMode) return;
+    if (nextMode === "groups") {
+      setSidebarMode("groups");
+      return;
+    }
+
+    const newestUnread = summary?.directs.find((direct) => direct.has_unread);
+    if (newestUnread && !newestUnread.is_active) {
+      const generation = ++refreshGeneration.current;
+      desiredDirectPublicKeyRef.current = newestUnread.public_key;
+      const cached = directConversationCache.current.get(newestUnread.public_key);
+      if (cached) setDirectConversation(cached);
+      setSummary((current) => current ? {
+        ...current,
+        directs: current.directs.map((candidate) => ({
+          ...candidate,
+          is_active: candidate.public_key === newestUnread.public_key,
+          has_unread: candidate.public_key === newestUnread.public_key
+            ? false
+            : candidate.has_unread,
+        })),
+      } : current);
+      try {
+        const local = await noise<LocalSummary>({
+          action: "select_direct",
+          public_key: newestUnread.public_key,
+        });
+        if (generation !== refreshGeneration.current) return;
+        if (local) setSummary(local);
+        await markDirectRead(newestUnread.public_key);
+      } catch (cause) {
+        if (generation === refreshGeneration.current) setError(message(cause));
+      }
+    }
+    setSidebarMode("directs");
   }
 
   if (!isTauri) return <BrowserFoundation />;
@@ -571,18 +935,40 @@ export default function App() {
     );
   }
 
-  const selectedConversation = conversation?.group.group_id === activeGroupId ? conversation : null;
-  const selectedDirectConversation = directConversation?.contact.public_key === activeDirectPublicKey
+  const selectedConversationState = conversation?.group.group_id === activeGroupId ? conversation : null;
+  const selectedGroupPending = activeGroupId ? optimisticGroupMessages.get(activeGroupId) ?? [] : [];
+  const selectedConversation = selectedConversationState ? {
+    ...selectedConversationState,
+    messages: [
+      ...selectedConversationState.messages,
+      ...selectedGroupPending.filter((pending) =>
+        !selectedConversationState.messages.some((item) => item.event_id === pending.event_id)
+      ),
+    ],
+  } : null;
+  const selectedDirectConversationState = directConversation?.contact.public_key === activeDirectPublicKey
     ? directConversation
     : null;
+  const selectedDirectPending = activeDirectPublicKey
+    ? optimisticDirectMessages.get(activeDirectPublicKey) ?? []
+    : [];
+  const selectedDirectConversation = selectedDirectConversationState ? {
+    ...selectedDirectConversationState,
+    messages: [
+      ...selectedDirectConversationState.messages,
+      ...selectedDirectPending.filter((pending) =>
+        !selectedDirectConversationState.messages.some((item) => item.event_id === pending.event_id)
+      ),
+    ],
+  } : null;
 
   return (
     <div className={`app-shell ${appBackgroundSource ? "group-background-active" : ""}`} style={activeAccentStyle}>
       {appBackgroundSource && <div className="group-app-background" style={{ backgroundImage: `url(${JSON.stringify(appBackgroundSource)})` }} aria-hidden="true" />}
-      <Sidebar
+        <Sidebar
         summary={summary}
         mode={sidebarMode}
-        onMode={setSidebarMode}
+        onMode={(mode) => void switchSidebarMode(mode)}
         onMake={() => setDialog({ type: "make" })}
         onJoin={() => setDialog({ type: "join" })}
         onProfile={() => setDialog({ type: "profile", profile: summary.identity })}
@@ -624,39 +1010,39 @@ export default function App() {
               }
               onBan={(member) => setDialog({ type: "ban_member", member })}
               onReport={(message) => setDialog({ type: "report_message", message })}
-              onSend={(text, pending, onProgress, replyToMessageId) =>
-                perform(async () => {
-                  let attachment: MediaAttachment | null = null;
-                  if (pending) {
-                    const chunks: MediaChunk[] = [];
-                    const chunkSize = 1024 * 1024;
-                    for (let offset = 0; offset < pending.file.size; offset += chunkSize) {
-                      const chunk = await noise<MediaChunk>({
-                        action: "upload_media_chunk",
-                        data_base64: await fileBase64(pending.file.slice(offset, offset + chunkSize)),
-                        relays,
-                      });
-                      if (!chunk) throw new Error("relay did not return a media chunk reference");
-                      chunks.push(chunk);
-                      onProgress(Math.min(100, Math.round(((offset + chunk.byte_length) / pending.file.size) * 100)));
-                    }
-                    attachment = {
-                      file_name: pending.name,
-                      mime_type: pending.mimeType,
-                      byte_length: pending.byteLength,
-                      chunks,
-                    };
-                  }
-                  await noise<null>({
+              onSend={async (text, pending, onProgress, replyToMessageId) => {
+                const groupId = selectedConversation.group.group_id;
+                const optimistic = optimisticMessage(summary.identity, text, pending, replyToMessageId);
+                if (!pending) addOptimisticGroupMessage(groupId, optimistic);
+                let attachment: MediaAttachment | null = null;
+                let result: SentMessageResult | null = null;
+                const sent = await perform(async () => {
+                  attachment = await uploadPendingMedia(pending, "upload_media_chunk", onProgress);
+                  result = await noise<SentMessageResult>({
                     action: "say",
                     text,
                     attachment,
                     reply_to_message_id: replyToMessageId,
                     relays,
                   });
-                  await refresh();
-                })
-              }
+                  if (!result) throw new Error("the relay did not confirm the message");
+                }, false);
+                if (!sent || !result) {
+                  if (pending) releaseOptimisticPreview(optimistic);
+                  else removeOptimisticGroupMessage(groupId, optimistic.event_id);
+                  return false;
+                }
+                const confirmed = result as SentMessageResult;
+                if (pending) addOptimisticGroupMessage(groupId, optimistic);
+                if (attachment && optimistic.local_attachment) {
+                  mediaCache.set(mediaCacheKey(attachment), optimistic.local_attachment.preview_url);
+                  sentMediaPreviewCache.set(confirmed.event_id, optimistic.local_attachment);
+                }
+                confirmOptimisticGroupMessage(groupId, optimistic.event_id, confirmed, attachment);
+                void refresh().catch((cause) => setError(message(cause)));
+                void noise({ action: "sync_account", relays }).catch(() => undefined);
+                return true;
+              }}
             />
           ) : activeGroupId ? <Loading /> : (
             <EmptyGroup
@@ -674,11 +1060,39 @@ export default function App() {
               selfPublicKey={summary.identity.public_key}
               onPerson={(person) => setDialog({ type: "person", person })}
               onDelete={() => setDialog({ type: "delete_direct", direct: selectedDirectConversation.contact })}
-              onSend={(text, pending, onProgress, replyToMessageId) => perform(async () => {
-                const attachment = await uploadPendingMedia(pending, "upload_direct_media_chunk", onProgress);
-                await noise({ action: "say_direct", text, attachment, reply_to_message_id: replyToMessageId, relays });
-                await refresh();
-              })}
+              onSend={async (text, pending, onProgress, replyToMessageId) => {
+                const publicKey = selectedDirectConversation.contact.public_key;
+                const optimistic = optimisticMessage(summary.identity, text, pending, replyToMessageId);
+                if (!pending) addOptimisticDirectMessage(publicKey, optimistic);
+                let attachment: MediaAttachment | null = null;
+                let result: SentMessageResult | null = null;
+                const sent = await perform(async () => {
+                  attachment = await uploadPendingMedia(pending, "upload_direct_media_chunk", onProgress);
+                  result = await noise<SentMessageResult>({
+                    action: "say_direct",
+                    text,
+                    attachment,
+                    reply_to_message_id: replyToMessageId,
+                    relays,
+                  });
+                  if (!result) throw new Error("the relay did not confirm the message");
+                }, false);
+                if (!sent || !result) {
+                  if (pending) releaseOptimisticPreview(optimistic);
+                  else removeOptimisticDirectMessage(publicKey, optimistic.event_id);
+                  return false;
+                }
+                const confirmed = result as SentMessageResult;
+                if (pending) addOptimisticDirectMessage(publicKey, optimistic);
+                if (attachment && optimistic.local_attachment) {
+                  mediaCache.set(mediaCacheKey(attachment), optimistic.local_attachment.preview_url);
+                  sentMediaPreviewCache.set(confirmed.event_id, optimistic.local_attachment);
+                }
+                confirmOptimisticDirectMessage(publicKey, optimistic.event_id, confirmed, attachment);
+                void refresh().catch((cause) => setError(message(cause)));
+                void noise({ action: "sync_account", relays }).catch(() => undefined);
+                return true;
+              }}
             />
           ) : activeDirectPublicKey ? <Loading /> : <EmptyDirects />}
         </section>
@@ -888,7 +1302,7 @@ export default function App() {
               setSummary(local);
               setConversation(null);
               groupConversationCache.current.delete(dialog.group.group_id);
-              mediaCache.clear();
+              clearMediaMemoryCache();
               clearProfileImageMemoryCache();
               await refresh();
               setDialog(null);
@@ -910,7 +1324,7 @@ export default function App() {
               });
               setSummary(local);
               groupConversationCache.current.delete(dialog.group.group_id);
-              mediaCache.clear();
+              clearMediaMemoryCache();
               clearProfileImageMemoryCache();
               await refresh();
               setDialog(null);
@@ -928,7 +1342,7 @@ export default function App() {
             setSummary(local);
             setDirectConversation(null);
             directConversationCache.current.delete(dialog.direct.public_key);
-            mediaCache.clear();
+            clearMediaMemoryCache();
             await refresh();
             setDialog(null);
           })}
@@ -947,7 +1361,7 @@ export default function App() {
               relays,
             });
             refreshGeneration.current += 1;
-            mediaCache.clear();
+            clearMediaMemoryCache();
             clearProfileImageMemoryCache();
             groupConversationCache.current.clear();
             directConversationCache.current.clear();
@@ -965,7 +1379,7 @@ export default function App() {
           onLogout={() => perform(async () => {
             await noise({ action: "logout" });
             refreshGeneration.current += 1;
-            mediaCache.clear();
+            clearMediaMemoryCache();
             clearProfileImageMemoryCache();
             groupConversationCache.current.clear();
             directConversationCache.current.clear();
@@ -1033,8 +1447,9 @@ function Sidebar({
   const hasUnreadDirects = summary.directs.some((direct) => direct.has_unread);
   return (
     <aside className="sidebar">
-      <div className="sidebar-drag" data-tauri-drag-region />
-      <div className="brand"><NoiseMark size={22} /><strong>noise</strong></div>
+      <div className="sidebar-drag" data-tauri-drag-region>
+        <div className="brand" data-tauri-drag-region><NoiseMark size={22} /><strong>noise</strong></div>
+      </div>
       <div className="sidebar-tabs">
         <button className={mode === "groups" ? "active" : ""} onClick={() => onMode("groups")}><UsersRound size={14} /> groups</button>
         <button className={mode === "directs" ? "active" : ""} onClick={() => onMode("directs")}><MessagesSquare size={14} /> dms{hasUnreadDirects && <span className="tab-unread-dot" aria-label="unread direct messages" />}</button>
@@ -1210,6 +1625,20 @@ function useMessageListPosition(conversationKey: string, messageCount: number) {
   return { ref, onScroll };
 }
 
+function useAutosizeComposer(
+  ref: RefObject<HTMLTextAreaElement | null>,
+  value: string,
+) {
+  useLayoutEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+    element.style.height = "0px";
+    const height = Math.min(element.scrollHeight, 168);
+    element.style.height = `${Math.max(height, 42)}px`;
+    element.style.overflowY = element.scrollHeight > 168 ? "auto" : "hidden";
+  }, [ref, value]);
+}
+
 function ConversationPanel({
   conversation,
   busy,
@@ -1254,6 +1683,7 @@ function ConversationPanel({
   const [replyingTo, setReplyingTo] = useState<MessageSummary | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
+  useAutosizeComposer(composerInput, draft);
   const messageList = useMessageListPosition(conversation.group.group_id, conversation.messages.length);
   const selfMember = conversation.members.find((member) => member.public_key === selfPublicKey);
   const canModerate = canEditGroup || selfMember?.is_moderator === true;
@@ -1284,20 +1714,28 @@ function ConversationPanel({
       byteLength: file.size,
       file,
       previewUrl: URL.createObjectURL(file),
+      videoPreview: file.type.startsWith("video/")
+        ? prepareVideoPreview(file)
+        : null,
     });
     if (fileInput.current) fileInput.current.value = "";
   }
   async function submit() {
     const text = draft.trim();
     if ((!text && !attachment) || busy || (text && !canSendMessages) || (attachment && !canSendMedia)) return;
+    const submittedDraft = draft;
+    const submittedReply = replyingTo;
     const pendingAttachment = attachment;
+    setDraft("");
+    setReplyingTo(null);
     if (pendingAttachment) setUploadProgress(0);
-    const sent = await onSend(text, pendingAttachment, setUploadProgress, replyingTo?.message_id ?? null);
+    const sent = await onSend(text, pendingAttachment, setUploadProgress, submittedReply?.message_id ?? null);
     setUploadProgress(null);
     if (sent) {
-      setDraft("");
       setAttachment(null);
-      setReplyingTo(null);
+    } else {
+      setDraft((current) => current || submittedDraft);
+      setReplyingTo((current) => current ?? submittedReply);
     }
   }
   return (
@@ -1318,11 +1756,11 @@ function ConversationPanel({
       <div className="messages" ref={messageList.ref} onScroll={messageList.onScroll}>
         {conversation.messages.length === 0 && <div className="quiet">the group is quiet</div>}
         {conversation.messages.map((item) => (
-          <MessageRow key={item.event_id} message={item} own={item.author_public_key === selfPublicKey} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={(event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} />
+          <MessageRow key={item.event_id} message={item} own={item.author_public_key === selfPublicKey} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} mediaScopeId={conversation.group.group_id} />
         ))}
       </div>
       {selfMember && (canSendMessages || canSendMedia) ? <div className="composer">
-        {replyingTo && <ReplyTarget message={replyingTo} onClose={() => setReplyingTo(null)} />}
+        {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.group.group_id} onClose={() => setReplyingTo(null)} />}
         {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => { const video = event.currentTarget; if (Number.isFinite(video.duration) && video.duration > 0) video.currentTime = Math.min(0.25, video.duration / 2); }} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}{uploadProgress !== null && <div className="attachment-progress"><i style={{ width: `${uploadProgress}%` }} /><span>{uploadProgress}%</span></div>}<button disabled={busy} onClick={() => setAttachment(null)} aria-label="remove attachment"><X size={14} /></button></div>}
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
         <button className="attach-button" disabled={busy || !canSendMedia} onClick={() => fileInput.current?.click()} aria-label="attach media" title={canSendMedia ? "attach media" : "members cannot send media"}><Paperclip size={17} /></button>
@@ -1352,13 +1790,17 @@ function ConversationPanel({
           {sortedMembers.map((member) => (
             <div key={member.public_key} className="member-sidebar-row">
               <button className="member-sidebar-main" onClick={() => onPerson(member)}>
-                <Avatar name={member.username} image={member.avatar} size={30} />
+                <span className="member-avatar-wrap">
+                  <Avatar name={member.username} image={member.avatar} size={30} />
+                  {member.public_key === conversation.group.owner_public_key
+                    ? <span className="member-role-mark founder" aria-label="group founder" title="group founder"><Crown size={9} /></span>
+                    : member.is_moderator && <span className="member-role-mark moderator" aria-label="group moderator" title="group moderator"><Shield size={8} /></span>}
+                </span>
                 <span className="member-sidebar-copy">
-                  <span>
-                    <strong>@{member.username}</strong>
-                    {member.public_key === conversation.group.owner_public_key ? <i>founder</i> : member.is_moderator && <i>mod</i>}
+                  <strong>@{member.username}</strong>
+                  <span className="member-sidebar-meta">
+                    <small>{member.bio || "tuned in"}</small>
                   </span>
-                  <small>{member.bio || "tuned in"}</small>
                 </span>
               </button>
               {member.public_key !== selfPublicKey && <button className="member-actions" aria-label={`actions for ${member.username}`} onClick={(event) => { const rect = event.currentTarget.getBoundingClientRect(); setMemberMenu({ member, x: rect.right, y: rect.bottom + 4 }); }}><MoreHorizontal size={15} /></button>}
@@ -1366,6 +1808,7 @@ function ConversationPanel({
           ))}
         </div>
       </aside>
+      <AppVersionFooter />
       {memberMenu && <MemberContextMenu
         member={memberMenu.member}
         x={memberMenu.x}
@@ -1407,6 +1850,7 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, onPerson, 
   const [replyingTo, setReplyingTo] = useState<MessageSummary | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
+  useAutosizeComposer(composerInput, draft);
   const messageList = useMessageListPosition(conversation.contact.public_key, conversation.messages.length);
   const attachmentPreview = attachment?.previewUrl;
   useEffect(() => () => { if (attachmentPreview) URL.revokeObjectURL(attachmentPreview); }, [attachmentPreview]);
@@ -1421,20 +1865,34 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, onPerson, 
       setAttachmentError("media can be up to 500 MB");
       return;
     }
-    setAttachment({ name: file.name, mimeType: file.type, byteLength: file.size, file, previewUrl: URL.createObjectURL(file) });
+    setAttachment({
+      name: file.name,
+      mimeType: file.type,
+      byteLength: file.size,
+      file,
+      previewUrl: URL.createObjectURL(file),
+      videoPreview: file.type.startsWith("video/")
+        ? prepareVideoPreview(file)
+        : null,
+    });
     if (fileInput.current) fileInput.current.value = "";
   }
   async function submit() {
     const text = draft.trim();
     if ((!text && !attachment) || busy) return;
+    const submittedDraft = draft;
+    const submittedReply = replyingTo;
     const pendingAttachment = attachment;
+    setDraft("");
+    setReplyingTo(null);
     if (pendingAttachment) setUploadProgress(0);
-    const sent = await onSend(text, pendingAttachment, setUploadProgress, replyingTo?.message_id ?? null);
+    const sent = await onSend(text, pendingAttachment, setUploadProgress, submittedReply?.message_id ?? null);
     setUploadProgress(null);
     if (sent) {
-      setDraft("");
       setAttachment(null);
-      setReplyingTo(null);
+    } else {
+      setDraft((current) => current || submittedDraft);
+      setReplyingTo((current) => current ?? submittedReply);
     }
   }
   const person = { public_key: conversation.contact.public_key, username: conversation.contact.username, bio: conversation.contact.bio, avatar: conversation.contact.avatar, accepts_direct_messages: conversation.contact.accepts_direct_messages };
@@ -1449,10 +1907,10 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, onPerson, 
       </header>
       <div className="messages" ref={messageList.ref} onScroll={messageList.onScroll}>
         {conversation.messages.length === 0 && <div className="quiet">start the conversation</div>}
-        {conversation.messages.map((item) => <MessageRow key={item.event_id} message={item} own={item.author_public_key === selfPublicKey} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={(event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} mediaScopeId={conversation.media_scope_id} />)}
+        {conversation.messages.map((item) => <MessageRow key={item.event_id} message={item} own={item.author_public_key === selfPublicKey} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} mediaScopeId={conversation.media_scope_id} />)}
       </div>
       {conversation.contact.accepts_direct_messages ? <div className="composer">
-        {replyingTo && <ReplyTarget message={replyingTo} onClose={() => setReplyingTo(null)} />}
+        {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.media_scope_id} onClose={() => setReplyingTo(null)} />}
         {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => primeVideoFrame(event.currentTarget)} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}{uploadProgress !== null && <div className="attachment-progress"><i style={{ width: `${uploadProgress}%` }} /><span>{uploadProgress}%</span></div>}<button disabled={busy} onClick={() => setAttachment(null)} aria-label="remove attachment"><X size={14} /></button></div>}
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
         <button className="attach-button" disabled={busy} onClick={() => fileInput.current?.click()} aria-label="attach media"><Paperclip size={17} /></button>
@@ -1469,13 +1927,31 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, onPerson, 
         <p>{conversation.contact.bio || "no bio yet"}</p>
         <span className={`direct-profile-status ${conversation.contact.accepts_direct_messages ? "open" : "closed"}`}><i />{conversation.contact.accepts_direct_messages ? "accepting DMs" : "DMs closed"}</span>
       </aside>
+      <AppVersionFooter />
       {messageMenu && <MessageContextMenu x={messageMenu.x} y={messageMenu.y} busy={busy} onClose={() => setMessageMenu(null)} onReply={() => { setReplyingTo(messageMenu.message); setMessageMenu(null); window.setTimeout(() => composerInput.current?.focus(), 0); }} />}
     </div>
   );
 }
 
-function ReplyTarget({ message, onClose }: { message: MessageSummary; onClose: () => void }) {
-  return <div className="reply-target"><Reply size={15} /><span><small>replying to @{message.username}</small><strong>{replyPreview(message)}</strong></span><button onClick={onClose} aria-label="cancel reply"><X size={14} /></button></div>;
+function ReplyTarget({ message, mediaScopeId, onClose }: { message: MessageSummary; mediaScopeId?: string; onClose: () => void }) {
+  return <div className="reply-target"><Reply size={15} />{message.attachment && <ReplyMediaThumbnail message={message as MessageSummary & { attachment: MediaAttachment }} scopeId={mediaScopeId} />}<span><small>replying to @{message.username}</small><strong>{replyPreview(message)}</strong></span><button onClick={onClose} aria-label="cancel reply"><X size={14} /></button></div>;
+}
+
+function AppVersionFooter() {
+  const [version, setVersion] = useState(cachedAppVersion);
+  useEffect(() => {
+    if (version || !isTauri) return;
+    let active = true;
+    void import("@tauri-apps/api/app")
+      .then(({ getVersion }) => getVersion())
+      .then((currentVersion) => {
+        cachedAppVersion = currentVersion;
+        if (active) setVersion(currentVersion);
+      })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, [version]);
+  return <div className="member-sidebar-footer"><span>{version ? `Beta Version ${version}` : "Beta Version"}</span></div>;
 }
 
 function MessageRow({
@@ -1494,9 +1970,10 @@ function MessageRow({
   mediaScopeId?: string;
 }) {
   const person = { public_key: message.author_public_key, username: message.username, bio: message.bio, avatar: message.avatar, accepts_direct_messages: message.accepts_direct_messages };
+  const localAttachment = message.local_attachment ?? sentMediaPreviewCache.get(message.event_id);
   return (
     <article
-      className={`message-row ${own ? "own" : ""}`}
+      className={`message-row ${own ? "own" : ""} ${message.optimistic ? "optimistic" : ""}`}
       onMouseDown={onContextMenu ? (event) => { if (event.button === 2) event.preventDefault(); } : undefined}
       onContextMenu={onContextMenu ? (event) => {
         event.preventDefault();
@@ -1505,7 +1982,7 @@ function MessageRow({
       } : undefined}
     >
       <button onClick={() => onPerson(person)}><Avatar name={message.username} image={message.avatar} size={34} /></button>
-      <div className="message-body"><div className="message-meta"><button onClick={() => onPerson(person)}>@{message.username}</button></div>{message.reply_to_message_id && <div className="message-reply-reference">{replyTo ? <><strong>@{replyTo.username}</strong><span>{replyPreview(replyTo)}</span></> : <span>original message unavailable</span>}</div>}{message.text && <p>{message.text}</p>}{message.attachment && <MessageMedia attachment={message.attachment} scopeId={mediaScopeId} />}<time className="message-time">{formatTime(message.created_at_millis)}</time></div>
+      <div className="message-body"><div className="message-meta"><button onClick={() => onPerson(person)}>@{message.username}</button></div>{message.reply_to_message_id && <div className="message-reply-reference">{replyTo ? <>{replyTo.attachment && <ReplyMediaThumbnail message={replyTo as MessageSummary & { attachment: MediaAttachment }} scopeId={mediaScopeId} />}<span className="message-reply-copy"><strong>@{replyTo.username}</strong><span>{replyPreview(replyTo)}</span></span></> : <span>original message unavailable</span>}</div>}{message.text && <p>{message.text}</p>}{localAttachment ? <LocalMessageMedia attachment={localAttachment} manifest={message.attachment} /> : message.attachment && <MessageMedia attachment={message.attachment} scopeId={mediaScopeId} />}<time className="message-time">{formatTime(message.created_at_millis)}</time></div>
     </article>
   );
 }
@@ -1513,52 +1990,278 @@ function MessageRow({
 function replyPreview(message: MessageSummary) {
   const text = message.text.trim();
   if (text) return text.length > 96 ? `${text.slice(0, 96)}…` : text;
-  if (message.attachment?.mime_type.startsWith("image/")) return "image";
+  if (message.attachment?.mime_type.startsWith("image/")) return "photo";
   if (message.attachment?.mime_type.startsWith("video/")) return "video";
   if (message.attachment?.mime_type.startsWith("audio/")) return "audio";
   return "message";
 }
 
+function ReplyMediaThumbnail({ message, scopeId }: { message: MessageSummary & { attachment: MediaAttachment }; scopeId?: string }) {
+  const { attachment } = message;
+  const localAttachment = message.local_attachment ?? sentMediaPreviewCache.get(message.event_id);
+  const { source } = useMediaSource(attachment, scopeId);
+  const image = attachment.mime_type.startsWith("image/");
+  const video = attachment.mime_type.startsWith("video/");
+  const posterCacheKey = mediaCacheKey(attachment);
+  const poster = mediaPoster(attachment) ?? videoPosterCache.get(posterCacheKey);
+  if (image) {
+    const imageSource = localAttachment?.preview_url ?? source;
+    return <span className="reply-media-thumbnail">{imageSource ? <img src={imageSource} alt="" /> : <LoaderCircle className="spinner" size={13} />}</span>;
+  }
+  if (video) {
+    const videoSource = localAttachment?.preview_url ?? source;
+    return <span className="reply-media-thumbnail video">{poster ? <img src={poster} alt="" /> : videoSource ? <video src={videoSource} muted playsInline preload="metadata" onLoadedMetadata={(event) => primeVideoFrame(event.currentTarget)} /> : <LoaderCircle className="spinner" size={13} />}<i><Play size={9} fill="currentColor" /></i></span>;
+  }
+  return <span className="reply-media-thumbnail audio"><AudioWaveform size={18} /></span>;
+}
+
 function MessageMedia({ attachment, scopeId }: { attachment: MediaAttachment; scopeId?: string }) {
   const { source, failed } = useMediaSource(attachment, scopeId);
-  return <div className="message-media">{source ? attachment.mime_type.startsWith("image/") ? <img src={source} alt="shared media" /> : attachment.mime_type.startsWith("video/") ? <ChatVideo source={source} /> : <audio src={source} controls preload="metadata" /> : <div className="media-loading">{failed ? "media unavailable" : <><LoaderCircle className="spinner" size={15} /> decrypting media</>}</div>}</div>;
+  const poster = mediaPoster(attachment);
+  const video = attachment.mime_type.startsWith("video/");
+  const posterCacheKey = mediaCacheKey(attachment);
+  return <div className="message-media">{video && (poster || videoPosterCache.has(posterCacheKey)) ? <ChatVideo source={source ?? undefined} poster={poster} posterCacheKey={posterCacheKey} pixelWidth={attachment.pixel_width} pixelHeight={attachment.pixel_height} /> : source ? attachment.mime_type.startsWith("image/") ? <img src={source} alt="shared media" /> : video ? <ChatVideo source={source} posterCacheKey={posterCacheKey} /> : <audio src={source} controls preload="metadata" /> : <div className="media-loading">{failed ? "media unavailable" : <><LoaderCircle className="spinner" size={15} /> decrypting media</>}</div>}</div>;
+}
+
+function LocalMessageMedia({ attachment, manifest }: { attachment: NonNullable<MessageSummary["local_attachment"]>; manifest: MediaAttachment | null }) {
+  const poster = manifest ? mediaPoster(manifest) : undefined;
+  const posterCacheKey = manifest ? mediaCacheKey(manifest) : undefined;
+  return <div className="message-media">{attachment.mime_type.startsWith("image/") ? <img src={attachment.preview_url} alt="shared media" /> : attachment.mime_type.startsWith("video/") ? <ChatVideo source={attachment.preview_url} poster={poster} posterCacheKey={posterCacheKey} pixelWidth={manifest?.pixel_width} pixelHeight={manifest?.pixel_height} /> : <audio src={attachment.preview_url} controls preload="metadata" />}</div>;
+}
+
+function mediaPoster(attachment: MediaAttachment) {
+  return attachment.preview_data_base64 && attachment.preview_mime_type
+    ? `data:${attachment.preview_mime_type};base64,${attachment.preview_data_base64}`
+    : undefined;
 }
 
 function useMediaSource(attachment: MediaAttachment, scopeId?: string) {
-  const cacheKey = attachment.chunks.map((chunk) => chunk.blob_id).join(":");
+  const cacheKey = mediaCacheKey(attachment);
   const [source, setSource] = useState(() => mediaCache.get(cacheKey) ?? null);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
     if (source) return;
     let active = true;
-    void noise<AttachmentData>({ action: "fetch_attachment", attachment, scope_id: scopeId, relays })
-      .then(async (data) => {
-        if (!active || !data) return;
-        const { convertFileSrc } = await import("@tauri-apps/api/core");
-        const next = convertFileSrc(data.file_path);
-        mediaCache.set(cacheKey, next);
-        setSource(next);
-      })
-      .catch(() => active && setFailed(true));
-    return () => { active = false; };
-  }, [attachment, cacheKey, scopeId, source]);
+    let retryTimer: number | null = null;
+    setFailed(false);
+    const load = async () => {
+      for (let attempt = 0; active && attempt < 12; attempt += 1) {
+        try {
+          const data = await noise<AttachmentData>({
+            action: "fetch_attachment",
+            attachment,
+            scope_id: scopeId,
+            relays,
+          });
+          if (!active) return;
+          if (!data) throw new Error("media is not available yet");
+          const { convertFileSrc } = await import("@tauri-apps/api/core");
+          const next = convertFileSrc(data.file_path);
+          mediaCache.set(cacheKey, next);
+          setSource(next);
+          return;
+        } catch {
+          if (!active) return;
+          if (attempt === 11) {
+            setFailed(true);
+            return;
+          }
+          const delay = Math.min(400 * 1.6 ** attempt, 3000);
+          await new Promise<void>((resolve) => {
+            retryTimer = window.setTimeout(resolve, delay);
+          });
+        }
+      }
+    };
+    void load();
+    return () => {
+      active = false;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+    };
+  }, [cacheKey, scopeId, source]);
   return { source, failed };
 }
 
-function ChatVideo({ source }: { source: string }) {
-  const [showControls, setShowControls] = useState(false);
-  return <video
-    src={source}
-    controls={showControls}
-    playsInline
-    preload="auto"
-    onLoadedMetadata={(event) => primeVideoFrame(event.currentTarget)}
-    onMouseEnter={() => setShowControls(true)}
-    onMouseLeave={() => setShowControls(false)}
-    onFocus={() => setShowControls(true)}
-    onBlur={() => setShowControls(false)}
-    onPointerDown={() => setShowControls(true)}
-  />;
+function ChatVideo({
+  source,
+  poster,
+  posterCacheKey,
+  pixelWidth,
+  pixelHeight,
+}: {
+  source?: string;
+  poster?: string;
+  posterCacheKey?: string;
+  pixelWidth?: number | null;
+  pixelHeight?: number | null;
+}) {
+  const [playing, setPlaying] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const [hasStarted, setHasStarted] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [playbackFrameReady, setPlaybackFrameReady] = useState(false);
+  const [decodedPoster, setDecodedPoster] = useState(
+    () => (posterCacheKey ? videoPosterCache.get(posterCacheKey) : undefined) ?? poster,
+  );
+  const video = useRef<HTMLVideoElement>(null);
+  useEffect(() => {
+    setPlaybackFrameReady(false);
+    setHasStarted(false);
+  }, [source]);
+  useEffect(() => {
+    if (!poster) return;
+    let active = true;
+    void imageIsNearBlack(poster).then((nearBlack) => {
+      if (!active) return;
+      if (nearBlack) {
+        if (posterCacheKey) videoPosterCache.delete(posterCacheKey);
+        setDecodedPoster(undefined);
+        const element = video.current;
+        if (element && element.readyState >= HTMLMediaElement.HAVE_METADATA) {
+          element.dataset.thumbnailPrimed = "false";
+          primeVideoFrame(element);
+        }
+        return;
+      }
+      if (posterCacheKey) videoPosterCache.set(posterCacheKey, poster);
+      setDecodedPoster(poster);
+    });
+    return () => { active = false; };
+  }, [poster, posterCacheKey]);
+  const capturePoster = (element: HTMLVideoElement) => {
+    if (decodedPoster || !posterCacheKey || !element.videoWidth || !element.videoHeight) return;
+    try {
+      if (videoFrameIsNearBlack(element)) {
+        const previewTimes = videoPreviewTimes(element.duration);
+        const currentIndex = Number(element.dataset.posterAttempt ?? "0");
+        if (currentIndex < previewTimes.length - 1) {
+          const nextIndex = currentIndex + 1;
+          element.dataset.posterAttempt = String(nextIndex);
+          element.currentTime = previewTimes[nextIndex];
+          return;
+        }
+      }
+      const scale = Math.min(1, 480 / Math.max(element.videoWidth, element.videoHeight));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(element.videoWidth * scale));
+      canvas.height = Math.max(1, Math.round(element.videoHeight * scale));
+      const context = canvas.getContext("2d");
+      if (!context) return;
+      context.drawImage(element, 0, 0, canvas.width, canvas.height);
+      const next = canvas.toDataURL("image/jpeg", 0.68);
+      videoPosterCache.set(posterCacheKey, next);
+      setDecodedPoster(next);
+    } catch {
+      // Some platform codecs disallow canvas capture; the cached file still plays normally.
+    }
+  };
+  const hasDimensions = Boolean(pixelWidth && pixelHeight);
+  const frameStyle = hasDimensions
+    ? {
+        width: `min(${Math.max(1, Math.round(Math.min(pixelWidth!, 420, 480 * (pixelWidth! / pixelHeight!))))}px, 100%)`,
+        aspectRatio: `${pixelWidth} / ${pixelHeight}`,
+      }
+    : undefined;
+  const togglePlayback = () => {
+    const element = video.current;
+    if (!element || !source) return;
+    if (element.paused) void element.play();
+    else element.pause();
+  };
+  const toggleMuted = () => {
+    const element = video.current;
+    if (element) element.muted = !element.muted;
+  };
+  const seek = (value: number) => {
+    const element = video.current;
+    if (!element) return;
+    const nextTime = Math.min(Math.max(value, 0), duration || 0);
+    element.currentTime = nextTime;
+    setCurrentTime(nextTime);
+  };
+  const revealOnRenderedFrame = (element: HTMLVideoElement) => {
+    if (playbackFrameReady) return;
+    if ("requestVideoFrameCallback" in element) {
+      element.requestVideoFrameCallback(() => setPlaybackFrameReady(true));
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => setPlaybackFrameReady(true));
+    });
+  };
+  return <div className={`chat-video ${hasDimensions ? "sized" : ""} ${hasStarted ? "started" : ""}`} style={frameStyle}>
+    <video
+      ref={video}
+      src={source}
+      poster={decodedPoster}
+      width={pixelWidth ?? undefined}
+      height={pixelHeight ?? undefined}
+      muted={muted}
+      playsInline
+      preload="auto"
+      onLoadedMetadata={(event) => {
+        const element = event.currentTarget;
+        setDuration(Number.isFinite(element.duration) ? element.duration : 0);
+        setCurrentTime(element.currentTime);
+        setMuted(element.muted);
+        if (!decodedPoster) primeVideoFrame(element);
+      }}
+      onLoadedData={(event) => capturePoster(event.currentTarget)}
+      onSeeked={(event) => capturePoster(event.currentTarget)}
+      onPlay={() => {
+        setPlaying(true);
+        setHasStarted(true);
+      }}
+      onPlaying={(event) => revealOnRenderedFrame(event.currentTarget)}
+      onPause={() => setPlaying(false)}
+      onEnded={() => setPlaying(false)}
+      onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+      onDurationChange={(event) => setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0)}
+      onVolumeChange={(event) => setMuted(event.currentTarget.muted)}
+      onClick={togglePlayback}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          togglePlayback();
+        }
+      }}
+      tabIndex={0}
+      aria-label="video"
+      title="play or pause video"
+    />
+    {decodedPoster && !playbackFrameReady && <img className="chat-video-poster-cover" src={decodedPoster} alt="" aria-hidden="true" />}
+    {!hasStarted && source && <button type="button" className="chat-video-start" onClick={togglePlayback} aria-label="play video" title="play video"><Play size={25} fill="currentColor" /></button>}
+    <div className="noise-video-controls" aria-label="video controls">
+      <button type="button" className="noise-video-control-button" disabled={!source} onClick={togglePlayback} aria-label={playing ? "pause video" : "play video"} title={playing ? "pause" : "play"}>
+        {playing ? <Pause size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" />}
+      </button>
+      <span className="noise-video-time">{formatVideoTime(currentTime)}</span>
+      <input
+        className="noise-video-scrubber"
+        type="range"
+        min="0"
+        max={duration || 0}
+        step="0.1"
+        value={Math.min(currentTime, duration || 0)}
+        onChange={(event) => seek(Number(event.currentTarget.value))}
+        aria-label="seek video"
+        aria-valuetext={`${formatVideoTime(currentTime)} of ${formatVideoTime(duration)}`}
+        disabled={!source || !duration}
+      />
+      <span className="noise-video-time">{formatVideoTime(duration)}</span>
+      <button type="button" className="noise-video-control-button" disabled={!source} onClick={toggleMuted} aria-label={muted ? "unmute video" : "mute video"} title={muted ? "unmute" : "mute"}>
+        {muted ? <VolumeX size={17} /> : <Volume2 size={17} />}
+      </button>
+    </div>
+  </div>;
+}
+
+function formatVideoTime(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
+  const wholeSeconds = Math.floor(seconds);
+  const minutes = Math.floor(wholeSeconds / 60);
+  return `${minutes}:${String(wholeSeconds % 60).padStart(2, "0")}`;
 }
 
 type MediaMessage = MessageSummary & { attachment: MediaAttachment };
@@ -1572,12 +2275,12 @@ function MediaGalleryDialog({ group, messages, onClose }: { group: GroupSummary;
       {selected ? (
         <div className="gallery-view">
           <button className="gallery-back" onClick={() => setSelected(null)}><ArrowLeft size={14} /> all media</button>
-          <div className="gallery-viewer"><MessageMedia key={selected.event_id} attachment={selected.attachment} /></div>
+          <div className="gallery-viewer"><MessageMedia key={selected.event_id} attachment={selected.attachment} scopeId={group.group_id} /></div>
           <small>shared by @{selected.username} · {formatGalleryDate(selected.created_at_millis)}</small>
         </div>
       ) : media.length ? (
         <div className="media-gallery">
-          {media.map((item) => <GalleryTile key={item.event_id} message={item} onOpen={() => setSelected(item)} />)}
+          {media.map((item) => <GalleryTile key={item.event_id} message={item} scopeId={group.group_id} onOpen={() => setSelected(item)} />)}
         </div>
       ) : (
         <div className="empty-gallery"><Images size={27} /><span>no media has been shared yet</span></div>
@@ -1586,9 +2289,9 @@ function MediaGalleryDialog({ group, messages, onClose }: { group: GroupSummary;
   );
 }
 
-function GalleryTile({ message, onOpen }: { message: MediaMessage; onOpen: () => void }) {
+function GalleryTile({ message, scopeId, onOpen }: { message: MediaMessage; scopeId: string; onOpen: () => void }) {
   const { attachment } = message;
-  const { source, failed } = useMediaSource(attachment);
+  const { source, failed } = useMediaSource(attachment, scopeId);
   const image = attachment.mime_type.startsWith("image/");
   const video = attachment.mime_type.startsWith("video/");
   return (
@@ -2048,11 +2751,8 @@ function ErrorToast({ error, onClose }: { error: string; onClose: () => void }) 
 
 function UpdateBanner({ status, retry, restart, dismiss }: ReturnType<typeof useAutoUpdater>) {
   if (!status) return null;
-  if (status.phase === "downloading") {
-    return <div className="update-banner"><span><strong>Noise {status.version}</strong><small>{status.progress === null ? "downloading update" : `downloading update · ${status.progress}%`}</small></span><div className="update-progress"><i style={{ width: `${status.progress ?? 8}%` }} /></div></div>;
-  }
   if (status.phase === "ready") {
-    return <div className="update-banner ready"><span><strong>Noise {status.version} is ready</strong><small>restart to finish updating</small></span><button onClick={restart}>restart Noise</button></div>;
+    return <div className="update-banner ready"><span><strong>Noise {status.version} is ready</strong><small>{status.restartFailed ? "restart failed · close and reopen Noise" : "update installed · restart when you're ready"}</small></span><button onClick={restart}>{status.restartFailed ? "try restart" : "restart Noise"}</button></div>;
   }
   return <div className="update-banner failed"><span><strong>update failed</strong><small>your current version is still intact</small></span><button onClick={retry}>try again</button><button className="update-dismiss" onClick={dismiss} aria-label="dismiss update"><X size={14} /></button></div>;
 }
@@ -2074,13 +2774,75 @@ function formatGalleryDate(millis: number) {
 function primeVideoFrame(video: HTMLVideoElement) {
   if (video.dataset.thumbnailPrimed === "true") return;
   video.dataset.thumbnailPrimed = "true";
-  video.currentTime = Number.isFinite(video.duration) && video.duration > 0
-    ? Math.min(0.05, video.duration / 2)
-    : 0.001;
+  const previewTimes = videoPreviewTimes(video.duration);
+  video.dataset.posterAttempt = "0";
+  video.currentTime = previewTimes[0] ?? 0.001;
+}
+
+function videoPreviewTimes(duration: number) {
+  if (!Number.isFinite(duration) || duration <= 0) return [];
+  const end = Math.max(0.001, duration - 0.05);
+  return [
+    Math.min(end, Math.max(0.12, Math.min(0.5, duration * 0.03))),
+    Math.min(end, Math.max(0.35, Math.min(1.5, duration * 0.1))),
+    Math.min(end, Math.max(0.7, Math.min(3, duration * 0.2))),
+  ].filter((time, index, times) => index === 0 || Math.abs(time - times[index - 1]) > 0.02);
+}
+
+function videoFrameIsNearBlack(video: HTMLVideoElement) {
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = 24;
+    canvas.height = 24;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    if (!context) return false;
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    let luminance = 0;
+    let brightest = 0;
+    for (let index = 0; index < pixels.length; index += 4) {
+      const value = pixels[index] * 0.2126 + pixels[index + 1] * 0.7152 + pixels[index + 2] * 0.0722;
+      luminance += value;
+      brightest = Math.max(brightest, value);
+    }
+    return luminance / (pixels.length / 4) < 18 && brightest < 48;
+  } catch {
+    return false;
+  }
+}
+
+function imageIsNearBlack(source: string) {
+  return new Promise<boolean>((resolve) => {
+    const image = new Image();
+    image.onload = () => {
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = 24;
+        canvas.height = 24;
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        if (!context) return resolve(false);
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+        let luminance = 0;
+        let brightest = 0;
+        for (let index = 0; index < pixels.length; index += 4) {
+          const value = pixels[index] * 0.2126 + pixels[index + 1] * 0.7152 + pixels[index + 2] * 0.0722;
+          luminance += value;
+          brightest = Math.max(brightest, value);
+        }
+        resolve(luminance / (pixels.length / 4) < 18 && brightest < 48);
+      } catch {
+        resolve(false);
+      }
+    };
+    image.onerror = () => resolve(false);
+    image.src = source;
+  });
 }
 
 async function uploadPendingMedia(pending: PendingMedia | null, action: "upload_media_chunk" | "upload_direct_media_chunk", onProgress: (progress: number) => void): Promise<MediaAttachment | null> {
   if (!pending) return null;
+  const videoPreview = pending.videoPreview;
   const chunks: MediaChunk[] = [];
   const chunkSize = 1024 * 1024;
   for (let offset = 0; offset < pending.file.size; offset += chunkSize) {
@@ -2093,11 +2855,16 @@ async function uploadPendingMedia(pending: PendingMedia | null, action: "upload_
     chunks.push(chunk);
     onProgress(Math.min(100, Math.round(((offset + chunk.byte_length) / pending.file.size) * 100)));
   }
+  const preview = videoPreview ? await videoPreview : null;
   return {
     file_name: pending.name,
     mime_type: pending.mimeType,
     byte_length: pending.byteLength,
     chunks,
+    preview_data_base64: preview?.dataBase64 ?? null,
+    preview_mime_type: preview?.mimeType ?? null,
+    pixel_width: preview?.pixelWidth ?? null,
+    pixel_height: preview?.pixelHeight ?? null,
   };
 }
 

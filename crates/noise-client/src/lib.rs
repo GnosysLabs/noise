@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -22,9 +22,12 @@ use noise_transport::{
 use ohttp::ClientRequest;
 use serde::{Deserialize, Serialize};
 
+mod relay_pool;
+
 #[derive(Clone)]
 pub struct NoiseClient {
     http: reqwest::Client,
+    mask_relays: Vec<RelayDescriptor>,
 }
 
 impl Default for NoiseClient {
@@ -35,6 +38,7 @@ impl Default for NoiseClient {
                 .timeout(std::time::Duration::from_secs(40))
                 .build()
                 .expect("Noise HTTP configuration is valid"),
+            mask_relays: Vec::new(),
         }
     }
 }
@@ -123,6 +127,13 @@ pub struct MessageSummary {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SentMessageResult {
+    pub event_id: String,
+    pub message_id: String,
+    pub created_at_millis: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Conversation {
     pub group: GroupSummary,
     pub members: Vec<MemberSummary>,
@@ -174,10 +185,33 @@ pub struct DirectConversation {
     pub messages: Vec<DirectMessageSummary>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DirectInbox {
+    pub summary: LocalSummary,
+    pub conversations: Vec<DirectConversation>,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct GroupWatch {
     pub revision: u64,
     pub changed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReplyNotificationSummary {
+    pub event_id: String,
+    pub group_id: String,
+    pub group_name: String,
+    pub username: String,
+    pub text: String,
+    pub attachment_mime_type: Option<String>,
+    pub created_at_millis: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReplyNotificationSnapshot {
+    pub group_id: String,
+    pub replies: Vec<ReplyNotificationSummary>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -226,6 +260,8 @@ struct ClientState {
     #[serde(default)]
     direct_latest_incoming: HashMap<String, DirectMessageMarker>,
     #[serde(default)]
+    direct_latest_activity: HashMap<String, DirectMessageMarker>,
+    #[serde(default)]
     direct_read_through: HashMap<String, DirectMessageMarker>,
     #[serde(default)]
     group_frequencies: HashMap<String, String>,
@@ -257,6 +293,8 @@ struct AccountVaultContents {
     direct_closed_periods: Vec<DirectClosedPeriod>,
     #[serde(default)]
     direct_read_through: HashMap<String, DirectMessageMarker>,
+    #[serde(default)]
+    direct_latest_activity: HashMap<String, DirectMessageMarker>,
     group_frequencies: HashMap<String, String>,
     next_author_sequence: u64,
 }
@@ -361,6 +399,7 @@ impl ClientState {
             direct_deleted_before: self.direct_deleted_before.clone(),
             direct_closed_periods: self.direct_closed_periods.clone(),
             direct_read_through: self.direct_read_through.clone(),
+            direct_latest_activity: self.direct_latest_activity.clone(),
             group_frequencies: self.group_frequencies.clone(),
             next_author_sequence: self.next_author_sequence,
         }
@@ -382,6 +421,7 @@ impl ClientState {
             direct_deleted_before: contents.direct_deleted_before,
             direct_closed_periods: contents.direct_closed_periods,
             direct_latest_incoming: HashMap::new(),
+            direct_latest_activity: contents.direct_latest_activity,
             direct_read_through: contents.direct_read_through,
             group_frequencies: contents.group_frequencies,
             next_author_sequence: contents.next_author_sequence,
@@ -500,20 +540,28 @@ impl ClientState {
                     is_active: self.active_group_id.as_deref() == Some(&group.group_id),
                 })
                 .collect(),
-            directs: self
-                .direct_contacts
-                .iter()
-                .map(|contact| DirectSummary {
-                    public_key: contact.public_key.clone(),
-                    username: contact.username.clone(),
-                    bio: contact.bio.clone(),
-                    avatar: contact.avatar.clone(),
-                    accepts_direct_messages: contact.accepts_direct_messages,
-                    is_active: self.active_direct_public_key.as_deref()
-                        == Some(&contact.public_key),
-                    has_unread: self.direct_has_unread(&contact.public_key),
-                })
-                .collect(),
+            directs: {
+                let mut contacts = self.direct_contacts.iter().collect::<Vec<_>>();
+                contacts.sort_by(|left, right| {
+                    self.direct_latest_activity
+                        .get(&right.public_key)
+                        .cmp(&self.direct_latest_activity.get(&left.public_key))
+                        .then_with(|| left.public_key.cmp(&right.public_key))
+                });
+                contacts
+                    .into_iter()
+                    .map(|contact| DirectSummary {
+                        public_key: contact.public_key.clone(),
+                        username: contact.username.clone(),
+                        bio: contact.bio.clone(),
+                        avatar: contact.avatar.clone(),
+                        accepts_direct_messages: contact.accepts_direct_messages,
+                        is_active: self.active_direct_public_key.as_deref()
+                            == Some(&contact.public_key),
+                        has_unread: self.direct_has_unread(&contact.public_key),
+                    })
+                    .collect()
+            },
             known_people: self
                 .known_people
                 .iter()
@@ -532,6 +580,29 @@ impl ClientState {
 }
 
 impl NoiseClient {
+    pub fn with_mask_relays(relays: Vec<String>) -> anyhow::Result<Self> {
+        let mut client = Self::default();
+        for value in relays.into_iter().take(16) {
+            let relay = RelayDescriptor::parse(&value)?;
+            if !client
+                .mask_relays
+                .iter()
+                .any(|current| current.base_url == relay.base_url)
+            {
+                client.mask_relays.push(relay);
+            }
+        }
+        Ok(client)
+    }
+
+    pub async fn discover_relay_masks(
+        &self,
+        cache_path: impl AsRef<Path>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<Vec<String>> {
+        relay_pool::discover(cache_path.as_ref(), relays).await
+    }
+
     pub async fn initialize(
         &self,
         path: impl AsRef<Path>,
@@ -595,6 +666,7 @@ impl NoiseClient {
             direct_deleted_before: HashMap::new(),
             direct_closed_periods: Vec::new(),
             direct_latest_incoming: HashMap::new(),
+            direct_latest_activity: HashMap::new(),
             direct_read_through: HashMap::new(),
             group_frequencies: HashMap::new(),
             next_author_sequence: 0,
@@ -737,6 +809,80 @@ impl NoiseClient {
         let group = state.active_group()?;
         self.watch_id(&group.group_id, since, relay_list(relays)?)
             .await
+    }
+
+    pub async fn watch_group_id(
+        &self,
+        path: impl AsRef<Path>,
+        group_id: &str,
+        since: Option<u64>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<GroupWatch> {
+        let state = load_state(path.as_ref())?;
+        let group = state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .context("unknown group")?;
+        self.watch_id(&group.group_id, since, relay_list(relays)?)
+            .await
+    }
+
+    pub async fn reply_notification_snapshot(
+        &self,
+        path: impl AsRef<Path>,
+        group_id: &str,
+        relays: Vec<String>,
+    ) -> anyhow::Result<ReplyNotificationSnapshot> {
+        let state = load_state(path.as_ref())?;
+        let group = state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .cloned()
+            .context("unknown group")?;
+        let identity_public_key = state.identity()?.public_key_base64();
+        let events = self.fetch_events(&group, relay_list(relays)?).await?;
+        let view = GroupState::rebuild(&group, &events);
+        let own_message_ids = view
+            .messages
+            .iter()
+            .filter(|message| message.author_public_key == identity_public_key)
+            .map(|message| message.message_id.clone())
+            .collect::<HashSet<_>>();
+        let group_name = view.profile.name.clone();
+        let mut replies = view
+            .messages
+            .iter()
+            .filter(|message| message.author_public_key != identity_public_key)
+            .filter(|message| {
+                message
+                    .reply_to_message_id
+                    .as_ref()
+                    .is_some_and(|message_id| own_message_ids.contains(message_id))
+            })
+            .map(|message| ReplyNotificationSummary {
+                event_id: message.event_id.clone(),
+                group_id: group.group_id.clone(),
+                group_name: group_name.clone(),
+                username: message.username.clone(),
+                text: message.text.clone(),
+                attachment_mime_type: message
+                    .attachment
+                    .as_ref()
+                    .map(|attachment| attachment.mime_type.clone()),
+                created_at_millis: message.created_at_millis,
+            })
+            .collect::<Vec<_>>();
+        replies.sort_by(|left, right| {
+            left.created_at_millis
+                .cmp(&right.created_at_millis)
+                .then_with(|| left.event_id.cmp(&right.event_id))
+        });
+        Ok(ReplyNotificationSnapshot {
+            group_id: group.group_id,
+            replies,
+        })
     }
 
     pub async fn watch_account(
@@ -1395,6 +1541,72 @@ impl NoiseClient {
         state.summary()
     }
 
+    pub async fn direct_inbox(
+        &self,
+        path: impl AsRef<Path>,
+        cache_path: impl AsRef<Path>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<DirectInbox> {
+        let path = path.as_ref();
+        let (state, messages) = self
+            .sync_direct_inbox(path, cache_path.as_ref(), relay_list(relays)?)
+            .await?;
+        let identity = state.identity()?;
+        let mut messages_by_contact = HashMap::<String, Vec<DirectMessageSummary>>::new();
+        for message in messages {
+            messages_by_contact
+                .entry(message.counterparty_public_key)
+                .or_default()
+                .push(message.message);
+        }
+        let conversations = state
+            .direct_contacts
+            .iter()
+            .map(|contact| {
+                Ok(DirectConversation {
+                    contact: direct_summary(
+                        contact,
+                        state.active_direct_public_key.as_deref() == Some(&contact.public_key),
+                        state.direct_has_unread(&contact.public_key),
+                    ),
+                    media_scope_id: identity.direct_scope_id(&contact.public_key)?,
+                    messages: messages_by_contact
+                        .remove(&contact.public_key)
+                        .unwrap_or_default(),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(DirectInbox {
+            summary: state.summary()?,
+            conversations,
+        })
+    }
+
+    pub fn mark_direct_read(
+        &self,
+        path: impl AsRef<Path>,
+        public_key: &str,
+    ) -> anyhow::Result<LocalSummary> {
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        if !state
+            .direct_contacts
+            .iter()
+            .any(|contact| contact.public_key == public_key)
+        {
+            bail!("unknown direct conversation")
+        }
+        if let Some(latest) = state.direct_latest_incoming.get(public_key).cloned()
+            && state.direct_read_through.get(public_key) != Some(&latest)
+        {
+            state
+                .direct_read_through
+                .insert(public_key.to_owned(), latest);
+            save_state(path, &state)?;
+        }
+        state.summary()
+    }
+
     pub async fn direct_conversation(
         &self,
         path: impl AsRef<Path>,
@@ -1420,9 +1632,6 @@ impl NoiseClient {
             && state.direct_read_through.get(&public_key) != Some(&latest)
         {
             state.direct_read_through.insert(public_key.clone(), latest);
-            if state.account.is_some() {
-                self.publish_account_state(&mut state, &relays).await?;
-            }
             save_state(path, &state)?;
         }
         Ok(DirectConversation {
@@ -1454,7 +1663,7 @@ impl NoiseClient {
         attachment: Option<MediaAttachment>,
         reply_to_message_id: Option<String>,
         relays: Vec<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SentMessageResult> {
         let path = path.as_ref();
         let mut state = load_state(path)?;
         let text = text.into();
@@ -1508,11 +1717,25 @@ impl NoiseClient {
             reply_to_message_id,
             sequence,
         )?;
+        let sent = SentMessageResult {
+            event_id: sender_event.event_id.clone(),
+            message_id: direct_message_id(&self_public_key, sequence),
+            created_at_millis: sender_event.created_at_millis,
+        };
         let relays = relay_list(relays)?;
         self.publish_event(&relays, &recipient_event).await?;
         self.publish_event(&relays, &sender_event).await?;
+        let marker = DirectMessageMarker {
+            created_at_millis: sender_event.created_at_millis,
+            event_id: sender_event.event_id,
+        };
+        state
+            .direct_latest_activity
+            .entry(contact.public_key)
+            .and_modify(|latest| *latest = latest.clone().max(marker.clone()))
+            .or_insert(marker);
         save_state(path, &state)?;
-        Ok(())
+        Ok(sent)
     }
 
     pub async fn upload_direct_media_chunk(
@@ -1602,6 +1825,7 @@ impl NoiseClient {
             .direct_contacts
             .retain(|candidate| candidate.public_key != contact.public_key);
         state.direct_latest_incoming.remove(&contact.public_key);
+        state.direct_latest_activity.remove(&contact.public_key);
         state.direct_read_through.remove(&contact.public_key);
         state.active_direct_public_key = state
             .direct_contacts
@@ -1616,7 +1840,7 @@ impl NoiseClient {
         path: impl AsRef<Path>,
         text: impl Into<String>,
         relays: Vec<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SentMessageResult> {
         self.send_message(path.as_ref(), text.into(), None, None, relays)
             .await
     }
@@ -1627,7 +1851,7 @@ impl NoiseClient {
         text: impl Into<String>,
         reply_to_message_id: Option<String>,
         relays: Vec<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SentMessageResult> {
         self.send_message(
             path.as_ref(),
             text.into(),
@@ -1644,7 +1868,7 @@ impl NoiseClient {
         text: impl Into<String>,
         attachment: MediaAttachment,
         relays: Vec<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SentMessageResult> {
         validate_media_reference(&attachment)?;
         self.send_message(path.as_ref(), text.into(), Some(attachment), None, relays)
             .await
@@ -1657,7 +1881,7 @@ impl NoiseClient {
         attachment: MediaAttachment,
         reply_to_message_id: Option<String>,
         relays: Vec<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SentMessageResult> {
         validate_media_reference(&attachment)?;
         self.send_message(
             path.as_ref(),
@@ -1676,7 +1900,7 @@ impl NoiseClient {
         attachment: Option<MediaAttachment>,
         reply_to_message_id: Option<String>,
         relays: Vec<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SentMessageResult> {
         if text.trim().is_empty() && attachment.is_none() {
             bail!("message cannot be empty")
         }
@@ -1703,9 +1927,14 @@ impl NoiseClient {
                 sequence,
             )?
         };
+        let sent = SentMessageResult {
+            event_id: event.event_id.clone(),
+            message_id: event.event_id.clone(),
+            created_at_millis: event.created_at_millis,
+        };
         self.publish_event(&relays, &event).await?;
         save_state(path, &state)?;
-        Ok(())
+        Ok(sent)
     }
 
     pub async fn set_moderator(
@@ -2257,6 +2486,7 @@ impl NoiseClient {
         let active_before = state.active_direct_public_key.clone();
         let deletions_before = state.direct_deleted_before.clone();
         let latest_incoming_before = state.direct_latest_incoming.clone();
+        let latest_activity_before = state.direct_latest_activity.clone();
         let decoded = events
             .iter()
             .filter_map(|event| decrypt_direct_event(&identity, &state, event))
@@ -2289,6 +2519,7 @@ impl NoiseClient {
         for public_key in &newly_deleted {
             purge_scope_cache(cache_path, &identity.direct_scope_id(public_key)?)?;
             state.direct_latest_incoming.remove(public_key);
+            state.direct_latest_activity.remove(public_key);
             state.direct_read_through.remove(public_key);
         }
         state
@@ -2321,11 +2552,16 @@ impl NoiseClient {
         });
         for message in &messages {
             state.remember_direct(message.contact.clone());
+            let marker = DirectMessageMarker {
+                created_at_millis: message.message.created_at_millis,
+                event_id: message.message.event_id.clone(),
+            };
+            state
+                .direct_latest_activity
+                .entry(message.counterparty_public_key.clone())
+                .and_modify(|latest| *latest = latest.clone().max(marker.clone()))
+                .or_insert_with(|| marker.clone());
             if message.message.author_public_key != self_public_key {
-                let marker = DirectMessageMarker {
-                    created_at_millis: message.message.created_at_millis,
-                    event_id: message.message.event_id.clone(),
-                };
                 state
                     .direct_latest_incoming
                     .entry(message.counterparty_public_key.clone())
@@ -2355,6 +2591,7 @@ impl NoiseClient {
             || state.active_direct_public_key != active_before
             || state.direct_deleted_before != deletions_before
             || state.direct_latest_incoming != latest_incoming_before
+            || state.direct_latest_activity != latest_activity_before
         {
             save_state(path, &state)?;
         }
@@ -2708,9 +2945,15 @@ impl NoiseClient {
         let storage = relays
             .get(storage_index)
             .context("relay index is invalid")?;
-        let mask = (1..relays.len())
-            .map(|offset| &relays[(storage_index + offset) % relays.len()])
-            .find(|candidate| candidate.base_url != storage.base_url);
+        let mask = self
+            .mask_relays
+            .iter()
+            .find(|candidate| candidate.base_url != storage.base_url)
+            .or_else(|| {
+                (1..relays.len())
+                    .map(|offset| &relays[(storage_index + offset) % relays.len()])
+                    .find(|candidate| candidate.base_url != storage.base_url)
+            });
         if let (Some(config), Some(mask)) = (storage.ohttp_config.as_deref(), mask) {
             return self
                 .oblivious_request(storage, mask, config, method, path, body)
@@ -2748,8 +2991,16 @@ impl NoiseClient {
             .encapsulate(&request)
             .context("could not seal private relay request")?;
         let endpoint = format!("{}{OHTTP_RELAY_PATH}", mask.base_url);
-        let response = self
-            .http
+        let http = if self
+            .mask_relays
+            .iter()
+            .any(|candidate| candidate.base_url == mask.base_url)
+        {
+            relay_pool::client_for_mask(&mask.base_url).await?
+        } else {
+            self.http.clone()
+        };
+        let response = http
             .post(endpoint)
             .header(reqwest::header::CONTENT_TYPE, OHTTP_REQUEST_MEDIA_TYPE)
             .header(GATEWAY_HEADER, &storage.base_url)
@@ -3116,6 +3367,23 @@ fn validate_media_reference(media: &MediaAttachment) -> anyhow::Result<()> {
     }
     if byte_length != media.byte_length {
         bail!("media chunk sizes do not match the manifest")
+    }
+    match (
+        media.preview_data_base64.as_deref(),
+        media.preview_mime_type.as_deref(),
+        media.pixel_width,
+        media.pixel_height,
+    ) {
+        (None, None, None, None) => {}
+        (Some(data), Some("image/jpeg"), Some(width), Some(height))
+            if media.mime_type.starts_with("video/")
+                && !data.is_empty()
+                && data.len() <= 80_000
+                && width > 0
+                && width <= 16_384
+                && height > 0
+                && height <= 16_384 => {}
+        _ => bail!("media has an invalid preview"),
     }
     Ok(())
 }

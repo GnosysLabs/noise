@@ -408,6 +408,14 @@ pub struct MediaAttachment {
     pub mime_type: String,
     pub byte_length: u64,
     pub chunks: Vec<MediaChunk>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_data_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pixel_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pixel_height: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1723,6 +1731,28 @@ fn valid_media(media: &MediaAttachment) -> bool {
             .map(|chunk| u64::from(chunk.byte_length))
             .sum::<u64>()
             == media.byte_length
+        && valid_media_preview(media)
+}
+
+fn valid_media_preview(media: &MediaAttachment) -> bool {
+    match (
+        media.preview_data_base64.as_deref(),
+        media.preview_mime_type.as_deref(),
+        media.pixel_width,
+        media.pixel_height,
+    ) {
+        (None, None, None, None) => true,
+        (Some(data), Some("image/jpeg"), Some(width), Some(height)) => {
+            media.mime_type.starts_with("video/")
+                && !data.is_empty()
+                && data.len() <= 80_000
+                && width > 0
+                && width <= 16_384
+                && height > 0
+                && height <= 16_384
+        }
+        _ => false,
+    }
 }
 
 fn valid_message_id(message_id: &str) -> bool {

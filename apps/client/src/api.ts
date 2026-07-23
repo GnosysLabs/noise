@@ -21,14 +21,43 @@ export const relays = configuredRelays?.length ? configuredRelays : defaultRelay
 export const isTauri = "__TAURI_INTERNALS__" in window;
 document.documentElement.dataset.runtime = isTauri ? "tauri" : "browser";
 
+let relayDiscoveryStarted = false;
+let maskRelays: string[] = [];
+let maskRelayOffset = 0;
+
+function rotateMaskRelays() {
+  if (maskRelays.length < 2) return maskRelays;
+  const offset = maskRelayOffset++ % maskRelays.length;
+  return [...maskRelays.slice(offset), ...maskRelays.slice(0, offset)];
+}
+
+function startRelayDiscovery() {
+  if (!isTauri || relayDiscoveryStarted) return;
+  relayDiscoveryStarted = true;
+  void (async () => {
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const response = await invoke<Envelope<string[]>>("noise_invoke", {
+        request: { action: "discover_relay_masks", relays },
+      });
+      if (response.ok && response.data) maskRelays = response.data;
+    } catch {
+      // The pinned seed relays remain the privacy fallback.
+    }
+  })();
+}
+
 export async function noise<T>(request: NoiseRequest): Promise<T | null> {
   if (!isTauri) {
     throw new Error(
       "The browser protocol adapter is not connected yet. The shared interface is ready for its WASM core.",
     );
   }
+  startRelayDiscovery();
   const { invoke } = await import("@tauri-apps/api/core");
-  const response = await invoke<Envelope<T>>("noise_invoke", { request });
+  const response = await invoke<Envelope<T>>("noise_invoke", {
+    request: { ...request, mask_relays: rotateMaskRelays() },
+  });
   if (!response.ok) throw new Error(response.error ?? "unknown Noise core error");
   return response.data ?? null;
 }

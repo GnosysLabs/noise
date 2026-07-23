@@ -67,6 +67,10 @@ export type MediaAttachment = {
   mime_type: string;
   byte_length: number;
   chunks: MediaChunk[];
+  preview_data_base64?: string | null;
+  preview_mime_type?: string | null;
+  pixel_width?: number | null;
+  pixel_height?: number | null;
 };
 
 export type MessageSummary = {
@@ -81,6 +85,11 @@ export type MessageSummary = {
   attachment: MediaAttachment | null;
   reply_to_message_id: string | null;
   created_at_millis: number;
+  optimistic?: boolean;
+  local_attachment?: {
+    preview_url: string;
+    mime_type: string;
+  };
 };
 
 export type Conversation = {
@@ -122,6 +131,17 @@ export type DirectMessageSummary = {
   attachment: MediaAttachment | null;
   reply_to_message_id: string | null;
   created_at_millis: number;
+  optimistic?: boolean;
+  local_attachment?: {
+    preview_url: string;
+    mime_type: string;
+  };
+};
+
+export type SentMessageResult = {
+  event_id: string;
+  message_id: string;
+  created_at_millis: number;
 };
 
 export type DirectConversation = {
@@ -130,9 +150,29 @@ export type DirectConversation = {
   messages: DirectMessageSummary[];
 };
 
+export type DirectInbox = {
+  summary: LocalSummary;
+  conversations: DirectConversation[];
+};
+
 export type GroupWatch = {
   revision: number;
   changed: boolean;
+};
+
+export type ReplyNotificationSummary = {
+  event_id: string;
+  group_id: string;
+  group_name: string;
+  username: string;
+  text: string;
+  attachment_mime_type: string | null;
+  created_at_millis: number;
+};
+
+export type ReplyNotificationSnapshot = {
+  group_id: string;
+  replies: ReplyNotificationSummary[];
 };
 
 export type MakeResult = {

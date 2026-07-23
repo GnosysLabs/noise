@@ -1,3 +1,5 @@
+mod discovery;
+mod identity;
 mod privacy;
 mod store;
 
@@ -6,7 +8,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, bail};
@@ -24,8 +26,8 @@ use noise_core::{
 };
 use noise_transport::{
     GATEWAY_HEADER, OHTTP_GATEWAY_PATH, OHTTP_KEYS_MEDIA_TYPE, OHTTP_KEYS_PATH, OHTTP_RELAY_PATH,
-    OHTTP_REQUEST_MEDIA_TYPE, OHTTP_RESPONSE_MEDIA_TYPE, PlainRequest, RelayDescriptor,
-    encode_response,
+    OHTTP_REQUEST_MEDIA_TYPE, OHTTP_RESPONSE_MEDIA_TYPE, PlainRequest, RELAY_DIRECTORY_PATH,
+    RelayDescriptor, SIGNED_RELAY_DESCRIPTOR_PATH, SignedRelayDescriptor, encode_response,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -35,8 +37,16 @@ use tokio::{
 };
 use tower_http::cors::CorsLayer;
 
+use discovery::{
+    AnnouncementLimiter, RelayDirectory, announce_relay, client_for_verified_relay,
+    fetch_relay_directory, verify_relay_reachability,
+};
+use identity::RelayIdentity;
 use privacy::PrivacyGateway;
 use store::DurableStore;
+
+const MAX_DISCOVERY_TARGETS_PER_ROUND: usize = 8;
+const MAX_DISCOVERED_RELAYS_PER_TARGET: usize = 16;
 
 #[derive(Debug, Parser)]
 #[command(name = "noise-relay", about = "An untrusted Noise protocol relay")]
@@ -51,6 +61,10 @@ struct Args {
     public_url: Option<String>,
     #[arg(long)]
     mask_target: Vec<String>,
+    #[arg(long)]
+    bootstrap_relay: Vec<String>,
+    #[arg(long, default_value_t = 30)]
+    discovery_interval_seconds: u64,
 }
 
 #[derive(Clone)]
@@ -68,6 +82,12 @@ struct AppState {
     client: reqwest::Client,
     store: DurableStore,
     privacy: PrivacyGateway,
+    relay_identity: RelayIdentity,
+    relay_directory: RelayDirectory,
+    announcement_limiter: AnnouncementLimiter,
+    bootstrap_relays: Arc<Vec<String>>,
+    discovery_interval: Duration,
+    allow_local_discovery: bool,
     mask_targets: Arc<HashSet<String>>,
     public_url: Option<String>,
 }
@@ -118,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from("relay-data").join(args.listen.port().to_string()));
     let (store, recovered) = DurableStore::open(&data_directory).await?;
     let privacy = PrivacyGateway::open(&data_directory)?;
+    let relay_identity = RelayIdentity::open(&data_directory)?;
     let public_url = args
         .public_url
         .map(|url| RelayDescriptor::parse(&url).map(|descriptor| descriptor.base_url))
@@ -138,6 +159,22 @@ async fn main() -> anyhow::Result<()> {
         .into_iter()
         .map(|peer| peer.trim_end_matches('/').to_owned())
         .collect::<Vec<_>>();
+    let mut bootstrap_relays = args
+        .bootstrap_relay
+        .iter()
+        .map(|relay| RelayDescriptor::parse(relay).map(|descriptor| descriptor.base_url))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    bootstrap_relays.sort();
+    bootstrap_relays.dedup();
+    if let Some(public_url) = public_url.as_ref() {
+        bootstrap_relays.retain(|relay| relay != public_url);
+    }
+    let allow_local_discovery = public_url
+        .as_ref()
+        .map(|url| RelayDescriptor::parse(url).map(|descriptor| descriptor.is_local()))
+        .transpose()?
+        .unwrap_or(false);
+    let relay_directory = RelayDirectory::new(recovered.relay_descriptors, store.clone());
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(40))
@@ -157,6 +194,12 @@ async fn main() -> anyhow::Result<()> {
         client,
         store,
         privacy,
+        relay_identity,
+        relay_directory,
+        announcement_limiter: AnnouncementLimiter::new(),
+        bootstrap_relays: Arc::new(bootstrap_relays),
+        discovery_interval: Duration::from_secs(args.discovery_interval_seconds.max(1)),
+        allow_local_discovery,
         mask_targets: Arc::new(mask_targets),
         public_url: public_url.clone(),
     };
@@ -180,6 +223,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/snapshot", get(snapshot))
         .route(OHTTP_KEYS_PATH, get(ohttp_keys))
         .route("/v1/relay-descriptor", get(relay_descriptor))
+        .route(SIGNED_RELAY_DESCRIPTOR_PATH, get(signed_relay_descriptor))
+        .route(
+            RELAY_DIRECTORY_PATH,
+            get(get_relay_directory).post(announce_relay_descriptor),
+        )
         .route(OHTTP_GATEWAY_PATH, post(ohttp_gateway))
         .route(OHTTP_RELAY_PATH, post(ohttp_relay))
         // Relays only accept public invitations and signed, encrypted objects;
@@ -191,11 +239,17 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("could not bind relay to {}", args.listen))?;
+    tokio::spawn(relay_discovery_loop(state.clone()));
     println!(
         "noise relay listening on http://{} with {} peer(s); durable data at {}",
         args.listen,
         state.peers.len(),
         state.store.path().display()
+    );
+    println!("relay identity: {}", state.relay_identity.relay_id());
+    println!(
+        "relay discovery has {} bootstrap(s)",
+        state.bootstrap_relays.len()
     );
     if let Some(public_url) = public_url {
         println!(
@@ -459,6 +513,123 @@ async fn relay_descriptor(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+async fn signed_relay_descriptor(State(state): State<AppState>) -> Response {
+    let Some(public_url) = state.public_url.as_deref() else {
+        return (StatusCode::NOT_FOUND, "relay public URL is not configured").into_response();
+    };
+    let now = match unix_seconds() {
+        Ok(now) => now,
+        Err(error) => {
+            eprintln!("could not read system clock: {error:#}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "system clock is before the Unix epoch",
+            )
+                .into_response();
+        }
+    };
+    match state
+        .relay_identity
+        .signed_descriptor(public_url, state.privacy.public_config(), now)
+    {
+        Ok(descriptor) => Json(descriptor).into_response(),
+        Err(error) => {
+            eprintln!("could not create signed relay descriptor: {error:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not create signed relay descriptor",
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn get_relay_directory(State(state): State<AppState>) -> Response {
+    let Some(public_url) = state.public_url.as_deref() else {
+        return (StatusCode::NOT_FOUND, "relay public URL is not configured").into_response();
+    };
+    let now = match unix_seconds() {
+        Ok(now) => now,
+        Err(error) => {
+            eprintln!("could not read system clock: {error:#}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "system clock is before the Unix epoch",
+            )
+                .into_response();
+        }
+    };
+    let own =
+        match state
+            .relay_identity
+            .signed_descriptor(public_url, state.privacy.public_config(), now)
+        {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                eprintln!("could not create signed relay descriptor: {error:#}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not create signed relay descriptor",
+                )
+                    .into_response();
+            }
+        };
+    let mut descriptors = state.relay_directory.list(now).await;
+    descriptors.retain(|descriptor| descriptor.relay_id != own.relay_id);
+    descriptors.push(own);
+    descriptors.sort_by(|left, right| left.relay_id.cmp(&right.relay_id));
+    Json(descriptors).into_response()
+}
+
+async fn announce_relay_descriptor(
+    State(state): State<AppState>,
+    Json(announced): Json<SignedRelayDescriptor>,
+) -> Response {
+    let now = match unix_seconds() {
+        Ok(now) => now,
+        Err(error) => {
+            eprintln!("could not read system clock: {error:#}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "system clock is before the Unix epoch",
+            )
+                .into_response();
+        }
+    };
+    if announced.relay_id == state.relay_identity.relay_id() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let Some(_permit) = state.announcement_limiter.begin().await else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "relay announcement verification is busy",
+        )
+            .into_response();
+    };
+    let reachable =
+        match verify_relay_reachability(&announced, now, state.allow_local_discovery).await {
+            Ok(descriptor) => descriptor,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    "relay could not prove public reachability",
+                )
+                    .into_response();
+            }
+        };
+    match state.relay_directory.insert(reachable, now).await {
+        Ok(_) => StatusCode::ACCEPTED.into_response(),
+        Err(error) => {
+            eprintln!("could not store relay announcement: {error:#}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "relay directory is unavailable",
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn ohttp_gateway(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if !has_media_type(&headers, OHTTP_REQUEST_MEDIA_TYPE) {
         return (
@@ -504,12 +675,37 @@ async fn ohttp_relay(State(state): State<AppState>, headers: HeaderMap, body: By
     else {
         return (StatusCode::BAD_REQUEST, "privacy gateway is missing").into_response();
     };
-    if !state.mask_targets.contains(target) {
+    let configured_target = state.mask_targets.contains(target);
+    let discovered_target = if configured_target {
+        false
+    } else {
+        let Ok(now) = unix_seconds() else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "system clock is before the Unix epoch",
+            )
+                .into_response();
+        };
+        state
+            .relay_directory
+            .descriptor_for_base_url(target, now)
+            .await
+            .is_some()
+    };
+    if !configured_target && !discovered_target {
         return (StatusCode::FORBIDDEN, "privacy gateway is not allowed").into_response();
     }
     let endpoint = format!("{target}{OHTTP_GATEWAY_PATH}");
-    let Ok(response) = state
-        .client
+    let client = if configured_target {
+        state.client.clone()
+    } else {
+        let Ok(client) = client_for_verified_relay(target, state.allow_local_discovery).await
+        else {
+            return (StatusCode::BAD_GATEWAY, "privacy gateway is unavailable").into_response();
+        };
+        client
+    };
+    let Ok(response) = client
         .post(endpoint)
         .header(CONTENT_TYPE.as_str(), OHTTP_REQUEST_MEDIA_TYPE)
         .body(body)
@@ -1265,6 +1461,72 @@ async fn gossip_group_deletion(state: AppState, deletion: GroupDeletion) {
     }
 }
 
+async fn relay_discovery_loop(state: AppState) {
+    let Some(public_url) = state.public_url.as_deref() else {
+        return;
+    };
+    sleep(Duration::from_millis(250)).await;
+    loop {
+        let Ok(now) = unix_seconds() else {
+            sleep(state.discovery_interval).await;
+            continue;
+        };
+        let Ok(own) =
+            state
+                .relay_identity
+                .signed_descriptor(public_url, state.privacy.public_config(), now)
+        else {
+            sleep(state.discovery_interval).await;
+            continue;
+        };
+        let known = state.relay_directory.list(now).await;
+        let mut seen = HashSet::new();
+        let mut targets = Vec::new();
+        for target in state.bootstrap_relays.iter() {
+            if target != public_url && seen.insert(target.clone()) {
+                targets.push(target.clone());
+            }
+        }
+        if !known.is_empty() {
+            let start = (now / state.discovery_interval.as_secs()) as usize % known.len();
+            for offset in 0..known.len().min(MAX_DISCOVERY_TARGETS_PER_ROUND) {
+                let target = &known[(start + offset) % known.len()].base_url;
+                if target != public_url && seen.insert(target.clone()) {
+                    targets.push(target.clone());
+                }
+            }
+        }
+
+        for target in targets {
+            let _ = announce_relay(&target, &own, state.allow_local_discovery).await;
+            let Ok(descriptors) =
+                fetch_relay_directory(&target, now, state.allow_local_discovery).await
+            else {
+                continue;
+            };
+            if descriptors.is_empty() {
+                continue;
+            }
+            let start = now as usize % descriptors.len();
+            for offset in 0..descriptors.len().min(MAX_DISCOVERED_RELAYS_PER_TARGET) {
+                let announced = &descriptors[(start + offset) % descriptors.len()];
+                if announced.relay_id == own.relay_id {
+                    continue;
+                }
+                let Ok(reachable) =
+                    verify_relay_reachability(announced, now, state.allow_local_discovery).await
+                else {
+                    continue;
+                };
+                if let Err(error) = state.relay_directory.insert(reachable, now).await {
+                    eprintln!("could not persist discovered relay: {error:#}");
+                }
+            }
+        }
+        sleep(state.discovery_interval).await;
+    }
+}
+
 async fn anti_entropy_loop(state: AppState) {
     loop {
         for peer in state.peers.iter() {
@@ -1348,4 +1610,11 @@ async fn anti_entropy_loop(state: AppState) {
         }
         sleep(Duration::from_secs(2)).await;
     }
+}
+
+fn unix_seconds() -> anyhow::Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs())
 }

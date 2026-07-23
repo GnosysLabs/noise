@@ -9,6 +9,7 @@ use anyhow::{Context, anyhow};
 use noise_core::{
     AccountVault, EncryptedBlob, GroupDeletion, InviteRecord, InviteRotation, SignedEvent,
 };
+use noise_transport::SignedRelayDescriptor;
 use serde::Serialize;
 use turso::{Builder, Connection, params};
 
@@ -19,6 +20,7 @@ pub struct RecoveredState {
     pub events: HashMap<String, SignedEvent>,
     pub blobs: HashMap<String, EncryptedBlob>,
     pub deletions: HashMap<String, GroupDeletion>,
+    pub relay_descriptors: HashMap<String, SignedRelayDescriptor>,
 }
 
 #[derive(Clone)]
@@ -49,11 +51,16 @@ impl DurableStore {
                  object_id TEXT NOT NULL,
                  payload TEXT NOT NULL,
                  PRIMARY KEY (kind, object_id)
+             );
+             CREATE TABLE IF NOT EXISTS relay_directory (
+                 relay_id TEXT PRIMARY KEY,
+                 descriptor TEXT NOT NULL
              );",
             )
             .await?;
 
-        let recovered = recover(&connection).await?;
+        let mut recovered = recover(&connection).await?;
+        recovered.relay_descriptors = recover_relay_descriptors(&connection).await?;
         Ok((
             Self {
                 connection,
@@ -95,6 +102,24 @@ impl DurableStore {
                     "account",
                     vault.locator.clone(),
                     serde_json::to_string(vault)?
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn upsert_relay_descriptor(
+        &self,
+        descriptor: &SignedRelayDescriptor,
+    ) -> anyhow::Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO relay_directory (relay_id, descriptor)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(relay_id) DO UPDATE SET descriptor = excluded.descriptor",
+                params![
+                    descriptor.relay_id.clone(),
+                    serde_json::to_string(descriptor)?
                 ],
             )
             .await?;
@@ -325,5 +350,33 @@ async fn recover(connection: &Connection) -> anyhow::Result<RecoveredState> {
         events,
         blobs,
         deletions,
+        relay_descriptors: HashMap::new(),
     })
+}
+
+async fn recover_relay_descriptors(
+    connection: &Connection,
+) -> anyhow::Result<HashMap<String, SignedRelayDescriptor>> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    let mut descriptors = HashMap::new();
+    let mut rows = connection
+        .query(
+            "SELECT relay_id, descriptor FROM relay_directory ORDER BY relay_id",
+            (),
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        let relay_id: String = row.get(0)?;
+        let payload: String = row.get(1)?;
+        let Ok(descriptor) = serde_json::from_str::<SignedRelayDescriptor>(&payload) else {
+            continue;
+        };
+        if descriptor.relay_id == relay_id && descriptor.verify_at(now).is_ok() {
+            descriptors.insert(relay_id, descriptor);
+        }
+    }
+    Ok(descriptors)
 }

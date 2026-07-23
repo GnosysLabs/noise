@@ -13,6 +13,10 @@ use tokio::runtime::Runtime;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum Request {
+    DiscoverRelayMasks {
+        cache_path: String,
+        relays: Vec<String>,
+    },
     Status {
         state_path: String,
     },
@@ -146,10 +150,19 @@ enum Request {
         cache_path: String,
         relays: Vec<String>,
     },
+    DirectInbox {
+        state_path: String,
+        cache_path: String,
+        relays: Vec<String>,
+    },
     DirectConversation {
         state_path: String,
         cache_path: String,
         relays: Vec<String>,
+    },
+    MarkDirectRead {
+        state_path: String,
+        public_key: String,
     },
     WatchDirect {
         state_path: String,
@@ -213,6 +226,17 @@ enum Request {
         since: Option<u64>,
         relays: Vec<String>,
     },
+    WatchGroupId {
+        state_path: String,
+        group_id: String,
+        since: Option<u64>,
+        relays: Vec<String>,
+    },
+    ReplyNotificationSnapshot {
+        state_path: String,
+        group_id: String,
+        relays: Vec<String>,
+    },
     Leave {
         state_path: String,
         cache_path: String,
@@ -252,14 +276,30 @@ fn state_lock() -> &'static Mutex<()> {
 }
 
 fn invoke(request_json: &str) -> Result<Value, String> {
+    let request_value =
+        serde_json::from_str::<Value>(request_json).map_err(|error| error.to_string())?;
+    let mask_relays = request_value
+        .get("mask_relays")
+        .and_then(Value::as_array)
+        .map(|relays| {
+            relays
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let request =
-        serde_json::from_str::<Request>(request_json).map_err(|error| error.to_string())?;
+        serde_json::from_value::<Request>(request_value).map_err(|error| error.to_string())?;
     // The watch holds a network request for up to 20 seconds and never writes
     // local state. Everything else is serialized so a refresh cannot save an
     // older state snapshot over a message or profile update in progress.
     let _state_guard = if matches!(
         &request,
-        Request::WatchGroup { .. }
+        Request::DiscoverRelayMasks { .. }
+            | Request::WatchGroup { .. }
+            | Request::WatchGroupId { .. }
+            | Request::ReplyNotificationSnapshot { .. }
             | Request::WatchDirect { .. }
             | Request::WatchAccount { .. }
             | Request::FetchAvatar { .. }
@@ -275,9 +315,15 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|_| "local state lock is unavailable".to_owned())?,
         )
     };
-    let client = NoiseClient::default();
+    let client = NoiseClient::with_mask_relays(mask_relays).map_err(|error| error.to_string())?;
 
     match request {
+        Request::DiscoverRelayMasks { cache_path, relays } => serde_json::to_value(
+            runtime()?
+                .block_on(client.discover_relay_masks(cache_path, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         Request::Status { state_path } => {
             if !Path::new(&state_path).exists() {
                 return Ok(Value::Null);
@@ -513,7 +559,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             reply_to_message_id,
             relays,
         } => {
-            match attachment {
+            let sent = match attachment {
                 Some(attachment) => runtime()?
                     .block_on(client.say_with_attachment_reply(
                         state_path,
@@ -526,8 +572,8 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 None => runtime()?
                     .block_on(client.say_reply(state_path, text, reply_to_message_id, relays))
                     .map_err(|error| error.to_string())?,
-            }
-            Ok(Value::Null)
+            };
+            serde_json::to_value(sent).map_err(|error| error.to_string())
         }
         Request::StartDirect {
             state_path,
@@ -568,6 +614,16 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
+        Request::DirectInbox {
+            state_path,
+            cache_path,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.direct_inbox(state_path, cache_path, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         Request::DirectConversation {
             state_path,
             cache_path,
@@ -575,6 +631,15 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         } => serde_json::to_value(
             runtime()?
                 .block_on(client.direct_conversation(state_path, cache_path, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::MarkDirectRead {
+            state_path,
+            public_key,
+        } => serde_json::to_value(
+            client
+                .mark_direct_read(state_path, &public_key)
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
@@ -594,7 +659,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             attachment,
             reply_to_message_id,
             relays,
-        } => {
+        } => serde_json::to_value(
             runtime()?
                 .block_on(client.say_direct(
                     state_path,
@@ -603,9 +668,9 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                     reply_to_message_id,
                     relays,
                 ))
-                .map_err(|error| error.to_string())?;
-            Ok(Value::Null)
-        }
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         Request::DeleteDirect {
             state_path,
             cache_path,
@@ -705,6 +770,27 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         } => serde_json::to_value(
             runtime()?
                 .block_on(client.watch_group(state_path, since, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::WatchGroupId {
+            state_path,
+            group_id,
+            since,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.watch_group_id(state_path, &group_id, since, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::ReplyNotificationSnapshot {
+            state_path,
+            group_id,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.reply_notification_snapshot(state_path, &group_id, relays))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),

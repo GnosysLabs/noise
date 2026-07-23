@@ -12,6 +12,13 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Discover signed, reachable privacy-mask relays from one or more seeds.
+    DiscoverRelays {
+        #[arg(long)]
+        cache: PathBuf,
+        #[arg(long)]
+        relay: Vec<String>,
+    },
     /// Create a Noise ID and encrypted account vault.
     Init {
         #[arg(long)]
@@ -126,6 +133,11 @@ async fn main() -> anyhow::Result<()> {
     let client = NoiseClient::default();
 
     match args.command {
+        Command::DiscoverRelays { cache, relay } => {
+            for relay in client.discover_relay_masks(cache, relay).await? {
+                println!("{relay}");
+            }
+        }
         Command::Init {
             state,
             username,
