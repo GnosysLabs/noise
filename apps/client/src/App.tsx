@@ -3390,11 +3390,9 @@ function Onboarding({ busy, onCreate, onSignIn }: { busy: boolean; onCreate: (us
     /\p{N}/u.test(password),
     /[^\p{L}\p{N}]/u.test(password),
   ].filter(Boolean).length;
-  const avoidsCommonPasswords = password.length > 0 && !["password", "qwerty", "letmein", "123456"].some((weak) => password.toLowerCase().includes(weak));
   const passwordRequirements = [
     { label: "16–256 characters", met: passwordLength >= 16 && passwordLength <= 256 },
     { label: `24+ characters or ${passwordClasses}/3 character types`, met: passwordLength >= 24 || passwordClasses >= 3 },
-    { label: "no common password phrases", met: avoidsCommonPasswords },
     { label: "passwords match", met: confirmation.length > 0 && password === confirmation },
   ];
   const usernameReady = username.trim().length > 0;
