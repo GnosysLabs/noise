@@ -198,6 +198,7 @@ async fn main() -> anyhow::Result<()> {
             }
         );
     }
+    shard_store.discard_legacy_local_store()?;
     recovered.blobs.clear();
     recovered.legacy_blobs.clear();
     for shard_id in std::mem::take(&mut recovered.pending_shard_deletions) {

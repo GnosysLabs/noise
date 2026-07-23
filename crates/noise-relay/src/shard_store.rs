@@ -14,6 +14,7 @@ const DEFAULT_S3_PREFIX: &str = "noise-relay";
 pub struct ShardStore {
     primary: Arc<dyn ObjectStore>,
     legacy_local: Option<Arc<dyn ObjectStore>>,
+    legacy_local_directory: Arc<std::path::PathBuf>,
     prefix: Arc<str>,
     description: Arc<str>,
 }
@@ -45,6 +46,7 @@ impl ShardStore {
             return Ok(Self {
                 primary: local,
                 legacy_local: None,
+                legacy_local_directory: Arc::new(data_directory.join("blobs")),
                 prefix: Arc::from(""),
                 description: Arc::from(format!("local disk at {}", local_directory.display())),
             });
@@ -79,6 +81,7 @@ impl ShardStore {
             // If an operator moves an existing relay from local disk to S3,
             // reads lazily promote its old objects instead of breaking them.
             legacy_local: Some(local),
+            legacy_local_directory: Arc::new(data_directory.join("blobs")),
             prefix: Arc::from(prefix),
             description: Arc::from(location),
         })
@@ -187,6 +190,18 @@ impl ShardStore {
         local_result
             .with_context(|| format!("could not delete legacy local encrypted blob {blob_id}"))?;
         Ok(())
+    }
+
+    pub fn discard_legacy_local_store(&self) -> anyhow::Result<()> {
+        if !self.legacy_local_directory.exists() {
+            return Ok(());
+        }
+        fs::remove_dir_all(self.legacy_local_directory.as_ref()).with_context(|| {
+            format!(
+                "could not discard legacy full-media directory {}",
+                self.legacy_local_directory.display()
+            )
+        })
     }
 
     fn primary_object_path(&self, blob_id: &str) -> anyhow::Result<ObjectPath> {
