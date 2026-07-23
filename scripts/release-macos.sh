@@ -49,6 +49,9 @@ fi
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$updater_password"
 export APPLE_SIGNING_IDENTITY=${APPLE_SIGNING_IDENTITY:-"Developer ID Application: Christopher McElvogue (4PDUNTF69S)"}
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4}
+# Apple's current linker can corrupt stripped proc-macro dylibs before the
+# application link begins. The final .app is still code-signed and notarized.
+export CARGO_PROFILE_RELEASE_STRIP=${CARGO_PROFILE_RELEASE_STRIP:-false}
 
 configured_public_key=$(node -e 'const fs=require("fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).plugins.updater.pubkey)' "$config")
 key_file_public_key=$(tr -d '\r\n' < "$updater_key.pub")
