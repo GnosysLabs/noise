@@ -821,10 +821,7 @@ export default function App() {
       }
       const cached = groupConversationCache.current.get(activeGroup.group_id);
       if (cached) setConversation(cached);
-      const encryption = await noise<GroupEncryptionStatus>({
-        action: "sync_group_encryption",
-        relays,
-      });
+      const encryption = await syncGroupEncryption();
       if (generation !== refreshGeneration.current) return;
       setGroupEncryption(encryption);
       if (encryption?.phase === "removed") {
@@ -1001,10 +998,7 @@ export default function App() {
       const local = await noise<LocalSummary>({ action: "select_group", group_id: group.group_id });
       if (generation !== refreshGeneration.current) return;
       setSummary(local);
-      const encryption = await noise<GroupEncryptionStatus>({
-        action: "sync_group_encryption",
-        relays,
-      });
+      const encryption = await syncGroupEncryption();
       if (generation !== refreshGeneration.current) return;
       setGroupEncryption(encryption);
       if (encryption?.phase === "removed") {
@@ -3860,6 +3854,18 @@ function UpdateBanner({ status, retry, restart, dismiss }: ReturnType<typeof use
 }
 
 function Loading() { return <div className="loading"><LoaderCircle className="spinner" /></div>; }
+
+async function syncGroupEncryption(): Promise<GroupEncryptionStatus | null> {
+  try {
+    return await noise<GroupEncryptionStatus>({
+      action: "sync_group_encryption",
+      relays,
+    });
+  } catch (cause) {
+    if (message(cause).includes("unknown variant `sync_group_encryption`")) return null;
+    throw cause;
+  }
+}
 
 function EncryptionPending({ phase }: { phase: GroupEncryptionStatus["phase"] }) {
   return (
