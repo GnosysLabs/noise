@@ -2,6 +2,8 @@
 
 use std::{
     collections::HashSet,
+    fs,
+    path::Path,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -77,6 +79,79 @@ async fn noise_request_data(app: &tauri::AppHandle, request: Value) -> Result<Va
 #[tauri::command]
 async fn noise_invoke(app: tauri::AppHandle, request: Value) -> Value {
     execute_noise_request(&app, request).await
+}
+
+#[tauri::command]
+async fn download_media(
+    app: tauri::AppHandle,
+    source_path: String,
+    file_name: String,
+) -> Result<String, String> {
+    let cache_directory = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?
+        .join("media");
+    let download_directory = app
+        .path()
+        .download_dir()
+        .map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = fs::canonicalize(source_path).map_err(|error| error.to_string())?;
+        let cache = fs::canonicalize(cache_directory).map_err(|error| error.to_string())?;
+        if !source.starts_with(&cache) {
+            return Err(
+                "Noise can only download decrypted media from its private cache".to_owned(),
+            );
+        }
+        fs::create_dir_all(&download_directory).map_err(|error| error.to_string())?;
+        let raw_name = Path::new(&file_name)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("noise-media");
+        let sanitized = raw_name
+            .chars()
+            .map(|character| {
+                if character.is_control()
+                    || matches!(
+                        character,
+                        '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                    )
+                {
+                    '_'
+                } else {
+                    character
+                }
+            })
+            .collect::<String>();
+        let sanitized = sanitized.trim_matches([' ', '.']);
+        let sanitized = if sanitized.is_empty() {
+            "noise-media"
+        } else {
+            sanitized
+        };
+        let requested = Path::new(sanitized);
+        let stem = requested
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("noise-media");
+        let extension = requested.extension().and_then(|value| value.to_str());
+        let mut destination = download_directory.join(sanitized);
+        let mut copy_number = 2_u32;
+        while destination.exists() {
+            let candidate = if let Some(extension) = extension {
+                format!("{stem} ({copy_number}).{extension}")
+            } else {
+                format!("{stem} ({copy_number})")
+            };
+            destination = download_directory.join(candidate);
+            copy_number += 1;
+        }
+        fs::copy(&source, &destination).map_err(|error| error.to_string())?;
+        Ok(destination.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn network_request(
@@ -314,6 +389,7 @@ async fn group_reply_notification_loop(
     let mut revision = None;
     let mut known = HashSet::new();
     let mut baseline_ready = false;
+    let mut notify_after_millis = 0;
 
     loop {
         if !baseline_ready {
@@ -330,22 +406,12 @@ async fn group_reply_notification_loop(
                 ),
             )
             .await;
-            let snapshot = noise_request_data(
-                &app,
-                network_request(
-                    "reply_notification_snapshot",
-                    &relays,
-                    &mask_relays,
-                    [("group_id", Value::String(group_id.clone()))],
-                ),
-            )
-            .await;
-            if let (Ok(change), Ok(snapshot)) = (initial_watch, snapshot) {
+            if let Ok(change) = initial_watch {
                 revision = change.get("revision").and_then(Value::as_u64);
-                known = reply_notifications(&snapshot)
-                    .into_iter()
-                    .map(|notification| notification.event_id)
-                    .collect();
+                notify_after_millis = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_millis() as u64);
+                known.clear();
                 baseline_ready = true;
                 continue;
             }
@@ -387,7 +453,9 @@ async fn group_reply_notification_loop(
             continue;
         };
         for notification in reply_notifications(&snapshot) {
-            if known.insert(notification.event_id) {
+            if notification.created_at_millis > notify_after_millis
+                && known.insert(notification.event_id)
+            {
                 show_native_notification(&app, &notification.title, &notification.body);
             }
         }
@@ -496,6 +564,7 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             noise_invoke,
+            download_media,
             ensure_native_notification_permission
         ])
         .run(tauri::generate_context!())

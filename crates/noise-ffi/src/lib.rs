@@ -81,6 +81,12 @@ enum Request {
         #[serde(default)]
         remove_background: bool,
         #[serde(default)]
+        mobile_background_data_base64: Option<String>,
+        #[serde(default)]
+        mobile_background_mime_type: Option<String>,
+        #[serde(default)]
+        remove_mobile_background: bool,
+        #[serde(default)]
         accent_color: Option<String>,
         members_can_send_messages: Option<bool>,
         members_can_send_media: Option<bool>,
@@ -242,6 +248,10 @@ enum Request {
         state_path: String,
         relays: Vec<String>,
     },
+    CachedConversation {
+        state_path: String,
+        group_id: String,
+    },
     WatchGroup {
         state_path: String,
         since: Option<u64>,
@@ -255,6 +265,7 @@ enum Request {
     },
     HeartbeatPresence {
         state_path: String,
+        active: Option<bool>,
         relays: Vec<String>,
     },
     ReplyNotificationSnapshot {
@@ -325,6 +336,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             | Request::WatchGroup { .. }
             | Request::WatchGroupId { .. }
             | Request::SyncGroupActivity { .. }
+            | Request::CachedConversation { .. }
             | Request::HeartbeatPresence { .. }
             | Request::ReplyNotificationSnapshot { .. }
             | Request::WatchDirect { .. }
@@ -468,6 +480,9 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             background_data_base64,
             background_mime_type,
             remove_background,
+            mobile_background_data_base64,
+            mobile_background_mime_type,
+            remove_mobile_background,
             accent_color,
             members_can_send_messages,
             members_can_send_media,
@@ -485,6 +500,9 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                     background_data_base64,
                     background_mime_type,
                     remove_background,
+                    mobile_background_data_base64,
+                    mobile_background_mime_type,
+                    remove_mobile_background,
                     accent_color,
                     members_can_send_messages,
                     members_can_send_media,
@@ -845,6 +863,15 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
+        Request::CachedConversation {
+            state_path,
+            group_id,
+        } => serde_json::to_value(
+            client
+                .cached_conversation(state_path, &group_id)
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         Request::WatchGroup {
             state_path,
             since,
@@ -866,9 +893,13 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
-        Request::HeartbeatPresence { state_path, relays } => serde_json::to_value(
+        Request::HeartbeatPresence {
+            state_path,
+            active,
+            relays,
+        } => serde_json::to_value(
             runtime()?
-                .block_on(client.heartbeat_presence(state_path, relays))
+                .block_on(client.heartbeat_presence(state_path, active.unwrap_or(true), relays))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),

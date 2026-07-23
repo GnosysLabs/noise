@@ -4037,7 +4037,7 @@ dependencies = [
 
 [[package]]
 name = "noise-cli"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -4047,7 +4047,7 @@ dependencies = [
 
 [[package]]
 name = "noise-client"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4068,7 +4068,7 @@ dependencies = [
 
 [[package]]
 name = "noise-core"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -4094,7 +4094,7 @@ dependencies = [
 
 [[package]]
 name = "noise-desktop"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "dirs",
  "noise-ffi",
@@ -4110,7 +4110,7 @@ dependencies = [
 
 [[package]]
 name = "noise-ffi"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "noise-client",
  "serde",
@@ -4147,7 +4147,7 @@ dependencies = [
 
 [[package]]
 name = "noise-sim"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -4157,7 +4157,7 @@ dependencies = [
 
 [[package]]
 name = "noise-transport"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4170,7 +4170,7 @@ dependencies = [
 
 [[package]]
 name = "noise-web"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "getrandom 0.4.3",
  "noise-client",

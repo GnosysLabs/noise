@@ -53,6 +53,8 @@ use serde::{Deserialize, Serialize};
 mod relay_pool;
 
 const GROUP_PRESENCE_TTL_MILLIS: u64 = 50_000;
+const IDLE_GROUP_PRESENCE_TTL_MILLIS: u64 = 10_000;
+const ONLINE_PRESENCE_REMAINING_MILLIS: u64 = 15_000;
 const RECENT_GROUP_PRESENCE_MILLIS: u64 = 5 * 60_000;
 const EVENT_REPLICA_SETTLE_MILLIS: u64 = 500;
 const RELAY_REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -66,6 +68,12 @@ pub struct NoiseClient {
 pub struct GroupActivityUpdate {
     group_id: String,
     events: Vec<SignedEvent>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GroupActivityResult {
+    pub summary: LocalSummary,
+    pub conversation: Option<Conversation>,
 }
 
 impl Default for NoiseClient {
@@ -105,6 +113,7 @@ pub struct GroupSummary {
     pub rules: String,
     pub avatar: Option<ProfileImage>,
     pub background: Option<ProfileImage>,
+    pub mobile_background: Option<ProfileImage>,
     pub accent_color: String,
     pub members_can_send_messages: bool,
     pub members_can_send_media: bool,
@@ -357,6 +366,8 @@ struct ClientState {
     #[serde(default)]
     group_activity_initialized: HashSet<String>,
     #[serde(default)]
+    group_conversation_cache: HashMap<String, Conversation>,
+    #[serde(default)]
     group_frequencies: HashMap<String, String>,
     #[serde(default)]
     next_author_sequence: u64,
@@ -559,6 +570,7 @@ impl ClientState {
             group_read_through: contents.group_read_through,
             group_unread_messages: HashMap::new(),
             group_activity_initialized: contents.group_activity_initialized,
+            group_conversation_cache: HashMap::new(),
             group_frequencies: contents.group_frequencies,
             next_author_sequence: contents.next_author_sequence,
             account: Some(account),
@@ -787,6 +799,7 @@ impl ClientState {
                         rules: group.rules.clone(),
                         avatar: group.avatar.clone(),
                         background: group.background.clone(),
+                        mobile_background: group.mobile_background.clone(),
                         accent_color: group.accent_color.clone(),
                         members_can_send_messages: group.members_can_send_messages,
                         members_can_send_media: group.members_can_send_media,
@@ -953,6 +966,7 @@ impl NoiseClient {
             group_read_through: HashMap::new(),
             group_unread_messages: HashMap::new(),
             group_activity_initialized: HashSet::new(),
+            group_conversation_cache: HashMap::new(),
             group_frequencies: HashMap::new(),
             next_author_sequence: 0,
             account: Some(AccountSession {
@@ -1066,6 +1080,25 @@ impl NoiseClient {
         load_state(path.as_ref())?.summary()
     }
 
+    pub fn cached_conversation(
+        &self,
+        path: impl AsRef<Path>,
+        group_id: &str,
+    ) -> anyhow::Result<Option<Conversation>> {
+        let state = load_state(path.as_ref())?;
+        if !state.groups.iter().any(|group| group.group_id == group_id) {
+            bail!("unknown group")
+        }
+        let mut cached = state.group_conversation_cache.get(group_id).cloned();
+        if let Some(conversation) = cached.as_mut() {
+            conversation.group.is_active = state.active_group_id.as_deref() == Some(group_id);
+            conversation.group.unread_count = state.group_unread_count(group_id);
+            conversation.group.read_state_initialized =
+                state.group_activity_initialized.contains(group_id);
+        }
+        Ok(cached)
+    }
+
     #[must_use]
     pub fn has_local_state(&self, path: impl AsRef<Path>) -> bool {
         state_exists(path.as_ref())
@@ -1094,9 +1127,7 @@ impl NoiseClient {
     ) -> anyhow::Result<GroupWatch> {
         let state = load_state(path.as_ref())?;
         let group = state.active_group()?;
-        let identity = state.identity()?;
-        self.watch_id(group, &identity, since, relay_list(relays)?)
-            .await
+        self.watch_id(group, since, relay_list(relays)?).await
     }
 
     pub async fn watch_group_id(
@@ -1112,14 +1143,13 @@ impl NoiseClient {
             .iter()
             .find(|group| group.group_id == group_id)
             .context("unknown group")?;
-        let identity = state.identity()?;
-        self.watch_id(group, &identity, since, relay_list(relays)?)
-            .await
+        self.watch_id(group, since, relay_list(relays)?).await
     }
 
     pub async fn heartbeat_presence(
         &self,
         path: impl AsRef<Path>,
+        active: bool,
         relays: Vec<String>,
     ) -> anyhow::Result<usize> {
         let state = load_state(path.as_ref())?;
@@ -1127,7 +1157,9 @@ impl NoiseClient {
         let relays = relay_list(relays)?;
         let mut accepted = 0usize;
         for group in &state.groups {
-            accepted += self.publish_group_presence(group, &identity, &relays).await;
+            accepted += self
+                .publish_group_presence(group, &identity, &relays, active)
+                .await;
         }
         for contact in &state.direct_contacts {
             let Ok(mailbox) = identity.direct_mailbox(&contact.public_key, &contact.public_key)
@@ -1135,7 +1167,7 @@ impl NoiseClient {
                 continue;
             };
             accepted += self
-                .publish_group_presence(&mailbox, &identity, &relays)
+                .publish_group_presence(&mailbox, &identity, &relays, active)
                 .await;
         }
         Ok(accepted)
@@ -1237,11 +1269,9 @@ impl NoiseClient {
     async fn watch_id(
         &self,
         group: &GroupMembership,
-        identity: &Identity,
         since: Option<u64>,
         relays: Vec<RelayDescriptor>,
     ) -> anyhow::Result<GroupWatch> {
-        self.publish_group_presence(group, identity, &relays).await;
         let revision = since
             .map(|revision| revision.to_string())
             .unwrap_or_else(|| "initial".to_owned());
@@ -1267,7 +1297,9 @@ impl NoiseClient {
                     let Ok(public_key) = presence.open(group) else {
                         continue;
                     };
-                    if presence.expires_at_millis > now {
+                    if presence.expires_at_millis
+                        > now.saturating_add(ONLINE_PRESENCE_REMAINING_MILLIS)
+                    {
                         online_public_keys.push(public_key);
                     } else if presence
                         .expires_at_millis
@@ -1297,12 +1329,16 @@ impl NoiseClient {
         group: &GroupMembership,
         identity: &Identity,
         relays: &[RelayDescriptor],
+        active: bool,
     ) -> usize {
-        let Ok(presence) = GroupPresence::create(
-            identity,
-            group,
-            current_millis().saturating_add(GROUP_PRESENCE_TTL_MILLIS),
-        ) else {
+        let ttl = if active {
+            GROUP_PRESENCE_TTL_MILLIS
+        } else {
+            IDLE_GROUP_PRESENCE_TTL_MILLIS
+        };
+        let Ok(presence) =
+            GroupPresence::create(identity, group, current_millis().saturating_add(ttl))
+        else {
             return 0;
         };
         let Ok(body) = serde_json::to_vec(&presence) else {
@@ -1359,7 +1395,9 @@ impl NoiseClient {
                     else {
                         continue;
                     };
-                    if presence.expires_at_millis > now {
+                    if presence.expires_at_millis
+                        > now.saturating_add(ONLINE_PRESENCE_REMAINING_MILLIS)
+                    {
                         online_public_keys.push(public_key);
                     } else if presence
                         .expires_at_millis
@@ -1482,6 +1520,9 @@ impl NoiseClient {
         background_data_base64: Option<String>,
         background_mime_type: Option<String>,
         remove_background: bool,
+        mobile_background_data_base64: Option<String>,
+        mobile_background_mime_type: Option<String>,
+        remove_mobile_background: bool,
         accent_color: Option<String>,
         members_can_send_messages: Option<bool>,
         members_can_send_media: Option<bool>,
@@ -1581,11 +1622,43 @@ impl NoiseClient {
             current_group.background.clone()
         };
 
+        let mobile_background = if remove_mobile_background {
+            None
+        } else if let Some(encoded) = mobile_background_data_base64 {
+            let mime_type = mobile_background_mime_type
+                .context("mobile group background media type is missing")?;
+            if !matches!(
+                mime_type.as_str(),
+                "image/jpeg" | "image/png" | "image/webp"
+            ) {
+                bail!("mobile group backgrounds must be JPEG, PNG, or WebP images")
+            }
+            let data = STANDARD
+                .decode(encoded)
+                .context("mobile group background encoding is invalid")?;
+            if data.is_empty() || data.len() > 1536 * 1024 {
+                bail!("mobile group backgrounds must contain between 1 byte and 1.5 MiB")
+            }
+            let (blob, key_base64) =
+                EncryptedBlob::create_for_group(&data, current_group.group_id.clone())?;
+            let storage = self.store_blob_shards(&relays, &blob, &key_base64).await?;
+            Some(ProfileImage {
+                blob_id: blob.blob_id,
+                key_base64,
+                mime_type,
+                byte_length: data.len() as u32,
+                storage: Some(storage),
+            })
+        } else {
+            current_group.mobile_background.clone()
+        };
+
         state.groups[group_index].name = name.clone();
         state.groups[group_index].description = description.clone();
         state.groups[group_index].rules = rules.clone();
         state.groups[group_index].avatar = avatar.clone();
         state.groups[group_index].background = background.clone();
+        state.groups[group_index].mobile_background = mobile_background.clone();
         state.groups[group_index].accent_color = accent_color.clone();
         state.groups[group_index].members_can_send_messages = members_can_send_messages;
         state.groups[group_index].members_can_send_media = members_can_send_media;
@@ -1607,6 +1680,8 @@ impl NoiseClient {
                     rules,
                     avatar,
                     background,
+                    mobile_background,
+                    mobile_background_updated: true,
                     accent_color,
                     members_can_send_messages,
                     members_can_send_media,
@@ -1914,6 +1989,7 @@ impl NoiseClient {
             state.mls_control_logs.remove(&group.group_id);
             state.group_frequencies.remove(&group.group_id);
             state.forget_group_activity(&group.group_id);
+            state.group_conversation_cache.remove(&group.group_id);
             state
                 .groups
                 .retain(|candidate| candidate.group_id != group.group_id);
@@ -2208,6 +2284,7 @@ impl NoiseClient {
                 rules: group.rules,
                 avatar: group.avatar,
                 background: group.background,
+                mobile_background: group.mobile_background,
                 accent_color: group.accent_color,
                 members_can_send_messages: group.members_can_send_messages,
                 members_can_send_media: group.members_can_send_media,
@@ -2277,6 +2354,7 @@ impl NoiseClient {
                 rules: group.rules,
                 avatar: group.avatar,
                 background: group.background,
+                mobile_background: group.mobile_background,
                 accent_color: group.accent_color,
                 members_can_send_messages: group.members_can_send_messages,
                 members_can_send_media: group.members_can_send_media,
@@ -3160,6 +3238,7 @@ impl NoiseClient {
         state.mls_control_logs.remove(&group.group_id);
         state.group_frequencies.remove(&group.group_id);
         state.forget_group_activity(&group.group_id);
+        state.group_conversation_cache.remove(&group.group_id);
         state
             .groups
             .retain(|candidate| candidate.group_id != group.group_id);
@@ -3212,6 +3291,7 @@ impl NoiseClient {
         state.groups.remove(group_index);
         state.group_frequencies.remove(group_id);
         state.forget_group_activity(group_id);
+        state.group_conversation_cache.remove(group_id);
         state.mls_join_requests.remove(group_id);
         state.mls_local_geneses.remove(group_id);
         state.mls_control_logs.remove(group_id);
@@ -3340,7 +3420,7 @@ impl NoiseClient {
         path: impl AsRef<Path>,
         group_id: &str,
         relays: Vec<String>,
-    ) -> anyhow::Result<LocalSummary> {
+    ) -> anyhow::Result<GroupActivityResult> {
         let update = self
             .fetch_group_activity(path.as_ref(), group_id, relays)
             .await?;
@@ -3372,7 +3452,7 @@ impl NoiseClient {
         &self,
         path: impl AsRef<Path>,
         update: GroupActivityUpdate,
-    ) -> anyhow::Result<LocalSummary> {
+    ) -> anyhow::Result<GroupActivityResult> {
         let path = path.as_ref();
         let mut state = load_state(path)?;
         let group = state
@@ -3384,12 +3464,23 @@ impl NoiseClient {
         let identity_public_key = state.identity()?.public_key_base64();
         let group_id = group.group_id.clone();
         let view = rebuild_group_state(&state, &group, &update.events)?;
-        if view.members.contains_key(&identity_public_key)
-            && state.record_group_activity(&group_id, &view.messages, &identity_public_key)
-        {
+        let is_member = view.members.contains_key(&identity_public_key);
+        let activity_changed = is_member
+            && state.record_group_activity(&group_id, &view.messages, &identity_public_key);
+        let conversation = is_member
+            .then(|| cached_conversation_from_view(&state, &group, view, &identity_public_key));
+        if let Some(conversation) = conversation.as_ref() {
+            state
+                .group_conversation_cache
+                .insert(group_id, conversation.clone());
+        }
+        if activity_changed || conversation.is_some() {
             save_state(path, &state)?;
         }
-        state.summary()
+        Ok(GroupActivityResult {
+            summary: state.summary()?,
+            conversation,
+        })
     }
 
     pub fn mark_group_read(
@@ -3489,6 +3580,7 @@ impl NoiseClient {
             || state.groups[group_index].rules != resolved_profile.rules
             || state.groups[group_index].avatar != resolved_profile.avatar
             || state.groups[group_index].background != resolved_profile.background
+            || state.groups[group_index].mobile_background != resolved_profile.mobile_background
             || state.groups[group_index].accent_color != resolved_profile.accent_color
             || state.groups[group_index].members_can_send_messages
                 != resolved_profile.members_can_send_messages
@@ -3501,6 +3593,8 @@ impl NoiseClient {
             state.groups[group_index].rules = resolved_profile.rules.clone();
             state.groups[group_index].avatar = resolved_profile.avatar.clone();
             state.groups[group_index].background = resolved_profile.background.clone();
+            state.groups[group_index].mobile_background =
+                resolved_profile.mobile_background.clone();
             state.groups[group_index].accent_color = resolved_profile.accent_color.clone();
             state.groups[group_index].members_can_send_messages =
                 resolved_profile.members_can_send_messages;
@@ -3595,7 +3689,7 @@ impl NoiseClient {
             })
             .collect::<Vec<_>>();
         members.sort_by(|left, right| left.username.cmp(&right.username));
-        Ok(Conversation {
+        let conversation = Conversation {
             group: GroupSummary {
                 group_id: group.group_id.clone(),
                 name: resolved_profile.name,
@@ -3603,6 +3697,7 @@ impl NoiseClient {
                 rules: resolved_profile.rules,
                 avatar: resolved_profile.avatar,
                 background: resolved_profile.background,
+                mobile_background: resolved_profile.mobile_background,
                 accent_color: resolved_profile.accent_color,
                 members_can_send_messages: resolved_profile.members_can_send_messages,
                 members_can_send_media: resolved_profile.members_can_send_media,
@@ -3644,7 +3739,12 @@ impl NoiseClient {
             reports,
             reported_message_event_ids,
             rejected_events: view.rejected_events,
-        })
+        };
+        state
+            .group_conversation_cache
+            .insert(group.group_id.clone(), conversation.clone());
+        save_state(path, &state)?;
+        Ok(conversation)
     }
 
     async fn sync_direct_inbox(
@@ -4869,6 +4969,164 @@ fn sync_mls_state_from_log(
     Ok(Some(current_epoch))
 }
 
+fn cached_conversation_from_view(
+    state: &ClientState,
+    group: &GroupMembership,
+    view: GroupState,
+    identity_public_key: &str,
+) -> Conversation {
+    let resolved_owner = view.owner_public_key.clone().unwrap_or_default();
+    let resolved_profile = view.profile.clone();
+    let moderators = view.moderators.clone();
+    let mut banned_members = view
+        .banned_profiles
+        .values()
+        .cloned()
+        .map(|member| BannedMemberSummary {
+            public_key: member.public_key,
+            username: member.username,
+            bio: member.bio,
+            avatar: member.avatar,
+        })
+        .collect::<Vec<_>>();
+    banned_members.sort_by(|left, right| left.username.cmp(&right.username));
+
+    let can_view_reports =
+        resolved_owner == identity_public_key || moderators.contains(identity_public_key);
+    let mut reactions_by_message = HashMap::<String, Vec<ReactionSummary>>::new();
+    for reaction in &view.reactions {
+        let summaries = reactions_by_message
+            .entry(reaction.message_event_id.clone())
+            .or_default();
+        if let Some(summary) = summaries
+            .iter_mut()
+            .find(|summary| summary.emoji == reaction.emoji)
+        {
+            summary.count += 1;
+            summary
+                .reactor_public_keys
+                .push(reaction.reactor_public_key.clone());
+            summary.reacted_by_self |= reaction.reactor_public_key == identity_public_key;
+        } else {
+            summaries.push(ReactionSummary {
+                emoji: reaction.emoji.clone(),
+                count: 1,
+                reactor_public_keys: vec![reaction.reactor_public_key.clone()],
+                reacted_by_self: reaction.reactor_public_key == identity_public_key,
+            });
+        }
+    }
+
+    let reported_message_event_ids = view
+        .reports
+        .iter()
+        .filter(|report| report.reporter_public_key == identity_public_key)
+        .map(|report| report.message_event_id.clone())
+        .collect::<Vec<_>>();
+    let reports = view
+        .reports
+        .iter()
+        .filter(|_| can_view_reports)
+        .filter_map(|report| {
+            let message = view
+                .messages
+                .iter()
+                .find(|message| message.event_id == report.message_event_id)?;
+            Some(ReportSummary {
+                report_event_id: report.event_id.clone(),
+                reporter_public_key: report.reporter_public_key.clone(),
+                reporter_username: report.reporter_username.clone(),
+                reporter_avatar: report.reporter_avatar.clone(),
+                reason: report.reason.clone(),
+                created_at_millis: report.created_at_millis,
+                message: MessageSummary {
+                    event_id: message.event_id.clone(),
+                    message_id: message.message_id.clone(),
+                    author_public_key: message.author_public_key.clone(),
+                    username: message.username.clone(),
+                    bio: message.bio.clone(),
+                    avatar: message.avatar.clone(),
+                    accepts_direct_messages: message.accepts_direct_messages,
+                    text: message.text.clone(),
+                    attachment: message.attachment.clone(),
+                    reply_to_message_id: message.reply_to_message_id.clone(),
+                    created_at_millis: message.created_at_millis,
+                    reactions: reactions_by_message
+                        .get(&message.event_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut members = view
+        .members
+        .into_values()
+        .map(|member| MemberSummary {
+            is_moderator: moderators.contains(&member.public_key),
+            public_key: member.public_key,
+            username: member.username,
+            bio: member.bio,
+            avatar: member.avatar,
+            accepts_direct_messages: member.accepts_direct_messages,
+        })
+        .collect::<Vec<_>>();
+    members.sort_by(|left, right| left.username.cmp(&right.username));
+
+    Conversation {
+        group: GroupSummary {
+            group_id: group.group_id.clone(),
+            name: resolved_profile.name,
+            description: resolved_profile.description,
+            rules: resolved_profile.rules,
+            avatar: resolved_profile.avatar,
+            background: resolved_profile.background,
+            mobile_background: resolved_profile.mobile_background,
+            accent_color: resolved_profile.accent_color,
+            members_can_send_messages: resolved_profile.members_can_send_messages,
+            members_can_send_media: resolved_profile.members_can_send_media,
+            frequency: state
+                .group_frequencies
+                .get(&group.group_id)
+                .and_then(|frequency| display_frequency(frequency).ok()),
+            owner_public_key: resolved_owner,
+            remote_deletion_supported: !group.authority_nonce_base64.is_empty(),
+            is_active: state.active_group_id.as_deref() == Some(group.group_id.as_str()),
+            unread_count: state.group_unread_count(&group.group_id),
+            read_state_initialized: state.group_activity_initialized.contains(&group.group_id),
+        },
+        members,
+        banned_members,
+        messages: view
+            .messages
+            .into_iter()
+            .map(|message| {
+                let reactions = reactions_by_message
+                    .remove(&message.event_id)
+                    .unwrap_or_default();
+                MessageSummary {
+                    event_id: message.event_id,
+                    message_id: message.message_id,
+                    author_public_key: message.author_public_key,
+                    username: message.username,
+                    bio: message.bio,
+                    avatar: message.avatar,
+                    accepts_direct_messages: message.accepts_direct_messages,
+                    text: message.text,
+                    attachment: message.attachment,
+                    reply_to_message_id: message.reply_to_message_id,
+                    created_at_millis: message.created_at_millis,
+                    reactions,
+                }
+            })
+            .collect(),
+        reports,
+        reported_message_event_ids,
+        rejected_events: view.rejected_events,
+    }
+}
+
 fn rebuild_group_state(
     state: &ClientState,
     group: &GroupMembership,
@@ -5208,6 +5466,12 @@ fn group_storage_references(
     let mut references = Vec::new();
     references.extend(group.avatar.as_ref().and_then(image_storage_reference));
     references.extend(group.background.as_ref().and_then(image_storage_reference));
+    references.extend(
+        group
+            .mobile_background
+            .as_ref()
+            .and_then(image_storage_reference),
+    );
     for event in events {
         let Ok(payload) = event.decrypt(group) else {
             continue;
@@ -5218,6 +5482,12 @@ fn group_storage_references(
                 references.extend(
                     profile
                         .background
+                        .as_ref()
+                        .and_then(image_storage_reference),
+                );
+                references.extend(
+                    profile
+                        .mobile_background
                         .as_ref()
                         .and_then(image_storage_reference),
                 );

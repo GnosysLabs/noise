@@ -50,6 +50,7 @@ import type {
   DirectConversation,
   DirectInbox,
   DirectSummary,
+  GroupActivityResult,
   GroupEncryptionStatus,
   GroupSummary,
   GroupWatch,
@@ -91,8 +92,22 @@ type PersonSummary = Pick<MemberSummary, "public_key" | "username" | "bio" | "av
 };
 type SidebarMode = "groups" | "directs";
 type PresenceStatus = "online" | "recently-active" | "offline";
+const PRESENCE_IDLE_MILLIS = 5 * 60_000;
+const PRESENCE_HEARTBEAT_MILLIS = 20_000;
+const PRESENCE_OBSERVATION_STALE_MILLIS = 70_000;
 const DEFAULT_ACCENT_COLOR = "#7758ED";
 const ACCENT_PRESETS = ["#7758ED", "#E84D8A", "#F06A3C", "#E0A82E", "#43B581", "#24A6A6", "#4D82F0", "#A45EE5"];
+
+function presenceStatusesFromWatch(change: GroupWatch) {
+  const statuses = new Map<string, PresenceStatus>();
+  for (const publicKey of change.recently_active_public_keys ?? []) {
+    statuses.set(publicKey, "recently-active");
+  }
+  for (const publicKey of change.online_public_keys ?? []) {
+    statuses.set(publicKey, "online");
+  }
+  return statuses;
+}
 const UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
 const UPDATE_CHECK_HEARTBEAT_MS = 60 * 1000;
 let cachedAppVersion: string | null = null;
@@ -568,26 +583,39 @@ export default function App() {
   const [groupEncryption, setGroupEncryption] = useState<GroupEncryptionStatus | null>(null);
   const [directConversation, setDirectConversation] = useState<DirectConversation | null>(null);
   const [sidebarMode, setSidebarMode] = useState<SidebarMode>("groups");
+  const [pendingGroupId, setPendingGroupId] = useState<string | null>(null);
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [onlinePresence, setOnlinePresence] = useState<{
-    groupId: string | null;
-    statuses: Map<string, PresenceStatus>;
-  }>({ groupId: null, statuses: new Map() });
-  const [directPresenceStatuses, setDirectPresenceStatuses] = useState<Map<string, PresenceStatus>>(
+  const [presenceStatuses, setPresenceStatuses] = useState<Map<string, PresenceStatus>>(
     () => new Map(),
   );
   const updater = useAutoUpdater();
   const refreshGeneration = useRef(0);
   const groupConversationCache = useRef(new Map<string, Conversation>());
+  const presenceScopes = useRef(new Map<string, {
+    observedAt: number;
+    statuses: Map<string, PresenceStatus>;
+  }>());
+  const dirtyGroupIds = useRef(new Set<string>());
+  const groupWatchRevisions = useRef(new Map<string, number>());
   const directConversationCache = useRef(new Map<string, DirectConversation>());
   const groupReadInFlight = useRef(new Set<string>());
+  const groupSelectionInFlight = useRef(false);
+  const desiredGroupIdRef = useRef<string | null>(null);
   const sidebarModeRef = useRef(sidebarMode);
   const desiredDirectPublicKeyRef = useRef<string | null>(null);
   sidebarModeRef.current = sidebarMode;
   const summaryActiveDirectPublicKey = summary?.directs.find((direct) => direct.is_active)?.public_key ?? null;
+  const summaryActiveGroupId = summary?.groups.find((group) => group.is_active)?.group_id ?? null;
+  if (
+    (!desiredGroupIdRef.current
+      || !summary?.groups.some((group) => group.group_id === desiredGroupIdRef.current))
+    && summaryActiveGroupId
+  ) {
+    desiredGroupIdRef.current = summaryActiveGroupId;
+  }
   if (!desiredDirectPublicKeyRef.current && summaryActiveDirectPublicKey) {
     desiredDirectPublicKeyRef.current = summaryActiveDirectPublicKey;
   }
@@ -604,26 +632,103 @@ export default function App() {
   } | null>(null);
   const [directMenu, setDirectMenu] = useState<{ direct: DirectSummary; x: number; y: number } | null>(null);
   const identityPublicKey = summary?.identity.public_key ?? null;
+  const lastPresenceActivityAt = useRef(Date.now());
+  const selfPresenceActive = useRef(true);
+  const [selfPresenceStatus, setSelfPresenceStatus] = useState<PresenceStatus>("online");
+
+  useEffect(() => {
+    const suppressNativeContextMenu = (event: MouseEvent) => {
+      event.preventDefault();
+    };
+    document.addEventListener("contextmenu", suppressNativeContextMenu, true);
+    return () => document.removeEventListener("contextmenu", suppressNativeContextMenu, true);
+  }, []);
+
+  const updatePresenceScope = useCallback((
+    scopeId: string,
+    statuses: Map<string, PresenceStatus>,
+  ) => {
+    const now = Date.now();
+    presenceScopes.current.set(scopeId, { observedAt: now, statuses });
+    const merged = new Map<string, PresenceStatus>();
+    for (const [knownScopeId, observation] of presenceScopes.current) {
+      if (now - observation.observedAt > PRESENCE_OBSERVATION_STALE_MILLIS) {
+        presenceScopes.current.delete(knownScopeId);
+        continue;
+      }
+      for (const [publicKey, status] of observation.statuses) {
+        const existing = merged.get(publicKey);
+        if (status === "online" || !existing) {
+          merged.set(publicKey, status);
+        }
+      }
+    }
+    setPresenceStatuses(merged);
+  }, []);
 
   useEffect(() => {
     if (identityPublicKey) void ensureNotificationPermission();
   }, [identityPublicKey]);
 
   useEffect(() => {
+    presenceScopes.current.clear();
+    setPresenceStatuses(new Map());
+  }, [identityPublicKey]);
+
+  useEffect(() => {
     if (!identityPublicKey) return;
     let stopped = false;
     let timer: number | null = null;
-    const heartbeat = async () => {
-      try {
-        await noise({ action: "heartbeat_presence", relays });
-      } catch {
-        // Presence is best-effort and retries without interrupting chat.
-      }
-      if (!stopped) timer = window.setTimeout(() => void heartbeat(), 20_000);
+    let heartbeatQueue = Promise.resolve();
+    lastPresenceActivityAt.current = Date.now();
+    selfPresenceActive.current = true;
+    setSelfPresenceStatus("online");
+
+    const publish = (active: boolean) => {
+      heartbeatQueue = heartbeatQueue.then(async () => {
+        if (stopped) return;
+        try {
+          await noise({ action: "heartbeat_presence", active, relays });
+        } catch {
+          // Presence is best-effort and retries without interrupting chat.
+        }
+      });
+      return heartbeatQueue;
     };
+    const heartbeat = async () => {
+      const active = Date.now() - lastPresenceActivityAt.current < PRESENCE_IDLE_MILLIS;
+      if (selfPresenceActive.current !== active) {
+        selfPresenceActive.current = active;
+        setSelfPresenceStatus(active ? "online" : "recently-active");
+      }
+      await publish(active);
+      if (!stopped) {
+        timer = window.setTimeout(() => void heartbeat(), PRESENCE_HEARTBEAT_MILLIS);
+      }
+    };
+    const markActive = () => {
+      lastPresenceActivityAt.current = Date.now();
+      if (!selfPresenceActive.current) {
+        selfPresenceActive.current = true;
+        setSelfPresenceStatus("online");
+        void publish(true);
+      }
+    };
+    const activityEvents: (keyof WindowEventMap)[] = [
+      "keydown",
+      "pointerdown",
+      "pointermove",
+      "wheel",
+    ];
+    for (const eventName of activityEvents) {
+      window.addEventListener(eventName, markActive, { passive: true });
+    }
     void heartbeat();
     return () => {
       stopped = true;
+      for (const eventName of activityEvents) {
+        window.removeEventListener(eventName, markActive);
+      }
       if (timer !== null) window.clearTimeout(timer);
     };
   }, [identityPublicKey]);
@@ -838,6 +943,7 @@ export default function App() {
   }, [applyDirectInbox, markDirectRead]);
 
   const refresh = useCallback(async () => {
+    if (groupSelectionInFlight.current) return;
     const generation = ++refreshGeneration.current;
     const local = await noise<LocalSummary>({ action: "status" });
     if (generation !== refreshGeneration.current) return;
@@ -852,7 +958,15 @@ export default function App() {
         return;
       }
       const needsReadBaseline = !activeGroup.read_state_initialized;
-      const cached = groupConversationCache.current.get(activeGroup.group_id);
+      let cached = groupConversationCache.current.get(activeGroup.group_id);
+      if (!cached) {
+        cached = await noise<Conversation>({
+          action: "cached_conversation",
+          group_id: activeGroup.group_id,
+        }) ?? undefined;
+        if (generation !== refreshGeneration.current) return;
+        if (cached) groupConversationCache.current.set(activeGroup.group_id, cached);
+      }
       if (cached) setConversation(cached);
       const encryption = await syncGroupEncryption();
       if (generation !== refreshGeneration.current) return;
@@ -877,6 +991,7 @@ export default function App() {
       if (generation !== refreshGeneration.current) return;
       if (nextConversation) {
         groupConversationCache.current.set(nextConversation.group.group_id, nextConversation);
+        dirtyGroupIds.current.delete(nextConversation.group.group_id);
         setConversation(nextConversation);
       }
       setSummary(reconciled);
@@ -906,7 +1021,9 @@ export default function App() {
     void ensureNotificationPermission();
   }, [identityPublicKey]);
 
-  const activeGroup = summary?.groups.find((group) => group.is_active) ?? null;
+  const activeGroup = summary?.groups.find(
+    (group) => group.group_id === desiredGroupIdRef.current,
+  ) ?? summary?.groups.find((group) => group.is_active) ?? null;
   const activeGroupId = activeGroup?.group_id ?? null;
   const activeDirectPublicKey = summary?.directs.find((direct) => direct.is_active)?.public_key ?? null;
   const markCurrentGroupRead = useCallback(() => {
@@ -926,7 +1043,7 @@ export default function App() {
       .filter((group) => sidebarMode !== "groups" || group.group_id !== activeGroupId);
     let stopped = false;
     const watch = async (group: GroupSummary) => {
-      let revision: number | null = null;
+      let revision: number | null = groupWatchRevisions.current.get(group.group_id) ?? null;
       while (!stopped) {
         try {
           const initial = revision === null;
@@ -938,9 +1055,21 @@ export default function App() {
           });
           if (stopped || !change) return;
           revision = change.revision;
+          groupWatchRevisions.current.set(group.group_id, change.revision);
+          updatePresenceScope(
+            `group:${group.group_id}`,
+            presenceStatusesFromWatch(change),
+          );
           if (initial || change.changed) {
-            const reconciled = await syncGroupActivity(group.group_id);
-            if (!stopped && reconciled) setSummary(reconciled);
+            if (!initial && change.changed) dirtyGroupIds.current.add(group.group_id);
+            const activity = await syncGroupActivity(group.group_id);
+            if (!stopped && activity) {
+              if (activity.conversation) {
+                groupConversationCache.current.set(group.group_id, activity.conversation);
+                dirtyGroupIds.current.delete(group.group_id);
+              }
+              setSummary(activity.summary);
+            }
             if (initial && !group.read_state_initialized) {
               void noise<LocalSummary>({ action: "sync_account", relays })
                 .then((synced) => {
@@ -960,33 +1089,33 @@ export default function App() {
     return () => {
       stopped = true;
     };
-  }, [activeGroupId, groupWatchKey, identityPublicKey, sidebarMode]);
+  }, [activeGroupId, groupWatchKey, identityPublicKey, sidebarMode, updatePresenceScope]);
 
   useEffect(() => {
     if (sidebarMode !== "groups" || !activeGroupId) return;
     let stopped = false;
     const watch = async () => {
-      let revision: number | null = null;
+      let revision: number | null = groupWatchRevisions.current.get(activeGroupId) ?? null;
       while (!stopped) {
         try {
           const initial = revision === null;
           const change: GroupWatch | null = await noise<GroupWatch>({
-            action: "watch_group",
+            action: "watch_group_id",
+            group_id: activeGroupId,
             since: revision,
             relays,
           });
           if (stopped || !change) return;
           revision = change.revision;
-          const statuses = new Map<string, PresenceStatus>();
-          for (const publicKey of change.recently_active_public_keys ?? []) {
-            statuses.set(publicKey, "recently-active");
+          groupWatchRevisions.current.set(activeGroupId, change.revision);
+          updatePresenceScope(
+            `group:${activeGroupId}`,
+            presenceStatusesFromWatch(change),
+          );
+          if (!initial && change.changed) {
+            dirtyGroupIds.current.add(activeGroupId);
+            await refresh();
           }
-          for (const publicKey of change.online_public_keys ?? []) {
-            statuses.set(publicKey, "online");
-          }
-          if (identityPublicKey) statuses.set(identityPublicKey, "online");
-          setOnlinePresence({ groupId: activeGroupId, statuses });
-          if (!initial && change.changed) await refresh();
         } catch {
           await new Promise((resolve) => window.setTimeout(resolve, 1500));
         }
@@ -996,7 +1125,7 @@ export default function App() {
     return () => {
       stopped = true;
     };
-  }, [activeGroupId, identityPublicKey, refresh, sidebarMode]);
+  }, [activeGroupId, identityPublicKey, refresh, sidebarMode, updatePresenceScope]);
 
   useEffect(() => {
     if (!identityPublicKey) return;
@@ -1009,14 +1138,7 @@ export default function App() {
           const change: GroupWatch | null = await noise<GroupWatch>({ action: "watch_direct", since: revision, relays });
           if (stopped || !change) return;
           revision = change.revision;
-          const statuses = new Map<string, PresenceStatus>();
-          for (const publicKey of change.recently_active_public_keys ?? []) {
-            statuses.set(publicKey, "recently-active");
-          }
-          for (const publicKey of change.online_public_keys ?? []) {
-            statuses.set(publicKey, "online");
-          }
-          setDirectPresenceStatuses(statuses);
+          updatePresenceScope("directs", presenceStatusesFromWatch(change));
           if (initial) {
             await syncDirectInbox(sidebarModeRef.current === "directs");
           } else if (change.changed) {
@@ -1029,7 +1151,7 @@ export default function App() {
     };
     void watch();
     return () => { stopped = true; };
-  }, [identityPublicKey, syncDirectInbox]);
+  }, [identityPublicKey, syncDirectInbox, updatePresenceScope]);
 
   useEffect(() => {
     if (!identityPublicKey || !summary?.identity.noise_id) return;
@@ -1072,31 +1194,64 @@ export default function App() {
   }
 
   async function selectGroup(group: GroupSummary) {
-    if (group.is_active) return;
+    if (group.group_id === activeGroupId && !pendingGroupId) return;
+    const previousGroupId = activeGroupId;
     const needsReadBaseline = !group.read_state_initialized;
     const generation = ++refreshGeneration.current;
+    groupSelectionInFlight.current = true;
+    setPendingGroupId(group.group_id);
     setError(null);
     setGroupEncryption(null);
-    const cached = groupConversationCache.current.get(group.group_id);
-    if (cached) setConversation(cached);
-    setSummary((current) => current ? {
-      ...current,
-      groups: current.groups.map((candidate) => ({
-        ...candidate,
-        is_active: candidate.group_id === group.group_id,
-      })),
-    } : current);
 
     try {
+      let cached = groupConversationCache.current.get(group.group_id);
+      if (!cached) {
+        cached = await noise<Conversation>({
+          action: "cached_conversation",
+          group_id: group.group_id,
+        }) ?? undefined;
+        if (generation !== refreshGeneration.current) return;
+        if (cached) {
+          groupConversationCache.current.set(group.group_id, cached);
+          dirtyGroupIds.current.add(group.group_id);
+        }
+      }
+      if (cached) {
+        desiredGroupIdRef.current = group.group_id;
+        setConversation(cached);
+        setSummary((current) => current ? {
+          ...current,
+          groups: current.groups.map((candidate) => ({
+            ...candidate,
+            is_active: candidate.group_id === group.group_id,
+          })),
+        } : current);
+      }
+
       const local = await noise<LocalSummary>({ action: "select_group", group_id: group.group_id });
       if (generation !== refreshGeneration.current) return;
-      setSummary(local);
+      if (cached) {
+        setSummary(local);
+        if (!dirtyGroupIds.current.has(group.group_id)) {
+          if (needsReadBaseline) {
+            void noise<LocalSummary>({ action: "sync_account", relays })
+              .then((synced) => {
+                if (synced) setSummary(synced);
+              })
+              .catch(() => {
+                // The cached conversation is already usable; account sync retries normally.
+              });
+          }
+          return;
+        }
+      }
       const encryption = await syncGroupEncryption();
       if (generation !== refreshGeneration.current) return;
-      setGroupEncryption(encryption);
       if (encryption?.phase === "removed") {
         const reconciled = await noise<LocalSummary>({ action: "status" });
         if (generation !== refreshGeneration.current) return;
+        desiredGroupIdRef.current = reconciled?.groups.find((candidate) => candidate.is_active)?.group_id
+          ?? previousGroupId;
         setConversation(null);
         setGroupEncryption(null);
         setSummary(reconciled);
@@ -1106,16 +1261,23 @@ export default function App() {
         encryption?.phase === "waiting_for_admission"
         || encryption?.phase === "waiting_for_device"
       ) {
+        desiredGroupIdRef.current = group.group_id;
+        setSummary(local);
+        setGroupEncryption(encryption);
         setConversation(null);
         return;
       }
       const fresh = await noise<Conversation>({ action: "conversation", relays });
       const reconciled = await noise<LocalSummary>({ action: "status" });
       if (generation !== refreshGeneration.current) return;
-      if (fresh) {
-        groupConversationCache.current.set(fresh.group.group_id, fresh);
-        setConversation(fresh);
+      if (!fresh || fresh.group.group_id !== group.group_id) {
+        throw new Error("the selected group did not return its conversation");
       }
+      groupConversationCache.current.set(fresh.group.group_id, fresh);
+      dirtyGroupIds.current.delete(fresh.group.group_id);
+      desiredGroupIdRef.current = group.group_id;
+      setConversation(fresh);
+      setGroupEncryption(encryption);
       setSummary(reconciled);
       if (needsReadBaseline) {
         void noise<LocalSummary>({ action: "sync_account", relays })
@@ -1127,7 +1289,19 @@ export default function App() {
           });
       }
     } catch (cause) {
-      if (generation === refreshGeneration.current) setError(message(cause));
+      if (generation === refreshGeneration.current) {
+        desiredGroupIdRef.current = previousGroupId;
+        if (previousGroupId) {
+          const previous = groupConversationCache.current.get(previousGroupId);
+          if (previous) setConversation(previous);
+        }
+        setError(message(cause));
+      }
+    } finally {
+      if (generation === refreshGeneration.current) {
+        groupSelectionInFlight.current = false;
+        setPendingGroupId(null);
+      }
     }
   }
 
@@ -1314,17 +1488,25 @@ export default function App() {
       ),
     ],
   } : null;
-  const selectedPresenceStatuses = onlinePresence.groupId === activeGroupId
-    ? onlinePresence.statuses
-    : new Map([[summary.identity.public_key, "online" as PresenceStatus]]);
+  const selectedPresenceStatuses = new Map(presenceStatuses);
+  selectedPresenceStatuses.set(summary.identity.public_key, selfPresenceStatus);
+  const visibleSummary = activeGroupId ? {
+    ...summary,
+    groups: summary.groups.map((group) => ({
+      ...group,
+      is_active: group.group_id === activeGroupId,
+    })),
+  } : summary;
 
   return (
     <div className={`app-shell ${appBackgroundSource ? "group-background-active" : ""}`} style={activeAccentStyle}>
       {appBackgroundSource && <div className="group-app-background" style={{ backgroundImage: `url(${JSON.stringify(appBackgroundSource)})` }} aria-hidden="true" />}
         <Sidebar
-        summary={summary}
+        summary={visibleSummary}
         mode={sidebarMode}
-        directPresenceStatuses={directPresenceStatuses}
+        pendingGroupId={pendingGroupId}
+        directPresenceStatuses={presenceStatuses}
+        selfPresenceStatus={selfPresenceStatus}
         onMode={(mode) => void switchSidebarMode(mode)}
         onMake={() => setDialog({ type: "make" })}
         onJoin={() => setDialog({ type: "join" })}
@@ -1343,7 +1525,7 @@ export default function App() {
             <ConversationPanel
               key={selectedConversation.group.group_id}
               conversation={selectedConversation}
-              busy={busy}
+              busy={busy || pendingGroupId === selectedConversation.group.group_id}
               hasBackground={Boolean(appBackgroundSource)}
               canEditGroup={selectedConversation.group.owner_public_key === summary.identity.public_key}
               unreadCount={activeGroup?.unread_count ?? 0}
@@ -1360,6 +1542,10 @@ export default function App() {
                 message: item,
                 scopeId: selectedConversation.group.group_id,
               })}
+              onDownload={(item) => perform(async () => {
+                if (!item.attachment) throw new Error("this message has no media");
+                await downloadAttachment(item.attachment, selectedConversation.group.group_id);
+              }, false)}
               onReaction={async (item, emoji) => {
                 const groupId = selectedConversation.group.group_id;
                 const enabled = !item.reactions?.some(
@@ -1456,9 +1642,14 @@ export default function App() {
               conversation={selectedDirectConversation}
               busy={busy}
               selfPublicKey={summary.identity.public_key}
-              contactPresence={directPresenceStatuses.get(selectedDirectConversation.contact.public_key) ?? "offline"}
+              selfPresence={selfPresenceStatus}
+              contactPresence={presenceStatuses.get(selectedDirectConversation.contact.public_key) ?? "offline"}
               onPerson={(person) => setDialog({ type: "person", person })}
               onDelete={() => setDialog({ type: "delete_direct", direct: selectedDirectConversation.contact })}
+              onDownload={(item) => perform(async () => {
+                if (!item.attachment) throw new Error("this message has no media");
+                await downloadAttachment(item.attachment, selectedDirectConversation.media_scope_id);
+              }, false)}
               onSend={async (text, pending, onProgress, replyToMessageId, signal) => {
                 const publicKey = selectedDirectConversation.contact.public_key;
                 const optimistic = optimisticMessage(summary.identity, text, pending, replyToMessageId);
@@ -1589,7 +1780,7 @@ export default function App() {
             const updatedGroup = local.groups.find((group) => group.group_id === dialog.group.group_id);
             if (updatedGroup) setDialog({ type: "group", group: updatedGroup });
           })}
-          onSave={(name, description, accentColor, avatar, removeAvatar, background, removeBackground, membersCanSendMessages, membersCanSendMedia) =>
+          onSave={(name, description, accentColor, avatar, removeAvatar, background, removeBackground, mobileBackground, removeMobileBackground, membersCanSendMessages, membersCanSendMedia) =>
             perform(async () => {
               const local = await noise<LocalSummary>({
                 action: "update_group_profile",
@@ -1603,6 +1794,9 @@ export default function App() {
                 background_data_base64: background,
                 background_mime_type: background ? "image/jpeg" : null,
                 remove_background: removeBackground,
+                mobile_background_data_base64: mobileBackground,
+                mobile_background_mime_type: mobileBackground ? "image/jpeg" : null,
+                remove_mobile_background: removeMobileBackground,
                 members_can_send_messages: membersCanSendMessages,
                 members_can_send_media: membersCanSendMedia,
                 relays,
@@ -1847,7 +2041,9 @@ export default function App() {
 function Sidebar({
   summary,
   mode,
+  pendingGroupId,
   directPresenceStatuses,
+  selfPresenceStatus,
   onMode,
   onMake,
   onJoin,
@@ -1859,7 +2055,9 @@ function Sidebar({
 }: {
   summary: LocalSummary;
   mode: SidebarMode;
+  pendingGroupId: string | null;
   directPresenceStatuses: Map<string, PresenceStatus>;
+  selfPresenceStatus: PresenceStatus;
   onMode: (mode: SidebarMode) => void;
   onMake: () => void;
   onJoin: () => void;
@@ -1886,7 +2084,7 @@ function Sidebar({
       <div className="group-list">
         {mode === "groups" ? summary.groups.map((group) => (
           <button
-            className={`group-row ${group.is_active ? "active" : ""}`}
+            className={`group-row ${group.is_active ? "active" : ""} ${pendingGroupId === group.group_id ? "pending" : ""}`}
             key={group.group_id}
             onClick={() => onSelect(group)}
             onContextMenu={(event) => {
@@ -1920,7 +2118,7 @@ function Sidebar({
         {mode === "directs" && summary.directs.length === 0 && <div className="empty-direct-list">message someone from a shared group</div>}
       </div>
       <button className="self-profile" onClick={onProfile}>
-        <PresenceAvatar name={summary.identity.username} image={summary.identity.avatar} size={32} status="online" />
+        <PresenceAvatar name={summary.identity.username} image={summary.identity.avatar} size={32} status={selfPresenceStatus} />
         <span><strong>{summary.identity.username}</strong><small>{summary.identity.bio || "build your identity"}</small></span>
         <Settings2 size={13} />
       </button>
@@ -1986,7 +2184,9 @@ function DirectContextMenu({ x, y, onClose, onDelete }: { x: number; y: number; 
   return <div className="group-context-menu" style={{ left: Math.min(x, window.innerWidth - 190), top: Math.min(y, window.innerHeight - 58) }} onMouseDown={(event) => event.stopPropagation()}><button onClick={onDelete}><Trash2 size={14} /> delete conversation</button></div>;
 }
 
-function MessageContextMenu({ x, y, busy, onClose, onReact, onReply, onReport, onDelete, onBan }: { x: number; y: number; busy: boolean; onClose: () => void; onReact?: () => void; onReply: () => void; onReport?: () => void; onDelete?: () => void; onBan?: () => void }) {
+function MessageContextMenu({ x, y, busy, onClose, onReact, onReply, onDownload, onReport, onDelete, onBan }: { x: number; y: number; busy: boolean; onClose: () => void; onReact?: () => void; onReply: () => void; onDownload?: () => Promise<boolean>; onReport?: () => void; onDelete?: () => void; onBan?: () => void }) {
+  const [downloading, setDownloading] = useState(false);
+  const [downloaded, setDownloaded] = useState(false);
   useEffect(() => {
     const close = () => onClose();
     const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
@@ -1999,8 +2199,8 @@ function MessageContextMenu({ x, y, busy, onClose, onReact, onReply, onReport, o
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [onClose]);
-  const menuHeight = 50 + (onReact ? 42 : 0) + (onReport ? 42 : 0) + (onDelete ? 42 : 0) + (onBan ? 42 : 0);
-  return <div className="member-context-menu" style={{ left: Math.min(x, window.innerWidth - 200), top: Math.min(y, window.innerHeight - menuHeight) }} onMouseDown={(event) => event.stopPropagation()}>{onReact && <button disabled={busy} onClick={onReact}><SmilePlus size={14} /> react</button>}<button disabled={busy} onClick={onReply}><Reply size={14} /> reply</button>{onReport && <button className="report-action" disabled={busy} onClick={onReport}><TriangleAlert size={14} /> report message</button>}{onDelete && <button className="danger" disabled={busy} onClick={onDelete}><Trash2 size={14} /> delete message</button>}{onBan && <button className="danger" disabled={busy} onClick={onBan}><UserRoundX size={14} /> ban member</button>}</div>;
+  const menuHeight = 50 + (onReact ? 42 : 0) + (onDownload ? 42 : 0) + (onReport ? 42 : 0) + (onDelete ? 42 : 0) + (onBan ? 42 : 0);
+  return <div className="member-context-menu" style={{ left: Math.min(x, window.innerWidth - 200), top: Math.min(y, window.innerHeight - menuHeight) }} onMouseDown={(event) => event.stopPropagation()}>{onReact && <button disabled={busy || downloading} onClick={onReact}><SmilePlus size={14} /> react</button>}<button disabled={busy || downloading} onClick={onReply}><Reply size={14} /> reply</button>{onDownload && <button disabled={busy || downloading || downloaded} onClick={() => { setDownloading(true); void onDownload().then((success) => { setDownloading(false); if (success) { setDownloaded(true); window.setTimeout(onClose, 650); } else { onClose(); } }); }}>{downloaded ? <Check size={14} /> : downloading ? <LoaderCircle className="spinner" size={14} /> : <Download size={14} />}{downloaded ? "downloaded" : downloading ? "downloading" : "download media"}</button>}{onReport && <button className="report-action" disabled={busy || downloading} onClick={onReport}><TriangleAlert size={14} /> report message</button>}{onDelete && <button className="danger" disabled={busy || downloading} onClick={onDelete}><Trash2 size={14} /> delete message</button>}{onBan && <button className="danger" disabled={busy || downloading} onClick={onBan}><UserRoundX size={14} /> ban member</button>}</div>;
 }
 
 function MemberContextMenu({ member, x, y, canDesignate, canBan, onClose, onMessage, onSetModerator, onBan }: { member: MemberSummary; x: number; y: number; canDesignate: boolean; canBan: boolean; onClose: () => void; onMessage: () => void; onSetModerator: (enabled: boolean) => void; onBan: () => void }) {
@@ -2164,6 +2364,7 @@ function ConversationPanel({
   onPerson,
   onMessage,
   onDeleteMessage,
+  onDownload,
   onReaction,
   onSetModerator,
   onBan,
@@ -2185,6 +2386,7 @@ function ConversationPanel({
   onPerson: (person: PersonSummary) => void;
   onMessage: (person: PersonSummary) => void;
   onDeleteMessage: (message: MessageSummary) => void;
+  onDownload: (message: MessageSummary) => Promise<boolean>;
   onReaction: (message: MessageSummary, emoji: string) => Promise<void>;
   onSetModerator: (member: MemberSummary, enabled: boolean) => Promise<boolean>;
   onBan: (member: MemberSummary) => void;
@@ -2231,6 +2433,34 @@ function ConversationPanel({
       || presenceRank(left) - presenceRank(right)
       || left.username.localeCompare(right.username);
   });
+  const moderationMembers = sortedMembers.filter((member) =>
+    member.public_key === conversation.group.owner_public_key || member.is_moderator
+  );
+  const regularMembers = sortedMembers.filter((member) =>
+    member.public_key !== conversation.group.owner_public_key && !member.is_moderator
+  );
+  const renderMember = (member: MemberSummary) => (
+    <div key={member.public_key} className="member-sidebar-row">
+      <button className="member-sidebar-main" onClick={() => onPerson({
+        ...member,
+        presence_status: presenceStatuses.get(member.public_key) ?? "offline",
+      })}>
+        <span className="member-avatar-wrap">
+          <PresenceAvatar name={member.username} image={member.avatar} size={30} status={presenceStatuses.get(member.public_key) ?? "offline"} />
+          {member.public_key === conversation.group.owner_public_key
+            ? <span className="member-role-mark founder" aria-label="group founder" title="group founder"><Crown size={9} /></span>
+            : member.is_moderator && <span className="member-role-mark moderator" aria-label="group moderator" title="group moderator"><Shield size={8} /></span>}
+        </span>
+        <span className="member-sidebar-copy">
+          <strong>{member.username}</strong>
+          <span className="member-sidebar-meta">
+            <small>{member.bio || "tuned in"}</small>
+          </span>
+        </span>
+      </button>
+      {member.public_key !== selfPublicKey && <button className="member-actions" aria-label={`actions for ${member.username}`} onClick={(event) => { const rect = event.currentTarget.getBoundingClientRect(); setMemberMenu({ member, x: rect.right, y: rect.bottom + 4 }); }}><MoreHorizontal size={15} /></button>}
+    </div>
+  );
   const attachmentPreview = attachment?.previewUrl;
   useEffect(() => () => {
     if (attachmentPreview) URL.revokeObjectURL(attachmentPreview);
@@ -2325,33 +2555,21 @@ function ConversationPanel({
         <button className="send-button" disabled={(!draft.trim() && !attachment) || busy || (!!draft.trim() && !canSendMessages) || (!!attachment && !canSendMedia)} onClick={() => void submit()}><ArrowUp size={17} /></button>
       </div> : selfMember ? <div className="membership-revoked"><ShieldOff size={16} /> only moderators can post right now</div> : <div className="membership-revoked"><UserRoundX size={16} /> you no longer have access to this group</div>}
       <aside className="member-sidebar">
-        <div className="member-sidebar-heading">
-          <strong>members</strong>
-          <span>{conversation.members.length}</span>
-        </div>
         <div className="member-sidebar-list">
-          {sortedMembers.map((member) => (
-            <div key={member.public_key} className="member-sidebar-row">
-              <button className="member-sidebar-main" onClick={() => onPerson({
-                ...member,
-                presence_status: presenceStatuses.get(member.public_key) ?? "offline",
-              })}>
-                <span className="member-avatar-wrap">
-                  <PresenceAvatar name={member.username} image={member.avatar} size={30} status={presenceStatuses.get(member.public_key) ?? "offline"} />
-                  {member.public_key === conversation.group.owner_public_key
-                    ? <span className="member-role-mark founder" aria-label="group founder" title="group founder"><Crown size={9} /></span>
-                    : member.is_moderator && <span className="member-role-mark moderator" aria-label="group moderator" title="group moderator"><Shield size={8} /></span>}
-                </span>
-                <span className="member-sidebar-copy">
-                  <strong>{member.username}</strong>
-                  <span className="member-sidebar-meta">
-                    <small>{member.bio || "tuned in"}</small>
-                  </span>
-                </span>
-              </button>
-              {member.public_key !== selfPublicKey && <button className="member-actions" aria-label={`actions for ${member.username}`} onClick={(event) => { const rect = event.currentTarget.getBoundingClientRect(); setMemberMenu({ member, x: rect.right, y: rect.bottom + 4 }); }}><MoreHorizontal size={15} /></button>}
+          <section className="member-sidebar-section">
+            <div className="member-sidebar-heading">
+              <strong>moderation</strong>
+              <span>{moderationMembers.length}</span>
             </div>
-          ))}
+            {moderationMembers.map(renderMember)}
+          </section>
+          <section className="member-sidebar-section">
+            <div className="member-sidebar-heading">
+              <strong>members</strong>
+              <span>{regularMembers.length}</span>
+            </div>
+            {regularMembers.map(renderMember)}
+          </section>
         </div>
       </aside>
       <AppVersionFooter />
@@ -2380,6 +2598,7 @@ function ConversationPanel({
           setMessageMenu(null);
         }}
         onReply={() => { setReplyingTo(messageMenu.message); setMessageMenu(null); window.setTimeout(() => composerInput.current?.focus(), 0); }}
+        onDownload={messageMenu.message.attachment ? () => onDownload(messageMenu.message) : undefined}
         onReport={!canModerate && messageMenu.message.author_public_key !== selfPublicKey && !conversation.reported_message_event_ids.includes(messageMenu.message.event_id) ? () => { onReport(messageMenu.message); setMessageMenu(null); } : undefined}
         onDelete={(canModerate || messageMenu.message.author_public_key === selfPublicKey) ? () => { onDeleteMessage(messageMenu.message); setMessageMenu(null); } : undefined}
         onBan={(() => {
@@ -2405,7 +2624,7 @@ function ConversationPanel({
   );
 }
 
-function DirectConversationPanel({ conversation, busy, selfPublicKey, contactPresence, onPerson, onDelete, onSend }: { conversation: DirectConversation; busy: boolean; selfPublicKey: string; contactPresence: PresenceStatus; onPerson: (person: PersonSummary) => void; onDelete: () => void; onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null, signal: AbortSignal) => Promise<boolean> }) {
+function DirectConversationPanel({ conversation, busy, selfPublicKey, selfPresence, contactPresence, onPerson, onDelete, onDownload, onSend }: { conversation: DirectConversation; busy: boolean; selfPublicKey: string; selfPresence: PresenceStatus; contactPresence: PresenceStatus; onPerson: (person: PersonSummary) => void; onDelete: () => void; onDownload: (message: MessageSummary) => Promise<boolean>; onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null, signal: AbortSignal) => Promise<boolean> }) {
   const [draft, setDraft] = useState("");
   const [attachment, setAttachment] = useState<PendingMedia | null>(null);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
@@ -2485,7 +2704,7 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, contactPre
       </header>
       <div className="messages" ref={messageList.ref} onScroll={messageList.onScroll}>
         {conversation.messages.length === 0 && <div className="quiet">start the conversation</div>}
-        {messageList.visibleMessages.map((item) => <MessageRow key={item.event_id} message={item} own={item.author_public_key === selfPublicKey} presence={item.author_public_key === selfPublicKey ? "online" : contactPresence} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} mediaScopeId={conversation.media_scope_id} />)}
+        {messageList.visibleMessages.map((item) => <MessageRow key={item.event_id} message={item} own={item.author_public_key === selfPublicKey} presence={item.author_public_key === selfPublicKey ? selfPresence : contactPresence} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} mediaScopeId={conversation.media_scope_id} />)}
       </div>
       {conversation.contact.accepts_direct_messages ? <div className="composer">
         {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.media_scope_id} onClose={() => setReplyingTo(null)} />}
@@ -2506,7 +2725,7 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, contactPre
         <span className={`direct-profile-status ${conversation.contact.accepts_direct_messages ? "open" : "closed"}`}><i />{conversation.contact.accepts_direct_messages ? "accepting DMs" : "DMs closed"}</span>
       </aside>
       <AppVersionFooter />
-      {messageMenu && <MessageContextMenu x={messageMenu.x} y={messageMenu.y} busy={busy} onClose={() => setMessageMenu(null)} onReply={() => { setReplyingTo(messageMenu.message); setMessageMenu(null); window.setTimeout(() => composerInput.current?.focus(), 0); }} />}
+      {messageMenu && <MessageContextMenu x={messageMenu.x} y={messageMenu.y} busy={busy} onClose={() => setMessageMenu(null)} onReply={() => { setReplyingTo(messageMenu.message); setMessageMenu(null); window.setTimeout(() => composerInput.current?.focus(), 0); }} onDownload={messageMenu.message.attachment ? () => onDownload(messageMenu.message) : undefined} />}
     </div>
   );
 }
@@ -2541,7 +2760,7 @@ function AppVersionFooter() {
       {isTauri
         ? <span>{version ? `Beta V.${version}` : "Beta"}</span>
         : <a href="https://makenoise.chat/#download" target="_blank" rel="noreferrer"><Download size={13} />{desktopDownloadLabel}</a>}
-      <button onClick={() => setShowAbout(true)} aria-label="about Noise" title="about Noise"><Info size={13} /></button>
+      <button onClick={() => setShowAbout(true)} aria-label="about noise" title="about noise"><Info size={13} /></button>
     </div>
     {showAbout && <AboutNoiseDialog onClose={() => setShowAbout(false)} />}
   </>;
@@ -2549,28 +2768,36 @@ function AppVersionFooter() {
 
 function AboutNoiseDialog({ onClose }: { onClose: () => void }) {
   return (
-    <Modal onClose={onClose}>
-      <DialogHeading icon={<NoiseMark size={28} />} title="about Noise" detail="private group communication without personal information" />
+    <Modal onClose={onClose} wide className="about-noise-modal">
+      <DialogHeading icon={<NoiseMark size={30} />} title="how noise works" detail="private groups without phone numbers, email addresses, or a central owner" />
       <div className="about-noise">
         <section>
-          <strong>your identity belongs to you</strong>
-          <p>Noise creates a cryptographic identity on your device. It does not require a phone number, email address, legal name, contact list, or location. Your Noise ID and password unlock an encrypted account vault so the same identity can be restored on another device.</p>
+          <strong>your account is yours</strong>
+          <p>You sign in with a noise ID and password instead of a phone number or email. Your display name and photo can change without changing who you are to the people and groups that know you.</p>
         </section>
         <section>
-          <strong>content is encrypted before it leaves</strong>
-          <p>Messages, profiles, group activity, and media are encrypted locally with XChaCha20-Poly1305. DMs use a pairwise key derived by the two identity keys. Every event is signed with its author’s identity key, so clients can reject forged or modified history before displaying it.</p>
+          <strong>locked before it leaves</strong>
+          <p>noise locks messages, DMs, profiles, and uploads on your device before sending them anywhere. Relay machines carry the locked data, but they do not receive the readable contents.</p>
         </section>
         <section>
-          <strong>relays provide availability, not authority</strong>
-          <p>Relays replicate opaque encrypted events and media chunks so offline devices can catch up. Groups and identities do not belong to a relay. Noise can use one relay as a privacy mask so the storage relay receives the request without receiving the client connection.</p>
+          <strong>group locks change with membership</strong>
+          <p>When someone joins, leaves, or is banned, the group gets a new lock for future activity. New members can receive the group’s earlier history, while removed members cannot open anything posted afterward.</p>
         </section>
         <section>
-          <strong>groups are private by design</strong>
-          <p>There is no public group directory or recommendation feed. People join using a group’s 12-digit frequency, and each client independently rebuilds signed membership and moderation history.</p>
+          <strong>frequencies are invitations</strong>
+          <p>A group’s 12-digit frequency helps someone find the group and ask to join. It is not the key that unlocks the chat, and the founder can revoke it or replace it with a new one.</p>
         </section>
-        <section className="about-beta">
-          <strong>what Beta means</strong>
-          <p>Noise has not been independently audited. Groups currently use a shared encrypted group key without forward secrecy or automatic key rotation after removal, and a 12-digit frequency is not a high-entropy secret. Treat this as an evolving private-messaging protocol, not a finished high-risk security tool.</p>
+        <section>
+          <strong>relays keep noise available</strong>
+          <p>Relays hold locked group activity so people can catch up after being offline. One relay can also pass a request to another, helping prevent the machine storing the data from seeing where the request began.</p>
+        </section>
+        <section>
+          <strong>media is spread out</strong>
+          <p>Photos and videos are locked, split into pieces, and spread across several relays with recovery pieces added. No relay needs the whole file, and noise can rebuild it when enough pieces are available.</p>
+        </section>
+        <section className="about-boundary">
+          <strong>fyi</strong>
+          <p>noise cannot stop someone from taking a screenshot, exporting content, or reading an unlocked or compromised device. Its security design has not yet received an independent audit.</p>
         </section>
       </div>
       <DialogButtons><button className="primary" onClick={onClose}>done</button></DialogButtons>
@@ -2763,6 +2990,31 @@ function requestMediaSource(attachment: MediaAttachment, scopeId?: string) {
     });
   mediaLoadPromises.set(cacheKey, request);
   return request;
+}
+
+async function downloadAttachment(attachment: MediaAttachment, scopeId?: string) {
+  const data = await noise<AttachmentData>({
+    action: "fetch_attachment",
+    attachment,
+    scope_id: scopeId,
+    relays,
+  });
+  if (!data) throw new Error("media is unavailable");
+  if (isTauri) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke<string>("download_media", {
+      sourcePath: data.file_path,
+      fileName: attachment.file_name,
+    });
+    return;
+  }
+  const link = document.createElement("a");
+  link.href = data.file_path;
+  link.download = attachment.file_name || "noise-media";
+  link.style.display = "none";
+  document.body.append(link);
+  link.click();
+  link.remove();
 }
 
 function prepareMediaSource(attachment: MediaAttachment, source: string) {
@@ -3647,7 +3899,7 @@ function SettingsDialog({ profile, busy, onClose, onSave, onLogout, onDeleteAcco
   );
 }
 
-function GroupSettingsDialog({ group, bannedMembers, presenceStatuses, busy, onClose, onSave, onUnban, onRotateFrequency }: { group: GroupSummary; bannedMembers: BannedMemberSummary[]; presenceStatuses: Map<string, PresenceStatus>; busy: boolean; onClose: () => void; onSave: (name: string, description: string, accentColor: string, avatar: string | null, removeAvatar: boolean, background: string | null, removeBackground: boolean, membersCanSendMessages: boolean, membersCanSendMedia: boolean) => Promise<boolean>; onUnban: (member: BannedMemberSummary) => Promise<boolean>; onRotateFrequency: (revokeOnly: boolean) => Promise<boolean> }) {
+function GroupSettingsDialog({ group, bannedMembers, presenceStatuses, busy, onClose, onSave, onUnban, onRotateFrequency }: { group: GroupSummary; bannedMembers: BannedMemberSummary[]; presenceStatuses: Map<string, PresenceStatus>; busy: boolean; onClose: () => void; onSave: (name: string, description: string, accentColor: string, avatar: string | null, removeAvatar: boolean, background: string | null, removeBackground: boolean, mobileBackground: string | null, removeMobileBackground: boolean, membersCanSendMessages: boolean, membersCanSendMedia: boolean) => Promise<boolean>; onUnban: (member: BannedMemberSummary) => Promise<boolean>; onRotateFrequency: (revokeOnly: boolean) => Promise<boolean> }) {
   const [tab, setTab] = useState<"identity" | "appearance" | "general" | "banned">("identity");
   const [revokeArmed, setRevokeArmed] = useState(false);
   const [name, setName] = useState(group.name);
@@ -3656,7 +3908,8 @@ function GroupSettingsDialog({ group, bannedMembers, presenceStatuses, busy, onC
   const [membersCanSendMessages, setMembersCanSendMessages] = useState(group.members_can_send_messages);
   const [membersCanSendMedia, setMembersCanSendMedia] = useState(group.members_can_send_media);
   const image = useImageSelection();
-  const background = useBackgroundSelection();
+  const background = useBackgroundSelection("desktop");
+  const mobileBackground = useBackgroundSelection("mobile");
   const hasGroupIcon = Boolean(image.preview || (!image.removed && group.avatar));
   const settingsChanged = name.trim() !== group.name
     || description !== group.description
@@ -3666,7 +3919,9 @@ function GroupSettingsDialog({ group, bannedMembers, presenceStatuses, busy, onC
     || image.base64 !== null
     || image.removed
     || background.base64 !== null
-    || background.removed;
+    || background.removed
+    || mobileBackground.base64 !== null
+    || mobileBackground.removed;
   return (
     <Modal onClose={onClose} className="group-settings-modal">
       <DialogHeading icon={<Settings2 />} title="group settings" detail={group.name} />
@@ -3691,7 +3946,10 @@ function GroupSettingsDialog({ group, bannedMembers, presenceStatuses, busy, onC
           <LabeledArea label="description" count={`${description.length}/200`}><textarea value={description} onChange={(event) => setDescription(event.target.value)} /></LabeledArea>
         </div>}
         {tab === "appearance" && <div className="group-settings-appearance">
-          <BackgroundPicker existing={group.background} selection={background} disabled={busy} />
+          <div className="group-background-pickers">
+            <BackgroundPicker existing={group.background} selection={background} disabled={busy} label="chat background · desktop" recommendation="1920 × 1080 recommended" />
+            <BackgroundPicker existing={group.mobile_background} selection={mobileBackground} disabled={busy} label="chat background · mobile" recommendation="1290 × 2796 recommended" mobile />
+          </div>
           <div className="group-accent-setting">
             <div className="group-accent-heading"><span><strong>accent color</strong><small>group-wide theme</small></span><code>{accentColor}</code></div>
             <div className="accent-color-controls">
@@ -3725,7 +3983,7 @@ function GroupSettingsDialog({ group, bannedMembers, presenceStatuses, busy, onC
         </section>}
       </div>
       <DialogButtons onClose={onClose} closeLabel={settingsChanged ? "cancel" : "close"}>
-        {settingsChanged && <button className="primary" disabled={!name.trim() || name.length > 80 || description.length > 200 || background.busy || busy} onClick={() => void onSave(name.trim(), description, accentColor, image.base64, image.removed, background.base64, background.removed, membersCanSendMessages, membersCanSendMedia)}>save settings</button>}
+        {settingsChanged && <button className="primary" disabled={!name.trim() || name.length > 80 || description.length > 200 || background.busy || mobileBackground.busy || busy} onClick={() => void onSave(name.trim(), description, accentColor, image.base64, image.removed, background.base64, background.removed, mobileBackground.base64, mobileBackground.removed, membersCanSendMessages, membersCanSendMedia)}>save settings</button>}
       </DialogButtons>
     </Modal>
   );
@@ -3900,33 +4158,33 @@ function ImagePicker({ name, existing, selection, square = false, disabled = fal
   return <button className="image-picker" disabled={disabled} onClick={() => input.current?.click()}><span className={`avatar ${square ? "square" : ""}`} style={{ width: 96, height: 96 }}>{selection.preview ? <img src={selection.preview} alt="" /> : <Avatar name={name} image={selection.removed ? null : existing} size={96} square={square} />}</span>{!disabled && <i><Camera size={13} /></i>}<input ref={input} hidden type="file" accept="image/*" onChange={(event) => void selection.choose(event.target.files?.[0])} /></button>;
 }
 
-function BackgroundPicker({ existing, selection, disabled = false }: { existing: ProfileImage | null; selection: ReturnType<typeof useBackgroundSelection>; disabled?: boolean }) {
+function BackgroundPicker({ existing, selection, label, recommendation, mobile = false, disabled = false }: { existing: ProfileImage | null; selection: ReturnType<typeof useBackgroundSelection>; label: string; recommendation: string; mobile?: boolean; disabled?: boolean }) {
   const input = useRef<HTMLInputElement>(null);
   const existingSource = useProfileImageSource(selection.removed ? null : existing);
   const source = selection.preview ?? existingSource;
   const hasBackground = Boolean(selection.preview || (!selection.removed && existing));
   return (
-    <div className="background-picker">
+    <div className={`background-picker ${mobile ? "mobile" : "desktop"}`}>
       <div className="background-picker-control">
         <button className="background-picker-preview" disabled={disabled || selection.busy} onClick={() => input.current?.click()}>
           {source
-            ? <img src={source} alt="selected group chat background" />
+            ? <img src={source} alt={`selected ${label}`} />
             : hasBackground
               ? <span><LoaderCircle className="spinner" size={16} /></span>
               : <span><Camera size={17} /> add background</span>}
           {source && <i><Camera size={12} /></i>}
         </button>
-        {hasBackground && <button className="background-picker-remove" disabled={disabled || selection.busy} onClick={selection.remove} aria-label="remove chat background" title="remove chat background"><X size={11} /></button>}
+        {hasBackground && <button className="background-picker-remove" disabled={disabled || selection.busy} onClick={selection.remove} aria-label={`remove ${label}`} title={`remove ${label}`}><X size={11} /></button>}
       </div>
       <input ref={input} hidden type="file" accept="image/*" onChange={(event) => { const target = event.currentTarget; void selection.choose(target.files?.[0]).finally(() => { target.value = ""; }); }} />
-      <small>chat background</small>
-      <em>1920 × 1080 recommended</em>
+      <small>{label}</small>
+      <em>{recommendation}</em>
       {selection.error && <p>{selection.error}</p>}
     </div>
   );
 }
 
-function useBackgroundSelection() {
+function useBackgroundSelection(variant: "desktop" | "mobile") {
   const [base64, setBase64] = useState<string | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
   const [removed, setRemoved] = useState(false);
@@ -3943,7 +4201,7 @@ function useBackgroundSelection() {
       setBusy(true);
       setError(null);
       try {
-        const data = await prepareGroupBackground(file);
+        const data = await prepareGroupBackground(file, variant);
         setBase64(data);
         setPreview(`data:image/jpeg;base64,${data}`);
         setRemoved(false);
@@ -4007,13 +4265,17 @@ async function syncGroupEncryption(): Promise<GroupEncryptionStatus | null> {
   }
 }
 
-async function syncGroupActivity(groupId: string): Promise<LocalSummary | null> {
+async function syncGroupActivity(groupId: string): Promise<GroupActivityResult | null> {
   try {
-    return await noise<LocalSummary>({
+    const result = await noise<GroupActivityResult | LocalSummary>({
       action: "sync_group_activity",
       group_id: groupId,
       relays,
     });
+    if (!result) return null;
+    return "summary" in result
+      ? result
+      : { summary: result, conversation: null };
   } catch (cause) {
     if (message(cause).includes("unknown variant `sync_group_activity`")) return null;
     throw cause;

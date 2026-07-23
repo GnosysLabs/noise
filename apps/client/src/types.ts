@@ -22,6 +22,7 @@ export type GroupSummary = {
   rules: string;
   avatar: ProfileImage | null;
   background: ProfileImage | null;
+  mobile_background: ProfileImage | null;
   accent_color: string;
   members_can_send_messages: boolean;
   members_can_send_media: boolean;
@@ -129,6 +130,11 @@ export type Conversation = {
   reports: ReportSummary[];
   reported_message_event_ids: string[];
   rejected_events: number;
+};
+
+export type GroupActivityResult = {
+  summary: LocalSummary;
+  conversation: Conversation | null;
 };
 
 export type GroupEncryptionStatus = {

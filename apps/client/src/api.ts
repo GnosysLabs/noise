@@ -36,6 +36,7 @@ let browserMutationQueue = Promise.resolve();
 
 const browserConcurrentActions = new Set([
   "discover_relay_masks",
+  "cached_conversation",
   "fetch_avatar",
   "fetch_attachment",
   "heartbeat_presence",
@@ -146,10 +147,12 @@ export async function prepareImage(file: File): Promise<string> {
   return btoa(binary);
 }
 
-export async function prepareGroupBackground(file: File): Promise<string> {
+export async function prepareGroupBackground(file: File, variant: "desktop" | "mobile" = "desktop"): Promise<string> {
   if (!file.type.startsWith("image/")) throw new Error("choose an image file");
   const bitmap = await createImageBitmap(file);
-  const scale = Math.min(1, 1920 / bitmap.width, 1080 / bitmap.height);
+  const maximumWidth = variant === "mobile" ? 1290 : 1920;
+  const maximumHeight = variant === "mobile" ? 2796 : 1080;
+  const scale = Math.min(1, maximumWidth / bitmap.width, maximumHeight / bitmap.height);
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.round(bitmap.width * scale));
   canvas.height = Math.max(1, Math.round(bitmap.height * scale));

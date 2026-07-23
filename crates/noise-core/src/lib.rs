@@ -139,6 +139,7 @@ impl Identity {
             rules: String::new(),
             avatar: None,
             background: None,
+            mobile_background: None,
             accent_color: default_group_accent_color(),
             members_can_send_messages: true,
             members_can_send_media: true,
@@ -768,6 +769,10 @@ pub struct GroupProfile {
     pub avatar: Option<ProfileImage>,
     #[serde(default)]
     pub background: Option<ProfileImage>,
+    #[serde(default)]
+    pub mobile_background: Option<ProfileImage>,
+    #[serde(default)]
+    pub mobile_background_updated: bool,
     #[serde(default = "default_group_accent_color")]
     pub accent_color: String,
     #[serde(default = "default_true")]
@@ -788,6 +793,8 @@ pub struct GroupMembership {
     pub avatar: Option<ProfileImage>,
     #[serde(default)]
     pub background: Option<ProfileImage>,
+    #[serde(default)]
+    pub mobile_background: Option<ProfileImage>,
     #[serde(default = "default_group_accent_color")]
     pub accent_color: String,
     #[serde(default = "default_true")]
@@ -812,6 +819,7 @@ impl GroupMembership {
             rules: String::new(),
             avatar: None,
             background: None,
+            mobile_background: None,
             accent_color: default_group_accent_color(),
             members_can_send_messages: true,
             members_can_send_media: true,
@@ -832,6 +840,7 @@ impl GroupMembership {
             rules: String::new(),
             avatar: None,
             background: None,
+            mobile_background: None,
             accent_color: default_group_accent_color(),
             members_can_send_messages: true,
             members_can_send_media: true,
@@ -848,6 +857,8 @@ impl GroupMembership {
             rules: self.rules.clone(),
             avatar: self.avatar.clone(),
             background: self.background.clone(),
+            mobile_background: self.mobile_background.clone(),
+            mobile_background_updated: true,
             accent_color: self.accent_color.clone(),
             members_can_send_messages: self.members_can_send_messages,
             members_can_send_media: self.members_can_send_media,
@@ -2044,13 +2055,18 @@ impl GroupState {
                         profile.accepts_direct_messages,
                     );
                 }
-                GroupEventPayload::GroupProfileUpdated { profile } => {
+                GroupEventPayload::GroupProfileUpdated { mut profile } => {
                     let is_owner =
                         state.owner_public_key.as_deref() == Some(event.author_public_key.as_str());
                     let is_active = state.members.contains_key(&event.author_public_key);
                     if !is_owner || !is_active || !valid_group_profile(&profile) {
                         state.rejected_events += 1;
                         continue;
+                    }
+                    if !profile.mobile_background_updated
+                        && profile.mobile_background.is_none()
+                    {
+                        profile.mobile_background = state.profile.mobile_background.clone();
                     }
                     state.profile = profile;
                 }
@@ -2404,6 +2420,14 @@ fn valid_group_profile(profile: &GroupProfile) -> bool {
                     .is_none_or(|storage| storage.verify(&avatar.blob_id).is_ok())
         })
         && profile.background.as_ref().is_none_or(|background| {
+            background.byte_length > 0
+                && background.byte_length <= 1536 * 1024
+                && background
+                    .storage
+                    .as_ref()
+                    .is_none_or(|storage| storage.verify(&background.blob_id).is_ok())
+        })
+        && profile.mobile_background.as_ref().is_none_or(|background| {
             background.byte_length > 0
                 && background.byte_length <= 1536 * 1024
                 && background
@@ -2856,6 +2880,8 @@ mod tests {
                     rules: String::new(),
                     avatar: None,
                     background: None,
+                    mobile_background: None,
+                    mobile_background_updated: true,
                     accent_color: default_group_accent_color(),
                     members_can_send_messages: false,
                     members_can_send_media: true,
@@ -2888,6 +2914,82 @@ mod tests {
         assert!(state.members.contains_key(&member.public_key_base64()));
         assert!(state.messages.is_empty());
         assert_eq!(state.rejected_events, 1);
+    }
+
+    #[test]
+    fn present_legacy_mobile_background_is_applied_without_allowing_legacy_removal() {
+        let founder = Identity::generate();
+        let group = GroupMembership::create_owned("background", founder.public_key_base64());
+        let founder_profile = Profile {
+            username: "founder".into(),
+            bio: String::new(),
+            avatar: None,
+            accepts_direct_messages: true,
+        };
+        let mobile_background = ProfileImage {
+            blob_id: "a".repeat(64),
+            key_base64: "key".into(),
+            mime_type: "image/jpeg".into(),
+            byte_length: 1,
+            storage: None,
+        };
+        let profile = |mobile_background, mobile_background_updated| GroupProfile {
+            name: "background".into(),
+            description: String::new(),
+            rules: String::new(),
+            avatar: None,
+            background: None,
+            mobile_background,
+            mobile_background_updated,
+            accent_color: default_group_accent_color(),
+            members_can_send_messages: true,
+            members_can_send_media: true,
+        };
+        let mut events = vec![
+            SignedEvent::member_joined(&founder, &group, &founder_profile, 0).unwrap(),
+            SignedEvent::group_profile_updated(
+                &founder,
+                &group,
+                &profile(Some(mobile_background.clone()), false),
+                1,
+            )
+            .unwrap(),
+        ];
+
+        let applied = GroupState::rebuild(&group, &events);
+        assert_eq!(
+            applied.profile.mobile_background.as_ref(),
+            Some(&mobile_background)
+        );
+
+        events.push(
+            SignedEvent::group_profile_updated(
+                &founder,
+                &group,
+                &profile(None, false),
+                2,
+            )
+            .unwrap(),
+        );
+        let preserved = GroupState::rebuild(&group, &events);
+        assert_eq!(
+            preserved.profile.mobile_background.as_ref(),
+            Some(&mobile_background)
+        );
+
+        events.push(
+            SignedEvent::group_profile_updated(
+                &founder,
+                &group,
+                &profile(None, true),
+                3,
+            )
+            .unwrap(),
+        );
+        assert!(GroupState::rebuild(&group, &events)
+            .profile
+            .mobile_background
+            .is_none());
     }
 
     #[test]

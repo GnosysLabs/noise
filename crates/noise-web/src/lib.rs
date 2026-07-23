@@ -140,6 +140,9 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                     optional::<String>(&request, "background_data_base64")?,
                     optional::<String>(&request, "background_mime_type")?,
                     optional::<bool>(&request, "remove_background")?.unwrap_or(false),
+                    optional::<String>(&request, "mobile_background_data_base64")?,
+                    optional::<String>(&request, "mobile_background_mime_type")?,
+                    optional::<bool>(&request, "remove_mobile_background")?.unwrap_or(false),
                     optional::<String>(&request, "accent_color")?,
                     optional::<bool>(&request, "members_can_send_messages")?,
                     optional::<bool>(&request, "members_can_send_media")?,
@@ -407,6 +410,11 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .await
                 .map_err(|error| error.to_string())?,
         ),
+        "cached_conversation" => data(
+            client
+                .cached_conversation(STATE_PATH, &required::<String>(&request, "group_id")?)
+                .map_err(|error| error.to_string())?,
+        ),
         "watch_group" => data(
             client
                 .watch_group(
@@ -430,7 +438,11 @@ async fn dispatch(request: Value) -> Result<Value, String> {
         ),
         "heartbeat_presence" => data(
             client
-                .heartbeat_presence(STATE_PATH, relays(&request)?)
+                .heartbeat_presence(
+                    STATE_PATH,
+                    optional::<bool>(&request, "active")?.unwrap_or(true),
+                    relays(&request)?,
+                )
                 .await
                 .map_err(|error| error.to_string())?,
         ),
