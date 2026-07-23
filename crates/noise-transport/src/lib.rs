@@ -19,7 +19,7 @@ pub const OHTTP_KEYS_PATH: &str = "/v1/ohttp-keys";
 pub const OHTTP_RELAY_PATH: &str = "/v1/ohttp/relay";
 pub const RELAY_DIRECTORY_PATH: &str = "/v3/relays";
 pub const SIGNED_RELAY_DESCRIPTOR_PATH: &str = "/v3/relay-descriptor";
-pub const RELAY_PROTOCOL_VERSION: u16 = 3;
+pub const RELAY_PROTOCOL_VERSION: u16 = 4;
 
 const PAD_BUCKETS: &[usize] = &[
     1024,

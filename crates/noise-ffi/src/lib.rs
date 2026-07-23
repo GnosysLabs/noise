@@ -125,6 +125,11 @@ enum Request {
         frequency: String,
         relays: Vec<String>,
     },
+    SyncGroupEncryption {
+        state_path: String,
+        cache_path: String,
+        relays: Vec<String>,
+    },
     Say {
         state_path: String,
         text: String,
@@ -561,6 +566,16 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         } => serde_json::to_value(
             runtime()?
                 .block_on(client.join(state_path, &frequency, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::SyncGroupEncryption {
+            state_path,
+            cache_path,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.sync_active_group_encryption(state_path, cache_path, relays))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),

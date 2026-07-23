@@ -15,6 +15,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
+mod production_e2ee;
+pub use production_e2ee::{
+    HistoryKeyLink, MlsAccountState, MlsCommitBundle, MlsControlLog, MlsDeviceCredential,
+    MlsEpochRecord, MlsEpochSummary, MlsGroupGenesis, MlsJoinRequest, MlsLegacyHistoryBridge,
+    MlsRemovalReason, MlsRemovalRequest,
+};
+
 const FREQUENCY_SPACE: u64 = 1_000_000_000_000;
 const NOISE_ID_SPACE: u64 = 1_000_000_000_000;
 const INVITE_KDF_CONTEXT: &str = "xyz.gnosyslabs.noise.frequency-invite.v1";
@@ -58,6 +65,10 @@ pub enum NoiseError {
     ErasureCoding,
     #[error("invalid group authority")]
     InvalidGroupAuthority,
+    #[error("invalid MLS state")]
+    InvalidMlsState,
+    #[error("MLS operation failed")]
+    Mls,
     #[error("serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
 }
@@ -1310,26 +1321,57 @@ pub enum GroupEventPayload {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedEvent {
     pub event_id: String,
     pub group_id: String,
     pub author_public_key: String,
     pub author_sequence: u64,
     pub created_at_millis: u64,
+    #[serde(default = "default_event_encryption_version")]
+    pub encryption_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
     pub nonce_base64: String,
     pub ciphertext_base64: String,
     pub signature_base64: String,
 }
 
+fn default_event_encryption_version() -> u32 {
+    1
+}
+
 #[derive(Serialize)]
-struct UnsignedEvent<'a> {
+struct UnsignedEventV1<'a> {
     group_id: &'a str,
     author_public_key: &'a str,
     author_sequence: u64,
     created_at_millis: u64,
     nonce_base64: &'a str,
     ciphertext_base64: &'a str,
+}
+
+#[derive(Serialize)]
+struct UnsignedEventV2<'a> {
+    encryption_version: u32,
+    epoch: u64,
+    group_id: &'a str,
+    author_public_key: &'a str,
+    author_sequence: u64,
+    created_at_millis: u64,
+    nonce_base64: &'a str,
+    ciphertext_base64: &'a str,
+}
+
+#[derive(Serialize)]
+struct EventAadV2<'a> {
+    context: &'static str,
+    encryption_version: u32,
+    epoch: u64,
+    group_id: &'a str,
+    author_public_key: &'a str,
+    author_sequence: u64,
+    created_at_millis: u64,
 }
 
 impl SignedEvent {
@@ -1339,7 +1381,7 @@ impl SignedEvent {
         profile: &Profile,
         author_sequence: u64,
     ) -> Result<Self, NoiseError> {
-        Self::create(
+        Self::create_legacy(
             identity,
             group,
             GroupEventPayload::MemberJoined {
@@ -1358,7 +1400,7 @@ impl SignedEvent {
         profile: &Profile,
         author_sequence: u64,
     ) -> Result<Self, NoiseError> {
-        Self::create(
+        Self::create_legacy(
             identity,
             group,
             GroupEventPayload::ProfileUpdated {
@@ -1374,7 +1416,7 @@ impl SignedEvent {
         profile: &GroupProfile,
         author_sequence: u64,
     ) -> Result<Self, NoiseError> {
-        Self::create(
+        Self::create_legacy(
             identity,
             group,
             GroupEventPayload::GroupProfileUpdated {
@@ -1389,7 +1431,7 @@ impl SignedEvent {
         group: &GroupMembership,
         author_sequence: u64,
     ) -> Result<Self, NoiseError> {
-        Self::create(
+        Self::create_legacy(
             identity,
             group,
             GroupEventPayload::MemberLeft,
@@ -1404,7 +1446,7 @@ impl SignedEvent {
         enabled: bool,
         author_sequence: u64,
     ) -> Result<Self, NoiseError> {
-        Self::create(
+        Self::create_legacy(
             identity,
             group,
             GroupEventPayload::ModeratorSet {
@@ -1421,7 +1463,7 @@ impl SignedEvent {
         message_event_id: impl Into<String>,
         author_sequence: u64,
     ) -> Result<Self, NoiseError> {
-        Self::create(
+        Self::create_legacy(
             identity,
             group,
             GroupEventPayload::MessageDeleted {
@@ -1439,7 +1481,7 @@ impl SignedEvent {
         enabled: bool,
         author_sequence: u64,
     ) -> Result<Self, NoiseError> {
-        Self::create(
+        Self::create_legacy(
             identity,
             group,
             GroupEventPayload::ReactionSet {
@@ -1456,7 +1498,7 @@ impl SignedEvent {
         group: &GroupMembership,
         author_sequence: u64,
     ) -> Result<Self, NoiseError> {
-        Self::create(
+        Self::create_legacy(
             identity,
             group,
             GroupEventPayload::OwnMessagesDeleted,
@@ -1471,7 +1513,7 @@ impl SignedEvent {
         reason: impl Into<String>,
         author_sequence: u64,
     ) -> Result<Self, NoiseError> {
-        Self::create(
+        Self::create_legacy(
             identity,
             group,
             GroupEventPayload::MessageReported {
@@ -1488,7 +1530,7 @@ impl SignedEvent {
         report_event_id: impl Into<String>,
         author_sequence: u64,
     ) -> Result<Self, NoiseError> {
-        Self::create(
+        Self::create_legacy(
             identity,
             group,
             GroupEventPayload::ReportResolved {
@@ -1505,7 +1547,7 @@ impl SignedEvent {
         delete_messages: bool,
         author_sequence: u64,
     ) -> Result<Self, NoiseError> {
-        Self::create(
+        Self::create_legacy(
             identity,
             group,
             GroupEventPayload::MemberBanned {
@@ -1522,7 +1564,7 @@ impl SignedEvent {
         member_public_key: impl Into<String>,
         author_sequence: u64,
     ) -> Result<Self, NoiseError> {
-        Self::create(
+        Self::create_legacy(
             identity,
             group,
             GroupEventPayload::MemberUnbanned {
@@ -1542,7 +1584,7 @@ impl SignedEvent {
         reply_to_message_id: Option<String>,
         author_sequence: u64,
     ) -> Result<Self, NoiseError> {
-        Self::create(
+        Self::create_legacy(
             identity,
             mailbox,
             GroupEventPayload::DirectMessage {
@@ -1562,7 +1604,7 @@ impl SignedEvent {
         recipient_public_key: impl Into<String>,
         author_sequence: u64,
     ) -> Result<Self, NoiseError> {
-        Self::create(
+        Self::create_legacy(
             identity,
             mailbox,
             GroupEventPayload::DirectThreadDeleted {
@@ -1588,7 +1630,7 @@ impl SignedEvent {
         reply_to_message_id: Option<String>,
         author_sequence: u64,
     ) -> Result<Self, NoiseError> {
-        Self::create(
+        Self::create_legacy(
             identity,
             group,
             GroupEventPayload::Message {
@@ -1618,7 +1660,7 @@ impl SignedEvent {
         reply_to_message_id: Option<String>,
         author_sequence: u64,
     ) -> Result<Self, NoiseError> {
-        Self::create(
+        Self::create_legacy(
             identity,
             group,
             GroupEventPayload::Message {
@@ -1630,7 +1672,7 @@ impl SignedEvent {
         )
     }
 
-    fn create(
+    pub fn create_legacy(
         identity: &Identity,
         group: &GroupMembership,
         payload: GroupEventPayload,
@@ -1656,6 +1698,59 @@ impl SignedEvent {
             author_public_key,
             author_sequence,
             created_at_millis: now_millis(),
+            encryption_version: 1,
+            epoch: None,
+            nonce_base64: STANDARD_NO_PAD.encode(nonce),
+            ciphertext_base64: STANDARD_NO_PAD.encode(ciphertext),
+            signature_base64: String::new(),
+        };
+        let signing_bytes = event.signing_bytes()?;
+        event.signature_base64 = identity.sign(&signing_bytes);
+        event.event_id = event.calculate_id(&signing_bytes)?;
+        Ok(event)
+    }
+
+    pub fn create_for_epoch(
+        identity: &Identity,
+        group_id: impl Into<String>,
+        archive_key_base64: &str,
+        epoch: u64,
+        payload: GroupEventPayload,
+        author_sequence: u64,
+    ) -> Result<Self, NoiseError> {
+        let group_id = group_id.into();
+        if !valid_hex_id(&group_id) {
+            return Err(NoiseError::GroupMismatch);
+        }
+        let archive_key = decode_array::<32>(archive_key_base64, "archive key")?;
+        let nonce: [u8; 24] = random();
+        let author_public_key = identity.public_key_base64();
+        let created_at_millis = now_millis();
+        let aad = event_aad_v2(
+            &group_id,
+            &author_public_key,
+            author_sequence,
+            created_at_millis,
+            epoch,
+        )?;
+        let plaintext = serde_json::to_vec(&payload)?;
+        let ciphertext = XChaCha20Poly1305::new((&archive_key).into())
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| NoiseError::Crypto)?;
+        let mut event = Self {
+            event_id: String::new(),
+            group_id,
+            author_public_key,
+            author_sequence,
+            created_at_millis,
+            encryption_version: 2,
+            epoch: Some(epoch),
             nonce_base64: STANDARD_NO_PAD.encode(nonce),
             ciphertext_base64: STANDARD_NO_PAD.encode(ciphertext),
             signature_base64: String::new(),
@@ -1681,6 +1776,9 @@ impl SignedEvent {
 
     pub fn decrypt(&self, group: &GroupMembership) -> Result<GroupEventPayload, NoiseError> {
         self.verify()?;
+        if self.encryption_version != 1 || self.epoch.is_some() {
+            return Err(NoiseError::InvalidMlsState);
+        }
         if self.group_id != group.group_id {
             return Err(NoiseError::GroupMismatch);
         }
@@ -1699,15 +1797,60 @@ impl SignedEvent {
         Ok(serde_json::from_slice(&plaintext)?)
     }
 
+    pub fn decrypt_epoch(
+        &self,
+        expected_group_id: &str,
+        archive_key_base64: &str,
+    ) -> Result<GroupEventPayload, NoiseError> {
+        self.verify()?;
+        if self.encryption_version != 2 || self.group_id != expected_group_id {
+            return Err(NoiseError::GroupMismatch);
+        }
+        let epoch = self.epoch.ok_or(NoiseError::InvalidMlsState)?;
+        let archive_key = decode_array::<32>(archive_key_base64, "archive key")?;
+        let nonce = decode_array::<24>(&self.nonce_base64, "message nonce")?;
+        let ciphertext = decode(&self.ciphertext_base64, "message ciphertext")?;
+        let aad = event_aad_v2(
+            &self.group_id,
+            &self.author_public_key,
+            self.author_sequence,
+            self.created_at_millis,
+            epoch,
+        )?;
+        let plaintext = XChaCha20Poly1305::new((&archive_key).into())
+            .decrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| NoiseError::Crypto)?;
+        Ok(serde_json::from_slice(&plaintext)?)
+    }
+
     fn signing_bytes(&self) -> Result<Vec<u8>, NoiseError> {
-        Ok(serde_json::to_vec(&UnsignedEvent {
-            group_id: &self.group_id,
-            author_public_key: &self.author_public_key,
-            author_sequence: self.author_sequence,
-            created_at_millis: self.created_at_millis,
-            nonce_base64: &self.nonce_base64,
-            ciphertext_base64: &self.ciphertext_base64,
-        })?)
+        match (self.encryption_version, self.epoch) {
+            (1, None) => Ok(serde_json::to_vec(&UnsignedEventV1 {
+                group_id: &self.group_id,
+                author_public_key: &self.author_public_key,
+                author_sequence: self.author_sequence,
+                created_at_millis: self.created_at_millis,
+                nonce_base64: &self.nonce_base64,
+                ciphertext_base64: &self.ciphertext_base64,
+            })?),
+            (2, Some(epoch)) => Ok(serde_json::to_vec(&UnsignedEventV2 {
+                encryption_version: self.encryption_version,
+                epoch,
+                group_id: &self.group_id,
+                author_public_key: &self.author_public_key,
+                author_sequence: self.author_sequence,
+                created_at_millis: self.created_at_millis,
+                nonce_base64: &self.nonce_base64,
+                ciphertext_base64: &self.ciphertext_base64,
+            })?),
+            _ => Err(NoiseError::InvalidMlsState),
+        }
     }
 
     fn calculate_id(&self, signing_bytes: &[u8]) -> Result<String, NoiseError> {
@@ -1717,6 +1860,24 @@ impl SignedEvent {
         hasher.update(&signature);
         Ok(hasher.finalize().to_hex().to_string())
     }
+}
+
+fn event_aad_v2(
+    group_id: &str,
+    author_public_key: &str,
+    author_sequence: u64,
+    created_at_millis: u64,
+    epoch: u64,
+) -> Result<Vec<u8>, NoiseError> {
+    Ok(serde_json::to_vec(&EventAadV2 {
+        context: "xyz.gnosyslabs.noise.group-event.v2",
+        encryption_version: 2,
+        epoch,
+        group_id,
+        author_public_key,
+        author_sequence,
+        created_at_millis,
+    })?)
 }
 
 #[derive(Clone, Debug)]
@@ -1779,6 +1940,15 @@ pub struct GroupState {
 
 impl GroupState {
     pub fn rebuild(group: &GroupMembership, events: &[SignedEvent]) -> Self {
+        Self::rebuild_with_epoch_keys(group, events, &HashMap::new(), &HashMap::new())
+    }
+
+    pub fn rebuild_with_epoch_keys(
+        group: &GroupMembership,
+        events: &[SignedEvent],
+        epoch_keys: &HashMap<u64, String>,
+        epoch_members: &HashMap<u64, HashSet<String>>,
+    ) -> Self {
         let mut ordered = events.iter().collect::<Vec<_>>();
         ordered.sort_by(|left, right| {
             left.created_at_millis
@@ -1802,7 +1972,21 @@ impl GroupState {
                 state.rejected_events += 1;
                 continue;
             }
-            let Ok(payload) = event.decrypt(group) else {
+            let payload = match (event.encryption_version, event.epoch) {
+                (1, None) => event.decrypt(group),
+                (2, Some(epoch))
+                    if epoch_members
+                        .get(&epoch)
+                        .is_some_and(|members| members.contains(&event.author_public_key)) =>
+                {
+                    epoch_keys
+                        .get(&epoch)
+                        .ok_or(NoiseError::InvalidMlsState)
+                        .and_then(|key| event.decrypt_epoch(&group.group_id, key))
+                }
+                _ => Err(NoiseError::InvalidMlsState),
+            };
+            let Ok(payload) = payload else {
                 state.rejected_events += 1;
                 continue;
             };

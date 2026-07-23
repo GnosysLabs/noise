@@ -7,8 +7,8 @@ use std::{
 
 use anyhow::{Context, anyhow};
 use noise_core::{
-    AccountVault, EncryptedBlob, GroupDeletion, InviteRecord, InviteRotation, SignedEvent,
-    StorageShard,
+    AccountVault, EncryptedBlob, GroupDeletion, InviteRecord, InviteRotation, MlsEpochRecord,
+    MlsGroupGenesis, MlsJoinRequest, MlsRemovalRequest, SignedEvent, StorageShard,
 };
 use noise_transport::SignedRelayDescriptor;
 use serde::Serialize;
@@ -32,6 +32,10 @@ pub struct RecoveredState {
     pub invites: HashMap<String, InviteRecord>,
     pub invite_rotations: HashMap<String, InviteRotation>,
     pub events: HashMap<String, SignedEvent>,
+    pub mls_join_requests: HashMap<String, MlsJoinRequest>,
+    pub mls_removal_requests: HashMap<String, MlsRemovalRequest>,
+    pub mls_geneses: HashMap<String, MlsGroupGenesis>,
+    pub mls_epochs: HashMap<String, MlsEpochRecord>,
     pub blobs: Vec<String>,
     pub legacy_blobs: Vec<LegacyBlobMetadata>,
     pub pending_blob_deletions: Vec<String>,
@@ -328,6 +332,9 @@ impl DurableStore {
         deletion: &GroupDeletion,
         invite_ids: &[String],
         event_ids: &[String],
+        mls_join_request_ids: &[String],
+        mls_removal_request_ids: &[String],
+        mls_epoch_ids: &[String],
     ) -> anyhow::Result<()> {
         let payload = serde_json::to_string(deletion)?;
         let connection = self.connection.lock().await;
@@ -346,7 +353,19 @@ impl DurableStore {
                     params!["invite_rotation", deletion.group_id.clone()],
                 )
                 .await?;
-            for (kind, object_ids) in [("invite", invite_ids), ("event", event_ids)] {
+            connection
+                .execute(
+                    "DELETE FROM relay_objects WHERE kind = ?1 AND object_id = ?2",
+                    params!["mls_genesis", deletion.group_id.clone()],
+                )
+                .await?;
+            for (kind, object_ids) in [
+                ("invite", invite_ids),
+                ("event", event_ids),
+                ("mls_join_request", mls_join_request_ids),
+                ("mls_removal_request", mls_removal_request_ids),
+                ("mls_epoch", mls_epoch_ids),
+            ] {
                 for object_id in object_ids {
                     connection
                         .execute(
@@ -422,6 +441,10 @@ async fn recover(connection: &Connection) -> anyhow::Result<RecoveredState> {
     let mut invites = HashMap::new();
     let mut invite_rotations = HashMap::new();
     let mut events = HashMap::new();
+    let mut mls_join_requests = HashMap::new();
+    let mut mls_removal_requests = HashMap::new();
+    let mut mls_geneses = HashMap::new();
+    let mut mls_epochs = HashMap::new();
     let mut blobs = Vec::new();
     let mut legacy_blobs = Vec::new();
     let mut pending_blob_deletions = Vec::new();
@@ -545,6 +568,60 @@ async fn recover(connection: &Connection) -> anyhow::Result<RecoveredState> {
                 }
                 events.insert(object_id, event);
             }
+            "mls_join_request" => {
+                let request: MlsJoinRequest =
+                    serde_json::from_str(&payload).with_context(|| {
+                        format!("stored MLS join request {object_id} is invalid JSON")
+                    })?;
+                request.verify().with_context(|| {
+                    format!("stored MLS join request {object_id} failed verification")
+                })?;
+                if request.request_id != object_id {
+                    return Err(anyhow!(
+                        "stored MLS join request key does not match its request id"
+                    ));
+                }
+                mls_join_requests.insert(object_id, request);
+            }
+            "mls_removal_request" => {
+                let request: MlsRemovalRequest =
+                    serde_json::from_str(&payload).with_context(|| {
+                        format!("stored MLS removal request {object_id} is invalid JSON")
+                    })?;
+                request.verify().with_context(|| {
+                    format!("stored MLS removal request {object_id} failed verification")
+                })?;
+                if request.request_id != object_id {
+                    return Err(anyhow!(
+                        "stored MLS removal request key does not match its request id"
+                    ));
+                }
+                mls_removal_requests.insert(object_id, request);
+            }
+            "mls_genesis" => {
+                let genesis: MlsGroupGenesis = serde_json::from_str(&payload)
+                    .with_context(|| format!("stored MLS genesis {object_id} is invalid JSON"))?;
+                genesis.verify().with_context(|| {
+                    format!("stored MLS genesis {object_id} failed verification")
+                })?;
+                if genesis.group_id != object_id {
+                    return Err(anyhow!(
+                        "stored MLS genesis key does not match its group id"
+                    ));
+                }
+                mls_geneses.insert(object_id, genesis);
+            }
+            "mls_epoch" => {
+                let epoch: MlsEpochRecord = serde_json::from_str(&payload)
+                    .with_context(|| format!("stored MLS epoch {object_id} is invalid JSON"))?;
+                epoch
+                    .verify()
+                    .with_context(|| format!("stored MLS epoch {object_id} failed verification"))?;
+                if epoch.record_id != object_id {
+                    return Err(anyhow!("stored MLS epoch key does not match its record id"));
+                }
+                mls_epochs.insert(object_id, epoch);
+            }
             "blob" => {
                 let blob: EncryptedBlob = serde_json::from_str(&payload)
                     .with_context(|| format!("stored blob {object_id} is invalid JSON"))?;
@@ -590,12 +667,20 @@ async fn recover(connection: &Connection) -> anyhow::Result<RecoveredState> {
         }
     }
     events.retain(|_, event| !deletions.contains_key(&event.group_id));
+    mls_join_requests.retain(|_, request| !deletions.contains_key(&request.group_id));
+    mls_removal_requests.retain(|_, request| !deletions.contains_key(&request.group_id));
+    mls_geneses.retain(|group_id, _| !deletions.contains_key(group_id));
+    mls_epochs.retain(|_, epoch| !deletions.contains_key(&epoch.bundle.group_id));
 
     Ok(RecoveredState {
         accounts,
         invites,
         invite_rotations,
         events,
+        mls_join_requests,
+        mls_removal_requests,
+        mls_geneses,
+        mls_epochs,
         blobs,
         legacy_blobs,
         pending_blob_deletions,

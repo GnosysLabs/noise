@@ -63,4 +63,4 @@ const resolveLatestDownloads = async () => {
   }
 };
 
-resolveLatestDownloads();
+if (downloadLinks.length) resolveLatestDownloads();

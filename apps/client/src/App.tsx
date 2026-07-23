@@ -49,6 +49,7 @@ import type {
   DirectConversation,
   DirectInbox,
   DirectSummary,
+  GroupEncryptionStatus,
   GroupSummary,
   GroupWatch,
   IdentitySummary,
@@ -548,6 +549,7 @@ function useAutoUpdater() {
 export default function App() {
   const [summary, setSummary] = useState<LocalSummary | null>(null);
   const [conversation, setConversation] = useState<Conversation | null>(null);
+  const [groupEncryption, setGroupEncryption] = useState<GroupEncryptionStatus | null>(null);
   const [directConversation, setDirectConversation] = useState<DirectConversation | null>(null);
   const [sidebarMode, setSidebarMode] = useState<SidebarMode>("groups");
   const [dialog, setDialog] = useState<Dialog | null>(null);
@@ -814,10 +816,32 @@ export default function App() {
       const activeGroup = local.groups.find((group) => group.is_active);
       if (!activeGroup) {
         setConversation(null);
+        setGroupEncryption(null);
         return;
       }
       const cached = groupConversationCache.current.get(activeGroup.group_id);
       if (cached) setConversation(cached);
+      const encryption = await noise<GroupEncryptionStatus>({
+        action: "sync_group_encryption",
+        relays,
+      });
+      if (generation !== refreshGeneration.current) return;
+      setGroupEncryption(encryption);
+      if (encryption?.phase === "removed") {
+        const reconciled = await noise<LocalSummary>({ action: "status" });
+        if (generation !== refreshGeneration.current) return;
+        setConversation(null);
+        setGroupEncryption(null);
+        setSummary(reconciled);
+        return;
+      }
+      if (
+        encryption?.phase === "waiting_for_admission"
+        || encryption?.phase === "waiting_for_device"
+      ) {
+        setConversation(null);
+        return;
+      }
       const nextConversation = await noise<Conversation>({ action: "conversation", relays });
       const reconciled = await noise<LocalSummary>({ action: "status" });
       if (generation !== refreshGeneration.current) return;
@@ -962,6 +986,7 @@ export default function App() {
     if (group.is_active) return;
     const generation = ++refreshGeneration.current;
     setError(null);
+    setGroupEncryption(null);
     const cached = groupConversationCache.current.get(group.group_id);
     if (cached) setConversation(cached);
     setSummary((current) => current ? {
@@ -976,6 +1001,27 @@ export default function App() {
       const local = await noise<LocalSummary>({ action: "select_group", group_id: group.group_id });
       if (generation !== refreshGeneration.current) return;
       setSummary(local);
+      const encryption = await noise<GroupEncryptionStatus>({
+        action: "sync_group_encryption",
+        relays,
+      });
+      if (generation !== refreshGeneration.current) return;
+      setGroupEncryption(encryption);
+      if (encryption?.phase === "removed") {
+        const reconciled = await noise<LocalSummary>({ action: "status" });
+        if (generation !== refreshGeneration.current) return;
+        setConversation(null);
+        setGroupEncryption(null);
+        setSummary(reconciled);
+        return;
+      }
+      if (
+        encryption?.phase === "waiting_for_admission"
+        || encryption?.phase === "waiting_for_device"
+      ) {
+        setConversation(null);
+        return;
+      }
       const fresh = await noise<Conversation>({ action: "conversation", relays });
       const reconciled = await noise<LocalSummary>({ action: "status" });
       if (generation !== refreshGeneration.current) return;
@@ -1292,7 +1338,13 @@ export default function App() {
                 return true;
               }}
             />
-          ) : activeGroupId ? <Loading /> : (
+          ) : activeGroupId && groupEncryption?.group_id === activeGroupId
+            && (
+              groupEncryption.phase === "waiting_for_admission"
+              || groupEncryption.phase === "waiting_for_device"
+            ) ? (
+              <EncryptionPending phase={groupEncryption.phase} />
+            ) : activeGroupId ? <Loading /> : (
             <EmptyGroup
               onMake={() => setDialog({ type: "make" })}
               onJoin={() => setDialog({ type: "join" })}
@@ -3335,8 +3387,30 @@ function Onboarding({ busy, onCreate, onSignIn }: { busy: boolean; onCreate: (us
   const [noiseId, setNoiseId] = useState("");
   const [password, setPassword] = useState("");
   const [confirmation, setConfirmation] = useState("");
+  const [createAttempted, setCreateAttempted] = useState(false);
   const displayedNoiseId = noiseId.match(/.{1,4}/g)?.join(" ") ?? "";
-  const createReady = username.trim().length > 0 && password.length >= 16 && password === confirmation;
+  const passwordLength = Array.from(password).length;
+  const passwordClasses = [
+    /\p{Ll}/u.test(password),
+    /\p{Lu}/u.test(password),
+    /\p{N}/u.test(password),
+    /[^\p{L}\p{N}]/u.test(password),
+  ].filter(Boolean).length;
+  const avoidsCommonPasswords = password.length > 0 && !["password", "qwerty", "letmein", "123456"].some((weak) => password.toLowerCase().includes(weak));
+  const passwordRequirements = [
+    { label: "16–256 characters", met: passwordLength >= 16 && passwordLength <= 256 },
+    { label: `24+ characters or ${passwordClasses}/3 character types`, met: passwordLength >= 24 || passwordClasses >= 3 },
+    { label: "no common password phrases", met: avoidsCommonPasswords },
+    { label: "passwords match", met: confirmation.length > 0 && password === confirmation },
+  ];
+  const usernameReady = username.trim().length > 0;
+  const passwordReady = passwordRequirements.every((requirement) => requirement.met);
+  const createReady = usernameReady && passwordReady;
+  const submitCreate = () => {
+    setCreateAttempted(true);
+    if (busy || !createReady) return;
+    void onCreate(username.trim(), password);
+  };
   return (
     <div className="onboarding" data-tauri-drag-region>
       <NoiseMark size={54} />
@@ -3347,11 +3421,18 @@ function Onboarding({ busy, onCreate, onSignIn }: { busy: boolean; onCreate: (us
         <button className={mode === "signin" ? "active" : ""} onClick={() => setMode("signin")}>sign in</button>
       </div>
       {mode === "create" ? <>
-        <input autoFocus value={username} maxLength={32} onChange={(event) => setUsername(event.target.value)} placeholder="display name" />
-        <input type="password" autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="strong password" />
-        <input type="password" autoComplete="new-password" value={confirmation} onChange={(event) => setConfirmation(event.target.value)} placeholder="confirm password" onKeyDown={(event) => { if (event.key === "Enter" && createReady) void onCreate(username.trim(), password); }} />
-        <button disabled={!createReady || busy} onClick={() => void onCreate(username.trim(), password)}>{busy && <LoaderCircle className="spinner" size={14} />} create identity</button>
-        <small>use 16+ characters and a password manager or long passphrase</small>
+        <input autoFocus value={username} maxLength={32} aria-invalid={createAttempted && !usernameReady} onChange={(event) => setUsername(event.target.value)} placeholder="display name" />
+        <input type="password" autoComplete="new-password" value={password} aria-describedby="password-requirements" aria-invalid={createAttempted && !passwordReady} onChange={(event) => setPassword(event.target.value)} placeholder="strong password" />
+        <input type="password" autoComplete="new-password" value={confirmation} aria-describedby="password-requirements" aria-invalid={createAttempted && password !== confirmation} onChange={(event) => setConfirmation(event.target.value)} placeholder="confirm password" onKeyDown={(event) => { if (event.key === "Enter") submitCreate(); }} />
+        <div id="password-requirements" className={`password-requirements${createAttempted && !createReady ? " invalid" : ""}`} aria-live="polite">
+          <strong>password requirements</strong>
+          <ul>
+            {passwordRequirements.map((requirement) => <li key={requirement.label} className={requirement.met ? "met" : ""}><Check size={11} /> {requirement.label}</li>)}
+          </ul>
+          {createAttempted && !createReady && <span><TriangleAlert size={12} /> {usernameReady ? "complete the requirements above to continue" : "enter a display name to continue"}</span>}
+        </div>
+        <button disabled={!createReady || busy} onClick={submitCreate}>{busy && <LoaderCircle className="spinner" size={14} />} create identity</button>
+        <small>use a password manager or a long, memorable passphrase</small>
       </> : <>
         <input autoFocus className="frequency-input" inputMode="numeric" value={displayedNoiseId} onChange={(event) => setNoiseId(event.target.value.replace(/\D/g, "").slice(0, 12))} placeholder="0000 0000 0000" />
         <input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="password" onKeyDown={(event) => { if (event.key === "Enter" && noiseId.length === 12 && password) void onSignIn(noiseId, password); }} />
@@ -3779,6 +3860,21 @@ function UpdateBanner({ status, retry, restart, dismiss }: ReturnType<typeof use
 }
 
 function Loading() { return <div className="loading"><LoaderCircle className="spinner" /></div>; }
+
+function EncryptionPending({ phase }: { phase: GroupEncryptionStatus["phase"] }) {
+  return (
+    <div className="encryption-pending">
+      <Shield />
+      <strong>securing this device</strong>
+      <span>
+        {phase === "waiting_for_admission"
+          ? "the group founder will admit this identity automatically"
+          : "another authenticated device must admit this device"}
+      </span>
+      <small>you can leave Noise open — this screen updates as soon as the group confirms</small>
+    </div>
+  );
+}
 
 function formatTime(millis: number) {
   return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(millis));

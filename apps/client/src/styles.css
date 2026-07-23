@@ -250,16 +250,31 @@ button:disabled { cursor: default; opacity: 0.48; }
 
 .onboarding, .loading, .browser-foundation, .empty-group { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; flex-direction: column; background: #1c1b1e; }
 .group-background-active .conversation-pane .loading { background: transparent; }
+.encryption-pending { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 9px; padding: 32px; text-align: center; background: rgba(28,27,30,.72); }
+.encryption-pending > svg { width: 28px; height: 28px; color: var(--accent); }
+.encryption-pending strong { font-size: 16px; }
+.encryption-pending span { max-width: 360px; color: var(--muted); font-size: 13px; }
+.encryption-pending small { max-width: 420px; color: var(--faint); font-size: 11px; }
 .onboarding { gap: 10px; }
 .onboarding > svg, .empty-group > svg, .browser-foundation > svg { color: var(--accent); }
 .onboarding h1 { margin: 10px 0 -5px; font-size: 44px; letter-spacing: -2.5px; }
 .onboarding p { margin: 0 0 10px; color: var(--muted); font-size: 14px; }
 .onboarding input { width: 300px; height: 45px; padding: 0 15px; border: 0; outline: 0; border-radius: 11px; background: var(--soft); font-size: 16px; }
+.onboarding input[aria-invalid="true"] { box-shadow: inset 0 0 0 1px rgba(255,112,125,.7); }
 .onboarding > button { display: flex; align-items: center; justify-content: center; gap: 7px; width: 300px; height: 44px; margin-top: 2px; border-radius: 22px; background: var(--accent); color: var(--accent-contrast); }
 .onboarding > small { position: absolute; bottom: 22px; color: var(--faint); }
 .onboarding-tabs { display: grid; width: 300px; grid-template-columns: 1fr 1fr; gap: 3px; margin-bottom: 2px; padding: 3px; border-radius: 10px; background: rgba(0,0,0,.18); }
 .onboarding-tabs button { height: 31px; border-radius: 7px; background: transparent; color: var(--muted); font-size: 11px; font-weight: 600; }
 .onboarding-tabs button.active { background: rgba(255,255,255,.095); color: #fff; box-shadow: 0 1px 5px rgba(0,0,0,.18); }
+.password-requirements { width: 300px; padding: 10px 12px; border: 1px solid rgba(255,255,255,.07); border-radius: 11px; background: rgba(0,0,0,.14); }
+.password-requirements > strong { display: block; margin-bottom: 7px; color: var(--muted); font-size: 10px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; }
+.password-requirements ul { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; margin: 0; padding: 0; list-style: none; }
+.password-requirements li { display: flex; align-items: center; gap: 4px; color: var(--faint); font-size: 10px; line-height: 1.25; }
+.password-requirements li svg { flex: none; opacity: .38; }
+.password-requirements li.met { color: #8fdcaf; }
+.password-requirements li.met svg { opacity: 1; }
+.password-requirements > span { display: flex; align-items: center; gap: 5px; margin-top: 8px; color: #ff8f99; font-size: 10px; line-height: 1.3; }
+.password-requirements.invalid { border-color: rgba(255,112,125,.28); }
 .browser-foundation { padding: 40px; text-align: center; }
 .browser-foundation h1 { margin: 18px 0 8px; }
 .browser-foundation p { max-width: 540px; margin: 0; color: var(--muted); line-height: 1.5; }

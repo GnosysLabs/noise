@@ -129,6 +129,19 @@ export type Conversation = {
   rejected_events: number;
 };
 
+export type GroupEncryptionStatus = {
+  group_id: string;
+  phase:
+    | "active"
+    | "waiting_for_founder"
+    | "waiting_for_members"
+    | "waiting_for_admission"
+    | "waiting_for_device"
+    | "removed";
+  epoch: number | null;
+  missing_member_public_keys: string[];
+};
+
 export type ReportSummary = {
   report_event_id: string;
   reporter_public_key: string;

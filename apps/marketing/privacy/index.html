@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#09080c" />
+    <meta
+      name="description"
+      content="Noise Privacy Policy: what the Noise apps, website, and official relays process and how privacy works across the relay network."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Noise" />
+    <meta property="og:title" content="Privacy Policy — Noise" />
+    <meta
+      property="og:description"
+      content="What Noise processes, what stays encrypted, and where independent relay operators fit."
+    />
+    <meta property="og:url" content="https://makenoise.chat/privacy/" />
+    <meta property="og:image" content="https://makenoise.chat/og.png" />
+    <link rel="canonical" href="https://makenoise.chat/privacy/" />
+    <link rel="icon" href="/noise.svg" type="image/svg+xml" />
+    <title>Privacy Policy — Noise</title>
+    <script type="module" src="/src.js"></script>
+  </head>
+  <body class="legal-body">
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="site-header legal-header" data-header>
+      <a class="wordmark" href="/" aria-label="Noise home">
+        <img src="/noise.svg" alt="" width="32" height="32" />
+        <span>noise</span>
+      </a>
+
+      <nav aria-label="Legal navigation">
+        <a aria-current="page" href="/privacy/">Privacy</a>
+        <a href="/terms/">Terms</a>
+        <a href="mailto:admin@gnosyslabs.xyz">Contact</a>
+      </nav>
+
+      <a class="nav-cta" href="https://app.makenoise.chat">Open Noise <span>↗</span></a>
+    </header>
+
+    <main class="legal-page" id="main">
+      <header class="legal-hero">
+        <p class="section-kicker">Legal / Privacy</p>
+        <h1>Privacy without<br />the vague promises.</h1>
+        <p class="legal-intro">
+          Noise is designed to work without your phone number, email address, legal name,
+          contact list, or location. This policy explains the information the service still
+          needs to function—and the limits of a network run by more than one operator.
+        </p>
+        <div class="legal-meta">
+          <span>Effective July 23, 2026</span>
+          <span>Last updated July 23, 2026</span>
+        </div>
+      </header>
+
+      <div class="legal-layout">
+        <aside class="legal-index" aria-label="Privacy Policy sections">
+          <p>On this page</p>
+          <a href="#scope">01 / Scope</a>
+          <a href="#information">02 / Information</a>
+          <a href="#use">03 / How it is used</a>
+          <a href="#sharing">04 / Sharing</a>
+          <a href="#retention">05 / Retention</a>
+          <a href="#rights">06 / Your rights</a>
+          <a href="#contact">07 / Contact</a>
+        </aside>
+
+        <article class="legal-copy">
+          <section id="scope">
+            <p class="legal-number">01</p>
+            <h2>Scope and who we are</h2>
+            <p>
+              This Privacy Policy applies to the Noise desktop applications, web application,
+              marketing website, and relays operated by Gnosys Labs (together, the
+              “Gnosys Labs Services”). “Noise,” “we,” “us,” and “our” refer to Gnosys Labs.
+            </p>
+            <p>
+              Noise is an open relay network. Relays run by other people or organizations are
+              independent services under their operators’ control. Those operators may have
+              their own logging, storage, retention, and legal obligations. This policy does
+              not control what an independent operator does outside the Noise protocol.
+            </p>
+          </section>
+
+          <section id="information">
+            <p class="legal-number">02</p>
+            <h2>Information Noise processes</h2>
+
+            <h3>Account and profile information</h3>
+            <p>
+              Noise creates a random Noise ID and cryptographic identity. Your chosen display
+              name, avatar, and bio are optional profile information. Noise does not require a
+              phone number, email address, legal name, address book, birthday, or location to
+              create an account.
+            </p>
+            <p>
+              Your password is used on your device to derive the credentials that unlock your
+              encrypted account vault. Gnosys Labs does not receive or store your plaintext
+              password and cannot recover a lost Noise ID or password for you.
+            </p>
+
+            <h3>Messages, group activity, and media</h3>
+            <p>
+              Noise clients create signed group, direct-message, membership, moderation, and
+              profile events. Message bodies and media are encrypted on your device before
+              relay transport. Relays may store encrypted events, encrypted account state,
+              invitation locators, signatures, object identifiers, timestamps, routing
+              information, deletion records, and other protocol data needed to deliver,
+              authenticate, synchronize, moderate, and delete content.
+            </p>
+            <p>
+              Encrypted media is divided into opaque shards and distributed among a
+              client-selected set of relays. A participating relay stores only the shards
+              assigned to it, either on local storage or an operator-configured
+              S3-compatible service.
+            </p>
+
+            <h3>Device and browser storage</h3>
+            <p>
+              Desktop apps keep local identity state, message state, preferences, and media
+              caches on your device. The web app stores an encrypted browser vault in
+              IndexedDB and protects it with a non-exportable key generated by your browser.
+              Clearing site data, using private browsing, browser resets, operating-system
+              backups, or device-management tools can affect or copy that local data.
+            </p>
+
+            <h3>Network and diagnostic information</h3>
+            <p>
+              When your device connects, network providers necessarily process information
+              such as IP addresses, request timing, user-agent information, and traffic
+              volume. Noise can route a storage request through a mask relay so the storage
+              relay sees the mask instead of your direct connection. The mask relay and
+              infrastructure providers may still see network-level information.
+            </p>
+            <p>
+              The Gnosys Labs website and official relay configuration are not designed for
+              advertising or behavioral tracking. Our hosting, security, and network
+              providers—including Cloudflare—may process request and security data to deliver
+              and protect the service. The marketing site contacts GitHub’s API to locate the
+              current Noise release when a download link is shown.
+            </p>
+
+            <h3>Communications with us</h3>
+            <p>
+              If you email us or report a problem, we receive the information you choose to
+              send, including your email address and the contents of your message.
+            </p>
+          </section>
+
+          <section id="use">
+            <p class="legal-number">03</p>
+            <h2>How we use information</h2>
+            <p>We process information only as reasonably necessary to:</p>
+            <ul>
+              <li>create, restore, synchronize, and secure Noise identities;</li>
+              <li>route and make encrypted groups, messages, profiles, and media available;</li>
+              <li>provide moderation, deletion, abuse prevention, and network-integrity features;</li>
+              <li>diagnose failures, protect the service, and improve reliability;</li>
+              <li>respond to support, privacy, and legal requests; and</li>
+              <li>comply with law and enforce the Terms of Service.</li>
+            </ul>
+            <p>
+              We do not sell personal information. We do not use Noise content for targeted
+              advertising, build advertising profiles, or operate a public people or group
+              directory.
+            </p>
+          </section>
+
+          <section id="sharing">
+            <p class="legal-number">04</p>
+            <h2>When information is shared</h2>
+            <p>Information may be processed or disclosed to:</p>
+            <ul>
+              <li>
+                <strong>Relay operators.</strong> The clients you use select relays to carry
+                and store protocol data. Independent relays are controlled by their operators.
+              </li>
+              <li>
+                <strong>Infrastructure providers.</strong> Hosting, content-delivery, DDoS
+                protection, object-storage, and similar providers process the data needed to
+                provide their services.
+              </li>
+              <li>
+                <strong>Other Noise users.</strong> People in a shared group or direct-message
+                thread receive the content and profile information you choose to share.
+              </li>
+              <li>
+                <strong>Legal and safety recipients.</strong> We may preserve or disclose
+                information when reasonably necessary to comply with law, protect rights and
+                safety, investigate abuse, or defend the service.
+              </li>
+              <li>
+                <strong>A successor.</strong> If the service or organization is reorganized,
+                acquired, or transferred, information may transfer with it subject to
+                applicable law.
+              </li>
+            </ul>
+            <p>
+              Encryption limits what Gnosys Labs and relay operators can read, but it does not
+              stop a recipient from saving, exporting, forwarding, or capturing content after
+              their client decrypts it.
+            </p>
+          </section>
+
+          <section id="retention">
+            <p class="legal-number">05</p>
+            <h2>Retention and deletion</h2>
+            <p>
+              Local data remains on your device until the app removes it, you log out, leave a
+              group, delete your account, clear browser data, uninstall the app, or remove it
+              through your operating system. Operating-system and device backups may retain
+              copies beyond that point.
+            </p>
+            <p>
+              Relay data remains available for the time needed to operate the protocol or
+              until it is deleted, expires, or the relay operator removes it. Noise supports
+              signed deletion events and deletion capabilities for encrypted media shards.
+              Deletion can be delayed when a relay, device, or storage provider is offline.
+            </p>
+            <div class="legal-callout">
+              <strong>Distributed deletion has real limits.</strong>
+              <p>
+                Noise cannot guarantee erasure from screenshots, exports, backups, modified
+                clients, offline devices, or independently operated relays that ignore or
+                never receive a deletion request.
+              </p>
+            </div>
+            <p>
+              Support and legal correspondence may be retained for as long as reasonably
+              necessary to answer the request, protect the service, and meet legal obligations.
+            </p>
+          </section>
+
+          <section id="security">
+            <p class="legal-number">06</p>
+            <h2>Security and early-alpha limits</h2>
+            <p>
+              Noise uses cryptographic identities, signed events, on-device encryption,
+              encrypted account vaults, and distributed encrypted media storage. No system is
+              perfectly secure. Noise is early-alpha software, and its protocol and
+              implementation have not been represented as a completed independent security
+              audit. Do not rely on Noise as a life-safety system or a guarantee of
+              high-risk anonymity.
+            </p>
+          </section>
+
+          <section id="transfers">
+            <p class="legal-number">07</p>
+            <h2>International processing</h2>
+            <p>
+              Noise is available over a global network. Gnosys Labs, infrastructure providers,
+              independent relays, and other users may process information in countries other
+              than your own. Privacy protections and government-access rules vary by location.
+            </p>
+          </section>
+
+          <section id="rights">
+            <p class="legal-number">08</p>
+            <h2>Your choices and privacy rights</h2>
+            <p>
+              Depending on where you live, you may have rights to request access, correction,
+              deletion, restriction, portability, or objection, and to appeal or complain to
+              a privacy regulator. You may also be entitled to know the categories and sources
+              of personal information we process and the recipients to whom it is disclosed.
+            </p>
+            <p>
+              You can change profile information and use deletion controls in the app. You may
+              also email <a href="mailto:admin@gnosyslabs.xyz">admin@gnosyslabs.xyz</a>. Because
+              Noise does not require an email address or legal identity, we may need your Noise
+              ID or cryptographic proof from your account to locate data and verify that a
+              request is yours. We cannot decrypt content or recover credentials we do not have.
+            </p>
+          </section>
+
+          <section id="children">
+            <p class="legal-number">09</p>
+            <h2>Children</h2>
+            <p>
+              Noise is not directed to children. You must be at least 18 years old to use the
+              Gnosys Labs Services. If you believe a child has provided personal information
+              through a service we operate, contact us so we can investigate.
+            </p>
+          </section>
+
+          <section id="changes">
+            <p class="legal-number">10</p>
+            <h2>Changes to this policy</h2>
+            <p>
+              We may update this policy as Noise changes. We will post the revised policy here
+              and change the “Last updated” date. Material changes may also be announced in the
+              app, on the website, or through the project repository.
+            </p>
+          </section>
+
+          <section id="contact">
+            <p class="legal-number">11</p>
+            <h2>Contact</h2>
+            <p>
+              Questions, privacy requests, or reports about this policy can be sent to
+              <a href="mailto:admin@gnosyslabs.xyz">admin@gnosyslabs.xyz</a>.
+            </p>
+          </section>
+        </article>
+      </div>
+    </main>
+
+    <footer class="legal-footer">
+      <div class="footer-brand">
+        <a class="wordmark" href="/">
+          <img src="/noise.svg" alt="" width="32" height="32" />
+          <span>noise</span>
+        </a>
+        <p>Private groups, on your frequency.</p>
+      </div>
+      <div class="footer-links">
+        <div>
+          <strong>Noise</strong>
+          <a href="https://app.makenoise.chat">Web app</a>
+          <a href="https://github.com/GnosysLabs/noise">GitHub</a>
+        </div>
+        <div>
+          <strong>Legal</strong>
+          <a aria-current="page" href="/privacy/">Privacy</a>
+          <a href="/terms/">Terms</a>
+          <a href="mailto:admin@gnosyslabs.xyz">Contact</a>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>© <span data-year></span> Gnosys Labs</span>
+        <span>Built out loud.</span>
+      </div>
+    </footer>
+  </body>
+</html>

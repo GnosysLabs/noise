@@ -29,8 +29,9 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use noise_core::{
-    AccountVault, GroupDeletion, GroupPresence, InviteRecord, InviteRotation, ShardDeletion,
-    SignedEvent, StorageShard,
+    AccountVault, GroupDeletion, GroupPresence, InviteRecord, InviteRotation, MlsControlLog,
+    MlsEpochRecord, MlsGroupGenesis, MlsJoinRequest, MlsRemovalRequest, ShardDeletion, SignedEvent,
+    StorageShard,
 };
 use noise_transport::{
     GATEWAY_HEADER, OHTTP_GATEWAY_PATH, OHTTP_KEYS_MEDIA_TYPE, OHTTP_KEYS_PATH, OHTTP_RELAY_PATH,
@@ -137,6 +138,10 @@ struct AppState {
     invites: Arc<RwLock<HashMap<String, InviteRecord>>>,
     invite_rotations: Arc<RwLock<HashMap<String, InviteRotation>>>,
     events: Arc<RwLock<HashMap<String, SignedEvent>>>,
+    mls_join_requests: Arc<RwLock<HashMap<String, MlsJoinRequest>>>,
+    mls_removal_requests: Arc<RwLock<HashMap<String, MlsRemovalRequest>>>,
+    mls_geneses: Arc<RwLock<HashMap<String, MlsGroupGenesis>>>,
+    mls_epochs: Arc<RwLock<HashMap<String, MlsEpochRecord>>>,
     shard_count: Arc<AtomicU64>,
     shard_bytes: Arc<AtomicU64>,
     storage_limit_bytes: u64,
@@ -169,6 +174,14 @@ struct Snapshot {
     invite_rotations: Vec<InviteRotation>,
     invites: Vec<InviteRecord>,
     events: Vec<SignedEvent>,
+    #[serde(default)]
+    mls_join_requests: Vec<MlsJoinRequest>,
+    #[serde(default)]
+    mls_removal_requests: Vec<MlsRemovalRequest>,
+    #[serde(default)]
+    mls_geneses: Vec<MlsGroupGenesis>,
+    #[serde(default)]
+    mls_epochs: Vec<MlsEpochRecord>,
 }
 
 #[derive(Serialize)]
@@ -538,6 +551,10 @@ async fn main() -> anyhow::Result<()> {
         invites: Arc::new(RwLock::new(recovered.invites)),
         invite_rotations: Arc::new(RwLock::new(recovered.invite_rotations)),
         events: Arc::new(RwLock::new(recovered.events)),
+        mls_join_requests: Arc::new(RwLock::new(recovered.mls_join_requests)),
+        mls_removal_requests: Arc::new(RwLock::new(recovered.mls_removal_requests)),
+        mls_geneses: Arc::new(RwLock::new(recovered.mls_geneses)),
+        mls_epochs: Arc::new(RwLock::new(recovered.mls_epochs)),
         shard_count: Arc::new(AtomicU64::new(recovered.shard_count)),
         shard_bytes: Arc::new(AtomicU64::new(recovered.shard_bytes)),
         storage_limit_bytes: args.storage_limit_bytes,
@@ -574,6 +591,22 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/invite-rotations", post(publish_invite_rotation))
         .route("/v1/events", post(publish_event))
         .route("/v1/groups/{group_id}/events", get(group_events))
+        .route("/v2/mls/join-requests", post(publish_mls_join_request))
+        .route(
+            "/v2/mls/groups/{group_id}/join-requests",
+            get(group_mls_join_requests),
+        )
+        .route(
+            "/v2/mls/removal-requests",
+            post(publish_mls_removal_request),
+        )
+        .route(
+            "/v2/mls/groups/{group_id}/removal-requests",
+            get(group_mls_removal_requests),
+        )
+        .route("/v2/mls/genesis", post(publish_mls_genesis))
+        .route("/v2/mls/epochs", post(publish_mls_epoch))
+        .route("/v2/mls/groups/{group_id}", get(group_mls_control_log))
         .route("/v1/groups/{group_id}/watch/{since}", get(group_watch))
         .route("/v1/groups/{group_id}/presence", post(publish_presence))
         .route("/v3/shards", post(publish_shard))
@@ -759,6 +792,9 @@ async fn publish_event(
     event
         .verify()
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    validate_mls_event(&state, &event)
+        .await
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
     match insert_event(&state, event.clone())
         .await
         .map_err(storage_error)?
@@ -795,6 +831,153 @@ async fn group_events(
             .then_with(|| left.event_id.cmp(&right.event_id))
     });
     Ok(Json(events))
+}
+
+async fn publish_mls_join_request(
+    State(state): State<AppState>,
+    Json(request): Json<MlsJoinRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    request
+        .verify()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    match insert_mls_join_request(&state, request.clone())
+        .await
+        .map_err(storage_error)?
+    {
+        InsertResult::Inserted => {
+            tokio::spawn(gossip_mls_join_request(state, request));
+        }
+        InsertResult::Deleted => {
+            return Err((StatusCode::GONE, "group has been deleted".into()));
+        }
+        InsertResult::Present => {}
+    }
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn group_mls_join_requests(
+    State(state): State<AppState>,
+    Path(group_id): Path<String>,
+) -> Result<Json<Vec<MlsJoinRequest>>, StatusCode> {
+    if state.deletions.read().await.contains_key(&group_id) {
+        return Err(StatusCode::GONE);
+    }
+    let mut requests = state
+        .mls_join_requests
+        .read()
+        .await
+        .values()
+        .filter(|request| request.group_id == group_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    requests.sort_by(|left, right| {
+        left.created_at_millis
+            .cmp(&right.created_at_millis)
+            .then_with(|| left.request_id.cmp(&right.request_id))
+    });
+    Ok(Json(requests))
+}
+
+async fn publish_mls_removal_request(
+    State(state): State<AppState>,
+    Json(request): Json<MlsRemovalRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    request
+        .verify()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    match insert_mls_removal_request(&state, request.clone())
+        .await
+        .map_err(storage_error)?
+    {
+        InsertResult::Inserted => {
+            tokio::spawn(gossip_mls_removal_request(state, request));
+        }
+        InsertResult::Deleted => {
+            return Err((StatusCode::GONE, "group has been deleted".into()));
+        }
+        InsertResult::Present => {}
+    }
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn group_mls_removal_requests(
+    State(state): State<AppState>,
+    Path(group_id): Path<String>,
+) -> Result<Json<Vec<MlsRemovalRequest>>, StatusCode> {
+    if state.deletions.read().await.contains_key(&group_id) {
+        return Err(StatusCode::GONE);
+    }
+    let mut requests = state
+        .mls_removal_requests
+        .read()
+        .await
+        .values()
+        .filter(|request| request.group_id == group_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    requests.sort_by(|left, right| {
+        left.created_at_millis
+            .cmp(&right.created_at_millis)
+            .then_with(|| left.request_id.cmp(&right.request_id))
+    });
+    Ok(Json(requests))
+}
+
+async fn publish_mls_genesis(
+    State(state): State<AppState>,
+    Json(genesis): Json<MlsGroupGenesis>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    genesis
+        .verify()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    match insert_mls_genesis(&state, genesis.clone())
+        .await
+        .map_err(control_storage_error)?
+    {
+        InsertResult::Inserted => {
+            tokio::spawn(gossip_mls_genesis(state, genesis));
+        }
+        InsertResult::Deleted => {
+            return Err((StatusCode::GONE, "group has been deleted".into()));
+        }
+        InsertResult::Present => {}
+    }
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn publish_mls_epoch(
+    State(state): State<AppState>,
+    Json(record): Json<MlsEpochRecord>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    record
+        .verify()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    match insert_mls_epoch(&state, record.clone())
+        .await
+        .map_err(control_storage_error)?
+    {
+        InsertResult::Inserted => {
+            tokio::spawn(gossip_mls_epoch(state, record));
+        }
+        InsertResult::Deleted => {
+            return Err((StatusCode::GONE, "group has been deleted".into()));
+        }
+        InsertResult::Present => {}
+    }
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn group_mls_control_log(
+    State(state): State<AppState>,
+    Path(group_id): Path<String>,
+) -> Result<Json<MlsControlLog>, StatusCode> {
+    if state.deletions.read().await.contains_key(&group_id) {
+        return Err(StatusCode::GONE);
+    }
+    mls_control_log(&state, &group_id)
+        .await
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn group_watch(
@@ -1375,6 +1558,9 @@ async fn dispatch_private_request(
             if let Err(error) = event.verify() {
                 return private_error(StatusCode::BAD_REQUEST, &error.to_string());
             }
+            if let Err(error) = validate_mls_event(state, &event).await {
+                return private_error(StatusCode::CONFLICT, &error.to_string());
+            }
             match insert_event(state, event.clone()).await {
                 Ok(InsertResult::Inserted) => {
                     tokio::spawn(gossip_event(state.clone(), event));
@@ -1387,6 +1573,98 @@ async fn dispatch_private_request(
                 Err(error) => {
                     eprintln!("relay storage error: {error:#}");
                     private_error(StatusCode::INTERNAL_SERVER_ERROR, "storage failed")
+                }
+            }
+        }
+        ("POST", "/v2/mls/join-requests") => {
+            let Ok(join_request) = serde_json::from_slice::<MlsJoinRequest>(&request.body) else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid MLS join request");
+            };
+            if let Err(error) = join_request.verify() {
+                return private_error(StatusCode::BAD_REQUEST, &error.to_string());
+            }
+            match insert_mls_join_request(state, join_request.clone()).await {
+                Ok(InsertResult::Inserted) => {
+                    tokio::spawn(gossip_mls_join_request(state.clone(), join_request));
+                    (StatusCode::ACCEPTED, Vec::new())
+                }
+                Ok(InsertResult::Present) => (StatusCode::ACCEPTED, Vec::new()),
+                Ok(InsertResult::Deleted) => {
+                    private_error(StatusCode::GONE, "group has been deleted")
+                }
+                Err(error) => {
+                    eprintln!("MLS join request rejected: {error:#}");
+                    private_error(StatusCode::CONFLICT, "MLS join request was rejected")
+                }
+            }
+        }
+        ("POST", "/v2/mls/removal-requests") => {
+            let Ok(removal_request) = serde_json::from_slice::<MlsRemovalRequest>(&request.body)
+            else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid MLS removal request");
+            };
+            if let Err(error) = removal_request.verify() {
+                return private_error(StatusCode::BAD_REQUEST, &error.to_string());
+            }
+            match insert_mls_removal_request(state, removal_request.clone()).await {
+                Ok(InsertResult::Inserted) => {
+                    tokio::spawn(gossip_mls_removal_request(state.clone(), removal_request));
+                    (StatusCode::ACCEPTED, Vec::new())
+                }
+                Ok(InsertResult::Present) => (StatusCode::ACCEPTED, Vec::new()),
+                Ok(InsertResult::Deleted) => {
+                    private_error(StatusCode::GONE, "group has been deleted")
+                }
+                Err(error) => {
+                    eprintln!("MLS removal request rejected: {error:#}");
+                    private_error(StatusCode::CONFLICT, "MLS removal request was rejected")
+                }
+            }
+        }
+        ("POST", "/v2/mls/genesis") => {
+            let Ok(genesis) = serde_json::from_slice::<MlsGroupGenesis>(&request.body) else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid MLS genesis");
+            };
+            if let Err(error) = genesis.verify() {
+                return private_error(StatusCode::BAD_REQUEST, &error.to_string());
+            }
+            match insert_mls_genesis(state, genesis.clone()).await {
+                Ok(InsertResult::Inserted) => {
+                    tokio::spawn(gossip_mls_genesis(state.clone(), genesis));
+                    (StatusCode::ACCEPTED, Vec::new())
+                }
+                Ok(InsertResult::Present) => (StatusCode::ACCEPTED, Vec::new()),
+                Ok(InsertResult::Deleted) => {
+                    private_error(StatusCode::GONE, "group has been deleted")
+                }
+                Err(error) => {
+                    eprintln!("MLS genesis rejected: {error:#}");
+                    private_error(StatusCode::CONFLICT, "MLS genesis conflicts")
+                }
+            }
+        }
+        ("POST", "/v2/mls/epochs") => {
+            let Ok(epoch) = serde_json::from_slice::<MlsEpochRecord>(&request.body) else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid MLS epoch");
+            };
+            if let Err(error) = epoch.verify() {
+                return private_error(StatusCode::BAD_REQUEST, &error.to_string());
+            }
+            match insert_mls_epoch(state, epoch.clone()).await {
+                Ok(InsertResult::Inserted) => {
+                    tokio::spawn(gossip_mls_epoch(state.clone(), epoch));
+                    (StatusCode::ACCEPTED, Vec::new())
+                }
+                Ok(InsertResult::Present) => (StatusCode::ACCEPTED, Vec::new()),
+                Ok(InsertResult::Deleted) => {
+                    private_error(StatusCode::GONE, "group has been deleted")
+                }
+                Err(error) => {
+                    eprintln!("MLS epoch rejected: {error:#}");
+                    private_error(
+                        StatusCode::CONFLICT,
+                        "MLS control head changed; fetch the latest epoch and retry",
+                    )
                 }
             }
         }
@@ -1445,6 +1723,64 @@ async fn dispatch_private_request(
                     private_error(StatusCode::GONE, "account was deleted")
                 }
                 Some(vault) => private_json(StatusCode::OK, &vault),
+                None => private_error(StatusCode::NOT_FOUND, "nothing here"),
+            }
+        }
+        ("GET", path)
+            if path.starts_with("/v2/mls/groups/") && path.ends_with("/join-requests") =>
+        {
+            let group_id = path
+                .trim_start_matches("/v2/mls/groups/")
+                .trim_end_matches("/join-requests");
+            if state.deletions.read().await.contains_key(group_id) {
+                return private_error(StatusCode::GONE, "group has been deleted");
+            }
+            let mut requests = state
+                .mls_join_requests
+                .read()
+                .await
+                .values()
+                .filter(|request| request.group_id == group_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            requests.sort_by(|left, right| {
+                left.created_at_millis
+                    .cmp(&right.created_at_millis)
+                    .then_with(|| left.request_id.cmp(&right.request_id))
+            });
+            private_json(StatusCode::OK, &requests)
+        }
+        ("GET", path)
+            if path.starts_with("/v2/mls/groups/") && path.ends_with("/removal-requests") =>
+        {
+            let group_id = path
+                .trim_start_matches("/v2/mls/groups/")
+                .trim_end_matches("/removal-requests");
+            if state.deletions.read().await.contains_key(group_id) {
+                return private_error(StatusCode::GONE, "group has been deleted");
+            }
+            let mut requests = state
+                .mls_removal_requests
+                .read()
+                .await
+                .values()
+                .filter(|request| request.group_id == group_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            requests.sort_by(|left, right| {
+                left.created_at_millis
+                    .cmp(&right.created_at_millis)
+                    .then_with(|| left.request_id.cmp(&right.request_id))
+            });
+            private_json(StatusCode::OK, &requests)
+        }
+        ("GET", path) if path.starts_with("/v2/mls/groups/") => {
+            let group_id = path.trim_start_matches("/v2/mls/groups/");
+            if state.deletions.read().await.contains_key(group_id) {
+                return private_error(StatusCode::GONE, "group has been deleted");
+            }
+            match mls_control_log(state, group_id).await {
+                Some(log) => private_json(StatusCode::OK, &log),
                 None => private_error(StatusCode::NOT_FOUND, "nothing here"),
             }
         }
@@ -1761,6 +2097,22 @@ async fn current_snapshot(state: &AppState) -> Snapshot {
             .collect(),
         invites: state.invites.read().await.values().cloned().collect(),
         events: state.events.read().await.values().cloned().collect(),
+        mls_join_requests: state
+            .mls_join_requests
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect(),
+        mls_removal_requests: state
+            .mls_removal_requests
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect(),
+        mls_geneses: state.mls_geneses.read().await.values().cloned().collect(),
+        mls_epochs: state.mls_epochs.read().await.values().cloned().collect(),
     }
 }
 
@@ -1769,6 +2121,14 @@ fn storage_error(error: anyhow::Error) -> (StatusCode, String) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         "relay could not persist the object".into(),
+    )
+}
+
+fn control_storage_error(error: anyhow::Error) -> (StatusCode, String) {
+    eprintln!("MLS control update rejected: {error:#}");
+    (
+        StatusCode::CONFLICT,
+        "MLS control head changed; fetch the latest epoch and retry".into(),
     )
 }
 
@@ -1896,6 +2256,7 @@ async fn apply_invite_rotation(
 }
 
 async fn insert_event(state: &AppState, event: SignedEvent) -> anyhow::Result<InsertResult> {
+    validate_mls_event(state, &event).await?;
     let _guard = state.mutations.lock().await;
     if state.deletions.read().await.contains_key(&event.group_id) {
         return Ok(InsertResult::Deleted);
@@ -1918,6 +2279,229 @@ async fn insert_event(state: &AppState, event: SignedEvent) -> anyhow::Result<In
     } else {
         InsertResult::Present
     })
+}
+
+async fn validate_mls_event(state: &AppState, event: &SignedEvent) -> anyhow::Result<()> {
+    let has_genesis = state.mls_geneses.read().await.contains_key(&event.group_id);
+    if !has_genesis {
+        if event.encryption_version == 1 && event.epoch.is_none() {
+            return Ok(());
+        }
+        bail!("group has not enabled MLS encryption")
+    }
+    if event.encryption_version != 2 {
+        bail!("legacy events are closed after MLS cutover")
+    }
+    let epoch = event.epoch.context("MLS event has no epoch")?;
+    let log = mls_control_log(state, &event.group_id)
+        .await
+        .context("group MLS control log is invalid")?;
+    let members = log
+        .member_accounts_at(epoch)
+        .context("MLS event references an unknown epoch")?;
+    if !members.contains(&event.author_public_key) {
+        bail!("event author was not a member in that MLS epoch")
+    }
+    Ok(())
+}
+
+async fn insert_mls_join_request(
+    state: &AppState,
+    request: MlsJoinRequest,
+) -> anyhow::Result<InsertResult> {
+    let _guard = state.mutations.lock().await;
+    if state.deletions.read().await.contains_key(&request.group_id) {
+        return Ok(InsertResult::Deleted);
+    }
+    let group_exists = state
+        .mls_geneses
+        .read()
+        .await
+        .contains_key(&request.group_id)
+        || state
+            .events
+            .read()
+            .await
+            .values()
+            .any(|event| event.group_id == request.group_id)
+        || state
+            .invites
+            .read()
+            .await
+            .values()
+            .any(|invite| invite.group_id.as_deref() == Some(request.group_id.as_str()));
+    if !group_exists {
+        bail!("MLS join request targets an unknown group")
+    }
+    let object_id = request.request_id.clone();
+    let inserted = state
+        .store
+        .insert("mls_join_request", object_id.clone(), &request)
+        .await?;
+    if inserted {
+        let group_id = request.group_id.clone();
+        state
+            .mls_join_requests
+            .write()
+            .await
+            .insert(object_id, request);
+        notify_group_change(state, &group_id).await;
+    }
+    Ok(if inserted {
+        InsertResult::Inserted
+    } else {
+        InsertResult::Present
+    })
+}
+
+async fn insert_mls_removal_request(
+    state: &AppState,
+    request: MlsRemovalRequest,
+) -> anyhow::Result<InsertResult> {
+    let _guard = state.mutations.lock().await;
+    if state.deletions.read().await.contains_key(&request.group_id) {
+        return Ok(InsertResult::Deleted);
+    }
+    if !state
+        .mls_geneses
+        .read()
+        .await
+        .contains_key(&request.group_id)
+    {
+        bail!("MLS removal request targets a group without a control log")
+    }
+    let object_id = request.request_id.clone();
+    let inserted = state
+        .store
+        .insert("mls_removal_request", object_id.clone(), &request)
+        .await?;
+    if inserted {
+        let group_id = request.group_id.clone();
+        state
+            .mls_removal_requests
+            .write()
+            .await
+            .insert(object_id, request);
+        notify_group_change(state, &group_id).await;
+    }
+    Ok(if inserted {
+        InsertResult::Inserted
+    } else {
+        InsertResult::Present
+    })
+}
+
+async fn insert_mls_genesis(
+    state: &AppState,
+    genesis: MlsGroupGenesis,
+) -> anyhow::Result<InsertResult> {
+    let _guard = state.mutations.lock().await;
+    if state.deletions.read().await.contains_key(&genesis.group_id) {
+        return Ok(InsertResult::Deleted);
+    }
+    if let Some(current) = state.mls_geneses.read().await.get(&genesis.group_id) {
+        if current.record_id == genesis.record_id {
+            return Ok(InsertResult::Present);
+        }
+        bail!("group already has a different MLS genesis")
+    }
+    let group_id = genesis.group_id.clone();
+    let inserted = state
+        .store
+        .insert("mls_genesis", group_id.clone(), &genesis)
+        .await?;
+    if !inserted {
+        bail!("stored MLS genesis conflicts with memory")
+    }
+    state
+        .mls_geneses
+        .write()
+        .await
+        .insert(group_id.clone(), genesis);
+    notify_group_change(state, &group_id).await;
+    Ok(InsertResult::Inserted)
+}
+
+async fn insert_mls_epoch(
+    state: &AppState,
+    record: MlsEpochRecord,
+) -> anyhow::Result<InsertResult> {
+    let _guard = state.mutations.lock().await;
+    let group_id = record.bundle.group_id.clone();
+    if state.deletions.read().await.contains_key(&group_id) {
+        return Ok(InsertResult::Deleted);
+    }
+    if state
+        .mls_epochs
+        .read()
+        .await
+        .contains_key(&record.record_id)
+    {
+        return Ok(InsertResult::Present);
+    }
+    let genesis = state
+        .mls_geneses
+        .read()
+        .await
+        .get(&group_id)
+        .cloned()
+        .context("group has no MLS genesis")?;
+    if record.owner_public_key != genesis.owner_public_key {
+        bail!("MLS epoch author is not the group founder")
+    }
+    let mut epochs = state
+        .mls_epochs
+        .read()
+        .await
+        .values()
+        .filter(|epoch| epoch.bundle.group_id == group_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    epochs.sort_by_key(|epoch| epoch.bundle.epoch);
+    let (head_epoch, head_record_id) = epochs
+        .last()
+        .map(|epoch| (epoch.bundle.epoch, epoch.record_id.as_str()))
+        .unwrap_or((0, genesis.record_id.as_str()));
+    if record.bundle.parent_epoch != head_epoch
+        || record.bundle.epoch != head_epoch.saturating_add(1)
+        || record.previous_record_id != head_record_id
+    {
+        bail!("MLS epoch does not extend the current control head")
+    }
+    let object_id = record.record_id.clone();
+    let inserted = state
+        .store
+        .insert("mls_epoch", object_id.clone(), &record)
+        .await?;
+    if !inserted {
+        bail!("stored MLS epoch conflicts with memory")
+    }
+    state.mls_epochs.write().await.insert(object_id, record);
+    notify_group_change(state, &group_id).await;
+    Ok(InsertResult::Inserted)
+}
+
+async fn mls_control_log(state: &AppState, group_id: &str) -> Option<MlsControlLog> {
+    let genesis = state.mls_geneses.read().await.get(group_id).cloned()?;
+    let mut epochs = state
+        .mls_epochs
+        .read()
+        .await
+        .values()
+        .filter(|epoch| epoch.bundle.group_id == group_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    epochs.sort_by_key(|epoch| epoch.bundle.epoch);
+    let log = MlsControlLog { genesis, epochs };
+    log.verify().ok()?;
+    Some(log)
+}
+
+async fn notify_group_change(state: &AppState, group_id: &str) {
+    if let Some(sender) = state.group_changes.read().await.get(group_id) {
+        let revision = sender.borrow().saturating_add(1);
+        sender.send_replace(revision);
+    }
 }
 
 async fn insert_shard(state: &AppState, shard: StorageShard) -> Result<bool, ShardInsertError> {
@@ -2040,9 +2624,40 @@ async fn apply_group_deletion(state: &AppState, deletion: GroupDeletion) -> anyh
         .filter(|(_, event)| event.group_id == deletion.group_id)
         .map(|(object_id, _)| object_id.clone())
         .collect::<Vec<_>>();
+    let mls_join_request_ids = state
+        .mls_join_requests
+        .read()
+        .await
+        .iter()
+        .filter(|(_, request)| request.group_id == deletion.group_id)
+        .map(|(object_id, _)| object_id.clone())
+        .collect::<Vec<_>>();
+    let mls_epoch_ids = state
+        .mls_epochs
+        .read()
+        .await
+        .iter()
+        .filter(|(_, epoch)| epoch.bundle.group_id == deletion.group_id)
+        .map(|(object_id, _)| object_id.clone())
+        .collect::<Vec<_>>();
+    let mls_removal_request_ids = state
+        .mls_removal_requests
+        .read()
+        .await
+        .iter()
+        .filter(|(_, request)| request.group_id == deletion.group_id)
+        .map(|(object_id, _)| object_id.clone())
+        .collect::<Vec<_>>();
     state
         .store
-        .apply_group_deletion(&deletion, &invite_ids, &event_ids)
+        .apply_group_deletion(
+            &deletion,
+            &invite_ids,
+            &event_ids,
+            &mls_join_request_ids,
+            &mls_removal_request_ids,
+            &mls_epoch_ids,
+        )
         .await?;
     state
         .invites
@@ -2059,6 +2674,22 @@ async fn apply_group_deletion(state: &AppState, deletion: GroupDeletion) -> anyh
         .write()
         .await
         .retain(|_, event| event.group_id != deletion.group_id);
+    state
+        .mls_join_requests
+        .write()
+        .await
+        .retain(|_, request| request.group_id != deletion.group_id);
+    state
+        .mls_removal_requests
+        .write()
+        .await
+        .retain(|_, request| request.group_id != deletion.group_id);
+    state.mls_geneses.write().await.remove(&deletion.group_id);
+    state
+        .mls_epochs
+        .write()
+        .await
+        .retain(|_, epoch| epoch.bundle.group_id != deletion.group_id);
     state
         .deletions
         .write()
@@ -2113,6 +2744,50 @@ async fn gossip_event(state: AppState, event: SignedEvent) {
             .client
             .post(format!("{peer}/v1/events"))
             .json(&event)
+            .send()
+            .await;
+    }
+}
+
+async fn gossip_mls_join_request(state: AppState, request: MlsJoinRequest) {
+    for peer in state.peers.iter() {
+        let _ = state
+            .client
+            .post(format!("{peer}/v2/mls/join-requests"))
+            .json(&request)
+            .send()
+            .await;
+    }
+}
+
+async fn gossip_mls_removal_request(state: AppState, request: MlsRemovalRequest) {
+    for peer in state.peers.iter() {
+        let _ = state
+            .client
+            .post(format!("{peer}/v2/mls/removal-requests"))
+            .json(&request)
+            .send()
+            .await;
+    }
+}
+
+async fn gossip_mls_genesis(state: AppState, genesis: MlsGroupGenesis) {
+    for peer in state.peers.iter() {
+        let _ = state
+            .client
+            .post(format!("{peer}/v2/mls/genesis"))
+            .json(&genesis)
+            .send()
+            .await;
+    }
+}
+
+async fn gossip_mls_epoch(state: AppState, epoch: MlsEpochRecord) {
+    for peer in state.peers.iter() {
+        let _ = state
+            .client
+            .post(format!("{peer}/v2/mls/epochs"))
+            .json(&epoch)
             .send()
             .await;
     }
@@ -2250,11 +2925,52 @@ async fn anti_entropy_loop(state: AppState) {
                     }
                 }
             }
-            for event in snapshot.events {
+            let (legacy_events, epoch_events): (Vec<_>, Vec<_>) = snapshot
+                .events
+                .into_iter()
+                .partition(|event| event.encryption_version == 1);
+            for event in legacy_events {
                 if event.verify().is_ok() {
                     if let Err(error) = insert_event(&state, event).await {
                         eprintln!("could not persist gossiped event: {error:#}");
                     }
+                }
+            }
+            for genesis in snapshot.mls_geneses {
+                if genesis.verify().is_ok()
+                    && let Err(error) = insert_mls_genesis(&state, genesis).await
+                {
+                    eprintln!("could not persist gossiped MLS genesis: {error:#}");
+                }
+            }
+            for request in snapshot.mls_join_requests {
+                if request.verify().is_ok()
+                    && let Err(error) = insert_mls_join_request(&state, request).await
+                {
+                    eprintln!("could not persist gossiped MLS join request: {error:#}");
+                }
+            }
+            for request in snapshot.mls_removal_requests {
+                if request.verify().is_ok()
+                    && let Err(error) = insert_mls_removal_request(&state, request).await
+                {
+                    eprintln!("could not persist gossiped MLS removal request: {error:#}");
+                }
+            }
+            let mut epochs = snapshot.mls_epochs;
+            epochs.sort_by_key(|epoch| epoch.bundle.epoch);
+            for epoch in epochs {
+                if epoch.verify().is_ok()
+                    && let Err(error) = insert_mls_epoch(&state, epoch).await
+                {
+                    eprintln!("could not persist gossiped MLS epoch: {error:#}");
+                }
+            }
+            for event in epoch_events {
+                if event.verify().is_ok()
+                    && let Err(error) = insert_event(&state, event).await
+                {
+                    eprintln!("could not persist gossiped MLS event: {error:#}");
                 }
             }
         }

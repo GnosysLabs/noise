@@ -222,6 +222,12 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .await
                 .map_err(|error| error.to_string())?,
         ),
+        "sync_group_encryption" => data(
+            client
+                .sync_active_group_encryption(STATE_PATH, CACHE_PATH, relays(&request)?)
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
         "say" => {
             let text = required::<String>(&request, "text")?;
             let attachment = optional::<MediaAttachment>(&request, "attachment")?;
