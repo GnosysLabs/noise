@@ -33,6 +33,7 @@ struct RelayPoolCache {
 }
 
 pub async fn discover(cache_path: &Path, seeds: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let cache_path = prepare_cache_file(cache_path)?;
     let now = unix_seconds()?;
     let seeds = seeds
         .iter()
@@ -46,7 +47,7 @@ pub async fn discover(cache_path: &Path, seeds: Vec<String>) -> anyhow::Result<V
         .iter()
         .map(|seed| seed.base_url.clone())
         .collect::<Vec<_>>();
-    let cached = load_cache(cache_path)
+    let cached = load_cache(&cache_path)
         .descriptors
         .into_iter()
         .filter(|descriptor| descriptor.verify_at(now).is_ok())
@@ -106,7 +107,7 @@ pub async fn discover(cache_path: &Path, seeds: Vec<String>) -> anyhow::Result<V
     verified.truncate(MAX_MASK_RELAYS);
 
     let _ = save_cache(
-        cache_path,
+        &cache_path,
         &RelayPoolCache {
             version: CACHE_VERSION,
             descriptors: verified.clone(),
@@ -124,6 +125,39 @@ pub async fn discover(cache_path: &Path, seeds: Vec<String>) -> anyhow::Result<V
             )
         })
         .collect())
+}
+
+fn prepare_cache_file(cache_root: &Path) -> anyhow::Result<std::path::PathBuf> {
+    const FILE_NAME: &str = "relay-pool.json";
+    if cache_root.is_file() {
+        // Older desktop builds mistakenly wrote the relay-pool JSON directly
+        // at Tauri's cache-directory path, preventing every other cache from
+        // creating a subdirectory there. Preserve that cache while repairing
+        // the path into the directory it was always meant to be.
+        let migration = cache_root.with_extension("relay-pool-migration");
+        if migration.exists() {
+            fs::remove_file(&migration)
+                .with_context(|| format!("could not clear {}", migration.display()))?;
+        }
+        fs::rename(cache_root, &migration)
+            .with_context(|| format!("could not move {}", cache_root.display()))?;
+        if let Err(error) = fs::create_dir_all(cache_root) {
+            let _ = fs::rename(&migration, cache_root);
+            return Err(error)
+                .with_context(|| format!("could not create {}", cache_root.display()));
+        }
+        let destination = cache_root.join(FILE_NAME);
+        if let Err(error) = fs::rename(&migration, &destination) {
+            let _ = fs::remove_dir(cache_root);
+            let _ = fs::rename(&migration, cache_root);
+            return Err(error)
+                .with_context(|| format!("could not migrate {}", destination.display()));
+        }
+        return Ok(destination);
+    }
+    fs::create_dir_all(cache_root)
+        .with_context(|| format!("could not create {}", cache_root.display()))?;
+    Ok(cache_root.join(FILE_NAME))
 }
 
 fn consider_descriptor(

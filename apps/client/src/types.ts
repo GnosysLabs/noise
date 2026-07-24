@@ -6,12 +6,32 @@ export type ProfileImage = {
   storage?: StorageManifest | null;
 };
 
+export type ProfileAlbum = {
+  blob_id: string;
+  key_base64: string;
+  byte_length: number;
+  item_count: number;
+  storage?: StorageManifest | null;
+};
+
+export type ProfileAlbumItem = {
+  id: string;
+  attachment: MediaAttachment;
+  created_at_millis: number;
+};
+
+export type ProfileAlbumData = {
+  scope_id: string;
+  items: ProfileAlbumItem[];
+};
+
 export type IdentitySummary = {
   username: string;
   public_key: string;
   noise_id: string | null;
   bio: string;
   avatar: ProfileImage | null;
+  album: ProfileAlbum | null;
   accepts_direct_messages: boolean;
 };
 
@@ -39,6 +59,8 @@ export type LocalSummary = {
   groups: GroupSummary[];
   directs: DirectSummary[];
   known_people: DirectSummary[];
+  blocked_people: DirectSummary[];
+  hidden_public_keys: string[];
 };
 
 export type DirectSummary = {
@@ -46,6 +68,7 @@ export type DirectSummary = {
   username: string;
   bio: string;
   avatar: ProfileImage | null;
+  album: ProfileAlbum | null;
   accepts_direct_messages: boolean;
   is_active: boolean;
   has_unread: boolean;
@@ -56,6 +79,7 @@ export type MemberSummary = {
   username: string;
   bio: string;
   avatar: ProfileImage | null;
+  album: ProfileAlbum | null;
   accepts_direct_messages: boolean;
   is_moderator: boolean;
 };
@@ -102,6 +126,7 @@ export type MessageSummary = {
   username: string;
   bio: string;
   avatar: ProfileImage | null;
+  album: ProfileAlbum | null;
   accepts_direct_messages: boolean;
   text: string;
   attachment: MediaAttachment | null;
@@ -174,6 +199,7 @@ export type DirectMessageSummary = {
   username: string;
   bio: string;
   avatar: ProfileImage | null;
+  album: ProfileAlbum | null;
   accepts_direct_messages: boolean;
   text: string;
   attachment: MediaAttachment | null;

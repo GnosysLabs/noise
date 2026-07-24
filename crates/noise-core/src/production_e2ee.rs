@@ -1369,7 +1369,7 @@ mod tests {
         let bob_identity = Identity::generate();
         let charlie_identity = Identity::generate();
         let group = GroupMembership::create_owned(
-            "production Noise group",
+            "production noise group",
             alice_identity.public_key_base64(),
         );
         let group_id = group.group_id.as_str();
@@ -1381,6 +1381,7 @@ mod tests {
             username: "bob".into(),
             bio: String::new(),
             avatar: None,
+            album: None,
             accepts_direct_messages: true,
         };
         let membership_proof =

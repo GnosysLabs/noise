@@ -28,6 +28,7 @@ const INVITE_KDF_CONTEXT: &str = "xyz.gnosyslabs.noise.frequency-invite.v1";
 const DIRECT_KEY_CONTEXT: &str = "xyz.gnosyslabs.noise.direct-key.v1";
 const DIRECT_MAILBOX_CONTEXT: &str = "xyz.gnosyslabs.noise.direct-mailbox.v1";
 const DIRECT_SCOPE_CONTEXT: &str = "xyz.gnosyslabs.noise.direct-scope.v1";
+const PROFILE_MEDIA_SCOPE_CONTEXT: &str = "xyz.gnosyslabs.noise.profile-media-scope.v1";
 const GROUP_PRESENCE_CONTEXT: &str = "xyz.gnosyslabs.noise.group-presence.v1";
 pub const DEFAULT_GROUP_ACCENT_COLOR: &str = "#7758ED";
 
@@ -47,7 +48,7 @@ pub enum NoiseError {
     Crypto,
     #[error("invalid frequency")]
     InvalidFrequency,
-    #[error("invalid Noise ID")]
+    #[error("invalid noise ID")]
     InvalidNoiseId,
     #[error("the invitation belongs to a different frequency")]
     FrequencyMismatch,
@@ -188,6 +189,15 @@ pub fn direct_message_id(author_public_key: &str, author_sequence: u64) -> Strin
     hasher.update(author_public_key.as_bytes());
     hasher.update(&author_sequence.to_be_bytes());
     hasher.finalize().to_hex().to_string()
+}
+
+pub fn profile_media_scope_id(public_key: &str) -> Result<String, NoiseError> {
+    let bytes = decode_array::<32>(public_key, "profile public key")?;
+    VerifyingKey::from_bytes(&bytes).map_err(|_| NoiseError::InvalidSignature)?;
+    Ok(blake3::derive_key(PROFILE_MEDIA_SCOPE_CONTEXT, &bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 #[derive(Clone, Debug)]
@@ -399,6 +409,8 @@ pub struct Profile {
     pub bio: String,
     #[serde(default)]
     pub avatar: Option<ProfileImage>,
+    #[serde(default)]
+    pub album: Option<ProfileAlbum>,
     #[serde(default = "default_true")]
     pub accepts_direct_messages: bool,
 }
@@ -415,6 +427,23 @@ pub struct ProfileImage {
     pub byte_length: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageManifest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileAlbum {
+    pub blob_id: String,
+    pub key_base64: String,
+    pub byte_length: u32,
+    pub item_count: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageManifest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileAlbumItem {
+    pub id: String,
+    pub attachment: MediaAttachment,
+    pub created_at_millis: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1273,6 +1302,8 @@ pub enum GroupEventPayload {
         bio: String,
         #[serde(default)]
         avatar: Option<ProfileImage>,
+        #[serde(default)]
+        album: Option<ProfileAlbum>,
         #[serde(default = "default_true")]
         accepts_direct_messages: bool,
     },
@@ -1321,6 +1352,11 @@ pub enum GroupEventPayload {
     },
     DirectThreadDeleted {
         recipient_public_key: String,
+    },
+    DirectBlockChanged {
+        recipient_public_key: String,
+        sender_profile: Profile,
+        blocked: bool,
     },
     MemberLeft,
     Message {
@@ -1399,6 +1435,7 @@ impl SignedEvent {
                 username: profile.username.clone(),
                 bio: profile.bio.clone(),
                 avatar: profile.avatar.clone(),
+                album: profile.album.clone(),
                 accepts_direct_messages: profile.accepts_direct_messages,
             },
             author_sequence,
@@ -1620,6 +1657,26 @@ impl SignedEvent {
             mailbox,
             GroupEventPayload::DirectThreadDeleted {
                 recipient_public_key: recipient_public_key.into(),
+            },
+            author_sequence,
+        )
+    }
+
+    pub fn direct_block_changed(
+        identity: &Identity,
+        mailbox: &GroupMembership,
+        recipient_public_key: impl Into<String>,
+        sender_profile: &Profile,
+        blocked: bool,
+        author_sequence: u64,
+    ) -> Result<Self, NoiseError> {
+        Self::create_legacy(
+            identity,
+            mailbox,
+            GroupEventPayload::DirectBlockChanged {
+                recipient_public_key: recipient_public_key.into(),
+                sender_profile: sender_profile.clone(),
+                blocked,
             },
             author_sequence,
         )
@@ -1897,6 +1954,7 @@ pub struct MemberState {
     pub username: String,
     pub bio: String,
     pub avatar: Option<ProfileImage>,
+    pub album: Option<ProfileAlbum>,
     pub accepts_direct_messages: bool,
     pub joined_at_millis: u64,
 }
@@ -1909,6 +1967,7 @@ pub struct AcceptedMessage {
     pub username: String,
     pub bio: String,
     pub avatar: Option<ProfileImage>,
+    pub album: Option<ProfileAlbum>,
     pub accepts_direct_messages: bool,
     pub text: String,
     pub attachment: Option<MediaAttachment>,
@@ -2008,6 +2067,7 @@ impl GroupState {
                     username,
                     bio,
                     avatar,
+                    album,
                     accepts_direct_messages,
                 } => {
                     if state.banned_members.contains(&event.author_public_key) {
@@ -2024,6 +2084,7 @@ impl GroupState {
                             username: username.clone(),
                             bio: bio.clone(),
                             avatar: avatar.clone(),
+                            album: album.clone(),
                             accepts_direct_messages,
                             joined_at_millis: event.created_at_millis,
                         },
@@ -2034,6 +2095,7 @@ impl GroupState {
                         &username,
                         &bio,
                         &avatar,
+                        &album,
                         accepts_direct_messages,
                     );
                 }
@@ -2045,6 +2107,7 @@ impl GroupState {
                     member.username = profile.username.clone();
                     member.bio = profile.bio.clone();
                     member.avatar = profile.avatar.clone();
+                    member.album = profile.album.clone();
                     member.accepts_direct_messages = profile.accepts_direct_messages;
                     update_message_profiles(
                         &mut state.messages,
@@ -2052,6 +2115,7 @@ impl GroupState {
                         &profile.username,
                         &profile.bio,
                         &profile.avatar,
+                        &profile.album,
                         profile.accepts_direct_messages,
                     );
                 }
@@ -2063,9 +2127,7 @@ impl GroupState {
                         state.rejected_events += 1;
                         continue;
                     }
-                    if !profile.mobile_background_updated
-                        && profile.mobile_background.is_none()
-                    {
+                    if !profile.mobile_background_updated && profile.mobile_background.is_none() {
                         profile.mobile_background = state.profile.mobile_background.clone();
                     }
                     state.profile = profile;
@@ -2266,7 +2328,8 @@ impl GroupState {
                     }
                 }
                 GroupEventPayload::DirectMessage { .. }
-                | GroupEventPayload::DirectThreadDeleted { .. } => {
+                | GroupEventPayload::DirectThreadDeleted { .. }
+                | GroupEventPayload::DirectBlockChanged { .. } => {
                     state.rejected_events += 1;
                 }
                 GroupEventPayload::Message {
@@ -2309,6 +2372,7 @@ impl GroupState {
                         username: member.username.clone(),
                         bio: member.bio.clone(),
                         avatar: member.avatar.clone(),
+                        album: member.album.clone(),
                         accepts_direct_messages: member.accepts_direct_messages,
                         text,
                         attachment,
@@ -2461,6 +2525,7 @@ fn update_message_profiles(
     username: &str,
     bio: &str,
     avatar: &Option<ProfileImage>,
+    album: &Option<ProfileAlbum>,
     accepts_direct_messages: bool,
 ) {
     for message in messages
@@ -2470,6 +2535,7 @@ fn update_message_profiles(
         message.username = username.to_owned();
         message.bio = bio.to_owned();
         message.avatar = avatar.clone();
+        message.album = album.clone();
         message.accepts_direct_messages = accepts_direct_messages;
     }
 }
@@ -2623,6 +2689,7 @@ mod tests {
                 username: "alice".into(),
                 bio: String::new(),
                 avatar: None,
+                album: None,
                 accepts_direct_messages: true,
             },
             0,
@@ -2636,6 +2703,7 @@ mod tests {
                 username: "alice".into(),
                 bio: "still listening".into(),
                 avatar: None,
+                album: None,
                 accepts_direct_messages: true,
             },
             2,
@@ -2685,6 +2753,7 @@ mod tests {
             username: username.into(),
             bio: String::new(),
             avatar: None,
+            album: None,
             accepts_direct_messages: true,
         };
         let mut events = Vec::new();
@@ -2732,6 +2801,7 @@ mod tests {
             username: username.into(),
             bio: String::new(),
             avatar: None,
+            album: None,
             accepts_direct_messages: true,
         };
         let mut events =
@@ -2770,6 +2840,7 @@ mod tests {
             username: username.into(),
             bio: String::new(),
             avatar: None,
+            album: None,
             accepts_direct_messages: true,
         };
         let mut events =
@@ -2819,6 +2890,7 @@ mod tests {
             username: username.into(),
             bio: String::new(),
             avatar: None,
+            album: None,
             accepts_direct_messages: true,
         };
         let mut events =
@@ -2863,6 +2935,7 @@ mod tests {
             username: username.into(),
             bio: String::new(),
             avatar: None,
+            album: None,
             accepts_direct_messages: true,
         };
         let mut events =
@@ -2924,6 +2997,7 @@ mod tests {
             username: "founder".into(),
             bio: String::new(),
             avatar: None,
+            album: None,
             accepts_direct_messages: true,
         };
         let mobile_background = ProfileImage {
@@ -2963,13 +3037,7 @@ mod tests {
         );
 
         events.push(
-            SignedEvent::group_profile_updated(
-                &founder,
-                &group,
-                &profile(None, false),
-                2,
-            )
-            .unwrap(),
+            SignedEvent::group_profile_updated(&founder, &group, &profile(None, false), 2).unwrap(),
         );
         let preserved = GroupState::rebuild(&group, &events);
         assert_eq!(
@@ -2978,18 +3046,14 @@ mod tests {
         );
 
         events.push(
-            SignedEvent::group_profile_updated(
-                &founder,
-                &group,
-                &profile(None, true),
-                3,
-            )
-            .unwrap(),
+            SignedEvent::group_profile_updated(&founder, &group, &profile(None, true), 3).unwrap(),
         );
-        assert!(GroupState::rebuild(&group, &events)
-            .profile
-            .mobile_background
-            .is_none());
+        assert!(
+            GroupState::rebuild(&group, &events)
+                .profile
+                .mobile_background
+                .is_none()
+        );
     }
 
     #[test]
@@ -3025,6 +3089,7 @@ mod tests {
                 username: "alice".into(),
                 bio: String::new(),
                 avatar: None,
+                album: None,
                 accepts_direct_messages: true,
             },
             "secret hello",
@@ -3054,6 +3119,30 @@ mod tests {
         assert!(matches!(
             deletion.decrypt(&bob_view_of_bob_mailbox).unwrap(),
             GroupEventPayload::DirectThreadDeleted { recipient_public_key } if recipient_public_key == bob_public_key
+        ));
+
+        let block = SignedEvent::direct_block_changed(
+            &alice,
+            &alice_view_of_bob_mailbox,
+            &bob_public_key,
+            &Profile {
+                username: "alice".into(),
+                bio: String::new(),
+                avatar: None,
+                album: None,
+                accepts_direct_messages: true,
+            },
+            true,
+            2,
+        )
+        .unwrap();
+        assert!(matches!(
+            block.decrypt(&bob_view_of_bob_mailbox).unwrap(),
+            GroupEventPayload::DirectBlockChanged {
+                recipient_public_key,
+                blocked: true,
+                ..
+            } if recipient_public_key == bob_public_key
         ));
     }
 }

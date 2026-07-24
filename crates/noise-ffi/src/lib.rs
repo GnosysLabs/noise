@@ -5,7 +5,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use noise_client::{MediaAttachment, NoiseClient, ProfileImage};
+use noise_client::{MediaAttachment, NoiseClient, ProfileAlbum, ProfileAlbumItem, ProfileImage};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
@@ -40,6 +40,7 @@ enum Request {
     },
     SyncReadState {
         state_path: String,
+        cache_path: String,
         relays: Vec<String>,
     },
     WatchAccount {
@@ -63,6 +64,17 @@ enum Request {
         avatar_mime_type: Option<String>,
         remove_avatar: bool,
         accepts_direct_messages: bool,
+        relays: Vec<String>,
+    },
+    FetchProfileAlbum {
+        state_path: String,
+        public_key: String,
+        album: ProfileAlbum,
+        relays: Vec<String>,
+    },
+    UpdateProfileAlbum {
+        state_path: String,
+        items: Vec<ProfileAlbumItem>,
         relays: Vec<String>,
     },
     UpdateGroupProfile {
@@ -119,6 +131,11 @@ enum Request {
         data_base64: String,
         relays: Vec<String>,
     },
+    UploadProfileMediaChunk {
+        state_path: String,
+        data_base64: String,
+        relays: Vec<String>,
+    },
     Make {
         state_path: String,
         name: String,
@@ -159,7 +176,20 @@ enum Request {
         username: String,
         bio: String,
         avatar: Option<ProfileImage>,
+        album: Option<ProfileAlbum>,
         accepts_direct_messages: bool,
+    },
+    SetBlock {
+        state_path: String,
+        cache_path: String,
+        public_key: String,
+        username: String,
+        bio: String,
+        avatar: Option<ProfileImage>,
+        album: Option<ProfileAlbum>,
+        accepts_direct_messages: bool,
+        blocked: bool,
+        relays: Vec<String>,
     },
     SelectDirect {
         state_path: String,
@@ -411,9 +441,13 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
-        Request::SyncReadState { state_path, relays } => serde_json::to_value(
+        Request::SyncReadState {
+            state_path,
+            cache_path,
+            relays,
+        } => serde_json::to_value(
             runtime()?
-                .block_on(client.sync_read_state(state_path, relays))
+                .block_on(client.sync_read_state(state_path, cache_path, relays))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
@@ -466,6 +500,27 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                     accepts_direct_messages,
                     relays,
                 ))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::FetchProfileAlbum {
+            state_path,
+            public_key,
+            album,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.fetch_profile_album(state_path, &public_key, &album, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::UpdateProfileAlbum {
+            state_path,
+            items,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.update_profile_album(state_path, items, relays))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
@@ -569,6 +624,16 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
+        Request::UploadProfileMediaChunk {
+            state_path,
+            data_base64,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.upload_profile_media_chunk(state_path, data_base64, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         Request::Make {
             state_path,
             name,
@@ -663,6 +728,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             username,
             bio,
             avatar,
+            album,
             accepts_direct_messages,
         } => serde_json::to_value(
             client
@@ -672,8 +738,37 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                     username,
                     bio,
                     avatar,
+                    album,
                     accepts_direct_messages,
                 )
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::SetBlock {
+            state_path,
+            cache_path,
+            public_key,
+            username,
+            bio,
+            avatar,
+            album,
+            accepts_direct_messages,
+            blocked,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.set_block(
+                    state_path,
+                    cache_path,
+                    &public_key,
+                    username,
+                    bio,
+                    avatar,
+                    album,
+                    accepts_direct_messages,
+                    blocked,
+                    relays,
+                ))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
@@ -994,7 +1089,7 @@ pub unsafe extern "C" fn noise_invoke(request_json: *const c_char) -> *mut c_cha
             Err(_) => json!({ "ok": false, "error": "request was not UTF-8" }).to_string(),
         }
     }))
-    .unwrap_or_else(|_| json!({ "ok": false, "error": "Noise core panicked" }).to_string());
+    .unwrap_or_else(|_| json!({ "ok": false, "error": "noise core panicked" }).to_string());
 
     owned_c_string(result)
 }

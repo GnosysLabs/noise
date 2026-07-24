@@ -35,17 +35,17 @@ fn state_path() -> Result<PathBuf, String> {
 
 async fn execute_noise_request(app: &tauri::AppHandle, mut request: Value) -> Value {
     let Ok(path) = state_path() else {
-        return json!({ "ok": false, "error": "could not locate Noise identity storage" });
+        return json!({ "ok": false, "error": "could not locate noise identity storage" });
     };
     let Some(request_object) = request.as_object_mut() else {
-        return json!({ "ok": false, "error": "Noise request must be an object" });
+        return json!({ "ok": false, "error": "noise request must be an object" });
     };
     request_object.insert(
         "state_path".into(),
         Value::String(path.to_string_lossy().into_owned()),
     );
     let Ok(cache_path) = app.path().app_cache_dir() else {
-        return json!({ "ok": false, "error": "could not locate Noise media cache" });
+        return json!({ "ok": false, "error": "could not locate noise media cache" });
     };
     request_object.insert(
         "cache_path".into(),
@@ -71,7 +71,7 @@ async fn noise_request_data(app: &tauri::AppHandle, request: Value) -> Result<Va
         Err(response
             .get("error")
             .and_then(Value::as_str)
-            .unwrap_or("Noise request failed")
+            .unwrap_or("noise request failed")
             .to_owned())
     }
 }
@@ -101,7 +101,7 @@ async fn download_media(
         let cache = fs::canonicalize(cache_directory).map_err(|error| error.to_string())?;
         if !source.starts_with(&cache) {
             return Err(
-                "Noise can only download decrypted media from its private cache".to_owned(),
+                "noise can only download decrypted media from its private cache".to_owned(),
             );
         }
         fs::create_dir_all(&download_directory).map_err(|error| error.to_string())?;
@@ -198,14 +198,14 @@ fn show_native_notification(_app: &tauri::AppHandle, title: &str, body: &str) {
             .body(body)
             .show()
         {
-            eprintln!("Noise could not deliver a macOS notification: {error}");
+            eprintln!("noise could not deliver a macOS notification: {error}");
         }
     }
 
     #[cfg(not(target_os = "macos"))]
     {
         if let Err(error) = _app.notification().builder().title(title).body(body).show() {
-            eprintln!("Noise could not deliver a desktop notification: {error}");
+            eprintln!("noise could not deliver a desktop notification: {error}");
         }
     }
 }
@@ -264,7 +264,7 @@ fn reply_notifications(snapshot: &Value) -> Vec<PendingNotification> {
         .flatten()
         .filter_map(|reply| {
             let event_id = reply.get("event_id")?.as_str()?.to_owned();
-            let group_name = reply.get("group_name")?.as_str().unwrap_or("Noise");
+            let group_name = reply.get("group_name")?.as_str().unwrap_or("noise");
             let username = reply.get("username")?.as_str().unwrap_or("someone");
             let text = reply
                 .get("text")
@@ -568,5 +568,5 @@ fn main() {
             ensure_native_notification_permission
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Noise");
+        .expect("error while running noise");
 }

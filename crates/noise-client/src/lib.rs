@@ -39,9 +39,10 @@ use noise_core::{
     StorageManifest, StorageShard, derive_account_credentials, direct_mailbox_id,
     direct_message_id, display_frequency, display_noise_id, encode_blob_for_storage,
     frequency_locator, generate_frequency, generate_noise_id, media_preview_is_valid,
-    normalize_frequency, reconstruct_blob_from_storage, valid_reaction_emoji,
+    normalize_frequency, profile_media_scope_id, reconstruct_blob_from_storage,
+    valid_reaction_emoji,
 };
-pub use noise_core::{MediaAttachment, MediaChunk, ProfileImage};
+pub use noise_core::{MediaAttachment, MediaChunk, ProfileAlbum, ProfileAlbumItem, ProfileImage};
 use noise_transport::{
     GATEWAY_HEADER, OHTTP_RELAY_PATH, OHTTP_REQUEST_MEDIA_TYPE, OHTTP_RESPONSE_MEDIA_TYPE,
     PlainResponse, RelayDescriptor, decode_response, encode_request,
@@ -83,11 +84,11 @@ impl Default for NoiseClient {
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(40))
             .build()
-            .expect("Noise HTTP configuration is valid");
+            .expect("noise HTTP configuration is valid");
         #[cfg(target_arch = "wasm32")]
         let http = reqwest::Client::builder()
             .build()
-            .expect("Noise HTTP configuration is valid");
+            .expect("noise HTTP configuration is valid");
         Self {
             http,
             mask_relays: Vec::new(),
@@ -102,6 +103,7 @@ pub struct IdentitySummary {
     pub noise_id: Option<String>,
     pub bio: String,
     pub avatar: Option<ProfileImage>,
+    pub album: Option<ProfileAlbum>,
     pub accepts_direct_messages: bool,
 }
 
@@ -131,6 +133,8 @@ pub struct LocalSummary {
     pub groups: Vec<GroupSummary>,
     pub directs: Vec<DirectSummary>,
     pub known_people: Vec<DirectSummary>,
+    pub blocked_people: Vec<DirectSummary>,
+    pub hidden_public_keys: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -139,6 +143,7 @@ pub struct DirectSummary {
     pub username: String,
     pub bio: String,
     pub avatar: Option<ProfileImage>,
+    pub album: Option<ProfileAlbum>,
     pub accepts_direct_messages: bool,
     pub is_active: bool,
     pub has_unread: bool,
@@ -170,6 +175,7 @@ pub struct MemberSummary {
     pub username: String,
     pub bio: String,
     pub avatar: Option<ProfileImage>,
+    pub album: Option<ProfileAlbum>,
     pub accepts_direct_messages: bool,
     pub is_moderator: bool,
 }
@@ -182,6 +188,7 @@ pub struct MessageSummary {
     pub username: String,
     pub bio: String,
     pub avatar: Option<ProfileImage>,
+    pub album: Option<ProfileAlbum>,
     pub accepts_direct_messages: bool,
     pub text: String,
     pub attachment: Option<MediaAttachment>,
@@ -243,6 +250,7 @@ pub struct DirectMessageSummary {
     pub username: String,
     pub bio: String,
     pub avatar: Option<ProfileImage>,
+    pub album: Option<ProfileAlbum>,
     pub accepts_direct_messages: bool,
     pub text: String,
     pub attachment: Option<MediaAttachment>,
@@ -261,6 +269,12 @@ pub struct DirectConversation {
 pub struct DirectInbox {
     pub summary: LocalSummary,
     pub conversations: Vec<DirectConversation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProfileAlbumData {
+    pub scope_id: String,
+    pub items: Vec<ProfileAlbumItem>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -322,12 +336,21 @@ enum DecryptedDirectEvent {
         counterparty_public_key: String,
         deleted_at_millis: u64,
     },
+    BlockChanged {
+        counterparty_public_key: String,
+        contact: DirectContact,
+        blocked: bool,
+        sequence: u64,
+        changed_at_millis: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ClientState {
     version: u32,
     profile: Profile,
+    #[serde(default)]
+    profile_sequence: u64,
     identity_secret_base64: String,
     #[serde(default)]
     mls_device: Option<MlsAccountState>,
@@ -338,11 +361,17 @@ struct ClientState {
     #[serde(default)]
     mls_control_logs: HashMap<String, MlsControlLog>,
     groups: Vec<GroupMembership>,
+    #[serde(default)]
+    group_memberships: HashMap<String, GroupMembershipRecord>,
     active_group_id: Option<String>,
     #[serde(default)]
     direct_contacts: Vec<DirectContact>,
     #[serde(default)]
     known_people: Vec<DirectContact>,
+    #[serde(default)]
+    block_states: HashMap<String, BlockState>,
+    #[serde(default)]
+    blocked_by_states: HashMap<String, BlockState>,
     #[serde(default)]
     active_direct_public_key: Option<String>,
     #[serde(default)]
@@ -387,11 +416,19 @@ struct AccountSession {
 struct AccountVaultContents {
     version: u32,
     profile: Profile,
+    #[serde(default)]
+    profile_sequence: u64,
     identity_secret_base64: String,
     groups: Vec<GroupMembership>,
+    #[serde(default)]
+    group_memberships: HashMap<String, GroupMembershipRecord>,
     active_group_id: Option<String>,
     direct_contacts: Vec<DirectContact>,
     known_people: Vec<DirectContact>,
+    #[serde(default)]
+    block_states: HashMap<String, BlockState>,
+    #[serde(default)]
+    blocked_by_states: HashMap<String, BlockState>,
     active_direct_public_key: Option<String>,
     direct_deleted_before: HashMap<String, u64>,
     direct_closed_periods: Vec<DirectClosedPeriod>,
@@ -410,6 +447,13 @@ struct AccountVaultContents {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct GroupMembershipRecord {
+    sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group: Option<GroupMembership>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct DirectContact {
     public_key: String,
     username: String,
@@ -417,14 +461,32 @@ struct DirectContact {
     bio: String,
     #[serde(default)]
     avatar: Option<ProfileImage>,
+    #[serde(default)]
+    album: Option<ProfileAlbum>,
     #[serde(default = "default_true")]
     accepts_direct_messages: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct BlockState {
+    person: DirectContact,
+    blocked: bool,
+    sequence: u64,
+    #[serde(default)]
+    changed_at_millis: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DirectClosedPeriod {
     closed_at_millis: u64,
     reopened_at_millis: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredProfileAlbum {
+    version: u8,
+    owner_public_key: String,
+    items: Vec<ProfileAlbumItem>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -445,6 +507,49 @@ fn merge_read_markers(
             .entry(public_key.clone())
             .and_modify(|existing| *existing = existing.clone().max(marker.clone()))
             .or_insert_with(|| marker.clone());
+    }
+    *current != before
+}
+
+fn merge_block_states(
+    current: &mut HashMap<String, BlockState>,
+    incoming: &HashMap<String, BlockState>,
+) -> bool {
+    let before = current.clone();
+    for (public_key, candidate) in incoming {
+        current
+            .entry(public_key.clone())
+            .and_modify(|existing| {
+                if (candidate.sequence, candidate.blocked) > (existing.sequence, existing.blocked) {
+                    *existing = candidate.clone();
+                }
+            })
+            .or_insert_with(|| candidate.clone());
+    }
+    *current != before
+}
+
+fn merge_group_membership_records(
+    current: &mut HashMap<String, GroupMembershipRecord>,
+    incoming: HashMap<String, GroupMembershipRecord>,
+) -> bool {
+    let before = current.clone();
+    for (group_id, candidate) in incoming {
+        match current.entry(group_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let existing = entry.get();
+                let candidate_wins = candidate.sequence > existing.sequence
+                    || (candidate.sequence == existing.sequence
+                        && candidate.group.is_none()
+                        && existing.group.is_some());
+                if candidate_wins {
+                    entry.insert(candidate);
+                }
+            }
+        }
     }
     *current != before
 }
@@ -482,15 +587,130 @@ impl ClientState {
             .context("this device has no MLS identity")
     }
 
-    fn add_group(&mut self, group: GroupMembership) {
-        if !self
+    fn ensure_group_membership_records(&mut self) {
+        for group in &self.groups {
+            self.group_memberships
+                .entry(group.group_id.clone())
+                .or_insert_with(|| GroupMembershipRecord {
+                    sequence: 0,
+                    group: Some(group.clone()),
+                });
+        }
+        self.reconcile_group_memberships();
+    }
+
+    fn vault_group_memberships(&self) -> HashMap<String, GroupMembershipRecord> {
+        let mut records = self.group_memberships.clone();
+        for group in &self.groups {
+            records
+                .entry(group.group_id.clone())
+                .and_modify(|record| {
+                    if record.group.is_some() {
+                        record.group = Some(group.clone());
+                    }
+                })
+                .or_insert_with(|| GroupMembershipRecord {
+                    sequence: 0,
+                    group: Some(group.clone()),
+                });
+        }
+        records
+    }
+
+    fn reconcile_group_memberships(&mut self) -> bool {
+        let before = self.groups.clone();
+        let mut present = self
+            .group_memberships
+            .iter()
+            .filter_map(|(group_id, record)| {
+                record
+                    .group
+                    .as_ref()
+                    .map(|group| (group_id.clone(), record.sequence, group.clone()))
+            })
+            .collect::<Vec<_>>();
+        present.sort_by(|left, right| {
+            let left_position = before
+                .iter()
+                .position(|group| group.group_id == left.0)
+                .unwrap_or(usize::MAX);
+            let right_position = before
+                .iter()
+                .position(|group| group.group_id == right.0)
+                .unwrap_or(usize::MAX);
+            left_position
+                .cmp(&right_position)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        self.groups = present
+            .into_iter()
+            .map(|(_, _, membership)| membership)
+            .collect();
+
+        let present_ids = self
             .groups
             .iter()
-            .any(|existing| existing.group_id == group.group_id)
-        {
-            self.groups.push(group.clone());
+            .map(|group| group.group_id.clone())
+            .collect::<HashSet<_>>();
+        let removed_ids = before
+            .iter()
+            .map(|group| group.group_id.clone())
+            .filter(|group_id| !present_ids.contains(group_id))
+            .collect::<Vec<_>>();
+        for group_id in removed_ids {
+            self.group_frequencies.remove(&group_id);
+            self.forget_group_activity(&group_id);
+            self.group_conversation_cache.remove(&group_id);
+            self.mls_join_requests.remove(&group_id);
+            self.mls_local_geneses.remove(&group_id);
+            self.mls_control_logs.remove(&group_id);
+            if let Some(mls) = self.mls_device.as_mut() {
+                let _ = mls.forget_group(&group_id);
+            }
         }
-        self.active_group_id = Some(group.group_id);
+        if self
+            .active_group_id
+            .as_ref()
+            .is_some_and(|group_id| !present_ids.contains(group_id))
+        {
+            self.active_group_id = self.groups.first().map(|group| group.group_id.clone());
+        }
+        before != self.groups
+    }
+
+    fn add_group(&mut self, group: GroupMembership) {
+        let group_id = group.group_id.clone();
+        let sequence = self.take_sequence();
+        self.group_memberships.insert(
+            group_id.clone(),
+            GroupMembershipRecord {
+                sequence,
+                group: Some(group.clone()),
+            },
+        );
+        if let Some(existing) = self
+            .groups
+            .iter_mut()
+            .find(|existing| existing.group_id == group_id)
+        {
+            *existing = group;
+        } else {
+            self.groups.push(group);
+        }
+        self.active_group_id = Some(group_id);
+    }
+
+    fn tombstone_group(&mut self, group_id: &str) {
+        let sequence = self.take_sequence();
+        self.group_memberships.insert(
+            group_id.to_owned(),
+            GroupMembershipRecord {
+                sequence,
+                group: None,
+            },
+        );
+        self.reconcile_group_memberships();
     }
 
     fn take_sequence(&mut self) -> u64 {
@@ -508,7 +728,7 @@ impl ClientState {
         let account = self
             .account
             .as_ref()
-            .context("this identity has no Noise ID")?;
+            .context("this identity has no noise ID")?;
         Ok(AccountCredentials {
             noise_id: account.noise_id.clone(),
             locator: account.locator.clone(),
@@ -520,11 +740,15 @@ impl ClientState {
         AccountVaultContents {
             version: 1,
             profile: self.profile.clone(),
+            profile_sequence: self.profile_sequence,
             identity_secret_base64: self.identity_secret_base64.clone(),
             groups: self.groups.clone(),
+            group_memberships: self.vault_group_memberships(),
             active_group_id: self.active_group_id.clone(),
             direct_contacts: self.direct_contacts.clone(),
             known_people: self.known_people.clone(),
+            block_states: self.block_states.clone(),
+            blocked_by_states: self.blocked_by_states.clone(),
             active_direct_public_key: self.active_direct_public_key.clone(),
             direct_deleted_before: self.direct_deleted_before.clone(),
             direct_closed_periods: self.direct_closed_periods.clone(),
@@ -540,13 +764,14 @@ impl ClientState {
 
     fn from_vault(contents: AccountVaultContents, account: AccountSession) -> anyhow::Result<Self> {
         if contents.version != 1 {
-            bail!("this account vault was created by an unsupported Noise version")
+            bail!("this account vault was created by an unsupported noise version")
         }
         let identity = Identity::from_secret_base64(&contents.identity_secret_base64)
             .context("stored identity is invalid")?;
-        let state = Self {
+        let mut state = Self {
             version: 3,
             profile: contents.profile,
+            profile_sequence: contents.profile_sequence,
             identity_secret_base64: contents.identity_secret_base64,
             mls_device: Some(
                 MlsAccountState::create(&identity)
@@ -556,9 +781,12 @@ impl ClientState {
             mls_local_geneses: HashMap::new(),
             mls_control_logs: HashMap::new(),
             groups: contents.groups,
+            group_memberships: contents.group_memberships,
             active_group_id: contents.active_group_id,
             direct_contacts: contents.direct_contacts,
             known_people: contents.known_people,
+            block_states: contents.block_states,
+            blocked_by_states: contents.blocked_by_states,
             active_direct_public_key: contents.active_direct_public_key,
             direct_deleted_before: contents.direct_deleted_before,
             direct_closed_periods: contents.direct_closed_periods,
@@ -575,7 +803,9 @@ impl ClientState {
             next_author_sequence: contents.next_author_sequence,
             account: Some(account),
         };
+        state.ensure_group_membership_records();
         state.identity()?;
+        state.apply_block_filters();
         Ok(state)
     }
 
@@ -641,6 +871,7 @@ impl ClientState {
         );
         let mut activity = messages
             .iter()
+            .filter(|message| !self.is_hidden(&message.author_public_key))
             .map(|message| MessageMarker {
                 created_at_millis: message.created_at_millis,
                 event_id: message.event_id.clone(),
@@ -651,6 +882,7 @@ impl ClientState {
         let incoming = messages
             .iter()
             .filter(|message| message.author_public_key != self_public_key)
+            .filter(|message| !self.is_hidden(&message.author_public_key))
             .map(|message| MessageMarker {
                 created_at_millis: message.created_at_millis,
                 event_id: message.event_id.clone(),
@@ -710,6 +942,102 @@ impl ClientState {
         self.group_activity_initialized.remove(group_id);
     }
 
+    fn is_blocked(&self, public_key: &str) -> bool {
+        self.block_states
+            .get(public_key)
+            .is_some_and(|state| state.blocked)
+    }
+
+    fn is_hidden(&self, public_key: &str) -> bool {
+        self.is_blocked(public_key)
+            || self
+                .blocked_by_states
+                .get(public_key)
+                .is_some_and(|state| state.blocked)
+    }
+
+    fn active_blocked_keys(&self) -> HashSet<String> {
+        self.block_states
+            .iter()
+            .filter(|(_, state)| state.blocked)
+            .map(|(public_key, _)| public_key.clone())
+            .collect()
+    }
+
+    fn active_hidden_keys(&self) -> HashSet<String> {
+        let mut hidden = self.active_blocked_keys();
+        hidden.extend(
+            self.blocked_by_states
+                .iter()
+                .filter(|(_, state)| state.blocked)
+                .map(|(public_key, _)| public_key.clone()),
+        );
+        hidden
+    }
+
+    fn apply_block_filters(&mut self) {
+        let block_cutoffs = self
+            .block_states
+            .iter()
+            .chain(self.blocked_by_states.iter())
+            .filter(|(_, state)| state.changed_at_millis > 0)
+            .map(|(public_key, state)| (public_key.clone(), state.changed_at_millis))
+            .collect::<Vec<_>>();
+        for (public_key, cutoff) in block_cutoffs {
+            self.direct_deleted_before
+                .entry(public_key)
+                .and_modify(|existing| *existing = (*existing).max(cutoff))
+                .or_insert(cutoff);
+        }
+        let unblocked_people = self
+            .block_states
+            .values()
+            .chain(self.blocked_by_states.values())
+            .filter(|state| !state.blocked)
+            .map(|state| state.person.clone())
+            .collect::<Vec<_>>();
+        for person in unblocked_people {
+            self.upsert_known_person(person);
+        }
+        let hidden = self.active_hidden_keys();
+        if hidden.is_empty() {
+            self.group_conversation_cache.clear();
+            return;
+        }
+        self.direct_contacts
+            .retain(|contact| !hidden.contains(&contact.public_key));
+        self.known_people
+            .retain(|contact| !hidden.contains(&contact.public_key));
+        for public_key in &hidden {
+            self.direct_latest_incoming.remove(public_key);
+            self.direct_latest_activity.remove(public_key);
+            self.direct_read_through.remove(public_key);
+        }
+        if self
+            .active_direct_public_key
+            .as_ref()
+            .is_some_and(|public_key| hidden.contains(public_key))
+        {
+            self.active_direct_public_key = self
+                .direct_contacts
+                .first()
+                .map(|contact| contact.public_key.clone());
+        }
+        let blocked_event_ids = self
+            .group_conversation_cache
+            .values()
+            .flat_map(|conversation| conversation.messages.iter())
+            .filter(|message| hidden.contains(&message.author_public_key))
+            .map(|message| message.event_id.clone())
+            .collect::<HashSet<_>>();
+        self.group_conversation_cache.clear();
+        for unread in self.group_unread_messages.values_mut() {
+            unread.retain(|marker| !blocked_event_ids.contains(&marker.event_id));
+        }
+        self.group_unread_messages
+            .retain(|_, unread| !unread.is_empty());
+    }
+
     fn upsert_known_person(&mut self, contact: DirectContact) {
         if contact.public_key
             == self
@@ -718,6 +1046,9 @@ impl ClientState {
                 .map(|identity| identity.public_key_base64())
                 .unwrap_or_default()
         {
+            return;
+        }
+        if self.is_hidden(&contact.public_key) {
             return;
         }
         if let Some(existing) = self
@@ -769,6 +1100,7 @@ impl ClientState {
                     .and_then(|account| display_noise_id(&account.noise_id).ok()),
                 bio: self.profile.bio.clone(),
                 avatar: self.profile.avatar.clone(),
+                album: self.profile.album.clone(),
                 accepts_direct_messages: self.profile.accepts_direct_messages,
             },
             groups: {
@@ -818,7 +1150,11 @@ impl ClientState {
                     .collect()
             },
             directs: {
-                let mut contacts = self.direct_contacts.iter().collect::<Vec<_>>();
+                let mut contacts = self
+                    .direct_contacts
+                    .iter()
+                    .filter(|contact| !self.is_hidden(&contact.public_key))
+                    .collect::<Vec<_>>();
                 contacts.sort_by(|left, right| {
                     self.direct_latest_activity
                         .get(&right.public_key)
@@ -832,6 +1168,7 @@ impl ClientState {
                         username: contact.username.clone(),
                         bio: contact.bio.clone(),
                         avatar: contact.avatar.clone(),
+                        album: contact.album.clone(),
                         accepts_direct_messages: contact.accepts_direct_messages,
                         is_active: self.active_direct_public_key.as_deref()
                             == Some(&contact.public_key),
@@ -842,16 +1179,33 @@ impl ClientState {
             known_people: self
                 .known_people
                 .iter()
+                .filter(|contact| !self.is_hidden(&contact.public_key))
                 .map(|contact| DirectSummary {
                     public_key: contact.public_key.clone(),
                     username: contact.username.clone(),
                     bio: contact.bio.clone(),
                     avatar: contact.avatar.clone(),
+                    album: contact.album.clone(),
                     accepts_direct_messages: contact.accepts_direct_messages,
                     is_active: false,
                     has_unread: false,
                 })
                 .collect(),
+            blocked_people: {
+                let mut people = self
+                    .block_states
+                    .values()
+                    .filter(|blocked| blocked.blocked)
+                    .map(|blocked| direct_summary(&blocked.person, false, false))
+                    .collect::<Vec<_>>();
+                people.sort_by(|left, right| left.username.cmp(&right.username));
+                people
+            },
+            hidden_public_keys: {
+                let mut hidden = self.active_hidden_keys().into_iter().collect::<Vec<_>>();
+                hidden.sort();
+                hidden
+            },
         })
     }
 }
@@ -902,7 +1256,7 @@ impl NoiseClient {
             bail!("{} already exists", path.display());
         }
         let username = username.into().trim().to_owned();
-        validate_username(&username)?;
+        validate_display_name(&username)?;
         let password = password.into();
         validate_password(&password)?;
         let noise_id = generate_noise_id();
@@ -941,8 +1295,10 @@ impl NoiseClient {
                 username,
                 bio: String::new(),
                 avatar,
+                album: None,
                 accepts_direct_messages: true,
             },
+            profile_sequence: current_nanos(),
             identity_secret_base64: identity.secret_base64(),
             mls_device: Some(
                 MlsAccountState::create(&identity)
@@ -952,9 +1308,12 @@ impl NoiseClient {
             mls_local_geneses: HashMap::new(),
             mls_control_logs: HashMap::new(),
             groups: Vec::new(),
+            group_memberships: HashMap::new(),
             active_group_id: None,
             direct_contacts: Vec::new(),
             known_people: Vec::new(),
+            block_states: HashMap::new(),
+            blocked_by_states: HashMap::new(),
             active_direct_public_key: None,
             direct_deleted_before: HashMap::new(),
             direct_closed_periods: Vec::new(),
@@ -994,18 +1353,18 @@ impl NoiseClient {
         }
         let password = password.into();
         if password.is_empty() || password.chars().count() > 256 {
-            bail!("Noise ID or password is incorrect")
+            bail!("noise ID or password is incorrect")
         }
         let credentials = derive_account_credentials(noise_id, &password)?;
         let vault = self
             .fetch_account_vault(&relay_list(relays)?, &credentials.locator)
             .await
-            .context("Noise ID or password is incorrect")?;
+            .context("noise ID or password is incorrect")?;
         let plaintext = vault
             .open(&credentials)
-            .map_err(|_| anyhow::anyhow!("Noise ID or password is incorrect"))?;
+            .map_err(|_| anyhow::anyhow!("noise ID or password is incorrect"))?;
         let contents: AccountVaultContents = serde_json::from_slice(&plaintext)
-            .map_err(|_| anyhow::anyhow!("Noise ID or password is incorrect"))?;
+            .map_err(|_| anyhow::anyhow!("noise ID or password is incorrect"))?;
         let account = AccountSession {
             noise_id: credentials.noise_id,
             locator: credentials.locator,
@@ -1013,9 +1372,9 @@ impl NoiseClient {
             revision: vault.revision,
         };
         let state = ClientState::from_vault(contents, account)
-            .map_err(|_| anyhow::anyhow!("Noise ID or password is incorrect"))?;
+            .map_err(|_| anyhow::anyhow!("noise ID or password is incorrect"))?;
         if state.identity()?.public_key_base64() != vault.identity_public_key {
-            bail!("Noise ID or password is incorrect")
+            bail!("noise ID or password is incorrect")
         }
         save_state(path, &state)?;
         state.summary()
@@ -1040,6 +1399,7 @@ impl NoiseClient {
     pub async fn sync_read_state(
         &self,
         path: impl AsRef<Path>,
+        cache_path: impl AsRef<Path>,
         relays: Vec<String>,
     ) -> anyhow::Result<LocalSummary> {
         let path = path.as_ref();
@@ -1052,7 +1412,35 @@ impl NoiseClient {
         let remote = self
             .fetch_account_vault(&relays, &credentials.locator)
             .await?;
-        let changed = Self::merge_remote_read_state(&mut state, &credentials, &remote)?;
+        let groups_before = state
+            .groups
+            .iter()
+            .map(|group| group.group_id.clone())
+            .collect::<HashSet<_>>();
+        let changed = Self::merge_remote_account_state(&mut state, &credentials, &remote)?;
+        let groups_after = state
+            .groups
+            .iter()
+            .map(|group| group.group_id.clone())
+            .collect::<HashSet<_>>();
+        let removed_groups = groups_before
+            .difference(&groups_after)
+            .cloned()
+            .collect::<Vec<_>>();
+        for group_id in &removed_groups {
+            purge_group_cache(cache_path.as_ref(), group_id)?;
+        }
+        if !removed_groups.is_empty() {
+            purge_profile_image_cache(cache_path.as_ref())?;
+        }
+        let blocked = state.active_hidden_keys();
+        if !blocked.is_empty() {
+            let identity = state.identity()?;
+            for public_key in blocked {
+                purge_scope_cache(cache_path.as_ref(), &identity.direct_scope_id(&public_key)?)?;
+                purge_scope_cache(cache_path.as_ref(), &profile_media_scope_id(&public_key)?)?;
+            }
+        }
         if changed {
             save_state(path, &state)?;
         }
@@ -1091,6 +1479,8 @@ impl NoiseClient {
         }
         let mut cached = state.group_conversation_cache.get(group_id).cloned();
         if let Some(conversation) = cached.as_mut() {
+            let blocked = state.active_hidden_keys();
+            filter_conversation_for_blocks(conversation, &blocked);
             conversation.group.is_active = state.active_group_id.as_deref() == Some(group_id);
             conversation.group.unread_count = state.group_unread_count(group_id);
             conversation.group.read_state_initialized =
@@ -1161,7 +1551,11 @@ impl NoiseClient {
                 .publish_group_presence(group, &identity, &relays, active)
                 .await;
         }
-        for contact in &state.direct_contacts {
+        for contact in state
+            .direct_contacts
+            .iter()
+            .filter(|contact| !state.is_hidden(&contact.public_key))
+        {
             let Ok(mailbox) = identity.direct_mailbox(&contact.public_key, &contact.public_key)
             else {
                 continue;
@@ -1192,6 +1586,7 @@ impl NoiseClient {
         let own_message_ids = view
             .messages
             .iter()
+            .filter(|message| !state.is_hidden(&message.author_public_key))
             .filter(|message| message.author_public_key == identity_public_key)
             .map(|message| message.message_id.clone())
             .collect::<HashSet<_>>();
@@ -1199,6 +1594,7 @@ impl NoiseClient {
         let mut replies = view
             .messages
             .iter()
+            .filter(|message| !state.is_hidden(&message.author_public_key))
             .filter(|message| message.author_public_key != identity_public_key)
             .filter(|message| {
                 message
@@ -1240,7 +1636,7 @@ impl NoiseClient {
         let account = state
             .account
             .as_ref()
-            .context("this identity has no Noise ID")?;
+            .context("this identity has no noise ID")?;
         let revision = since
             .map(|revision| revision.to_string())
             .unwrap_or_else(|| "initial".to_owned());
@@ -1255,7 +1651,7 @@ impl NoiseClient {
                 continue;
             };
             if response.status == 410 {
-                bail!("this Noise account has been deleted")
+                bail!("this noise account has been deleted")
             }
             if (200..300).contains(&response.status)
                 && let Ok(change) = serde_json::from_slice::<GroupWatch>(&response.body)
@@ -1436,7 +1832,7 @@ impl NoiseClient {
         let path = path.as_ref();
         let mut state = load_state(path)?;
         let username = username.into().trim().to_owned();
-        validate_username(&username)?;
+        validate_display_name(&username)?;
         let bio = bio.into().trim().to_owned();
         if bio.chars().count() > 160 {
             bail!("bios can contain at most 160 characters")
@@ -1490,6 +1886,7 @@ impl NoiseClient {
         state.profile.bio = bio;
         state.profile.avatar = avatar;
         state.profile.accepts_direct_messages = accepts_direct_messages;
+        state.profile_sequence = state.take_sequence();
         let identity = state.identity()?;
         for group in state.groups.clone() {
             let sequence = state.take_sequence();
@@ -1506,6 +1903,169 @@ impl NoiseClient {
         }
         save_state(path, &state)?;
         state.summary()
+    }
+
+    async fn open_profile_album(
+        &self,
+        public_key: &str,
+        album: &ProfileAlbum,
+    ) -> anyhow::Result<StoredProfileAlbum> {
+        validate_profile_album_reference(album)?;
+        let storage = album
+            .storage
+            .as_ref()
+            .context("this album is no longer available from the storage network")?;
+        let blob = self.reconstruct_blob(storage, &album.key_base64).await?;
+        if blob.group_id.is_some() {
+            bail!("profile album metadata has an invalid scope")
+        }
+        let plaintext = blob.open(&album.key_base64)?;
+        if plaintext.len() != album.byte_length as usize {
+            bail!("profile album metadata does not match its reference")
+        }
+        let stored: StoredProfileAlbum =
+            serde_json::from_slice(&plaintext).context("profile album metadata is invalid")?;
+        if stored.version != 1
+            || stored.owner_public_key != public_key
+            || stored.items.len() != usize::from(album.item_count)
+        {
+            bail!("profile album metadata is invalid")
+        }
+        validate_profile_album_items(&stored.items)?;
+        Ok(stored)
+    }
+
+    pub async fn fetch_profile_album(
+        &self,
+        path: impl AsRef<Path>,
+        public_key: &str,
+        album: &ProfileAlbum,
+        relays: Vec<String>,
+    ) -> anyhow::Result<ProfileAlbumData> {
+        let state = load_state(path.as_ref())?;
+        let identity = state.identity()?;
+        let self_public_key = identity.public_key_base64();
+        let expected = if public_key == self_public_key {
+            state.profile.album.as_ref()
+        } else {
+            state
+                .direct_contacts
+                .iter()
+                .chain(state.known_people.iter())
+                .find(|person| person.public_key == public_key && !state.is_hidden(public_key))
+                .and_then(|person| person.album.as_ref())
+        }
+        .context("this album does not belong to a known profile")?;
+        if expected != album {
+            bail!("this album reference is out of date")
+        }
+        let _relays = relay_list(relays)?;
+        let stored = self.open_profile_album(public_key, album).await?;
+        Ok(ProfileAlbumData {
+            scope_id: profile_media_scope_id(public_key)?,
+            items: stored.items,
+        })
+    }
+
+    pub async fn update_profile_album(
+        &self,
+        path: impl AsRef<Path>,
+        items: Vec<ProfileAlbumItem>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<LocalSummary> {
+        validate_profile_album_items(&items)?;
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        let identity = state.identity()?;
+        let self_public_key = identity.public_key_base64();
+        let relays = relay_list(relays)?;
+        let old_album = state.profile.album.clone();
+        let old_items = if let Some(album) = old_album.as_ref() {
+            self.open_profile_album(&self_public_key, album)
+                .await?
+                .items
+        } else {
+            Vec::new()
+        };
+        let new_album = if items.is_empty() {
+            None
+        } else {
+            let stored = StoredProfileAlbum {
+                version: 1,
+                owner_public_key: self_public_key.clone(),
+                items: items.clone(),
+            };
+            let plaintext = serde_json::to_vec(&stored)?;
+            if plaintext.len() > 2 * 1024 * 1024 {
+                bail!("this album has too much media metadata")
+            }
+            let (blob, key_base64) = EncryptedBlob::create(&plaintext)?;
+            let storage = self.store_blob_shards(&relays, &blob, &key_base64).await?;
+            Some(ProfileAlbum {
+                blob_id: blob.blob_id,
+                key_base64,
+                byte_length: plaintext.len() as u32,
+                item_count: items.len() as u16,
+                storage: Some(storage),
+            })
+        };
+        state.profile.album = new_album.clone();
+        state.profile_sequence = state.take_sequence();
+        for group in state.groups.clone() {
+            let sequence = state.take_sequence();
+            let event = create_group_event(
+                &state,
+                &identity,
+                &group,
+                GroupEventPayload::ProfileUpdated {
+                    profile: state.profile.clone(),
+                },
+                sequence,
+            )?;
+            self.publish_event(&relays, &event).await?;
+        }
+        save_state(path, &state)?;
+
+        let retained = items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut cleanup = old_items
+            .iter()
+            .filter(|item| !retained.contains(item.id.as_str()))
+            .flat_map(|item| attachment_storage_references(&item.attachment))
+            .collect::<Vec<_>>();
+        cleanup.extend(old_album.as_ref().and_then(profile_album_storage_reference));
+        if !cleanup.is_empty() {
+            let _ = self.erase_storage_references(cleanup, false).await;
+        }
+        Ok(state.summary()?)
+    }
+
+    pub async fn upload_profile_media_chunk(
+        &self,
+        path: impl AsRef<Path>,
+        data_base64: String,
+        relays: Vec<String>,
+    ) -> anyhow::Result<MediaChunk> {
+        let state = load_state(path.as_ref())?;
+        let scope_id = profile_media_scope_id(&state.identity()?.public_key_base64())?;
+        let data = STANDARD
+            .decode(data_base64)
+            .context("media chunk encoding is invalid")?;
+        if data.is_empty() || data.len() > 1024 * 1024 {
+            bail!("media chunks must contain between 1 byte and 1 MiB")
+        }
+        let (blob, key_base64) = EncryptedBlob::create_for_group(&data, scope_id)?;
+        let storage = self
+            .store_blob_shards(&relay_list(relays)?, &blob, &key_base64)
+            .await?;
+        Ok(MediaChunk {
+            blob_id: blob.blob_id,
+            key_base64,
+            byte_length: data.len() as u32,
+            storage: Some(storage),
+        })
     }
 
     pub async fn update_group_profile(
@@ -1806,7 +2366,20 @@ impl NoiseClient {
                         .ok()
                         .as_deref()
                         == Some(scope_id.as_str())
-                });
+                })
+                || profile_media_scope_id(&identity.public_key_base64())
+                    .ok()
+                    .as_deref()
+                    == Some(scope_id.as_str())
+                || state
+                    .direct_contacts
+                    .iter()
+                    .chain(state.known_people.iter())
+                    .filter(|person| !state.is_hidden(&person.public_key))
+                    .any(|person| {
+                        profile_media_scope_id(&person.public_key).ok().as_deref()
+                            == Some(scope_id.as_str())
+                    });
             if !allowed {
                 bail!("media does not belong to a known conversation")
             }
@@ -1990,13 +2563,7 @@ impl NoiseClient {
             state.group_frequencies.remove(&group.group_id);
             state.forget_group_activity(&group.group_id);
             state.group_conversation_cache.remove(&group.group_id);
-            state
-                .groups
-                .retain(|candidate| candidate.group_id != group.group_id);
-            state.active_group_id = state
-                .groups
-                .first()
-                .map(|candidate| candidate.group_id.clone());
+            state.tombstone_group(&group.group_id);
             save_state(path, &state)?;
             return Ok(GroupEncryptionStatus {
                 group_id: group.group_id,
@@ -2196,6 +2763,7 @@ impl NoiseClient {
                     username: state.profile.username.clone(),
                     bio: state.profile.bio.clone(),
                     avatar: state.profile.avatar.clone(),
+                    album: state.profile.album.clone(),
                     accepts_direct_messages: state.profile.accepts_direct_messages,
                 },
                 sequence,
@@ -2375,6 +2943,7 @@ impl NoiseClient {
         username: impl Into<String>,
         bio: impl Into<String>,
         avatar: Option<ProfileImage>,
+        album: Option<ProfileAlbum>,
         accepts_direct_messages: bool,
     ) -> anyhow::Result<LocalSummary> {
         let path = path.as_ref();
@@ -2382,6 +2951,9 @@ impl NoiseClient {
         let self_public_key = state.identity()?.public_key_base64();
         if public_key == self_public_key {
             bail!("you cannot start a direct message with yourself")
+        }
+        if state.is_hidden(public_key) {
+            bail!("you cannot message this person while either of you has the other blocked")
         }
         direct_mailbox_id(public_key).context("that identity has an invalid public key")?;
         let username = username.into();
@@ -2398,8 +2970,73 @@ impl NoiseClient {
             username,
             bio,
             avatar,
+            album,
             accepts_direct_messages,
         });
+        save_state(path, &state)?;
+        state.summary()
+    }
+
+    pub async fn set_block(
+        &self,
+        path: impl AsRef<Path>,
+        cache_path: impl AsRef<Path>,
+        public_key: &str,
+        username: impl Into<String>,
+        bio: impl Into<String>,
+        avatar: Option<ProfileImage>,
+        album: Option<ProfileAlbum>,
+        accepts_direct_messages: bool,
+        blocked: bool,
+        relays: Vec<String>,
+    ) -> anyhow::Result<LocalSummary> {
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        let self_public_key = state.identity()?.public_key_base64();
+        if public_key == self_public_key {
+            bail!("you cannot block yourself")
+        }
+        direct_mailbox_id(public_key).context("that identity has an invalid public key")?;
+        let person = DirectContact {
+            public_key: public_key.to_owned(),
+            username: username.into(),
+            bio: bio.into(),
+            avatar,
+            album,
+            accepts_direct_messages,
+        };
+        validate_username(&person.username)?;
+        if person.bio.chars().count() > 160 {
+            bail!("bios can contain at most 160 characters")
+        }
+        let identity = state.identity()?;
+        let recipient_mailbox = identity.direct_mailbox(public_key, public_key)?;
+        let sequence = state.take_sequence();
+        let notice = SignedEvent::direct_block_changed(
+            &identity,
+            &recipient_mailbox,
+            public_key,
+            &state.profile,
+            blocked,
+            sequence,
+        )?;
+        self.publish_event(&relay_list(relays)?, &notice).await?;
+        let changed_at_millis = notice.created_at_millis;
+        state.block_states.insert(
+            public_key.to_owned(),
+            BlockState {
+                person: person.clone(),
+                blocked,
+                sequence,
+                changed_at_millis,
+            },
+        );
+        if blocked {
+            let scope_id = state.identity()?.direct_scope_id(public_key)?;
+            purge_scope_cache(cache_path.as_ref(), &scope_id)?;
+            purge_scope_cache(cache_path.as_ref(), &profile_media_scope_id(public_key)?)?;
+        }
+        state.apply_block_filters();
         save_state(path, &state)?;
         state.summary()
     }
@@ -2411,6 +3048,9 @@ impl NoiseClient {
     ) -> anyhow::Result<LocalSummary> {
         let path = path.as_ref();
         let mut state = load_state(path)?;
+        if state.is_hidden(public_key) {
+            bail!("this conversation is unavailable while either person is blocked")
+        }
         if !state
             .direct_contacts
             .iter()
@@ -2447,6 +3087,7 @@ impl NoiseClient {
             .sync_direct_inbox(path, cache_path.as_ref(), relay_list(relays)?)
             .await?;
         let identity = state.identity()?;
+        let self_public_key = identity.public_key_base64();
         let mut messages_by_contact = HashMap::<String, Vec<DirectMessageSummary>>::new();
         for message in messages {
             messages_by_contact
@@ -2458,6 +3099,15 @@ impl NoiseClient {
             .direct_contacts
             .iter()
             .map(|contact| {
+                let mut messages = messages_by_contact
+                    .remove(&contact.public_key)
+                    .unwrap_or_default();
+                apply_current_direct_profiles(
+                    &mut messages,
+                    &self_public_key,
+                    &state.profile,
+                    contact,
+                );
                 Ok(DirectConversation {
                     contact: direct_summary(
                         contact,
@@ -2465,9 +3115,7 @@ impl NoiseClient {
                         state.direct_has_unread(&contact.public_key),
                     ),
                     media_scope_id: identity.direct_scope_id(&contact.public_key)?,
-                    messages: messages_by_contact
-                        .remove(&contact.public_key)
-                        .unwrap_or_default(),
+                    messages,
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -2517,6 +3165,9 @@ impl NoiseClient {
             .active_direct_public_key
             .clone()
             .context("choose a direct conversation first")?;
+        if state.is_hidden(&public_key) {
+            bail!("this conversation is unavailable while either person is blocked")
+        }
         let contact = state
             .direct_contacts
             .iter()
@@ -2529,14 +3180,18 @@ impl NoiseClient {
             state.direct_read_through.insert(public_key.clone(), latest);
             save_state(path, &state)?;
         }
+        let identity = state.identity()?;
+        let self_public_key = identity.public_key_base64();
+        let mut messages = messages
+            .into_iter()
+            .filter(|message| message.counterparty_public_key == public_key)
+            .map(|message| message.message)
+            .collect::<Vec<_>>();
+        apply_current_direct_profiles(&mut messages, &self_public_key, &state.profile, &contact);
         Ok(DirectConversation {
             contact: direct_summary(&contact, true, false),
-            media_scope_id: state.identity()?.direct_scope_id(&contact.public_key)?,
-            messages: messages
-                .into_iter()
-                .filter(|message| message.counterparty_public_key == public_key)
-                .map(|message| message.message)
-                .collect(),
+            media_scope_id: identity.direct_scope_id(&contact.public_key)?,
+            messages,
         })
     }
 
@@ -2553,6 +3208,7 @@ impl NoiseClient {
         let direct_mailboxes = state
             .direct_contacts
             .iter()
+            .filter(|contact| !state.is_hidden(&contact.public_key))
             .filter_map(|contact| {
                 identity
                     .direct_mailbox(&contact.public_key, &self_public_key)
@@ -2596,6 +3252,9 @@ impl NoiseClient {
             })
             .cloned()
             .context("choose a direct conversation first")?;
+        if state.is_hidden(&contact.public_key) {
+            bail!("you cannot message this person while either of you has the other blocked")
+        }
         if !contact.accepts_direct_messages {
             bail!("this person is not accepting direct messages")
         }
@@ -3239,13 +3898,7 @@ impl NoiseClient {
         state.group_frequencies.remove(&group.group_id);
         state.forget_group_activity(&group.group_id);
         state.group_conversation_cache.remove(&group.group_id);
-        state
-            .groups
-            .retain(|candidate| candidate.group_id != group.group_id);
-        state.active_group_id = state
-            .groups
-            .first()
-            .map(|candidate| candidate.group_id.clone());
+        state.tombstone_group(&group.group_id);
         save_state(path, &state)?;
         state.summary()
     }
@@ -3288,16 +3941,13 @@ impl NoiseClient {
             mls.forget_group(group_id)
                 .context("could not erase this group's local encryption state")?;
         }
-        state.groups.remove(group_index);
         state.group_frequencies.remove(group_id);
         state.forget_group_activity(group_id);
         state.group_conversation_cache.remove(group_id);
         state.mls_join_requests.remove(group_id);
         state.mls_local_geneses.remove(group_id);
         state.mls_control_logs.remove(group_id);
-        if state.active_group_id.as_deref() == Some(group_id) {
-            state.active_group_id = state.groups.first().map(|group| group.group_id.clone());
-        }
+        state.tombstone_group(group_id);
         save_state(path, &state)?;
         state.summary()
     }
@@ -3396,6 +4046,17 @@ impl NoiseClient {
             }
         }
 
+        if let Some(album) = state.profile.album.as_ref() {
+            let stored = self.open_profile_album(&self_public_key, album).await?;
+            let mut storage = stored
+                .items
+                .iter()
+                .flat_map(|item| attachment_storage_references(&item.attachment))
+                .collect::<Vec<_>>();
+            storage.extend(profile_album_storage_reference(album));
+            self.erase_storage_references(storage, true).await?;
+        }
+
         if let Some(account) = state.account.as_ref() {
             let revision = account
                 .revision
@@ -3467,8 +4128,13 @@ impl NoiseClient {
         let is_member = view.members.contains_key(&identity_public_key);
         let activity_changed = is_member
             && state.record_group_activity(&group_id, &view.messages, &identity_public_key);
-        let conversation = is_member
-            .then(|| cached_conversation_from_view(&state, &group, view, &identity_public_key));
+        let conversation = is_member.then(|| {
+            let mut conversation =
+                cached_conversation_from_view(&state, &group, view, &identity_public_key);
+            let blocked = state.active_hidden_keys();
+            filter_conversation_for_blocks(&mut conversation, &blocked);
+            conversation
+        });
         if let Some(conversation) = conversation.as_ref() {
             state
                 .group_conversation_cache
@@ -3539,6 +4205,7 @@ impl NoiseClient {
                     username: state.profile.username.clone(),
                     bio: state.profile.bio.clone(),
                     avatar: state.profile.avatar.clone(),
+                    album: state.profile.album.clone(),
                     accepts_direct_messages: state.profile.accepts_direct_messages,
                 },
                 sequence,
@@ -3572,6 +4239,7 @@ impl NoiseClient {
                 username: member.username.clone(),
                 bio: member.bio.clone(),
                 avatar: member.avatar.clone(),
+                album: member.album.clone(),
                 accepts_direct_messages: member.accepts_direct_messages,
             });
         }
@@ -3663,6 +4331,7 @@ impl NoiseClient {
                         username: message.username.clone(),
                         bio: message.bio.clone(),
                         avatar: message.avatar.clone(),
+                        album: message.album.clone(),
                         accepts_direct_messages: message.accepts_direct_messages,
                         text: message.text.clone(),
                         attachment: message.attachment.clone(),
@@ -3685,11 +4354,12 @@ impl NoiseClient {
                 username: member.username,
                 bio: member.bio,
                 avatar: member.avatar,
+                album: member.album,
                 accepts_direct_messages: member.accepts_direct_messages,
             })
             .collect::<Vec<_>>();
         members.sort_by(|left, right| left.username.cmp(&right.username));
-        let conversation = Conversation {
+        let mut conversation = Conversation {
             group: GroupSummary {
                 group_id: group.group_id.clone(),
                 name: resolved_profile.name,
@@ -3727,6 +4397,7 @@ impl NoiseClient {
                         username: message.username,
                         bio: message.bio,
                         avatar: message.avatar,
+                        album: message.album,
                         accepts_direct_messages: message.accepts_direct_messages,
                         text: message.text,
                         attachment: message.attachment,
@@ -3740,6 +4411,8 @@ impl NoiseClient {
             reported_message_event_ids,
             rejected_events: view.rejected_events,
         };
+        let blocked = state.active_hidden_keys();
+        filter_conversation_for_blocks(&mut conversation, &blocked);
         state
             .group_conversation_cache
             .insert(group.group_id.clone(), conversation.clone());
@@ -3757,10 +4430,13 @@ impl NoiseClient {
         let identity = state.identity()?;
         let self_public_key = identity.public_key_base64();
         let mailbox_id = direct_mailbox_id(&self_public_key)?;
-        let events = self.fetch_events_for_id(&mailbox_id, relays).await?;
+        let events = self
+            .fetch_events_for_id(&mailbox_id, relays.clone())
+            .await?;
         let contacts_before = state.direct_contacts.clone();
         let active_before = state.active_direct_public_key.clone();
         let deletions_before = state.direct_deleted_before.clone();
+        let blocked_by_before = state.blocked_by_states.clone();
         let latest_incoming_before = state.direct_latest_incoming.clone();
         let latest_activity_before = state.direct_latest_activity.clone();
         let decoded = events
@@ -3768,16 +4444,51 @@ impl NoiseClient {
             .filter_map(|event| decrypt_direct_event(&identity, &state, event))
             .collect::<Vec<_>>();
         for event in &decoded {
-            if let DecryptedDirectEvent::ThreadDeleted {
-                counterparty_public_key,
-                deleted_at_millis,
-            } = event
-            {
-                state
-                    .direct_deleted_before
-                    .entry(counterparty_public_key.clone())
-                    .and_modify(|cutoff| *cutoff = (*cutoff).max(*deleted_at_millis))
-                    .or_insert(*deleted_at_millis);
+            match event {
+                DecryptedDirectEvent::ThreadDeleted {
+                    counterparty_public_key,
+                    deleted_at_millis,
+                } => {
+                    state
+                        .direct_deleted_before
+                        .entry(counterparty_public_key.clone())
+                        .and_modify(|cutoff| *cutoff = (*cutoff).max(*deleted_at_millis))
+                        .or_insert(*deleted_at_millis);
+                }
+                DecryptedDirectEvent::BlockChanged {
+                    counterparty_public_key,
+                    contact,
+                    blocked,
+                    sequence,
+                    changed_at_millis,
+                } => {
+                    let candidate = BlockState {
+                        person: contact.clone(),
+                        blocked: *blocked,
+                        sequence: *sequence,
+                        changed_at_millis: *changed_at_millis,
+                    };
+                    state
+                        .blocked_by_states
+                        .entry(counterparty_public_key.clone())
+                        .and_modify(|existing| {
+                            if (candidate.sequence, candidate.blocked)
+                                > (existing.sequence, existing.blocked)
+                            {
+                                *existing = candidate.clone();
+                            }
+                        })
+                        .or_insert(candidate);
+                }
+                DecryptedDirectEvent::Message(_) => {}
+            }
+        }
+        let blocked_by_changed = state.blocked_by_states != blocked_by_before;
+        if blocked_by_changed {
+            state.apply_block_filters();
+            for public_key in state.active_hidden_keys() {
+                purge_scope_cache(cache_path, &identity.direct_scope_id(&public_key)?)?;
+                purge_scope_cache(cache_path, &profile_media_scope_id(&public_key)?)?;
             }
         }
         let newly_deleted = state
@@ -3811,6 +4522,7 @@ impl NoiseClient {
                             .get(&message.counterparty_public_key)
                             .copied()
                             .unwrap_or_default()
+                        && !state.is_hidden(&message.counterparty_public_key)
                         && (message.message.author_public_key == self_public_key
                             || !state
                                 .direct_messages_blocked_at(message.message.created_at_millis)) =>
@@ -3863,9 +4575,13 @@ impl NoiseClient {
                 .first()
                 .map(|contact| contact.public_key.clone());
         }
+        if blocked_by_changed && state.account.is_some() {
+            let _ = self.publish_account_state(&mut state, &relays).await;
+        }
         if state.direct_contacts != contacts_before
             || state.active_direct_public_key != active_before
             || state.direct_deleted_before != deletions_before
+            || state.blocked_by_states != blocked_by_before
             || state.direct_latest_incoming != latest_incoming_before
             || state.direct_latest_activity != latest_activity_before
         {
@@ -4097,7 +4813,7 @@ impl NoiseClient {
         let credentials = state.account_credentials()?;
         let identity = state.identity()?;
         if let Ok(remote) = self.fetch_account_vault(relays, &credentials.locator).await {
-            Self::merge_remote_read_state(state, &credentials, &remote)?;
+            Self::merge_remote_account_state(state, &credentials, &remote)?;
         }
 
         let mut last_error = None;
@@ -4105,7 +4821,7 @@ impl NoiseClient {
             let revision = state
                 .account
                 .as_ref()
-                .context("this identity has no Noise ID")?
+                .context("this identity has no noise ID")?
                 .revision
                 .checked_add(1)
                 .context("account vault revision is exhausted")?;
@@ -4127,12 +4843,12 @@ impl NoiseClient {
                 state
                     .account
                     .as_mut()
-                    .context("this identity has no Noise ID")?
+                    .context("this identity has no noise ID")?
                     .revision = revision;
                 return Ok(());
             }
 
-            Self::merge_remote_read_state(state, &credentials, &remote)?;
+            Self::merge_remote_account_state(state, &credentials, &remote)?;
             last_error = Some(publish_error.unwrap_or_else(|| {
                 anyhow::anyhow!("another device updated the encrypted account vault")
             }));
@@ -4141,7 +4857,7 @@ impl NoiseClient {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("account sync did not complete")))
     }
 
-    fn merge_remote_read_state(
+    fn merge_remote_account_state(
         state: &mut ClientState,
         credentials: &AccountCredentials,
         remote: &AccountVault,
@@ -4153,10 +4869,71 @@ impl NoiseClient {
         let contents: AccountVaultContents =
             serde_json::from_slice(&plaintext).context("encrypted account vault is invalid")?;
         if contents.version != 1 {
-            bail!("this account vault was created by an unsupported Noise version")
+            bail!("this account vault was created by an unsupported noise version")
         }
+        let local_account_revision = state
+            .account
+            .as_ref()
+            .context("this identity has no noise ID")?
+            .revision;
+        let profile_changed = contents.profile_sequence > state.profile_sequence
+            || (contents.profile_sequence == 0
+                && state.profile_sequence == 0
+                && remote.revision > local_account_revision);
+        if profile_changed {
+            state.profile = contents.profile.clone();
+            state.profile_sequence = contents.profile_sequence;
+        }
+        state.ensure_group_membership_records();
+        let memberships_before = state.group_memberships.clone();
+        let groups_before = state.groups.clone();
+        let frequencies_before = state.group_frequencies.clone();
+        let mut remote_memberships = contents.group_memberships.clone();
+        for group in &contents.groups {
+            remote_memberships
+                .entry(group.group_id.clone())
+                .or_insert_with(|| GroupMembershipRecord {
+                    sequence: 0,
+                    group: Some(group.clone()),
+                });
+        }
+        merge_group_membership_records(&mut state.group_memberships, remote_memberships);
+        state.reconcile_group_memberships();
+        let present_group_ids = state
+            .groups
+            .iter()
+            .map(|group| group.group_id.clone())
+            .collect::<HashSet<_>>();
+        for (group_id, frequency) in &contents.group_frequencies {
+            if present_group_ids.contains(group_id) {
+                state
+                    .group_frequencies
+                    .entry(group_id.clone())
+                    .or_insert_with(|| frequency.clone());
+            }
+        }
+        state
+            .group_frequencies
+            .retain(|group_id, _| present_group_ids.contains(group_id));
+        if state.active_group_id.is_none()
+            && contents
+                .active_group_id
+                .as_ref()
+                .is_some_and(|group_id| present_group_ids.contains(group_id))
+        {
+            state.active_group_id = contents.active_group_id.clone();
+        }
+        let memberships_changed = memberships_before != state.group_memberships
+            || groups_before != state.groups
+            || frequencies_before != state.group_frequencies;
         let direct_reads_changed = state.merge_direct_read_through(&contents.direct_read_through);
         let group_reads_changed = state.merge_group_read_through(&contents.group_read_through);
+        let blocks_changed = merge_block_states(&mut state.block_states, &contents.block_states);
+        let blocked_by_changed =
+            merge_block_states(&mut state.blocked_by_states, &contents.blocked_by_states);
+        if blocks_changed || blocked_by_changed {
+            state.apply_block_filters();
+        }
         let group_activity_changed = merge_read_markers(
             &mut state.group_latest_activity,
             &contents.group_latest_activity,
@@ -4169,11 +4946,15 @@ impl NoiseClient {
         let account = state
             .account
             .as_mut()
-            .context("this identity has no Noise ID")?;
+            .context("this identity has no noise ID")?;
         let revision_changed = remote.revision > account.revision;
         account.revision = account.revision.max(remote.revision);
         Ok(direct_reads_changed
+            || profile_changed
+            || memberships_changed
             || group_reads_changed
+            || blocks_changed
+            || blocked_by_changed
             || group_activity_changed
             || initialized_changed
             || revision_changed)
@@ -4822,6 +5603,7 @@ fn decrypt_direct_event(
                             username: sender_profile.username,
                             bio: sender_profile.bio,
                             avatar: sender_profile.avatar,
+                            album: sender_profile.album,
                             accepts_direct_messages: sender_profile.accepts_direct_messages,
                             text,
                             attachment,
@@ -4864,6 +5646,7 @@ fn decrypt_direct_event(
                 username: sender_profile.username.clone(),
                 bio: sender_profile.bio.clone(),
                 avatar: sender_profile.avatar.clone(),
+                album: sender_profile.album.clone(),
                 accepts_direct_messages: sender_profile.accepts_direct_messages,
             };
             Some(DecryptedDirectEvent::Message(DecryptedDirectMessage {
@@ -4876,6 +5659,7 @@ fn decrypt_direct_event(
                     username: sender_profile.username,
                     bio: sender_profile.bio,
                     avatar: sender_profile.avatar,
+                    album: sender_profile.album,
                     accepts_direct_messages: sender_profile.accepts_direct_messages,
                     text,
                     attachment,
@@ -4890,6 +5674,27 @@ fn decrypt_direct_event(
             counterparty_public_key: event.author_public_key.clone(),
             deleted_at_millis: event.created_at_millis,
         }),
+        GroupEventPayload::DirectBlockChanged {
+            recipient_public_key,
+            sender_profile,
+            blocked,
+        } if recipient_public_key == self_public_key && valid_direct_profile(&sender_profile) => {
+            let contact = DirectContact {
+                public_key: event.author_public_key.clone(),
+                username: sender_profile.username,
+                bio: sender_profile.bio,
+                avatar: sender_profile.avatar,
+                album: sender_profile.album,
+                accepts_direct_messages: sender_profile.accepts_direct_messages,
+            };
+            Some(DecryptedDirectEvent::BlockChanged {
+                counterparty_public_key: contact.public_key.clone(),
+                contact,
+                blocked,
+                sequence: event.author_sequence,
+                changed_at_millis: event.created_at_millis,
+            })
+        }
         _ => None,
     }
 }
@@ -4969,6 +5774,37 @@ fn sync_mls_state_from_log(
     Ok(Some(current_epoch))
 }
 
+fn filter_conversation_for_blocks(conversation: &mut Conversation, blocked: &HashSet<String>) {
+    if blocked.is_empty() {
+        return;
+    }
+    conversation
+        .members
+        .retain(|member| !blocked.contains(&member.public_key));
+    conversation
+        .messages
+        .retain(|message| !blocked.contains(&message.author_public_key));
+    for message in &mut conversation.messages {
+        for reaction in &mut message.reactions {
+            reaction
+                .reactor_public_keys
+                .retain(|public_key| !blocked.contains(public_key));
+            reaction.count = reaction.reactor_public_keys.len();
+        }
+        message.reactions.retain(|reaction| reaction.count > 0);
+    }
+    conversation.reports.retain(|report| {
+        !blocked.contains(&report.reporter_public_key)
+            && !blocked.contains(&report.message.author_public_key)
+    });
+    conversation.reported_message_event_ids.retain(|event_id| {
+        conversation
+            .messages
+            .iter()
+            .any(|message| &message.event_id == event_id)
+    });
+}
+
 fn cached_conversation_from_view(
     state: &ClientState,
     group: &GroupMembership,
@@ -5046,6 +5882,7 @@ fn cached_conversation_from_view(
                     username: message.username.clone(),
                     bio: message.bio.clone(),
                     avatar: message.avatar.clone(),
+                    album: message.album.clone(),
                     accepts_direct_messages: message.accepts_direct_messages,
                     text: message.text.clone(),
                     attachment: message.attachment.clone(),
@@ -5069,6 +5906,7 @@ fn cached_conversation_from_view(
             username: member.username,
             bio: member.bio,
             avatar: member.avatar,
+            album: member.album,
             accepts_direct_messages: member.accepts_direct_messages,
         })
         .collect::<Vec<_>>();
@@ -5112,6 +5950,7 @@ fn cached_conversation_from_view(
                     username: message.username,
                     bio: message.bio,
                     avatar: message.avatar,
+                    album: message.album,
                     accepts_direct_messages: message.accepts_direct_messages,
                     text: message.text,
                     attachment: message.attachment,
@@ -5398,6 +6237,7 @@ fn join_request_membership_profile(
         username,
         bio,
         avatar,
+        album,
         accepts_direct_messages,
     } = proof.decrypt(group).ok()?
     else {
@@ -5407,6 +6247,7 @@ fn join_request_membership_profile(
         username,
         bio,
         avatar,
+        album,
         accepts_direct_messages,
     };
     valid_direct_profile(&profile).then_some(profile)
@@ -5419,6 +6260,10 @@ fn valid_direct_profile(profile: &Profile) -> bool {
             .avatar
             .as_ref()
             .is_none_or(|avatar| avatar.byte_length > 0 && avatar.byte_length <= 256 * 1024)
+        && profile
+            .album
+            .as_ref()
+            .is_none_or(|album| validate_profile_album_reference(album).is_ok())
 }
 
 fn valid_direct_content(text: &str, attachment: Option<&MediaAttachment>) -> bool {
@@ -5433,9 +6278,33 @@ fn direct_summary(contact: &DirectContact, is_active: bool, has_unread: bool) ->
         username: contact.username.clone(),
         bio: contact.bio.clone(),
         avatar: contact.avatar.clone(),
+        album: contact.album.clone(),
         accepts_direct_messages: contact.accepts_direct_messages,
         is_active,
         has_unread,
+    }
+}
+
+fn apply_current_direct_profiles(
+    messages: &mut [DirectMessageSummary],
+    self_public_key: &str,
+    self_profile: &Profile,
+    contact: &DirectContact,
+) {
+    for message in messages {
+        if message.author_public_key == self_public_key {
+            message.username = self_profile.username.clone();
+            message.bio = self_profile.bio.clone();
+            message.avatar = self_profile.avatar.clone();
+            message.album = self_profile.album.clone();
+            message.accepts_direct_messages = self_profile.accepts_direct_messages;
+        } else if message.author_public_key == contact.public_key {
+            message.username = contact.username.clone();
+            message.bio = contact.bio.clone();
+            message.avatar = contact.avatar.clone();
+            message.album = contact.album.clone();
+            message.accepts_direct_messages = contact.accepts_direct_messages;
+        }
     }
 }
 
@@ -5457,6 +6326,54 @@ fn image_storage_reference(image: &ProfileImage) -> Option<(StorageManifest, Str
         .storage
         .as_ref()
         .map(|storage| (storage.clone(), image.key_base64.clone()))
+}
+
+fn profile_album_storage_reference(album: &ProfileAlbum) -> Option<(StorageManifest, String)> {
+    album
+        .storage
+        .as_ref()
+        .map(|storage| (storage.clone(), album.key_base64.clone()))
+}
+
+fn validate_profile_album_reference(album: &ProfileAlbum) -> anyhow::Result<()> {
+    if album.blob_id.len() != 64
+        || !album.blob_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || album.byte_length == 0
+        || album.byte_length > 2 * 1024 * 1024
+        || album.item_count == 0
+        || album.item_count > 48
+        || album.storage.is_none()
+    {
+        bail!("profile album reference is invalid")
+    }
+    Ok(())
+}
+
+fn validate_profile_album_items(items: &[ProfileAlbumItem]) -> anyhow::Result<()> {
+    if items.len() > 48 {
+        bail!("albums can contain at most 48 items")
+    }
+    let mut ids = HashSet::new();
+    for item in items {
+        if item.id.len() != 64
+            || !item.id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !ids.insert(item.id.as_str())
+            || item
+                .attachment
+                .chunks
+                .first()
+                .map(|chunk| chunk.blob_id.as_str())
+                != Some(item.id.as_str())
+            || item.created_at_millis == 0
+            || !(item.attachment.mime_type.starts_with("image/")
+                || item.attachment.mime_type.starts_with("video/"))
+            || item.attachment.byte_length > 500 * 1024 * 1024
+        {
+            bail!("profile album item is invalid")
+        }
+        validate_media_reference(&item.attachment)?;
+    }
+    Ok(())
 }
 
 fn group_storage_references(
@@ -5567,6 +6484,16 @@ fn is_local_relay(base_url: &str) -> bool {
 fn validate_username(username: &str) -> anyhow::Result<()> {
     if username.trim().is_empty() || username.chars().count() > 32 {
         bail!("display names must contain between 1 and 32 characters")
+    }
+    if username.chars().any(char::is_control) {
+        bail!("display names cannot contain control characters")
+    }
+    Ok(())
+}
+
+fn validate_display_name(username: &str) -> anyhow::Result<()> {
+    if username.trim().is_empty() || username.chars().count() > 16 {
+        bail!("display names must contain between 1 and 16 characters")
     }
     if username.chars().any(char::is_control) {
         bail!("display names cannot contain control characters")
@@ -5794,7 +6721,10 @@ fn state_exists(path: &Path) -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 fn load_state(path: &Path) -> anyhow::Result<ClientState> {
     let bytes = fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
-    serde_json::from_slice(&bytes).context("local state is invalid")
+    let mut state: ClientState =
+        serde_json::from_slice(&bytes).context("local state is invalid")?;
+    state.ensure_group_membership_records();
+    Ok(state)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -5803,7 +6733,10 @@ fn load_state(path: &Path) -> anyhow::Result<ClientState> {
     let bytes = WEB_STATE
         .with(|states| states.borrow().get(&key).cloned())
         .with_context(|| format!("could not read {}", path.display()))?;
-    serde_json::from_slice(&bytes).context("local state is invalid")
+    let mut state: ClientState =
+        serde_json::from_slice(&bytes).context("local state is invalid")?;
+    state.ensure_group_membership_records();
+    Ok(state)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -5862,6 +6795,62 @@ fn temporary_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn account_state(
+        identity: &Identity,
+        credentials: &AccountCredentials,
+        profile: Profile,
+        profile_sequence: u64,
+        revision: u64,
+    ) -> ClientState {
+        ClientState {
+            version: 3,
+            profile,
+            profile_sequence,
+            identity_secret_base64: identity.secret_base64(),
+            mls_device: None,
+            mls_join_requests: HashMap::new(),
+            mls_local_geneses: HashMap::new(),
+            mls_control_logs: HashMap::new(),
+            groups: Vec::new(),
+            group_memberships: HashMap::new(),
+            active_group_id: None,
+            direct_contacts: Vec::new(),
+            known_people: Vec::new(),
+            block_states: HashMap::new(),
+            blocked_by_states: HashMap::new(),
+            active_direct_public_key: None,
+            direct_deleted_before: HashMap::new(),
+            direct_closed_periods: Vec::new(),
+            direct_latest_incoming: HashMap::new(),
+            direct_latest_activity: HashMap::new(),
+            direct_read_through: HashMap::new(),
+            group_latest_incoming: HashMap::new(),
+            group_latest_activity: HashMap::new(),
+            group_read_through: HashMap::new(),
+            group_unread_messages: HashMap::new(),
+            group_activity_initialized: HashSet::new(),
+            group_conversation_cache: HashMap::new(),
+            group_frequencies: HashMap::new(),
+            next_author_sequence: profile_sequence.saturating_add(1),
+            account: Some(AccountSession {
+                noise_id: credentials.noise_id.clone(),
+                locator: credentials.locator.clone(),
+                vault_key_base64: credentials.vault_key_base64.clone(),
+                revision,
+            }),
+        }
+    }
+
+    fn test_profile(album: Option<ProfileAlbum>) -> Profile {
+        Profile {
+            username: "alice".to_owned(),
+            bio: "testing cross-device sync".to_owned(),
+            avatar: None,
+            album,
+            accepts_direct_messages: true,
+        }
+    }
+
     fn marker(created_at_millis: u64, event_id: &str) -> DirectMessageMarker {
         DirectMessageMarker {
             created_at_millis,
@@ -5885,5 +6874,138 @@ mod tests {
         assert!(merge_read_markers(&mut current, &newer));
         assert_eq!(current.get("alice"), Some(&marker(300, "event-d")));
         assert!(!merge_read_markers(&mut current, &newer));
+    }
+
+    #[test]
+    fn group_memberships_union_and_newest_lifecycle_record_wins() {
+        let first = GroupMembership::create("first");
+        let second = GroupMembership::create("second");
+        let first_id = first.group_id.clone();
+        let second_id = second.group_id.clone();
+        let mut current = HashMap::from([(
+            first_id.clone(),
+            GroupMembershipRecord {
+                sequence: 0,
+                group: Some(first.clone()),
+            },
+        )]);
+
+        assert!(merge_group_membership_records(
+            &mut current,
+            HashMap::from([(
+                second_id.clone(),
+                GroupMembershipRecord {
+                    sequence: 0,
+                    group: Some(second),
+                },
+            )]),
+        ));
+        assert_eq!(current.len(), 2);
+
+        assert!(merge_group_membership_records(
+            &mut current,
+            HashMap::from([(
+                first_id.clone(),
+                GroupMembershipRecord {
+                    sequence: 20,
+                    group: None,
+                },
+            )]),
+        ));
+        assert!(
+            current
+                .get(&first_id)
+                .is_some_and(|record| record.group.is_none())
+        );
+
+        assert!(!merge_group_membership_records(
+            &mut current,
+            HashMap::from([(
+                first_id.clone(),
+                GroupMembershipRecord {
+                    sequence: 0,
+                    group: Some(first.clone()),
+                },
+            )]),
+        ));
+        assert!(
+            current
+                .get(&first_id)
+                .is_some_and(|record| record.group.is_none())
+        );
+
+        assert!(merge_group_membership_records(
+            &mut current,
+            HashMap::from([(
+                first_id.clone(),
+                GroupMembershipRecord {
+                    sequence: 30,
+                    group: Some(first),
+                },
+            )]),
+        ));
+        assert!(
+            current
+                .get(&first_id)
+                .is_some_and(|record| record.group.is_some())
+        );
+    }
+
+    #[test]
+    fn two_clients_preserve_newer_profile_album_across_the_next_sync() {
+        let identity = Identity::generate();
+        let credentials = AccountCredentials {
+            noise_id: "123456789012".to_owned(),
+            locator: "ab".repeat(32),
+            vault_key_base64: base64::engine::general_purpose::STANDARD_NO_PAD.encode([7_u8; 32]),
+        };
+        let album = ProfileAlbum {
+            blob_id: "cd".repeat(32),
+            key_base64: base64::engine::general_purpose::STANDARD_NO_PAD.encode([9_u8; 32]),
+            byte_length: 1_024,
+            item_count: 11,
+            storage: None,
+        };
+        let client_a = account_state(&identity, &credentials, test_profile(Some(album)), 200, 1);
+        let remote_from_a = AccountVault::seal(
+            &identity,
+            &credentials,
+            2,
+            &serde_json::to_vec(&client_a.vault_contents()).unwrap(),
+        )
+        .unwrap();
+        let mut client_b = account_state(&identity, &credentials, test_profile(None), 100, 1);
+
+        assert!(
+            NoiseClient::merge_remote_account_state(&mut client_b, &credentials, &remote_from_a,)
+                .unwrap()
+        );
+        assert_eq!(
+            client_b
+                .profile
+                .album
+                .as_ref()
+                .map(|album| album.item_count),
+            Some(11)
+        );
+
+        let republished_by_b = AccountVault::seal(
+            &identity,
+            &credentials,
+            3,
+            &serde_json::to_vec(&client_b.vault_contents()).unwrap(),
+        )
+        .unwrap();
+        let republished: AccountVaultContents =
+            serde_json::from_slice(&republished_by_b.open(&credentials).unwrap()).unwrap();
+        assert_eq!(
+            republished
+                .profile
+                .album
+                .as_ref()
+                .map(|album| album.item_count),
+            Some(11)
+        );
+        assert_eq!(republished.profile_sequence, 200);
     }
 }

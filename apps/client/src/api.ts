@@ -39,11 +39,13 @@ const browserConcurrentActions = new Set([
   "cached_conversation",
   "fetch_avatar",
   "fetch_attachment",
+  "fetch_profile_album",
   "heartbeat_presence",
   "reply_notification_snapshot",
   "status",
   "upload_direct_media_chunk",
   "upload_media_chunk",
+  "upload_profile_media_chunk",
   "watch_account",
   "watch_direct",
   "watch_group",
@@ -53,7 +55,7 @@ const browserConcurrentActions = new Set([
 async function browserAdapter() {
   if (!browserAdapterPromise) {
     const wasmVersion = import.meta.env.VITE_NOISE_WASM_VERSION;
-    if (!wasmVersion) throw new Error("this Noise web build is missing its WASM version");
+    if (!wasmVersion) throw new Error("this noise web build is missing its WASM version");
     const adapterUrl = `/wasm/noise_web-${wasmVersion}.js`;
     browserAdapterPromise = import(/* @vite-ignore */ adapterUrl).then(async (adapter: BrowserAdapter) => {
       await adapter.default();
@@ -71,7 +73,7 @@ async function invokeBrowser<T>(request: NoiseRequest): Promise<T | null> {
       ...request,
       mask_relays: rotateMaskRelays(),
     }) as Envelope<T>;
-    if (!response.ok) throw new Error(response.error ?? "unknown Noise core error");
+    if (!response.ok) throw new Error(response.error ?? "unknown noise core error");
     if (!browserConcurrentActions.has(request.action)) {
       await persistBrowserVault(adapter);
     }
@@ -115,7 +117,7 @@ export async function noise<T>(request: NoiseRequest): Promise<T | null> {
   const response = await invoke<Envelope<T>>("noise_invoke", {
     request: { ...request, mask_relays: rotateMaskRelays() },
   });
-  if (!response.ok) throw new Error(response.error ?? "unknown Noise core error");
+  if (!response.ok) throw new Error(response.error ?? "unknown noise core error");
   return response.data ?? null;
 }
 

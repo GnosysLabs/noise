@@ -1,4 +1,4 @@
-use noise_client::{MediaAttachment, NoiseClient, ProfileImage};
+use noise_client::{MediaAttachment, NoiseClient, ProfileAlbum, ProfileAlbumItem, ProfileImage};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use wasm_bindgen::prelude::*;
@@ -87,7 +87,7 @@ async fn dispatch(request: Value) -> Result<Value, String> {
         ),
         "sync_read_state" => data(
             client
-                .sync_read_state(STATE_PATH, relays(&request)?)
+                .sync_read_state(STATE_PATH, CACHE_PATH, relays(&request)?)
                 .await
                 .map_err(|error| error.to_string())?,
         ),
@@ -122,6 +122,27 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                     optional::<String>(&request, "avatar_mime_type")?,
                     required::<bool>(&request, "remove_avatar")?,
                     required::<bool>(&request, "accepts_direct_messages")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "fetch_profile_album" => data(
+            client
+                .fetch_profile_album(
+                    STATE_PATH,
+                    &required::<String>(&request, "public_key")?,
+                    &required::<ProfileAlbum>(&request, "album")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "update_profile_album" => data(
+            client
+                .update_profile_album(
+                    STATE_PATH,
+                    required::<Vec<ProfileAlbumItem>>(&request, "items")?,
                     relays(&request)?,
                 )
                 .await
@@ -203,6 +224,16 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .await
                 .map_err(|error| error.to_string())?,
         ),
+        "upload_profile_media_chunk" => data(
+            client
+                .upload_profile_media_chunk(
+                    STATE_PATH,
+                    required::<String>(&request, "data_base64")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
         "make" => data(
             client
                 .make(
@@ -256,8 +287,26 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                     required::<String>(&request, "username")?,
                     required::<String>(&request, "bio")?,
                     optional::<ProfileImage>(&request, "avatar")?,
+                    optional::<ProfileAlbum>(&request, "album")?,
                     required::<bool>(&request, "accepts_direct_messages")?,
                 )
+                .map_err(|error| error.to_string())?,
+        ),
+        "set_block" => data(
+            client
+                .set_block(
+                    STATE_PATH,
+                    CACHE_PATH,
+                    &required::<String>(&request, "public_key")?,
+                    required::<String>(&request, "username")?,
+                    required::<String>(&request, "bio")?,
+                    optional::<ProfileImage>(&request, "avatar")?,
+                    optional::<ProfileAlbum>(&request, "album")?,
+                    required::<bool>(&request, "accepts_direct_messages")?,
+                    required::<bool>(&request, "blocked")?,
+                    relays(&request)?,
+                )
+                .await
                 .map_err(|error| error.to_string())?,
         ),
         "select_direct" => data(
@@ -486,7 +535,7 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?;
             Ok(Value::Null)
         }
-        _ => Err(format!("unsupported Noise action: {action}")),
+        _ => Err(format!("unsupported noise action: {action}")),
     }
 }
 

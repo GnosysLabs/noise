@@ -18,7 +18,7 @@ function MobileGate() {
         <defs><linearGradient id="mobile-noise-gradient" x1="214" y1="512" x2="810" y2="512"><stop stopColor="#a995ff" /><stop offset="1" stopColor="#5d40d2" /></linearGradient></defs>
       </svg>
       <h1>noise</h1>
-      <p>Noise for the web is built for desktop and laptop screens right now.</p>
+      <p>noise for the web is built for desktop and laptop screens right now.</p>
       <strong>Open this page on a computer, or download the desktop app.</strong>
       <div>
         <a href="https://github.com/GnosysLabs/noise/releases/latest">download for Mac</a>

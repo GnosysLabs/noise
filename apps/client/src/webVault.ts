@@ -32,7 +32,7 @@ function database() {
       };
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error ?? new Error("the encrypted browser vault could not be opened"));
-      request.onblocked = () => reject(new Error("another Noise tab is blocking the encrypted browser vault"));
+      request.onblocked = () => reject(new Error("another noise tab is blocking the encrypted browser vault"));
     });
   }
   return databasePromise;
@@ -90,7 +90,7 @@ export async function restoreBrowserVault(wasm: WasmSession) {
     throw new Error("the encrypted browser vault has an unsupported format");
   }
   const key = await readValue<CryptoKey>(DEVICE_KEY);
-  if (!key) throw new Error("this browser no longer has the key for its Noise vault; sign in again");
+  if (!key) throw new Error("this browser no longer has the key for its noise vault; sign in again");
   let plaintext: ArrayBuffer;
   try {
     plaintext = await crypto.subtle.decrypt(
@@ -103,7 +103,7 @@ export async function restoreBrowserVault(wasm: WasmSession) {
       encrypted.ciphertext,
     );
   } catch {
-    throw new Error("this browser could not unlock its Noise vault; sign in again");
+    throw new Error("this browser could not unlock its noise vault; sign in again");
   }
   wasm.restore_session(new Uint8Array(plaintext));
 }

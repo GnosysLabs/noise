@@ -61,6 +61,8 @@ import type {
   MediaChunk,
   MemberSummary,
   MessageSummary,
+  ProfileAlbumData,
+  ProfileAlbumItem,
   ProfileImage,
   ReactionSummary,
   ReportSummary,
@@ -85,17 +87,91 @@ type Dialog =
   | { type: "delete_direct"; direct: DirectSummary }
   | { type: "delete_account" }
   | { type: "logout" }
+  | { type: "block_person"; person: PersonSummary }
+  | { type: "album"; person: PersonSummary; editable: boolean }
   | { type: "person"; person: PersonSummary };
 
-type PersonSummary = Pick<MemberSummary, "public_key" | "username" | "bio" | "avatar" | "accepts_direct_messages"> & {
+type PersonSummary = Pick<MemberSummary, "public_key" | "username" | "bio" | "avatar" | "album" | "accepts_direct_messages"> & {
   presence_status?: PresenceStatus;
 };
 type SidebarMode = "groups" | "directs";
 type PresenceStatus = "online" | "recently-active" | "offline";
+
+function albumButtonLabel(
+  album: { item_count: number } | null | undefined,
+  label = "album",
+) {
+  return album && album.item_count > 0
+    ? `${label} (${album.item_count})`
+    : label;
+}
+
+function hideBlockedPeople(
+  conversation: Conversation,
+  blockedPublicKeys: Set<string>,
+): Conversation {
+  if (blockedPublicKeys.size === 0) return conversation;
+  const messages = conversation.messages
+    .filter((item) => !blockedPublicKeys.has(item.author_public_key))
+    .map((item) => ({
+      ...item,
+      reactions: item.reactions
+        ?.map((reaction) => {
+          const reactorPublicKeys = reaction.reactor_public_keys.filter(
+            (publicKey) => !blockedPublicKeys.has(publicKey),
+          );
+          return {
+            ...reaction,
+            reactor_public_keys: reactorPublicKeys,
+            count: reactorPublicKeys.length,
+          };
+        })
+        .filter((reaction) => reaction.count > 0),
+    }));
+  const visibleMessageIds = new Set(messages.map((item) => item.event_id));
+  return {
+    ...conversation,
+    members: conversation.members.filter(
+      (member) => !blockedPublicKeys.has(member.public_key),
+    ),
+    messages,
+    reports: conversation.reports.filter(
+      (report) =>
+        !blockedPublicKeys.has(report.reporter_public_key)
+        && !blockedPublicKeys.has(report.message.author_public_key),
+    ),
+    reported_message_event_ids: conversation.reported_message_event_ids.filter(
+      (eventId) => visibleMessageIds.has(eventId),
+    ),
+  };
+}
+
+function withCurrentDirectProfile(
+  message: MessageSummary,
+  self: IdentitySummary,
+  contact: DirectSummary,
+): MessageSummary {
+  const profile = message.author_public_key === self.public_key
+    ? self
+    : message.author_public_key === contact.public_key
+      ? contact
+      : null;
+  if (!profile) return message;
+  return {
+    ...message,
+    username: profile.username,
+    bio: profile.bio,
+    avatar: profile.avatar,
+    album: profile.album,
+    accepts_direct_messages: profile.accepts_direct_messages,
+  };
+}
+
 const PRESENCE_IDLE_MILLIS = 5 * 60_000;
 const PRESENCE_HEARTBEAT_MILLIS = 20_000;
 const PRESENCE_OBSERVATION_STALE_MILLIS = 70_000;
 const DEFAULT_ACCENT_COLOR = "#7758ED";
+const MAX_DISPLAY_NAME_LENGTH = 16;
 const ACCENT_PRESETS = ["#7758ED", "#E84D8A", "#F06A3C", "#E0A82E", "#43B581", "#24A6A6", "#4D82F0", "#A45EE5"];
 
 function presenceStatusesFromWatch(change: GroupWatch) {
@@ -447,6 +523,7 @@ function optimisticMessage(
     username: identity.username,
     bio: identity.bio,
     avatar: identity.avatar,
+    album: identity.album,
     accepts_direct_messages: identity.accepts_direct_messages,
     text,
     attachment: null,
@@ -536,7 +613,7 @@ function useAutoUpdater() {
       readyRef.current = true;
       setStatus({ phase: "ready", version: update.version });
     } catch (cause) {
-      console.error("Noise update failed", cause);
+      console.error("noise update failed", cause);
       if (updateFound) setStatus({ phase: "failed" });
     } finally {
       checkingRef.current = false;
@@ -564,7 +641,7 @@ function useAutoUpdater() {
     try {
       await relaunch();
     } catch (cause) {
-      console.error("Noise could not restart after updating", cause);
+      console.error("noise could not restart after updating", cause);
       setStatus((current) => current?.phase === "ready" ? { ...current, restartFailed: true } : current);
     }
   };
@@ -632,6 +709,8 @@ export default function App() {
   } | null>(null);
   const [directMenu, setDirectMenu] = useState<{ direct: DirectSummary; x: number; y: number } | null>(null);
   const identityPublicKey = summary?.identity.public_key ?? null;
+  const blockedPublicKeyKey = summary?.hidden_public_keys.join("|") ?? "";
+  const previousBlockedPublicKeyKey = useRef("");
   const lastPresenceActivityAt = useRef(Date.now());
   const selfPresenceActive = useRef(true);
   const [selfPresenceStatus, setSelfPresenceStatus] = useState<PresenceStatus>("online");
@@ -934,6 +1013,12 @@ export default function App() {
     const generation = refreshGeneration.current;
     const inbox = await noise<DirectInbox>({ action: "direct_inbox", relays });
     if (!inbox) return;
+    // The Rust client has already fetched and decrypted these messages. Keep them
+    // even if another UI selection changed while that work was in flight, so an
+    // unread badge can never point at a thread that still needs another fetch.
+    for (const item of inbox.conversations) {
+      directConversationCache.current.set(item.contact.public_key, item);
+    }
     if (generation !== refreshGeneration.current) return;
     applyDirectInbox(inbox);
     const activePublicKey = desiredDirectPublicKeyRef.current
@@ -1009,6 +1094,51 @@ export default function App() {
 
     await syncDirectInbox(true);
   }, [sidebarMode, syncDirectInbox]);
+
+  useEffect(() => {
+    if (!summary) {
+      previousBlockedPublicKeyKey.current = "";
+      return;
+    }
+    const blockedPublicKeys = new Set(summary?.hidden_public_keys ?? []);
+    const previousBlockedPublicKeys = new Set(
+      previousBlockedPublicKeyKey.current
+        ? previousBlockedPublicKeyKey.current.split("|")
+        : [],
+    );
+    const revealedSomeone = [...previousBlockedPublicKeys].some(
+      (publicKey) => !blockedPublicKeys.has(publicKey),
+    );
+    previousBlockedPublicKeyKey.current = blockedPublicKeyKey;
+
+    if (revealedSomeone) {
+      groupConversationCache.current.clear();
+      void refresh().catch((cause) => setError(message(cause)));
+    }
+    if (blockedPublicKeys.size === 0) return;
+    for (const [groupId, cached] of groupConversationCache.current) {
+      groupConversationCache.current.set(
+        groupId,
+        hideBlockedPeople(cached, blockedPublicKeys),
+      );
+    }
+    for (const publicKey of blockedPublicKeys) {
+      directConversationCache.current.delete(publicKey);
+    }
+    setConversation((current) =>
+      current ? hideBlockedPeople(current, blockedPublicKeys) : current
+    );
+    setDirectConversation((current) =>
+      current && blockedPublicKeys.has(current.contact.public_key) ? null : current
+    );
+    setDialog((current) =>
+      current
+      && (current.type === "person" || current.type === "block_person")
+      && blockedPublicKeys.has(current.person.public_key)
+        ? null
+        : current
+    );
+  }, [blockedPublicKeyKey]);
 
   useEffect(() => {
     void refresh()
@@ -1193,6 +1323,32 @@ export default function App() {
     }
   }
 
+  async function updateBlock(person: PersonSummary, blocked: boolean) {
+    return perform(async () => {
+      const local = await noise<LocalSummary>({
+        action: "set_block",
+        public_key: person.public_key,
+        username: person.username,
+        bio: person.bio,
+        avatar: person.avatar,
+        album: person.album,
+        accepts_direct_messages: person.accepts_direct_messages,
+        blocked,
+        relays,
+      });
+      if (!local) throw new Error(`could not ${blocked ? "block" : "unblock"} this person`);
+      setSummary(local);
+      if (blocked) {
+        directConversationCache.current.delete(person.public_key);
+        setDirectConversation((current) =>
+          current?.contact.public_key === person.public_key ? null : current
+        );
+        desiredDirectPublicKeyRef.current =
+          local.directs.find((direct) => direct.is_active)?.public_key ?? null;
+      }
+    });
+  }
+
   async function selectGroup(group: GroupSummary) {
     if (group.group_id === activeGroupId && !pendingGroupId) return;
     const previousGroupId = activeGroupId;
@@ -1353,6 +1509,7 @@ export default function App() {
         username: person.username,
         bio: person.bio,
         avatar: person.avatar,
+        album: person.album,
         accepts_direct_messages: person.accepts_direct_messages,
       });
       if (!local) throw new Error("the direct conversation could not be started");
@@ -1397,6 +1554,8 @@ export default function App() {
       return;
     }
 
+    // Showing a cached DM must not wait for the durable selection/read markers.
+    setSidebarMode("directs");
     const newestUnread = summary?.directs.find((direct) => direct.has_unread);
     if (newestUnread && !newestUnread.is_active) {
       const generation = ++refreshGeneration.current;
@@ -1425,7 +1584,6 @@ export default function App() {
         if (generation === refreshGeneration.current) setError(message(cause));
       }
     }
-    setSidebarMode("directs");
   }
 
   if (loading) return <><Loading /><UpdateBanner {...updater} /></>;
@@ -1488,6 +1646,9 @@ export default function App() {
       ),
     ],
   } : null;
+  const selectedDirectContact = activeDirectPublicKey
+    ? summary.directs.find((direct) => direct.public_key === activeDirectPublicKey) ?? null
+    : null;
   const selectedPresenceStatuses = new Map(presenceStatuses);
   selectedPresenceStatuses.set(summary.identity.public_key, selfPresenceStatus);
   const visibleSummary = activeGroupId ? {
@@ -1537,6 +1698,7 @@ export default function App() {
               onRules={() => setDialog({ type: "rules", group: selectedConversation.group })}
               onPerson={(person) => setDialog({ type: "person", person })}
               onMessage={(person) => void startDirect(person)}
+              onBlock={(person) => setDialog({ type: "block_person", person })}
               onDeleteMessage={(item) => setDialog({
                 type: "delete_message",
                 message: item,
@@ -1640,11 +1802,14 @@ export default function App() {
             <DirectConversationPanel
               key={selectedDirectConversation.contact.public_key}
               conversation={selectedDirectConversation}
+              contact={selectedDirectContact ?? selectedDirectConversation.contact}
               busy={busy}
-              selfPublicKey={summary.identity.public_key}
+              self={summary.identity}
               selfPresence={selfPresenceStatus}
               contactPresence={presenceStatuses.get(selectedDirectConversation.contact.public_key) ?? "offline"}
               onPerson={(person) => setDialog({ type: "person", person })}
+              onAlbum={(person) => setDialog({ type: "album", person, editable: false })}
+              onBlock={(person) => setDialog({ type: "block_person", person })}
               onDelete={() => setDialog({ type: "delete_direct", direct: selectedDirectConversation.contact })}
               onDownload={(item) => perform(async () => {
                 if (!item.attachment) throw new Error("this message has no media");
@@ -1738,10 +1903,16 @@ export default function App() {
       {dialog?.type === "profile" && (
         <SettingsDialog
           profile={dialog.profile}
+          blockedPeople={summary.blocked_people}
           busy={busy}
           onClose={() => setDialog(null)}
           onDeleteAccount={() => setDialog({ type: "delete_account" })}
           onLogout={() => setDialog({ type: "logout" })}
+          onSummary={(local) => {
+            setSummary(local);
+            setDialog({ type: "profile", profile: local.identity });
+          }}
+          onUnblock={(person) => updateBlock(person, false)}
           onSave={(username, bio, avatar, removeAvatar, acceptsDirectMessages) =>
             perform(async () => {
               const local = await noise<LocalSummary>({
@@ -2008,7 +2179,35 @@ export default function App() {
         />
       )}
       {dialog?.type === "person" && (
-        <PersonDialog person={dialog.person} canMessage={dialog.person.public_key !== summary.identity.public_key && dialog.person.accepts_direct_messages} onMessage={() => void startDirect(dialog.person)} onClose={() => setDialog(null)} />
+        <PersonDialog
+          person={dialog.person}
+          canMessage={dialog.person.public_key !== summary.identity.public_key && dialog.person.accepts_direct_messages}
+          canBlock={dialog.person.public_key !== summary.identity.public_key}
+          onMessage={() => void startDirect(dialog.person)}
+          onAlbum={() => setDialog({ type: "album", person: dialog.person, editable: false })}
+          onBlock={() => setDialog({ type: "block_person", person: dialog.person })}
+          onClose={() => setDialog(null)}
+        />
+      )}
+      {dialog?.type === "album" && (
+        <ProfileAlbumDialog
+          person={dialog.person}
+          editable={dialog.editable}
+          onClose={() => setDialog(null)}
+          onSummary={(local) => setSummary(local)}
+        />
+      )}
+      {dialog?.type === "block_person" && (
+        <BlockPersonDialog
+          person={dialog.person}
+          busy={busy}
+          onClose={() => setDialog({ type: "person", person: dialog.person })}
+          onBlock={async () => {
+            const blocked = await updateBlock(dialog.person, true);
+            if (blocked) setDialog(null);
+            return blocked;
+          }}
+        />
       )}
       {groupMenu && (
         <GroupContextMenu
@@ -2030,6 +2229,10 @@ export default function App() {
         x={directMenu.x}
         y={directMenu.y}
         onClose={() => setDirectMenu(null)}
+        onBlock={() => {
+          setDialog({ type: "block_person", person: directMenu.direct });
+          setDirectMenu(null);
+        }}
         onDelete={() => { setDialog({ type: "delete_direct", direct: directMenu.direct }); setDirectMenu(null); }}
       />}
       {error && <ErrorToast error={error} onClose={() => setError(null)} />}
@@ -2168,7 +2371,7 @@ function GroupContextMenu({
   );
 }
 
-function DirectContextMenu({ x, y, onClose, onDelete }: { x: number; y: number; onClose: () => void; onDelete: () => void }) {
+function DirectContextMenu({ x, y, onClose, onBlock, onDelete }: { x: number; y: number; onClose: () => void; onBlock: () => void; onDelete: () => void }) {
   useEffect(() => {
     const close = () => onClose();
     const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
@@ -2181,10 +2384,10 @@ function DirectContextMenu({ x, y, onClose, onDelete }: { x: number; y: number; 
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [onClose]);
-  return <div className="group-context-menu" style={{ left: Math.min(x, window.innerWidth - 190), top: Math.min(y, window.innerHeight - 58) }} onMouseDown={(event) => event.stopPropagation()}><button onClick={onDelete}><Trash2 size={14} /> delete conversation</button></div>;
+  return <div className="group-context-menu" style={{ left: Math.min(x, window.innerWidth - 190), top: Math.min(y, window.innerHeight - 100) }} onMouseDown={(event) => event.stopPropagation()}><button className="danger" onClick={onBlock}><ShieldOff size={14} /> block user</button><button onClick={onDelete}><Trash2 size={14} /> delete conversation</button></div>;
 }
 
-function MessageContextMenu({ x, y, busy, onClose, onReact, onReply, onDownload, onReport, onDelete, onBan }: { x: number; y: number; busy: boolean; onClose: () => void; onReact?: () => void; onReply: () => void; onDownload?: () => Promise<boolean>; onReport?: () => void; onDelete?: () => void; onBan?: () => void }) {
+function MessageContextMenu({ x, y, busy, onClose, onReact, onReply, onDownload, onReport, onBlock, onDelete, onBan }: { x: number; y: number; busy: boolean; onClose: () => void; onReact?: () => void; onReply: () => void; onDownload?: () => Promise<boolean>; onReport?: () => void; onBlock?: () => void; onDelete?: () => void; onBan?: () => void }) {
   const [downloading, setDownloading] = useState(false);
   const [downloaded, setDownloaded] = useState(false);
   useEffect(() => {
@@ -2199,11 +2402,11 @@ function MessageContextMenu({ x, y, busy, onClose, onReact, onReply, onDownload,
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [onClose]);
-  const menuHeight = 50 + (onReact ? 42 : 0) + (onDownload ? 42 : 0) + (onReport ? 42 : 0) + (onDelete ? 42 : 0) + (onBan ? 42 : 0);
-  return <div className="member-context-menu" style={{ left: Math.min(x, window.innerWidth - 200), top: Math.min(y, window.innerHeight - menuHeight) }} onMouseDown={(event) => event.stopPropagation()}>{onReact && <button disabled={busy || downloading} onClick={onReact}><SmilePlus size={14} /> react</button>}<button disabled={busy || downloading} onClick={onReply}><Reply size={14} /> reply</button>{onDownload && <button disabled={busy || downloading || downloaded} onClick={() => { setDownloading(true); void onDownload().then((success) => { setDownloading(false); if (success) { setDownloaded(true); window.setTimeout(onClose, 650); } else { onClose(); } }); }}>{downloaded ? <Check size={14} /> : downloading ? <LoaderCircle className="spinner" size={14} /> : <Download size={14} />}{downloaded ? "downloaded" : downloading ? "downloading" : "download media"}</button>}{onReport && <button className="report-action" disabled={busy || downloading} onClick={onReport}><TriangleAlert size={14} /> report message</button>}{onDelete && <button className="danger" disabled={busy || downloading} onClick={onDelete}><Trash2 size={14} /> delete message</button>}{onBan && <button className="danger" disabled={busy || downloading} onClick={onBan}><UserRoundX size={14} /> ban member</button>}</div>;
+  const menuHeight = 50 + (onReact ? 42 : 0) + (onDownload ? 42 : 0) + (onReport ? 42 : 0) + (onBlock ? 42 : 0) + (onDelete ? 42 : 0) + (onBan ? 42 : 0);
+  return <div className="member-context-menu" style={{ left: Math.min(x, window.innerWidth - 200), top: Math.min(y, window.innerHeight - menuHeight) }} onMouseDown={(event) => event.stopPropagation()}>{onReact && <button disabled={busy || downloading} onClick={onReact}><SmilePlus size={14} /> react</button>}<button disabled={busy || downloading} onClick={onReply}><Reply size={14} /> reply</button>{onDownload && <button disabled={busy || downloading || downloaded} onClick={() => { setDownloading(true); void onDownload().then((success) => { setDownloading(false); if (success) { setDownloaded(true); window.setTimeout(onClose, 650); } else { onClose(); } }); }}>{downloaded ? <Check size={14} /> : downloading ? <LoaderCircle className="spinner" size={14} /> : <Download size={14} />}{downloaded ? "downloaded" : downloading ? "downloading" : "download media"}</button>}{onReport && <button className="report-action" disabled={busy || downloading} onClick={onReport}><TriangleAlert size={14} /> report message</button>}{onBlock && <button className="danger" disabled={busy || downloading} onClick={onBlock}><ShieldOff size={14} /> block user</button>}{onDelete && <button className="danger" disabled={busy || downloading} onClick={onDelete}><Trash2 size={14} /> delete message</button>}{onBan && <button className="danger" disabled={busy || downloading} onClick={onBan}><UserRoundX size={14} /> ban member</button>}</div>;
 }
 
-function MemberContextMenu({ member, x, y, canDesignate, canBan, onClose, onMessage, onSetModerator, onBan }: { member: MemberSummary; x: number; y: number; canDesignate: boolean; canBan: boolean; onClose: () => void; onMessage: () => void; onSetModerator: (enabled: boolean) => void; onBan: () => void }) {
+function MemberContextMenu({ member, x, y, canDesignate, canBan, onClose, onMessage, onBlock, onSetModerator, onBan }: { member: MemberSummary; x: number; y: number; canDesignate: boolean; canBan: boolean; onClose: () => void; onMessage: () => void; onBlock: () => void; onSetModerator: (enabled: boolean) => void; onBan: () => void }) {
   useEffect(() => {
     const close = () => onClose();
     const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
@@ -2217,12 +2420,13 @@ function MemberContextMenu({ member, x, y, canDesignate, canBan, onClose, onMess
     };
   }, [onClose]);
   return (
-    <div className="member-context-menu" style={{ left: Math.min(x - 188, window.innerWidth - 196), top: Math.min(y, window.innerHeight - (48 + (canDesignate ? 42 : 0) + (canBan ? 42 : 0))) }} onMouseDown={(event) => event.stopPropagation()}>
+    <div className="member-context-menu" style={{ left: Math.min(x - 188, window.innerWidth - 196), top: Math.min(y, window.innerHeight - (90 + (canDesignate ? 42 : 0) + (canBan ? 42 : 0))) }} onMouseDown={(event) => event.stopPropagation()}>
       {member.accepts_direct_messages
         ? <button onClick={onMessage}><MessageCircle size={14} /> message</button>
         : <button disabled><MessageCircle size={14} /> DMs closed</button>}
       {canDesignate && <button onClick={() => onSetModerator(!member.is_moderator)}>{member.is_moderator ? <ShieldOff size={14} /> : <Shield size={14} />}{member.is_moderator ? "remove moderator" : "make moderator"}</button>}
       {canBan && <button className="danger" onClick={onBan}><UserRoundX size={14} /> ban member</button>}
+      <button className="danger" onClick={onBlock}><ShieldOff size={14} /> block user</button>
     </div>
   );
 }
@@ -2363,6 +2567,7 @@ function ConversationPanel({
   onRules,
   onPerson,
   onMessage,
+  onBlock,
   onDeleteMessage,
   onDownload,
   onReaction,
@@ -2385,6 +2590,7 @@ function ConversationPanel({
   onRules: () => void;
   onPerson: (person: PersonSummary) => void;
   onMessage: (person: PersonSummary) => void;
+  onBlock: (person: PersonSummary) => void;
   onDeleteMessage: (message: MessageSummary) => void;
   onDownload: (message: MessageSummary) => Promise<boolean>;
   onReaction: (message: MessageSummary, emoji: string) => Promise<void>;
@@ -2581,6 +2787,7 @@ function ConversationPanel({
         canBan={canModerate && memberMenu.member.public_key !== conversation.group.owner_public_key && (canEditGroup || !memberMenu.member.is_moderator)}
         onClose={() => setMemberMenu(null)}
         onMessage={() => { onMessage(memberMenu.member); setMemberMenu(null); }}
+        onBlock={() => { onBlock(memberMenu.member); setMemberMenu(null); }}
         onSetModerator={(enabled) => { void onSetModerator(memberMenu.member, enabled); setMemberMenu(null); }}
         onBan={() => { onBan(memberMenu.member); setMemberMenu(null); }}
       />}
@@ -2600,6 +2807,18 @@ function ConversationPanel({
         onReply={() => { setReplyingTo(messageMenu.message); setMessageMenu(null); window.setTimeout(() => composerInput.current?.focus(), 0); }}
         onDownload={messageMenu.message.attachment ? () => onDownload(messageMenu.message) : undefined}
         onReport={!canModerate && messageMenu.message.author_public_key !== selfPublicKey && !conversation.reported_message_event_ids.includes(messageMenu.message.event_id) ? () => { onReport(messageMenu.message); setMessageMenu(null); } : undefined}
+        onBlock={messageMenu.message.author_public_key !== selfPublicKey ? () => {
+          onBlock({
+            public_key: messageMenu.message.author_public_key,
+            username: messageMenu.message.username,
+            bio: messageMenu.message.bio,
+            avatar: messageMenu.message.avatar,
+            album: messageMenu.message.album,
+            accepts_direct_messages: messageMenu.message.accepts_direct_messages,
+            presence_status: presenceStatuses.get(messageMenu.message.author_public_key) ?? "offline",
+          });
+          setMessageMenu(null);
+        } : undefined}
         onDelete={(canModerate || messageMenu.message.author_public_key === selfPublicKey) ? () => { onDeleteMessage(messageMenu.message); setMessageMenu(null); } : undefined}
         onBan={(() => {
           const member = conversation.members.find((candidate) => candidate.public_key === messageMenu.message.author_public_key);
@@ -2624,7 +2843,7 @@ function ConversationPanel({
   );
 }
 
-function DirectConversationPanel({ conversation, busy, selfPublicKey, selfPresence, contactPresence, onPerson, onDelete, onDownload, onSend }: { conversation: DirectConversation; busy: boolean; selfPublicKey: string; selfPresence: PresenceStatus; contactPresence: PresenceStatus; onPerson: (person: PersonSummary) => void; onDelete: () => void; onDownload: (message: MessageSummary) => Promise<boolean>; onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null, signal: AbortSignal) => Promise<boolean> }) {
+function DirectConversationPanel({ conversation, contact, busy, self, selfPresence, contactPresence, onPerson, onAlbum, onBlock, onDelete, onDownload, onSend }: { conversation: DirectConversation; contact: DirectSummary; busy: boolean; self: IdentitySummary; selfPresence: PresenceStatus; contactPresence: PresenceStatus; onPerson: (person: PersonSummary) => void; onAlbum: (person: PersonSummary) => void; onBlock: (person: PersonSummary) => void; onDelete: () => void; onDownload: (message: MessageSummary) => Promise<boolean>; onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null, signal: AbortSignal) => Promise<boolean> }) {
   const [draft, setDraft] = useState("");
   const [attachment, setAttachment] = useState<PendingMedia | null>(null);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
@@ -2636,7 +2855,7 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, selfPresen
   const uploadController = useRef<AbortController | null>(null);
   useAutosizeComposer(composerInput, draft);
   const messageList = useChunkedMessageList(
-    conversation.contact.public_key,
+    contact.public_key,
     conversation.messages,
   );
   useWarmConversationMedia(
@@ -2692,37 +2911,48 @@ function DirectConversationPanel({ conversation, busy, selfPublicKey, selfPresen
       setReplyingTo((current) => current ?? submittedReply);
     }
   }
-  const person = { public_key: conversation.contact.public_key, username: conversation.contact.username, bio: conversation.contact.bio, avatar: conversation.contact.avatar, accepts_direct_messages: conversation.contact.accepts_direct_messages, presence_status: contactPresence };
+  const person = { public_key: contact.public_key, username: contact.username, bio: contact.bio, avatar: contact.avatar, album: contact.album, accepts_direct_messages: contact.accepts_direct_messages, presence_status: contactPresence };
   return (
     <div className="conversation direct-conversation">
       <header className="chat-header" data-tauri-drag-region>
         <div className="group-identity static" data-tauri-drag-region>
-          <PresenceAvatar name={conversation.contact.username} image={conversation.contact.avatar} size={36} status={contactPresence} />
-          <span><strong>{conversation.contact.username}</strong><small>{conversation.contact.bio || "encrypted direct message"}</small></span>
+          <PresenceAvatar name={contact.username} image={contact.avatar} size={36} status={contactPresence} />
+          <span><strong>{contact.username}</strong><small>{contact.bio || "encrypted direct message"}</small></span>
         </div>
         <div className="chat-header-actions"><button className="icon-button media-button delete-direct-button" onClick={onDelete} aria-label="delete conversation" title="delete conversation"><Trash2 size={16} /></button>{busy && <LoaderCircle className="spinner" size={14} />}</div>
       </header>
       <div className="messages" ref={messageList.ref} onScroll={messageList.onScroll}>
         {conversation.messages.length === 0 && <div className="quiet">start the conversation</div>}
-        {messageList.visibleMessages.map((item) => <MessageRow key={item.event_id} message={item} own={item.author_public_key === selfPublicKey} presence={item.author_public_key === selfPublicKey ? selfPresence : contactPresence} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} mediaScopeId={conversation.media_scope_id} />)}
+        {messageList.visibleMessages.map((rawItem) => {
+          const item = withCurrentDirectProfile(rawItem, self, contact);
+          const rawReply = conversation.messages.find(
+            (candidate) => candidate.message_id === item.reply_to_message_id,
+          );
+          const replyTo = rawReply ? withCurrentDirectProfile(rawReply, self, contact) : undefined;
+          return <MessageRow key={item.event_id} message={item} own={item.author_public_key === self.public_key} presence={item.author_public_key === self.public_key ? selfPresence : contactPresence} replyTo={replyTo} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} mediaScopeId={conversation.media_scope_id} />;
+        })}
       </div>
-      {conversation.contact.accepts_direct_messages ? <div className="composer">
+      {contact.accepts_direct_messages ? <div className="composer">
         {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.media_scope_id} onClose={() => setReplyingTo(null)} />}
         {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => primeVideoFrame(event.currentTarget)} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}{uploadProgress !== null && <div className="attachment-progress"><i style={{ width: `${uploadProgress}%` }} /><span>{uploadProgress}%</span></div>}<button onClick={() => { uploadController.current?.abort(); setAttachment(null); setUploadProgress(null); }} aria-label={uploadProgress !== null ? "cancel upload" : "remove attachment"}><X size={14} /></button></div>}
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
         <button className="attach-button" disabled={busy} onClick={() => fileInput.current?.click()} aria-label="attach media"><Paperclip size={17} /></button>
         <input ref={fileInput} hidden type="file" accept="image/*,video/*,audio/*" onChange={(event) => void chooseMedia(event.target.files?.[0])} />
-        <textarea ref={composerInput} rows={1} value={draft} placeholder={`message ${conversation.contact.username}`} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); } }} />
+        <textarea ref={composerInput} rows={1} value={draft} placeholder={`message ${contact.username}`} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); } }} />
         <button className="send-button" disabled={(!draft.trim() && !attachment) || busy} onClick={() => void submit()}><ArrowUp size={17} /></button>
-      </div> : <div className="membership-revoked"><MessageCircle size={16} /> {conversation.contact.username} isn’t accepting DMs</div>}
+      </div> : <div className="membership-revoked"><MessageCircle size={16} /> {contact.username} isn’t accepting DMs</div>}
       <aside className="member-sidebar direct-profile-sidebar">
         <button className="direct-profile-identity" onClick={() => onPerson(person)}>
-          <PresenceAvatar name={conversation.contact.username} image={conversation.contact.avatar} size={72} status={contactPresence} />
-          <strong>{conversation.contact.username}</strong>
+          <PresenceAvatar name={contact.username} image={contact.avatar} size={72} status={contactPresence} />
+          <strong>{contact.username}</strong>
         </button>
-        <div className="noise-signature"><small>Noise Signature</small><strong>{noiseSignature(conversation.contact.public_key)}</strong></div>
-        <p>{conversation.contact.bio || "no bio yet"}</p>
-        <span className={`direct-profile-status ${conversation.contact.accepts_direct_messages ? "open" : "closed"}`}><i />{conversation.contact.accepts_direct_messages ? "accepting DMs" : "DMs closed"}</span>
+        <div className="noise-signature"><small>noise signature</small><strong>{noiseSignature(contact.public_key)}</strong></div>
+        <p>{contact.bio || "no bio yet"}</p>
+        <div className="direct-profile-actions">
+          <button className="profile-album" onClick={() => onAlbum(person)}><Images size={14} /> {albumButtonLabel(contact.album)}</button>
+          <button className="profile-block" onClick={() => onBlock(person)}><ShieldOff size={14} /> block</button>
+        </div>
+        <span className={`direct-profile-status ${contact.accepts_direct_messages ? "open" : "closed"}`}><i />{contact.accepts_direct_messages ? "accepting DMs" : "DMs closed"}</span>
       </aside>
       <AppVersionFooter />
       {messageMenu && <MessageContextMenu x={messageMenu.x} y={messageMenu.y} busy={busy} onClose={() => setMessageMenu(null)} onReply={() => { setReplyingTo(messageMenu.message); setMessageMenu(null); window.setTimeout(() => composerInput.current?.focus(), 0); }} onDownload={messageMenu.message.attachment ? () => onDownload(messageMenu.message) : undefined} />}
@@ -2824,7 +3054,7 @@ function MessageRow({
   onPerson: (person: PersonSummary) => void;
   mediaScopeId?: string;
 }) {
-  const person = { public_key: message.author_public_key, username: message.username, bio: message.bio, avatar: message.avatar, accepts_direct_messages: message.accepts_direct_messages, presence_status: presence };
+  const person = { public_key: message.author_public_key, username: message.username, bio: message.bio, avatar: message.avatar, album: message.album, accepts_direct_messages: message.accepts_direct_messages, presence_status: presence };
   const localAttachment = message.local_attachment ?? sentMediaPreviewCache.get(message.event_id);
   const jumboEmojiCount = !localAttachment && !message.attachment
     ? emojiOnlyCount(message.text)
@@ -3658,6 +3888,365 @@ function MediaGalleryDialog({ group, messages, onClose }: { group: GroupSummary;
   );
 }
 
+const profileAlbumCache = new Map<string, ProfileAlbumData>();
+
+type PendingAlbumUpload = {
+  id: string;
+  file: File;
+  previewUrl: string;
+  attachment?: MediaAttachment;
+};
+
+function profileAlbumMessage(person: PersonSummary, item: ProfileAlbumItem): MediaMessage {
+  return {
+    event_id: item.id,
+    message_id: item.id,
+    author_public_key: person.public_key,
+    username: person.username,
+    bio: person.bio,
+    avatar: person.avatar,
+    album: person.album,
+    accepts_direct_messages: person.accepts_direct_messages,
+    text: "",
+    attachment: item.attachment,
+    reply_to_message_id: null,
+    created_at_millis: item.created_at_millis,
+    reactions: [],
+  };
+}
+
+function ProfileAlbumDialog({
+  person,
+  editable,
+  onClose,
+  onSummary,
+  embedded = false,
+}: {
+  person: PersonSummary;
+  editable: boolean;
+  onClose?: () => void;
+  onSummary: (summary: LocalSummary) => void;
+  embedded?: boolean;
+}) {
+  const cached = person.album ? profileAlbumCache.get(person.album.blob_id) ?? null : null;
+  const [album, setAlbum] = useState(person.album);
+  const [data, setData] = useState<ProfileAlbumData | null>(
+    cached ?? (person.album ? null : { scope_id: "", items: [] }),
+  );
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [pendingUploads, setPendingUploads] = useState<PendingAlbumUpload[]>([]);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [uploadIndex, setUploadIndex] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const uploadController = useRef<AbortController | null>(null);
+  const pendingUploadsRef = useRef<PendingAlbumUpload[]>([]);
+  const items = data?.items ?? [];
+  const media = items.map((item) => profileAlbumMessage(person, item));
+  const selectedIndex = selectedId
+    ? media.findIndex((item) => item.event_id === selectedId)
+    : -1;
+  const selected = selectedIndex >= 0 ? media[selectedIndex] : null;
+  const showPrevious = selectedIndex > 0;
+  const showNext = selectedIndex >= 0 && selectedIndex < media.length - 1;
+
+  useEffect(() => {
+    if (!album) {
+      setData({ scope_id: "", items: [] });
+      return;
+    }
+    const known = profileAlbumCache.get(album.blob_id);
+    if (known) {
+      setData(known);
+      return;
+    }
+    let active = true;
+    setData(null);
+    setError(null);
+    void noise<ProfileAlbumData>({
+      action: "fetch_profile_album",
+      public_key: person.public_key,
+      album,
+      relays,
+    }).then((next) => {
+      if (!active || !next) return;
+      profileAlbumCache.set(album.blob_id, next);
+      setData(next);
+    }).catch((cause) => {
+      if (active) setError(message(cause));
+    });
+    return () => { active = false; };
+  }, [album, person.public_key]);
+
+  useEffect(() => {
+    if (!selected) return;
+    const navigate = (event: KeyboardEvent) => {
+      if (event.key === "ArrowLeft" && showPrevious) {
+        event.preventDefault();
+        setSelectedId(media[selectedIndex - 1].event_id);
+      } else if (event.key === "ArrowRight" && showNext) {
+        event.preventDefault();
+        setSelectedId(media[selectedIndex + 1].event_id);
+      }
+    };
+    window.addEventListener("keydown", navigate);
+    return () => window.removeEventListener("keydown", navigate);
+  }, [media, selected, selectedIndex, showNext, showPrevious]);
+
+  useEffect(() => {
+    pendingUploadsRef.current = pendingUploads;
+  }, [pendingUploads]);
+
+  useEffect(() => () => {
+    uploadController.current?.abort();
+    for (const pending of pendingUploadsRef.current) {
+      URL.revokeObjectURL(pending.previewUrl);
+    }
+  }, []);
+
+  async function save(nextItems: ProfileAlbumItem[]) {
+    const local = await noise<LocalSummary>({
+      action: "update_profile_album",
+      items: nextItems,
+      relays,
+    });
+    if (!local) throw new Error("the album could not be updated");
+    onSummary(local);
+    await noise({ action: "sync_account", relays });
+    const nextAlbum = local.identity.album;
+    if (!nextAlbum) {
+      setAlbum(null);
+      setData({ scope_id: "", items: [] });
+      setSelectedId(null);
+      return;
+    }
+    const next = await noise<ProfileAlbumData>({
+      action: "fetch_profile_album",
+      public_key: local.identity.public_key,
+      album: nextAlbum,
+      relays,
+    });
+    if (!next) throw new Error("the updated album could not be loaded");
+    profileAlbumCache.set(nextAlbum.blob_id, next);
+    setAlbum(nextAlbum);
+    setData(next);
+  }
+
+  function queueMedia(files?: FileList | null) {
+    if (!files?.length || uploadProgress !== null) return;
+    const incoming = Array.from(files);
+    const batchSlots = Math.max(0, 10 - pendingUploads.length);
+    const albumSlots = Math.max(0, 48 - items.length - pendingUploads.length);
+    const available = Math.min(batchSlots, albumSlots);
+    const existing = new Set(
+      pendingUploads.map(({ file }) => `${file.name}:${file.size}:${file.lastModified}`),
+    );
+    const accepted: PendingAlbumUpload[] = [];
+    let invalid = 0;
+    let duplicate = 0;
+    for (const file of incoming) {
+      if (accepted.length >= available) break;
+      if (!/^(image|video)\//.test(file.type) || !file.size || file.size > 500 * 1024 * 1024) {
+        invalid += 1;
+        continue;
+      }
+      const fingerprint = `${file.name}:${file.size}:${file.lastModified}`;
+      if (existing.has(fingerprint)) {
+        duplicate += 1;
+        continue;
+      }
+      existing.add(fingerprint);
+      accepted.push({
+        id: crypto.randomUUID(),
+        file,
+        previewUrl: URL.createObjectURL(file),
+      });
+    }
+    if (accepted.length) setPendingUploads((current) => [...current, ...accepted]);
+    if (items.length >= 48 || albumSlots === 0) {
+      setError("your album can hold up to 48 items");
+    } else if (incoming.length > available) {
+      setError(`you can add up to ${available} more ${available === 1 ? "item" : "items"} in this upload`);
+    } else if (invalid) {
+      setError("photos and videos can be up to 500 MB each");
+    } else if (duplicate && !accepted.length) {
+      setError("those items are already selected");
+    } else {
+      setError(null);
+    }
+    if (fileInput.current) fileInput.current.value = "";
+  }
+
+  function removeQueued(id: string) {
+    if (uploadProgress !== null) return;
+    setPendingUploads((current) => {
+      const removed = current.find((item) => item.id === id);
+      if (removed) URL.revokeObjectURL(removed.previewUrl);
+      return current.filter((item) => item.id !== id);
+    });
+    setError(null);
+  }
+
+  function clearQueue() {
+    if (uploadProgress !== null) return;
+    for (const pending of pendingUploads) URL.revokeObjectURL(pending.previewUrl);
+    setPendingUploads([]);
+    setError(null);
+  }
+
+  async function uploadQueuedMedia() {
+    if (!pendingUploads.length || uploadProgress !== null) return;
+    setError(null);
+    setUploadProgress(0);
+    setUploadIndex(0);
+    const controller = new AbortController();
+    uploadController.current = controller;
+    try {
+      const uploaded: ProfileAlbumItem[] = [];
+      for (let index = 0; index < pendingUploads.length; index += 1) {
+        const queued = pendingUploads[index];
+        setUploadIndex(index);
+        let attachment = queued.attachment;
+        if (!attachment) {
+          const pending: PendingMedia = {
+            name: queued.file.name,
+            mimeType: queued.file.type,
+            byteLength: queued.file.size,
+            file: queued.file,
+            previewUrl: queued.previewUrl,
+            mediaPreview: queued.file.type.startsWith("video/")
+              ? prepareVideoPreview(queued.file)
+              : prepareImagePreview(queued.file),
+          };
+          attachment = await uploadPendingMedia(
+            pending,
+            "upload_profile_media_chunk",
+            (progress) => {
+              const overall = ((index + progress / 100) / pendingUploads.length) * 100;
+              setUploadProgress(Math.min(99, Math.round(overall)));
+            },
+            controller.signal,
+          ) ?? undefined;
+          if (attachment) {
+            setPendingUploads((current) => current.map((item) =>
+              item.id === queued.id ? { ...item, attachment } : item
+            ));
+          }
+        }
+        const id = attachment?.chunks[0]?.blob_id;
+        if (!attachment || !id) throw new Error("the uploaded media is incomplete");
+        uploaded.push({
+          id,
+          attachment,
+          created_at_millis: Date.now() + index,
+        });
+      }
+      setUploadProgress(100);
+      await save([...uploaded, ...items]);
+      for (const pending of pendingUploads) URL.revokeObjectURL(pending.previewUrl);
+      setPendingUploads([]);
+    } catch (cause) {
+      if (message(cause) !== "media upload cancelled") setError(message(cause));
+    } finally {
+      if (uploadController.current === controller) uploadController.current = null;
+      setUploadProgress(null);
+      setUploadIndex(0);
+      if (fileInput.current) fileInput.current.value = "";
+    }
+  }
+
+  async function removeSelected() {
+    if (!selected || uploadProgress !== null) return;
+    setError(null);
+    try {
+      await save(items.filter((item) => item.id !== selected.event_id));
+      setSelectedId(null);
+    } catch (cause) {
+      setError(message(cause));
+    }
+  }
+
+  const content = (
+    <>
+      {!embedded && <DialogHeading
+        icon={<Images />}
+        title={`${person.username}'s album`}
+        detail={`${items.length} of 48 ${items.length === 1 ? "item" : "items"}`}
+      />}
+      {editable && (
+        <div className="profile-album-toolbar">
+          <button className="primary" disabled={uploadProgress !== null || items.length + pendingUploads.length >= 48 || pendingUploads.length >= 10} onClick={() => fileInput.current?.click()}>
+            <Plus size={15} /> select photos or videos
+          </button>
+          <small>{pendingUploads.length
+            ? `${pendingUploads.length} of 10 selected`
+            : embedded
+              ? `${items.length} of 48 items · up to 10 at once`
+              : "up to 10 at once"}</small>
+          <input ref={fileInput} hidden multiple type="file" accept="image/*,video/*" onChange={(event) => queueMedia(event.target.files)} />
+        </div>
+      )}
+      {editable && pendingUploads.length > 0 && (
+        <section className="profile-album-queue">
+          <div className="profile-album-queue-heading">
+            <span>
+              <strong>{uploadProgress === null ? `${pendingUploads.length} ready to add` : `uploading ${uploadIndex + 1} of ${pendingUploads.length}`}</strong>
+              <small>{uploadProgress === null ? "review your selection before adding it to your album" : `${uploadProgress}% complete`}</small>
+            </span>
+            <div>
+              <button disabled={uploadProgress !== null} onClick={clearQueue}>clear</button>
+              <button className="primary" disabled={uploadProgress !== null} onClick={() => void uploadQueuedMedia()}>
+                <ArrowUp size={14} /> add {pendingUploads.length}
+              </button>
+              {uploadProgress !== null && <button className="cancel" onClick={() => uploadController.current?.abort()} aria-label="cancel upload"><X size={14} /></button>}
+            </div>
+          </div>
+          <div className="profile-album-queue-items">
+            {pendingUploads.map((pending, index) => (
+              <div className={`profile-album-queue-item ${uploadProgress !== null && index === uploadIndex ? "uploading" : ""} ${pending.attachment ? "uploaded" : ""}`} key={pending.id}>
+                {pending.file.type.startsWith("video/")
+                  ? <video src={pending.previewUrl} muted playsInline preload="metadata" />
+                  : <img src={pending.previewUrl} alt="" />}
+                {pending.file.type.startsWith("video/") && <i><Play size={12} fill="currentColor" /></i>}
+                {pending.attachment && <em><Check size={12} /></em>}
+                <button disabled={uploadProgress !== null} onClick={() => removeQueued(pending.id)} aria-label={`remove ${pending.file.name}`}><X size={12} /></button>
+              </div>
+            ))}
+          </div>
+          {uploadProgress !== null && <span className="profile-album-progress"><i style={{ width: `${uploadProgress}%` }} /></span>}
+        </section>
+      )}
+      {error && <p className="profile-album-error">{error}</p>}
+      {selected && data ? (
+        <div className="gallery-view">
+          <button className="gallery-back" onClick={() => setSelectedId(null)}><ArrowLeft size={14} /> {albumButtonLabel(album)}</button>
+          <div className="gallery-viewer">
+            <button className="gallery-nav previous" disabled={!showPrevious} onClick={() => showPrevious && setSelectedId(media[selectedIndex - 1].event_id)} aria-label="previous media"><ChevronLeft size={25} /></button>
+            <MessageMedia key={selected.event_id} attachment={selected.attachment} scopeId={data.scope_id} autoplayVideo />
+            <button className="gallery-nav next" disabled={!showNext} onClick={() => showNext && setSelectedId(media[selectedIndex + 1].event_id)} aria-label="next media"><ChevronRight size={25} /></button>
+          </div>
+          <div className="profile-album-meta">
+            <small>{selectedIndex + 1} of {media.length} · {formatGalleryDate(selected.created_at_millis)}</small>
+            {editable && <button className="danger" onClick={() => void removeSelected()}><Trash2 size={13} /> remove</button>}
+          </div>
+        </div>
+      ) : data ? (
+        media.length ? (
+          <div className="media-gallery">
+            {media.map((item) => <GalleryTile key={item.event_id} message={item} scopeId={data.scope_id} onOpen={() => setSelectedId(item.event_id)} />)}
+          </div>
+        ) : (
+          <div className="empty-gallery"><Images size={27} /><span>{editable ? "add photos and videos to your album" : "this album is empty"}</span></div>
+        )
+      ) : (
+        <div className="empty-gallery"><LoaderCircle className="spinner" size={25} /><span>loading album</span></div>
+      )}
+    </>
+  );
+  if (embedded) return <div className="profile-album-content embedded">{content}</div>;
+  return <Modal onClose={onClose ?? (() => undefined)} wide className="profile-album-modal"><div className="profile-album-content">{content}</div></Modal>;
+}
+
 function GalleryTile({ message, scopeId, onOpen }: { message: MediaMessage; scopeId: string; onOpen: () => void }) {
   const { attachment } = message;
   const visibility = useNearViewport<HTMLButtonElement>();
@@ -3707,17 +4296,22 @@ function useGalleryThumbnail(attachment: MediaAttachment, source: string | null)
   return generated ?? embedded;
 }
 
-function useProfileImageSource(image: ProfileImage | null) {
+function useProfileImageSource(
+  image: ProfileImage | null,
+  preservePreviousUntilReady = false,
+) {
   const [loaded, setLoaded] = useState<{ blobId: string; source: string } | null>(() => {
     if (!image) return null;
     const source = avatarCache.get(image.blob_id);
     return source ? { blobId: image.blob_id, source } : null;
   });
-  const source = image
+  const exactSource = image
     ? loaded?.blobId === image.blob_id
       ? loaded.source
       : avatarCache.get(image.blob_id)
     : undefined;
+  const source = exactSource
+    ?? (image && preservePreviousUntilReady ? loaded?.source : undefined);
   useEffect(() => {
     if (!image) {
       setLoaded(null);
@@ -3729,20 +4323,36 @@ function useProfileImageSource(image: ProfileImage | null) {
       setLoaded({ blobId: target.blob_id, source: cached });
       return;
     }
-    setLoaded(null);
+    if (!preservePreviousUntilReady) setLoaded(null);
     let active = true;
-    void loadProfileImageSource(target)
-      .then((source) => {
+    let retryTimer: number | undefined;
+    const load = async (attempt: number) => {
+      try {
+        const source = await loadProfileImageSource(target);
         if (active) setLoaded({ blobId: target.blob_id, source });
-      })
-      .catch(() => undefined);
-    return () => { active = false; };
-  }, [image?.blob_id, image?.key_base64, image?.mime_type, image?.byte_length]);
+      } catch {
+        if (!active || attempt >= 4) return;
+        const delay = [500, 1_200, 2_500, 5_000][attempt] ?? 5_000;
+        retryTimer = window.setTimeout(() => void load(attempt + 1), delay);
+      }
+    };
+    void load(0);
+    return () => {
+      active = false;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+    };
+  }, [
+    image?.blob_id,
+    image?.key_base64,
+    image?.mime_type,
+    image?.byte_length,
+    preservePreviousUntilReady,
+  ]);
   return source;
 }
 
 function Avatar({ name, image, size, square = false }: { name: string; image: ProfileImage | null; size: number; square?: boolean }) {
-  const source = useProfileImageSource(image);
+  const source = useProfileImageSource(image, true);
   return (
     <span className={`avatar ${square ? "square" : ""}`} style={{ width: size, height: size }}>
       {source ? <img src={source} alt="" /> : <b>{name.slice(0, 1).toUpperCase()}</b>}
@@ -3789,7 +4399,8 @@ function Onboarding({ busy, onCreate, onSignIn }: { busy: boolean; onCreate: (us
     { label: `24+ characters or ${passwordClasses}/3 character types`, met: passwordLength >= 24 || passwordClasses >= 3 },
     { label: "passwords match", met: confirmation.length > 0 && password === confirmation },
   ];
-  const usernameReady = username.trim().length > 0;
+  const usernameReady = username.trim().length > 0
+    && Array.from(username.trim()).length <= MAX_DISPLAY_NAME_LENGTH;
   const passwordReady = passwordRequirements.every((requirement) => requirement.met);
   const createReady = usernameReady && passwordReady;
   const submitCreate = () => {
@@ -3801,13 +4412,13 @@ function Onboarding({ busy, onCreate, onSignIn }: { busy: boolean; onCreate: (us
     <div className="onboarding" data-tauri-drag-region>
       <NoiseMark size={54} />
       <h1>noise</h1>
-      <p>no phone number. no email. just your Noise ID and password.</p>
+      <p>no phone number. no email. just your noise ID and password.</p>
       <div className="onboarding-tabs">
         <button className={mode === "create" ? "active" : ""} onClick={() => setMode("create")}>create identity</button>
         <button className={mode === "signin" ? "active" : ""} onClick={() => setMode("signin")}>sign in</button>
       </div>
       {mode === "create" ? <>
-        <input autoFocus value={username} maxLength={32} aria-invalid={createAttempted && !usernameReady} onChange={(event) => setUsername(event.target.value)} placeholder="display name" />
+        <input autoFocus value={username} maxLength={MAX_DISPLAY_NAME_LENGTH} aria-invalid={createAttempted && !usernameReady} onChange={(event) => setUsername(event.target.value)} placeholder="display name" />
         <input type="password" autoComplete="new-password" value={password} aria-describedby="password-requirements" aria-invalid={createAttempted && !passwordReady} onChange={(event) => setPassword(event.target.value)} placeholder="strong password" />
         <input type="password" autoComplete="new-password" value={confirmation} aria-describedby="password-requirements" aria-invalid={createAttempted && password !== confirmation} onChange={(event) => setConfirmation(event.target.value)} placeholder="confirm password" onKeyDown={(event) => { if (event.key === "Enter") submitCreate(); }} />
         <div id="password-requirements" className={`password-requirements${createAttempted && !createReady ? " invalid" : ""}`} aria-live="polite">
@@ -3853,47 +4464,87 @@ function FrequencyDialog({ group, frequency, onClose }: { group: string; frequen
 }
 
 function NoiseIdDialog({ noiseId, onClose }: { noiseId: string; onClose: () => void }) {
-  return <Modal onClose={onClose}><DialogHeading icon={<NoiseMark size={28} />} title="this is your Noise ID" detail="you’ll use it with your password to sign in on any device" /><div className="frequency-card">{noiseId}</div><p className="noise-id-warning">Save this somewhere private. Noise cannot recover it for you.</p><DialogButtons><CopyButton value={noiseId} label="copy Noise ID" /><button className="primary" onClick={onClose}>I saved it</button></DialogButtons></Modal>;
+  return <Modal onClose={onClose}><DialogHeading icon={<NoiseMark size={28} />} title="this is your noise ID" detail="you’ll use it with your password to sign in on any device" /><div className="frequency-card">{noiseId}</div><p className="noise-id-warning">Save this somewhere private. noise cannot recover it for you.</p><DialogButtons><CopyButton value={noiseId} label="copy noise ID" /><button className="primary" onClick={onClose}>I saved it</button></DialogButtons></Modal>;
 }
 
-function SettingsDialog({ profile, busy, onClose, onSave, onLogout, onDeleteAccount }: { profile: IdentitySummary; busy: boolean; onClose: () => void; onSave: (username: string, bio: string, avatar: string | null, remove: boolean, acceptsDirectMessages: boolean) => Promise<boolean>; onLogout: () => void; onDeleteAccount: () => void }) {
-  const [tab, setTab] = useState<"identity" | "privacy" | "account">("identity");
+function SettingsDialog({ profile, blockedPeople, busy, onClose, onSave, onUnblock, onSummary, onLogout, onDeleteAccount }: { profile: IdentitySummary; blockedPeople: DirectSummary[]; busy: boolean; onClose: () => void; onSave: (username: string, bio: string, avatar: string | null, remove: boolean, acceptsDirectMessages: boolean) => Promise<boolean>; onUnblock: (person: DirectSummary) => Promise<boolean>; onSummary: (summary: LocalSummary) => void; onLogout: () => void; onDeleteAccount: () => void }) {
+  const [tab, setTab] = useState<"identity" | "album" | "privacy" | "blocks" | "account">("identity");
   const [username, setUsername] = useState(profile.username);
   const [bio, setBio] = useState(profile.bio);
   const [acceptsDirectMessages, setAcceptsDirectMessages] = useState(profile.accepts_direct_messages);
+  const [saving, setSaving] = useState(false);
   const image = useImageSelection();
   const settingsChanged = username.trim() !== profile.username
     || bio !== profile.bio
     || acceptsDirectMessages !== profile.accepts_direct_messages
     || image.base64 !== null
     || image.removed;
+  const displayNameLength = Array.from(username.trim()).length;
+  const locked = busy || saving;
+  const saveSettings = async () => {
+    if (locked || !settingsChanged) return;
+    setSaving(true);
+    try {
+      await onSave(
+        username.trim(),
+        bio,
+        image.base64,
+        image.removed,
+        acceptsDirectMessages,
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
   return (
-    <Modal onClose={onClose}>
-      <DialogHeading icon={<Settings2 />} title="settings" detail="your Noise identity" />
-      <div className="group-settings-tabs" role="tablist" aria-label="user settings sections">
-        <button className={tab === "identity" ? "active" : ""} role="tab" aria-selected={tab === "identity"} onClick={() => setTab("identity")}>Identity</button>
-        <button className={tab === "privacy" ? "active" : ""} role="tab" aria-selected={tab === "privacy"} onClick={() => setTab("privacy")}>Privacy</button>
-        <button className={tab === "account" ? "active" : ""} role="tab" aria-selected={tab === "account"} onClick={() => setTab("account")}>Account</button>
+    <Modal onClose={onClose} closeDisabled={saving} className="user-settings-modal">
+      <DialogHeading icon={<Settings2 />} title="settings" detail="your noise identity" />
+      <div className="group-settings-tabs user-tabs" role="tablist" aria-label="user settings sections">
+        <button disabled={saving} className={tab === "identity" ? "active" : ""} role="tab" aria-selected={tab === "identity"} onClick={() => setTab("identity")}>Identity</button>
+        <button disabled={saving} className={tab === "album" ? "active" : ""} role="tab" aria-selected={tab === "album"} onClick={() => setTab("album")}>Album</button>
+        <button disabled={saving} className={tab === "privacy" ? "active" : ""} role="tab" aria-selected={tab === "privacy"} onClick={() => setTab("privacy")}>Privacy</button>
+        <button disabled={saving} className={tab === "blocks" ? "active" : ""} role="tab" aria-selected={tab === "blocks"} onClick={() => setTab("blocks")}>Blocks{blockedPeople.length > 0 && <i>{blockedPeople.length}</i>}</button>
+        <button disabled={saving} className={tab === "account" ? "active" : ""} role="tab" aria-selected={tab === "account"} onClick={() => setTab("account")}>Account</button>
       </div>
       <div className="group-settings-panel user-settings-panel" role="tabpanel">
         {tab === "identity" && <div className="group-settings-identity">
-          <div className="identity-editor"><ImagePicker name={username} existing={profile.avatar} selection={image} /><small>public identity</small></div>
-          <LabeledArea label="display name" count={`${username.length}/32`}><input value={username} maxLength={32} onChange={(event) => setUsername(event.target.value)} /></LabeledArea>
-          <LabeledArea label="bio" count={`${bio.length}/160`}><textarea value={bio} onChange={(event) => setBio(event.target.value)} /></LabeledArea>
+          <div className="identity-editor"><ImagePicker name={username} existing={profile.avatar} selection={image} disabled={locked} /><small>public identity</small></div>
+          <LabeledArea label="display name" count={`${displayNameLength}/${MAX_DISPLAY_NAME_LENGTH}`}><input disabled={locked} value={username} maxLength={MAX_DISPLAY_NAME_LENGTH} onChange={(event) => setUsername(event.target.value)} /></LabeledArea>
+          <LabeledArea label="bio" count={`${bio.length}/160`}><textarea disabled={locked} value={bio} onChange={(event) => setBio(event.target.value)} /></LabeledArea>
         </div>}
+        {tab === "album" && <ProfileAlbumDialog
+          embedded
+          editable
+          person={{
+            public_key: profile.public_key,
+            username: profile.username,
+            bio: profile.bio,
+            avatar: profile.avatar,
+            album: profile.album,
+            accepts_direct_messages: profile.accepts_direct_messages,
+            presence_status: "online",
+          }}
+          onSummary={onSummary}
+        />}
         {tab === "privacy" && <section className="settings-section user-privacy-settings">
           <h3>direct messages</h3>
-          <label className="settings-toggle-row"><span><strong>accept direct messages</strong><small>allow people from shared groups to message you</small></span><input type="checkbox" role="switch" checked={acceptsDirectMessages} onChange={(event) => setAcceptsDirectMessages(event.target.checked)} /></label>
+          <label className="settings-toggle-row"><span><strong>accept direct messages</strong><small>allow people from shared groups to message you</small></span><input disabled={locked} type="checkbox" role="switch" checked={acceptsDirectMessages} onChange={(event) => setAcceptsDirectMessages(event.target.checked)} /></label>
+        </section>}
+        {tab === "blocks" && <section className="settings-section user-block-settings">
+          <h3>blocked users</h3>
+          {blockedPeople.length ? <div className="banned-user-list">{blockedPeople.map((person) => <div className="banned-user-row" key={person.public_key}><Avatar name={person.username} image={person.avatar} size={30} /><span><strong>{person.username}</strong><small>{person.bio || "hidden from your noise"}</small></span><button disabled={locked} onClick={() => void onUnblock(person)}>unblock</button></div>)}</div> : <p className="empty-banned-users">you have not blocked anyone</p>}
         </section>}
         {tab === "account" && <div className="user-account-settings">
-          {profile.noise_id && <section className="settings-section"><h3>Noise ID</h3><div className="noise-id-setting"><strong>{profile.noise_id}</strong><CopyButton value={profile.noise_id} label="copy" /></div><p>Use this with your password to sign in on another device.</p></section>}
-          {profile.noise_id && <section className="settings-section account-session"><span><strong>log out on this device</strong><small>Your encrypted identity remains available on the relay network.</small></span><button disabled={busy} onClick={onLogout}>log out</button></section>}
-          <section className="settings-danger"><span><strong>delete account</strong><small>erase this identity and its encrypted account vault</small></span><button className="danger" disabled={busy} onClick={onDeleteAccount}>delete account</button></section>
+          {profile.noise_id && <section className="settings-section"><h3>noise ID</h3><div className="noise-id-setting"><strong>{profile.noise_id}</strong><CopyButton value={profile.noise_id} label="copy" /></div><p>Use this with your password to sign in on another device.</p></section>}
+          {profile.noise_id && <section className="settings-section account-session"><span><strong>log out on this device</strong><small>Your encrypted identity remains available on the relay network.</small></span><button disabled={locked} onClick={onLogout}>log out</button></section>}
+          <section className="settings-danger"><span><strong>delete account</strong><small>erase this identity and its encrypted account vault</small></span><button className="danger" disabled={locked} onClick={onDeleteAccount}>delete account</button></section>
         </div>}
       </div>
-      <DialogButtons onClose={onClose} closeLabel={settingsChanged ? "cancel" : "close"}>
-        {tab === "identity" && (profile.avatar || image.preview) && <button className="danger" onClick={image.remove}>remove photo</button>}
-        {settingsChanged && <button className="primary" disabled={!username.trim() || username.length > 32 || bio.length > 160 || busy} onClick={() => void onSave(username.trim(), bio, image.base64, image.removed, acceptsDirectMessages)}>save settings</button>}
+      <DialogButtons onClose={onClose} closeDisabled={saving} closeLabel={settingsChanged ? "cancel" : "close"}>
+        {tab === "identity" && (profile.avatar || image.preview) && <button className="danger" disabled={locked} onClick={image.remove}>remove photo</button>}
+        {settingsChanged && <button className="primary" disabled={!username.trim() || displayNameLength > MAX_DISPLAY_NAME_LENGTH || bio.length > 160 || locked} onClick={() => void saveSettings()}>
+          {saving && <LoaderCircle className="spinner" size={13} />} {saving ? "saving" : "save settings"}
+        </button>}
       </DialogButtons>
     </Modal>
   );
@@ -4071,17 +4722,17 @@ function LeaveGroupDialog({ group, busy, onClose, onLeave }: { group: GroupSumma
 }
 
 function DeleteDirectDialog({ direct, busy, onClose, onDelete }: { direct: DirectSummary; busy: boolean; onClose: () => void; onDelete: (forBoth: boolean) => Promise<boolean> }) {
-  return <Modal onClose={onClose}><DialogHeading icon={<Trash2 />} title="delete conversation?" detail={direct.username} /><p className="deletion-warning">Choose whether Noise should erase this thread only from this device or send a signed erasure to both users’ Noise clients.</p><div className="direct-delete-options"><button disabled={busy} onClick={() => void onDelete(false)}><strong>just for me</strong><small>erase this device’s history and cached media</small></button><button className="danger" disabled={busy} onClick={() => void onDelete(true)}><strong>for both of us</strong><small>ask all synced Noise clients to erase the thread</small></button></div><DialogButtons onClose={onClose} closeLabel="cancel">{busy && <LoaderCircle className="spinner" size={14} />}</DialogButtons></Modal>;
+  return <Modal onClose={onClose}><DialogHeading icon={<Trash2 />} title="delete conversation?" detail={direct.username} /><p className="deletion-warning">Choose whether noise should erase this thread only from this device or send a signed erasure to both users’ noise clients.</p><div className="direct-delete-options"><button disabled={busy} onClick={() => void onDelete(false)}><strong>just for me</strong><small>erase this device’s history and cached media</small></button><button className="danger" disabled={busy} onClick={() => void onDelete(true)}><strong>for both of us</strong><small>ask all synced noise clients to erase the thread</small></button></div><DialogButtons onClose={onClose} closeLabel="cancel">{busy && <LoaderCircle className="spinner" size={14} />}</DialogButtons></Modal>;
 }
 
 function DeleteAccountDialog({ busy, ownedGroupCount, onClose, onDelete }: { busy: boolean; ownedGroupCount: number; onClose: () => void; onDelete: (deleteGroupMessages: boolean, deleteDirectThreads: boolean) => Promise<boolean> }) {
   const [deleteGroupMessages, setDeleteGroupMessages] = useState(false);
   const [deleteDirectThreads, setDeleteDirectThreads] = useState(false);
-  return <Modal onClose={onClose}><DialogHeading icon={<UserRoundX />} title="delete your account?" detail="this permanently erases the identity on this device" />{ownedGroupCount > 0 && <p className="deletion-warning">{ownedGroupCount === 1 ? "The group you founded" : `The ${ownedGroupCount} groups you founded`} will also be permanently deleted so no group is left with a missing founder.</p>}<div className="account-delete-options"><label className="ban-history-option"><input type="checkbox" checked={deleteGroupMessages} onChange={(event) => setDeleteGroupMessages(event.target.checked)} /><span><strong>delete all messages I sent in groups</strong><small>send a signed removal to every group before leaving</small></span></label><label className="ban-history-option"><input type="checkbox" checked={deleteDirectThreads} onChange={(event) => setDeleteDirectThreads(event.target.checked)} /><span><strong>delete all DM threads</strong><small>ask both users’ Noise clients to erase every thread and cached media</small></span></label></div><p className="deletion-fine-print">Noise can erase relay data and tell official clients to forget it, but it cannot recall screenshots, exports, backups, or modified clients.</p><DialogButtons onClose={onClose}><button className="delete-confirm" disabled={busy} onClick={() => void onDelete(deleteGroupMessages, deleteDirectThreads)}>{busy && <LoaderCircle className="spinner" size={13} />} delete account</button></DialogButtons></Modal>;
+  return <Modal onClose={onClose}><DialogHeading icon={<UserRoundX />} title="delete your account?" detail="this permanently erases the identity on this device" />{ownedGroupCount > 0 && <p className="deletion-warning">{ownedGroupCount === 1 ? "The group you founded" : `The ${ownedGroupCount} groups you founded`} will also be permanently deleted so no group is left with a missing founder.</p>}<div className="account-delete-options"><label className="ban-history-option"><input type="checkbox" checked={deleteGroupMessages} onChange={(event) => setDeleteGroupMessages(event.target.checked)} /><span><strong>delete all messages I sent in groups</strong><small>send a signed removal to every group before leaving</small></span></label><label className="ban-history-option"><input type="checkbox" checked={deleteDirectThreads} onChange={(event) => setDeleteDirectThreads(event.target.checked)} /><span><strong>delete all DM threads</strong><small>ask both users’ noise clients to erase every thread and cached media</small></span></label></div><p className="deletion-fine-print">noise can erase relay data and tell official clients to forget it, but it cannot recall screenshots, exports, backups, or modified clients.</p><DialogButtons onClose={onClose}><button className="delete-confirm" disabled={busy} onClick={() => void onDelete(deleteGroupMessages, deleteDirectThreads)}>{busy && <LoaderCircle className="spinner" size={13} />} delete account</button></DialogButtons></Modal>;
 }
 
 function LogoutDialog({ busy, onClose, onLogout }: { busy: boolean; onClose: () => void; onLogout: () => Promise<boolean> }) {
-  return <Modal onClose={onClose} compact><DialogHeading icon={<LogOut />} title="log out on this device?" detail="your account stays encrypted on the relay network" /><p className="deletion-warning">Local identity data and cached media will be removed. Sign back in with your Noise ID and password.</p><DialogButtons onClose={onClose}><button className="primary" disabled={busy} onClick={() => void onLogout()}>{busy && <LoaderCircle className="spinner" size={13} />} log out</button></DialogButtons></Modal>;
+  return <Modal onClose={onClose} compact><DialogHeading icon={<LogOut />} title="log out on this device?" detail="your account stays encrypted on the relay network" /><p className="deletion-warning">Local identity data and cached media will be removed. Sign back in with your noise ID and password.</p><DialogButtons onClose={onClose}><button className="primary" disabled={busy} onClick={() => void onLogout()}>{busy && <LoaderCircle className="spinner" size={13} />} log out</button></DialogButtons></Modal>;
 }
 
 function DeleteGroupDialog({ group, busy, onClose, onDelete }: { group: GroupSummary; busy: boolean; onClose: () => void; onDelete: () => Promise<boolean> }) {
@@ -4102,7 +4753,7 @@ function DeleteMessageDialog({ message, scopeId, busy, onClose, onDelete }: { me
           <small>{formatTime(message.created_at_millis)}</small>
         </span>
       </div>
-      <p className="deletion-warning">This removes the message from the group history for everyone. It cannot be undone in Noise.</p>
+      <p className="deletion-warning">This removes the message from the group history for everyone. It cannot be undone in noise.</p>
       <DialogButtons onClose={onClose}>
         <button className="delete-confirm" disabled={busy} onClick={() => void onDelete()}>
           {busy && <LoaderCircle className="spinner" size={13} />} delete message
@@ -4112,8 +4763,26 @@ function DeleteMessageDialog({ message, scopeId, busy, onClose, onDelete }: { me
   );
 }
 
-function PersonDialog({ person, canMessage, onMessage, onClose }: { person: PersonSummary; canMessage: boolean; onMessage: () => void; onClose: () => void }) {
-  return <Modal onClose={onClose} compact><div className="person-card"><PresenceAvatar name={person.username} image={person.avatar} size={72} status={person.presence_status ?? "offline"} /><h2>{person.username}</h2><div className="noise-signature"><small>Noise Signature</small><strong>{noiseSignature(person.public_key)}</strong></div><p>{person.bio || "no bio yet"}</p>{canMessage && <button className="profile-message" onClick={onMessage}><MessageCircle size={15} /> message</button>}</div></Modal>;
+function BlockPersonDialog({ person, busy, onClose, onBlock }: { person: PersonSummary; busy: boolean; onClose: () => void; onBlock: () => Promise<boolean> }) {
+  return (
+    <Modal onClose={onClose}>
+      <DialogHeading
+        icon={<ShieldOff />}
+        title={`block ${person.username}?`}
+        detail="you will disappear from each other across noise"
+      />
+      <p className="deletion-warning">noise will hide both profiles, posts, reactions, and presence from each other. Direct messaging will stop, and this conversation and its cached media will be removed from your devices.</p>
+      <DialogButtons onClose={onClose}>
+        <button className="delete-confirm" disabled={busy} onClick={() => void onBlock()}>
+          {busy && <LoaderCircle className="spinner" size={13} />} block user
+        </button>
+      </DialogButtons>
+    </Modal>
+  );
+}
+
+function PersonDialog({ person, canMessage, canBlock, onMessage, onAlbum, onBlock, onClose }: { person: PersonSummary; canMessage: boolean; canBlock: boolean; onMessage: () => void; onAlbum: () => void; onBlock: () => void; onClose: () => void }) {
+  return <Modal onClose={onClose} compact><div className="person-card"><PresenceAvatar name={person.username} image={person.avatar} size={72} status={person.presence_status ?? "offline"} /><h2>{person.username}</h2><div className="noise-signature"><small>noise signature</small><strong>{noiseSignature(person.public_key)}</strong></div><p>{person.bio || "no bio yet"}</p><div className="person-actions">{canMessage && <button className="profile-message" onClick={onMessage}><MessageCircle size={15} /> dm</button>}<button className="profile-album" onClick={onAlbum}><Images size={15} /> {albumButtonLabel(person.album)}</button>{canBlock && <button className="profile-block" onClick={onBlock}><ShieldOff size={15} /> block</button>}</div></div></Modal>;
 }
 
 function noiseSignature(publicKey: string) {
@@ -4137,16 +4806,16 @@ function noiseSignature(publicKey: string) {
   }
 }
 
-function Modal({ children, onClose, compact = false, wide = false, className = "" }: { children: React.ReactNode; onClose: () => void; compact?: boolean; wide?: boolean; className?: string }) {
-  return <div className="modal-backdrop" onMouseDown={onClose}><section className={`modal ${compact ? "compact" : ""} ${wide ? "wide" : ""} ${className}`.trim()} onMouseDown={(event) => event.stopPropagation()}><button className="modal-close" onClick={onClose}><X size={15} /></button>{children}</section></div>;
+function Modal({ children, onClose, compact = false, wide = false, closeDisabled = false, className = "" }: { children: React.ReactNode; onClose: () => void; compact?: boolean; wide?: boolean; closeDisabled?: boolean; className?: string }) {
+  return <div className="modal-backdrop" onMouseDown={closeDisabled ? undefined : onClose}><section className={`modal ${compact ? "compact" : ""} ${wide ? "wide" : ""} ${className}`.trim()} onMouseDown={(event) => event.stopPropagation()}><button className="modal-close" disabled={closeDisabled} onClick={onClose} aria-label={closeDisabled ? "saving settings" : "close"}>{closeDisabled ? <LoaderCircle className="spinner" size={14} /> : <X size={15} />}</button>{children}</section></div>;
 }
 
 function DialogHeading({ icon, title, detail }: { icon: React.ReactNode; title: string; detail: string }) {
   return <div className="dialog-heading"><span>{icon}</span><h2>{title}</h2><p>{detail}</p></div>;
 }
 
-function DialogButtons({ children, onClose, closeLabel = "cancel" }: { children: React.ReactNode; onClose?: () => void; closeLabel?: string }) {
-  return <div className="dialog-buttons">{onClose && <button onClick={onClose}>{closeLabel}</button>}<span />{children}</div>;
+function DialogButtons({ children, onClose, closeDisabled = false, closeLabel = "cancel" }: { children: React.ReactNode; onClose?: () => void; closeDisabled?: boolean; closeLabel?: string }) {
+  return <div className="dialog-buttons">{onClose && <button disabled={closeDisabled} onClick={onClose}>{closeLabel}</button>}<span />{children}</div>;
 }
 
 function LabeledArea({ label, count, children }: { label: string; count?: string; children: React.ReactNode }) {
@@ -4246,7 +4915,7 @@ function ErrorToast({ error, onClose }: { error: string; onClose: () => void }) 
 function UpdateBanner({ status, retry, restart, dismiss }: ReturnType<typeof useAutoUpdater>) {
   if (!status) return null;
   if (status.phase === "ready") {
-    return <div className="update-banner ready"><span><strong>Noise {status.version} is ready</strong><small>{status.restartFailed ? "restart failed · close and reopen Noise" : "update installed · restart when you're ready"}</small></span><button onClick={restart}>{status.restartFailed ? "try restart" : "restart Noise"}</button></div>;
+    return <div className="update-banner ready"><span><strong>noise {status.version} is ready</strong><small>{status.restartFailed ? "restart failed · close and reopen noise" : "update installed · restart when you're ready"}</small></span><button onClick={restart}>{status.restartFailed ? "try restart" : "restart noise"}</button></div>;
   }
   return <div className="update-banner failed"><span><strong>update failed</strong><small>your current version is still intact</small></span><button onClick={retry}>try again</button><button className="update-dismiss" onClick={dismiss} aria-label="dismiss update"><X size={14} /></button></div>;
 }
@@ -4304,7 +4973,7 @@ function EncryptionPending({ phase }: { phase: GroupEncryptionStatus["phase"] })
           ? "the group founder will admit this identity automatically"
           : "another authenticated device must admit this device"}
       </span>
-      <small>you can leave Noise open — this screen updates as soon as the group confirms</small>
+      <small>you can leave noise open — this screen updates as soon as the group confirms</small>
     </div>
   );
 }
@@ -4386,7 +5055,7 @@ function imageIsNearBlack(source: string) {
   });
 }
 
-async function uploadPendingMedia(pending: PendingMedia | null, action: "upload_media_chunk" | "upload_direct_media_chunk", onProgress: (progress: number) => void, signal: AbortSignal): Promise<MediaAttachment | null> {
+async function uploadPendingMedia(pending: PendingMedia | null, action: "upload_media_chunk" | "upload_direct_media_chunk" | "upload_profile_media_chunk", onProgress: (progress: number) => void, signal: AbortSignal): Promise<MediaAttachment | null> {
   if (!pending) return null;
   const mediaPreview = pending.mediaPreview;
   const chunks: MediaChunk[] = [];
