@@ -1,0 +1,59 @@
+name: Windows client
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 installer
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/client/pnpm-lock.yaml
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            target
+          key: client-windows-${{ hashFiles('Cargo.lock') }}
+          restore-keys: client-windows-
+
+      - name: Install frontend dependencies
+        run: pnpm --dir apps/client install --frozen-lockfile
+
+      - name: Disable updater signing in CI
+        shell: pwsh
+        run: |
+          '{"bundle":{"createUpdaterArtifacts":false}}' |
+            Set-Content apps/client/src-tauri/tauri.ci.conf.json
+
+      - name: Build Windows installer
+        run: >
+          pnpm --dir apps/client tauri build
+          --config src-tauri/tauri.ci.conf.json
+          --ci
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: noise-windows-${{ github.sha }}
+          path: target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
