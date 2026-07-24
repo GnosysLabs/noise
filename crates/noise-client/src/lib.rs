@@ -352,8 +352,17 @@ struct ClientState {
     #[serde(default)]
     profile_sequence: u64,
     identity_secret_base64: String,
+    /// Legacy installation-wide MLS state. Existing local profiles may still
+    /// contain this field; group access is migrated into `mls_group_states`
+    /// before it is synchronized to the account vault.
     #[serde(default)]
     mls_device: Option<MlsAccountState>,
+    /// Password-vault-backed MLS recovery state, isolated per group so a fresh
+    /// installation can resume every group without another device.
+    #[serde(default)]
+    mls_group_states: HashMap<String, MlsAccountState>,
+    #[serde(default)]
+    mls_recovery_dirty: bool,
     #[serde(default)]
     mls_join_requests: HashMap<String, MlsJoinRequest>,
     #[serde(default)]
@@ -419,6 +428,8 @@ struct AccountVaultContents {
     #[serde(default)]
     profile_sequence: u64,
     identity_secret_base64: String,
+    #[serde(default)]
+    mls_group_states: HashMap<String, MlsAccountState>,
     groups: Vec<GroupMembership>,
     #[serde(default)]
     group_memberships: HashMap<String, GroupMembershipRecord>,
@@ -574,17 +585,83 @@ impl ClientState {
             .context("active group is missing from local state")
     }
 
-    fn ensure_mls_device(&mut self) -> anyhow::Result<&mut MlsAccountState> {
-        if self.mls_device.is_none() {
+    fn mls_group_state(&self, group_id: &str) -> Option<&MlsAccountState> {
+        self.mls_group_states.get(group_id).or_else(|| {
+            self.mls_device
+                .as_ref()
+                .filter(|mls| mls.epoch(group_id).is_ok())
+        })
+    }
+
+    fn ensure_mls_group_state(&mut self, group_id: &str) -> anyhow::Result<&mut MlsAccountState> {
+        if !self.mls_group_states.contains_key(group_id) {
             let identity = self.identity()?;
-            self.mls_device = Some(
+            let mut candidate = if let Some(legacy) = self
+                .mls_device
+                .as_ref()
+                .filter(|mls| mls.epoch(group_id).is_ok())
+            {
+                legacy.clone()
+            } else {
                 MlsAccountState::create(&identity)
-                    .context("could not create this device's MLS identity")?,
-            );
+                    .context("could not create this group's recoverable MLS identity")?
+            };
+            for other_group_id in self
+                .groups
+                .iter()
+                .map(|group| group.group_id.as_str())
+                .filter(|candidate_group_id| *candidate_group_id != group_id)
+            {
+                let _ = candidate.forget_group(other_group_id);
+            }
+            let recoverable = candidate.epoch(group_id).is_ok();
+            self.mls_group_states.insert(group_id.to_owned(), candidate);
+            if recoverable {
+                self.mls_recovery_dirty = true;
+            }
         }
-        self.mls_device
-            .as_mut()
-            .context("this device has no MLS identity")
+        self.mls_group_states
+            .get_mut(group_id)
+            .context("this group has no recoverable MLS identity")
+    }
+
+    fn set_mls_group_state(&mut self, group_id: &str, mls: MlsAccountState) {
+        let changed = self.mls_group_states.get(group_id) != Some(&mls);
+        let recoverable = mls.epoch(group_id).is_ok();
+        self.mls_group_states.insert(group_id.to_owned(), mls);
+        if changed && recoverable {
+            self.mls_recovery_dirty = true;
+        }
+    }
+
+    fn forget_mls_group(&mut self, group_id: &str) -> anyhow::Result<()> {
+        if self.mls_group_states.remove(group_id).is_some() {
+            self.mls_recovery_dirty = true;
+        }
+        if let Some(mls) = self.mls_device.as_mut() {
+            mls.forget_group(group_id)
+                .context("could not erase this group's legacy encryption state")?;
+        }
+        Ok(())
+    }
+
+    fn migrate_recoverable_mls_groups(&mut self) -> anyhow::Result<bool> {
+        let before = self.mls_group_states.clone();
+        let group_ids = self
+            .groups
+            .iter()
+            .map(|group| group.group_id.clone())
+            .collect::<Vec<_>>();
+        for group_id in group_ids {
+            if self
+                .mls_device
+                .as_ref()
+                .is_some_and(|mls| mls.epoch(&group_id).is_ok())
+            {
+                self.ensure_mls_group_state(&group_id)?;
+            }
+        }
+        Ok(before != self.mls_group_states)
     }
 
     fn ensure_group_membership_records(&mut self) {
@@ -615,6 +692,14 @@ impl ClientState {
                 });
         }
         records
+    }
+
+    fn vault_mls_group_states(&self) -> HashMap<String, MlsAccountState> {
+        self.mls_group_states
+            .iter()
+            .filter(|(group_id, mls)| mls.epoch(group_id).is_ok())
+            .map(|(group_id, mls)| (group_id.clone(), mls.clone()))
+            .collect()
     }
 
     fn reconcile_group_memberships(&mut self) -> bool {
@@ -665,9 +750,7 @@ impl ClientState {
             self.mls_join_requests.remove(&group_id);
             self.mls_local_geneses.remove(&group_id);
             self.mls_control_logs.remove(&group_id);
-            if let Some(mls) = self.mls_device.as_mut() {
-                let _ = mls.forget_group(&group_id);
-            }
+            let _ = self.forget_mls_group(&group_id);
         }
         if self
             .active_group_id
@@ -791,6 +874,7 @@ impl ClientState {
             profile: self.profile.clone(),
             profile_sequence: self.profile_sequence,
             identity_secret_base64: self.identity_secret_base64.clone(),
+            mls_group_states: self.vault_mls_group_states(),
             groups: self.groups.clone(),
             group_memberships: self.vault_group_memberships(),
             active_group_id: self.active_group_id.clone(),
@@ -817,15 +901,22 @@ impl ClientState {
         }
         let identity = Identity::from_secret_base64(&contents.identity_secret_base64)
             .context("stored identity is invalid")?;
+        let identity_public_key = identity.public_key_base64();
+        for (group_id, mls) in &contents.mls_group_states {
+            if mls.device_credential().account_public_key != identity_public_key
+                || mls.epoch(group_id).is_err()
+            {
+                bail!("encrypted account vault contains invalid group recovery state")
+            }
+        }
         let mut state = Self {
             version: 3,
             profile: contents.profile,
             profile_sequence: contents.profile_sequence,
             identity_secret_base64: contents.identity_secret_base64,
-            mls_device: Some(
-                MlsAccountState::create(&identity)
-                    .context("could not create this device's MLS identity")?,
-            ),
+            mls_device: None,
+            mls_group_states: contents.mls_group_states,
+            mls_recovery_dirty: false,
             mls_join_requests: HashMap::new(),
             mls_local_geneses: HashMap::new(),
             mls_control_logs: HashMap::new(),
@@ -1349,10 +1440,9 @@ impl NoiseClient {
             },
             profile_sequence: current_nanos(),
             identity_secret_base64: identity.secret_base64(),
-            mls_device: Some(
-                MlsAccountState::create(&identity)
-                    .context("could not create this device's MLS identity")?,
-            ),
+            mls_device: None,
+            mls_group_states: HashMap::new(),
+            mls_recovery_dirty: false,
             mls_join_requests: HashMap::new(),
             mls_local_geneses: HashMap::new(),
             mls_control_logs: HashMap::new(),
@@ -1490,7 +1580,13 @@ impl NoiseClient {
                 purge_scope_cache(cache_path.as_ref(), &profile_media_scope_id(&public_key)?)?;
             }
         }
-        if changed {
+        if changed || state.mls_recovery_dirty {
+            save_state(path, &state)?;
+        }
+        if state.mls_recovery_dirty {
+            self.publish_account_state(&mut state, &relays)
+                .await
+                .context("could not save automatic encrypted-group recovery")?;
             save_state(path, &state)?;
         }
         state.summary()
@@ -2573,10 +2669,9 @@ impl NoiseClient {
             state.mls_local_geneses.get(&group.group_id),
         ) && remote.genesis.record_id != local.record_id
         {
-            if let Some(mls) = state.mls_device.as_mut() {
-                mls.forget_group(&group.group_id)
-                    .context("could not replace a losing MLS genesis")?;
-            }
+            state
+                .forget_mls_group(&group.group_id)
+                .context("could not replace a losing MLS genesis")?;
             state.mls_local_geneses.remove(&group.group_id);
             save_state(path, &state)?;
         }
@@ -2601,10 +2696,9 @@ impl NoiseClient {
         if !active_members.contains(&self_public_key) && !has_pending_membership_proof {
             purge_group_cache(cache_path, &group.group_id)?;
             purge_profile_image_cache(cache_path)?;
-            if let Some(mls) = state.mls_device.as_mut() {
-                mls.forget_group(&group.group_id)
-                    .context("could not erase this group's local encryption state")?;
-            }
+            state
+                .forget_mls_group(&group.group_id)
+                .context("could not erase this group's local encryption state")?;
             state.mls_join_requests.remove(&group.group_id);
             state.mls_local_geneses.remove(&group.group_id);
             state.mls_control_logs.remove(&group.group_id);
@@ -2621,14 +2715,11 @@ impl NoiseClient {
             });
         }
 
-        let local_has_mls_group = state
-            .mls_device
-            .as_ref()
-            .is_some_and(|mls| mls.epoch(&group.group_id).is_ok());
+        let local_has_mls_group = state.mls_group_state(&group.group_id).is_some();
         if !local_has_mls_group {
             if !state.mls_join_requests.contains_key(&group.group_id) {
                 let request = {
-                    let mls = state.ensure_mls_device()?;
+                    let mls = state.ensure_mls_group_state(&group.group_id)?;
                     MlsJoinRequest::create(&identity, mls, group.group_id.clone())
                         .context("could not create this device's MLS join request")?
                 };
@@ -2683,11 +2774,11 @@ impl NoiseClient {
             }
 
             if !state.mls_local_geneses.contains_key(&group.group_id) {
-                let mut candidate = state.ensure_mls_device()?.clone();
+                let mut candidate = state.ensure_mls_group_state(&group.group_id)?.clone();
                 let genesis = candidate
                     .create_group_genesis(&identity, &group)
                     .context("could not create the group MLS genesis")?;
-                state.mls_device = Some(candidate);
+                state.set_mls_group_state(&group.group_id, candidate);
                 state
                     .mls_local_geneses
                     .insert(group.group_id.clone(), genesis);
@@ -2748,7 +2839,7 @@ impl NoiseClient {
                     save_state(path, &state)?;
                 }
                 self.publish_mls_epoch(&relays, &record).await?;
-                state.mls_device = Some(candidate);
+                state.set_mls_group_state(&group.group_id, candidate);
                 control_log.epochs.push(record);
                 state
                     .mls_control_logs
@@ -2780,7 +2871,7 @@ impl NoiseClient {
                 requests,
             )? {
                 self.publish_mls_epoch(&relays, &record).await?;
-                state.mls_device = Some(candidate);
+                state.set_mls_group_state(&group.group_id, candidate);
                 control_log.epochs.push(record);
             }
         }
@@ -2793,6 +2884,12 @@ impl NoiseClient {
             .mls_control_logs
             .insert(group.group_id.clone(), control_log.clone());
         save_state(path, &state)?;
+        if local_epoch.is_some() && state.mls_recovery_dirty && state.account.is_some() {
+            self.publish_account_state(&mut state, &relays)
+                .await
+                .context("could not save automatic encrypted-group recovery")?;
+            save_state(path, &state)?;
+        }
         let (head_epoch, _) = control_log.head();
         if local_epoch == Some(head_epoch)
             && control_log
@@ -2940,7 +3037,7 @@ impl NoiseClient {
             let membership_proof =
                 SignedEvent::member_joined(&identity, &group, &state.profile, sequence)?;
             let request = {
-                let mls = state.ensure_mls_device()?;
+                let mls = state.ensure_mls_group_state(&group.group_id)?;
                 MlsJoinRequest::create_with_membership_proof(
                     &identity,
                     mls,
@@ -3936,10 +4033,9 @@ impl NoiseClient {
         }
         purge_group_cache(cache_path.as_ref(), &group.group_id)?;
         purge_profile_image_cache(cache_path.as_ref())?;
-        if let Some(mls) = state.mls_device.as_mut() {
-            mls.forget_group(&group.group_id)
-                .context("could not erase this group's local encryption state")?;
-        }
+        state
+            .forget_mls_group(&group.group_id)
+            .context("could not erase this group's local encryption state")?;
         state.mls_join_requests.remove(&group.group_id);
         state.mls_local_geneses.remove(&group.group_id);
         state.mls_control_logs.remove(&group.group_id);
@@ -3985,10 +4081,9 @@ impl NoiseClient {
 
         purge_group_cache(cache_path.as_ref(), group_id)?;
         purge_profile_image_cache(cache_path.as_ref())?;
-        if let Some(mls) = state.mls_device.as_mut() {
-            mls.forget_group(group_id)
-                .context("could not erase this group's local encryption state")?;
-        }
+        state
+            .forget_mls_group(group_id)
+            .context("could not erase this group's local encryption state")?;
         state.group_frequencies.remove(group_id);
         state.forget_group_activity(group_id);
         state.group_conversation_cache.remove(group_id);
@@ -4870,6 +4965,7 @@ impl NoiseClient {
         state: &mut ClientState,
         relays: &[RelayDescriptor],
     ) -> anyhow::Result<()> {
+        state.migrate_recoverable_mls_groups()?;
         let credentials = state.account_credentials()?;
         let identity = state.identity()?;
         if let Ok(remote) = self.fetch_account_vault(relays, &credentials.locator).await {
@@ -4905,6 +5001,7 @@ impl NoiseClient {
                     .as_mut()
                     .context("this identity has no noise ID")?
                     .revision = revision;
+                state.mls_recovery_dirty = false;
                 return Ok(());
             }
 
@@ -4944,6 +5041,7 @@ impl NoiseClient {
             state.profile = contents.profile.clone();
             state.profile_sequence = contents.profile_sequence;
         }
+        let recovery_changed_before_merge = state.migrate_recoverable_mls_groups()?;
         state.ensure_group_membership_records();
         let memberships_before = state.group_memberships.clone();
         let groups_before = state.groups.clone();
@@ -4975,6 +5073,33 @@ impl NoiseClient {
         state
             .group_frequencies
             .retain(|group_id, _| present_group_ids.contains(group_id));
+        let identity_public_key = state.identity()?.public_key_base64();
+        let recovery_before = state.mls_group_states.clone();
+        for (group_id, remote_mls) in contents.mls_group_states {
+            if !present_group_ids.contains(&group_id) {
+                continue;
+            }
+            if remote_mls.device_credential().account_public_key != identity_public_key {
+                bail!("encrypted account vault contains another account's group recovery state")
+            }
+            let remote_epoch = remote_mls
+                .epoch(&group_id)
+                .context("encrypted account vault contains invalid group recovery state")?
+                .epoch;
+            let local_epoch = state
+                .mls_group_states
+                .get(&group_id)
+                .and_then(|local| local.epoch(&group_id).ok())
+                .map(|epoch| epoch.epoch);
+            if local_epoch.is_none_or(|local_epoch| remote_epoch > local_epoch) {
+                state.mls_group_states.insert(group_id, remote_mls);
+            }
+        }
+        state
+            .mls_group_states
+            .retain(|group_id, _| present_group_ids.contains(group_id));
+        let recovery_changed =
+            recovery_changed_before_merge || recovery_before != state.mls_group_states;
         if state.active_group_id.is_none()
             && contents
                 .active_group_id
@@ -5017,6 +5142,7 @@ impl NoiseClient {
             || blocked_by_changed
             || group_activity_changed
             || initialized_changed
+            || recovery_changed
             || revision_changed)
     }
 
@@ -5764,7 +5890,8 @@ fn sync_mls_state_from_log(
     log: &MlsControlLog,
 ) -> anyhow::Result<Option<u64>> {
     log.verify().context("group MLS control log is invalid")?;
-    let mut candidate = state.ensure_mls_device()?.clone();
+    let group_id = log.genesis.group_id.as_str();
+    let mut candidate = state.ensure_mls_group_state(group_id)?.clone();
     let local_epoch = candidate
         .epoch(&log.genesis.group_id)
         .ok()
@@ -5811,7 +5938,7 @@ fn sync_mls_state_from_log(
                 &record.member_accounts,
             )?;
         }
-        state.mls_device = Some(candidate);
+        state.set_mls_group_state(group_id, candidate);
         return Ok(Some(
             log.epochs
                 .last()
@@ -5830,7 +5957,7 @@ fn sync_mls_state_from_log(
         validate_mls_member_accounts(&candidate, &log.genesis.group_id, &record.member_accounts)?;
         current_epoch = record.bundle.epoch;
     }
-    state.mls_device = Some(candidate);
+    state.set_mls_group_state(group_id, candidate);
     Ok(Some(current_epoch))
 }
 
@@ -6036,9 +6163,8 @@ fn rebuild_group_state(
     };
     log.verify().context("cached MLS control log is invalid")?;
     let mls = state
-        .mls_device
-        .as_ref()
-        .context("this device has no MLS identity")?;
+        .mls_group_state(&group.group_id)
+        .context("this group has no recoverable MLS identity")?;
     let current = mls
         .epoch(&group.group_id)
         .context("this device is not in the current encrypted group")?;
@@ -6091,9 +6217,8 @@ fn active_group_epoch(
     }
     Ok(Some(
         state
-            .mls_device
-            .as_ref()
-            .context("this device has no MLS identity")?
+            .mls_group_state(group_id)
+            .context("this group has no recoverable MLS identity")?
             .epoch(group_id)
             .context("this device is not in the current encrypted group")?,
     ))
@@ -6152,9 +6277,8 @@ fn prepare_pending_member_add(
     requests: Vec<MlsJoinRequest>,
 ) -> anyhow::Result<Option<(MlsAccountState, MlsEpochRecord)>> {
     let mls = state
-        .mls_device
-        .as_ref()
-        .context("this device has no MLS identity")?;
+        .mls_group_state(&group.group_id)
+        .context("this group has no recoverable MLS identity")?;
     let current_devices = mls
         .member_devices(&group.group_id)
         .context("could not read current MLS devices")?
@@ -6227,9 +6351,8 @@ fn prepare_pending_member_removal(
     mut requests: Vec<MlsRemovalRequest>,
 ) -> anyhow::Result<Option<(MlsAccountState, MlsEpochRecord, Vec<MlsRemovalRequest>)>> {
     let mls = state
-        .mls_device
-        .as_ref()
-        .context("this device has no MLS identity")?;
+        .mls_group_state(&group.group_id)
+        .context("this group has no recoverable MLS identity")?;
     let (head_epoch, previous_record_id) = log.head();
     let current_members = log
         .member_accounts_at(head_epoch)
@@ -6868,6 +6991,8 @@ mod tests {
             profile_sequence,
             identity_secret_base64: identity.secret_base64(),
             mls_device: None,
+            mls_group_states: HashMap::new(),
+            mls_recovery_dirty: false,
             mls_join_requests: HashMap::new(),
             mls_local_geneses: HashMap::new(),
             mls_control_logs: HashMap::new(),
@@ -7157,5 +7282,81 @@ mod tests {
             Some(11)
         );
         assert_eq!(republished.profile_sequence, 200);
+    }
+
+    #[test]
+    fn account_vault_restores_group_encryption_without_device_admission() {
+        let identity = Identity::generate();
+        let credentials = AccountCredentials {
+            noise_id: "123456789012".to_owned(),
+            locator: "ab".repeat(32),
+            vault_key_base64: base64::engine::general_purpose::STANDARD_NO_PAD.encode([7_u8; 32]),
+        };
+        let mut state = account_state(&identity, &credentials, test_profile(None), 1, 1);
+        let group =
+            GroupMembership::create_owned("recoverable group", identity.public_key_base64());
+        let group_id = group.group_id.clone();
+        state.add_group(group.clone());
+
+        state.mls_group_states.insert(
+            group_id.clone(),
+            MlsAccountState::create(&identity).unwrap(),
+        );
+        assert!(
+            !state
+                .vault_contents()
+                .mls_group_states
+                .contains_key(&group_id),
+            "pending KeyPackage state must not make the recovery vault unrestorable"
+        );
+        state.mls_group_states.clear();
+
+        let mut legacy_mls = MlsAccountState::create(&identity).unwrap();
+        let genesis = legacy_mls.create_group_genesis(&identity, &group).unwrap();
+        let expected_epoch = legacy_mls.epoch(&group_id).unwrap();
+        let expected_device_id = legacy_mls.device_credential().device_id_base64.clone();
+        state.mls_device = Some(legacy_mls);
+
+        assert!(state.migrate_recoverable_mls_groups().unwrap());
+        assert!(state.mls_recovery_dirty);
+        let vault_contents = state.vault_contents();
+        assert!(vault_contents.mls_group_states.contains_key(&group_id));
+        let vault = AccountVault::seal(
+            &identity,
+            &credentials,
+            2,
+            &serde_json::to_vec(&vault_contents).unwrap(),
+        )
+        .unwrap();
+        let restored_contents = serde_json::from_slice(&vault.open(&credentials).unwrap()).unwrap();
+
+        let mut restored = ClientState::from_vault(
+            restored_contents,
+            state.account.clone().expect("test account session"),
+        )
+        .unwrap();
+        assert!(!restored.mls_recovery_dirty);
+        let restored_mls = restored
+            .mls_group_state(&group_id)
+            .expect("restored group encryption");
+
+        assert_eq!(restored_mls.epoch(&group_id).unwrap(), expected_epoch);
+        assert_eq!(
+            restored_mls.device_credential().device_id_base64,
+            expected_device_id
+        );
+        assert!(restored.mls_join_requests.is_empty());
+        assert_eq!(
+            sync_mls_state_from_log(
+                &mut restored,
+                &MlsControlLog {
+                    genesis,
+                    epochs: Vec::new(),
+                },
+            )
+            .unwrap(),
+            Some(0),
+        );
+        assert!(restored.mls_join_requests.is_empty());
     }
 }

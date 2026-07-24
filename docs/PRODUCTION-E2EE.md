@@ -162,21 +162,20 @@ thread deletion and account removal continue to use signed deletion events.
 
 ## Persistence and devices
 
-MLS state contains secret key material. Each installation uses a distinct MLS
-leaf whose credential is signed by the long-lived Noise account identity.
-Password sign-in therefore remains sufficient to authorize a new installation
-without making two devices share mutable ratchet state. Removing an account
-removes all of its leaves; later device management can revoke one certified
-leaf without changing the account's public Noise identity.
+MLS state contains secret key material. Noise keeps one recoverable MLS state
+per account and group rather than requiring every installation to be admitted
+as a new leaf. Each current per-group state is included in the synchronized
+account vault, which is encrypted by the high-entropy key derived from the
+Noise ID and password and signed by the long-lived account identity.
 
-Private MLS state never enters the synchronized account vault. It must live
-only in an encrypted local browser/device vault. The synchronized account vault
-may carry public device credentials and group pointers. A newly signed-in
-device publishes its certified KeyPackage; an existing founder device
-automatically admits it to the current epoch, whose archive root unlocks earlier
-history through the backward links. A recovery path that does not depend on an
-older founder device is still required before password-only restoration can be
-called complete.
+A newly signed-in installation restores those per-group states, verifies the
+signed MLS control log, advances through any later commits, and immediately
+unlocks the current archive root and its backward history links. No older
+device, founder session, or manual approval is part of account restoration.
+Account credentials are therefore the recovery and authorization boundary:
+anyone who can successfully sign in can recover the account's current groups.
+Leaving, banning, or deleting a group removes its recovery state from the next
+vault revision.
 
 The current desktop client stores local state in a permission-restricted but
 unencrypted JSON file. That is a production blocker. Before MLS is enabled for
@@ -195,8 +194,8 @@ Noise must not call this production encryption until all of these are true:
 - offline members can process ordered commits and catch up;
 - competing same-epoch commits fail closed instead of silently forking;
 - account restore retains current MLS state without restoring erased old state;
-- MLS private state is encrypted at rest and is never copied into the
-  synchronized account vault;
+- synchronized MLS recovery state is isolated per group and exists only inside
+  the password-encrypted account vault or encrypted local storage;
 - web, macOS, and Windows use the same vectors and protocol version;
 - corrupted, replayed, reordered, and forged control records are rejected;
 - the upgrade path is exercised against a copy of real relay history; and

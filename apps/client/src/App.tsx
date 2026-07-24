@@ -4975,7 +4975,13 @@ function UpdateBanner({ status, retry, restart, dismiss }: ReturnType<typeof use
   return <div className="update-banner failed"><span><strong>update failed</strong><small>your current version is still intact</small></span><button onClick={retry}>try again</button><button className="update-dismiss" onClick={dismiss} aria-label="dismiss update"><X size={14} /></button></div>;
 }
 
-function Loading() { return <div className="loading"><LoaderCircle className="spinner" /></div>; }
+function Loading() {
+  return (
+    <div className="loading" role="status" aria-label="loading noise">
+      <NoiseMark size={44} className="noise-loading-indicator" />
+    </div>
+  );
+}
 
 async function syncGroupEncryption(): Promise<GroupEncryptionStatus | null> {
   try {
@@ -5022,13 +5028,13 @@ function EncryptionPending({ phase }: { phase: GroupEncryptionStatus["phase"] })
   return (
     <div className="encryption-pending">
       <Shield />
-      <strong>securing this device</strong>
+      <strong>restoring this group</strong>
       <span>
         {phase === "waiting_for_admission"
           ? "the group founder will admit this identity automatically"
-          : "another authenticated device must admit this device"}
+          : "restoring encrypted group access from your noise account"}
       </span>
-      <small>you can leave noise open — this screen updates as soon as the group confirms</small>
+      <small>no other device is required — this screen updates automatically</small>
     </div>
   );
 }
