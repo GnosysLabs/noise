@@ -701,6 +701,55 @@ impl ClientState {
         self.active_group_id = Some(group_id);
     }
 
+    fn apply_resolved_group_profile(
+        &mut self,
+        group_id: &str,
+        profile: &GroupProfile,
+        owner_public_key: &str,
+    ) -> bool {
+        let Some(group) = self
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == group_id)
+        else {
+            return false;
+        };
+        let group_changed = group.name != profile.name
+            || group.description != profile.description
+            || group.rules != profile.rules
+            || group.avatar != profile.avatar
+            || group.background != profile.background
+            || group.mobile_background != profile.mobile_background
+            || group.accent_color != profile.accent_color
+            || group.members_can_send_messages != profile.members_can_send_messages
+            || group.members_can_send_media != profile.members_can_send_media
+            || group.owner_public_key != owner_public_key;
+        if group_changed {
+            group.name = profile.name.clone();
+            group.description = profile.description.clone();
+            group.rules = profile.rules.clone();
+            group.avatar = profile.avatar.clone();
+            group.background = profile.background.clone();
+            group.mobile_background = profile.mobile_background.clone();
+            group.accent_color = profile.accent_color.clone();
+            group.members_can_send_messages = profile.members_can_send_messages;
+            group.members_can_send_media = profile.members_can_send_media;
+            group.owner_public_key = owner_public_key.to_owned();
+        }
+        let resolved_group = group.clone();
+        let mut membership_changed = false;
+        if let Some(record) = self.group_memberships.get_mut(group_id)
+            && record
+                .group
+                .as_ref()
+                .is_some_and(|group| group != &resolved_group)
+        {
+            record.group = Some(resolved_group);
+            membership_changed = true;
+        }
+        group_changed || membership_changed
+    }
+
     fn tombstone_group(&mut self, group_id: &str) {
         let sequence = self.take_sequence();
         self.group_memberships.insert(
@@ -2213,20 +2262,30 @@ impl NoiseClient {
             current_group.mobile_background.clone()
         };
 
-        state.groups[group_index].name = name.clone();
-        state.groups[group_index].description = description.clone();
-        state.groups[group_index].rules = rules.clone();
-        state.groups[group_index].avatar = avatar.clone();
-        state.groups[group_index].background = background.clone();
-        state.groups[group_index].mobile_background = mobile_background.clone();
-        state.groups[group_index].accent_color = accent_color.clone();
-        state.groups[group_index].members_can_send_messages = members_can_send_messages;
-        state.groups[group_index].members_can_send_media = members_can_send_media;
-        if state.groups[group_index].owner_public_key.is_empty()
-            && let Some(owner) = view.owner_public_key
-        {
-            state.groups[group_index].owner_public_key = owner;
-        }
+        let owner_public_key = if current_group.owner_public_key.is_empty() {
+            view.owner_public_key
+                .clone()
+                .context("group founder is missing")?
+        } else {
+            current_group.owner_public_key.clone()
+        };
+        let resolved_profile = GroupProfile {
+            name,
+            description,
+            rules,
+            avatar,
+            background,
+            mobile_background,
+            mobile_background_updated: true,
+            accent_color,
+            members_can_send_messages,
+            members_can_send_media,
+        };
+        state.apply_resolved_group_profile(
+            &current_group.group_id,
+            &resolved_profile,
+            &owner_public_key,
+        );
         let group = state.groups[group_index].clone();
         let sequence = state.take_sequence();
         let event = create_group_event(
@@ -2234,18 +2293,7 @@ impl NoiseClient {
             &identity,
             &group,
             GroupEventPayload::GroupProfileUpdated {
-                profile: GroupProfile {
-                    name,
-                    description,
-                    rules,
-                    avatar,
-                    background,
-                    mobile_background,
-                    mobile_background_updated: true,
-                    accent_color,
-                    members_can_send_messages,
-                    members_can_send_media,
-                },
+                profile: resolved_profile,
             },
             sequence,
         )?;
@@ -4126,8 +4174,36 @@ impl NoiseClient {
         let group_id = group.group_id.clone();
         let view = rebuild_group_state(&state, &group, &update.events)?;
         let is_member = view.members.contains_key(&identity_public_key);
-        let activity_changed = is_member
+        let mut state_changed = is_member
             && state.record_group_activity(&group_id, &view.messages, &identity_public_key);
+        let resolved_owner = view.owner_public_key.clone().unwrap_or_else(|| {
+            state
+                .groups
+                .iter()
+                .find(|group| group.group_id == group_id)
+                .map(|group| group.owner_public_key.clone())
+                .unwrap_or_default()
+        });
+        if state.apply_resolved_group_profile(&group_id, &view.profile, &resolved_owner) {
+            state_changed = true;
+        }
+        let known_people_before = state.known_people.clone();
+        let direct_contacts_before = state.direct_contacts.clone();
+        for member in view.members.values() {
+            state.upsert_known_person(DirectContact {
+                public_key: member.public_key.clone(),
+                username: member.username.clone(),
+                bio: member.bio.clone(),
+                avatar: member.avatar.clone(),
+                album: member.album.clone(),
+                accepts_direct_messages: member.accepts_direct_messages,
+            });
+        }
+        if state.known_people != known_people_before
+            || state.direct_contacts != direct_contacts_before
+        {
+            state_changed = true;
+        }
         let conversation = is_member.then(|| {
             let mut conversation =
                 cached_conversation_from_view(&state, &group, view, &identity_public_key);
@@ -4140,7 +4216,7 @@ impl NoiseClient {
                 .group_conversation_cache
                 .insert(group_id, conversation.clone());
         }
-        if activity_changed || conversation.is_some() {
+        if state_changed || conversation.is_some() {
             save_state(path, &state)?;
         }
         Ok(GroupActivityResult {
@@ -4243,32 +4319,7 @@ impl NoiseClient {
                 accepts_direct_messages: member.accepts_direct_messages,
             });
         }
-        if state.groups[group_index].name != resolved_profile.name
-            || state.groups[group_index].description != resolved_profile.description
-            || state.groups[group_index].rules != resolved_profile.rules
-            || state.groups[group_index].avatar != resolved_profile.avatar
-            || state.groups[group_index].background != resolved_profile.background
-            || state.groups[group_index].mobile_background != resolved_profile.mobile_background
-            || state.groups[group_index].accent_color != resolved_profile.accent_color
-            || state.groups[group_index].members_can_send_messages
-                != resolved_profile.members_can_send_messages
-            || state.groups[group_index].members_can_send_media
-                != resolved_profile.members_can_send_media
-            || state.groups[group_index].owner_public_key != resolved_owner
-        {
-            state.groups[group_index].name = resolved_profile.name.clone();
-            state.groups[group_index].description = resolved_profile.description.clone();
-            state.groups[group_index].rules = resolved_profile.rules.clone();
-            state.groups[group_index].avatar = resolved_profile.avatar.clone();
-            state.groups[group_index].background = resolved_profile.background.clone();
-            state.groups[group_index].mobile_background =
-                resolved_profile.mobile_background.clone();
-            state.groups[group_index].accent_color = resolved_profile.accent_color.clone();
-            state.groups[group_index].members_can_send_messages =
-                resolved_profile.members_can_send_messages;
-            state.groups[group_index].members_can_send_media =
-                resolved_profile.members_can_send_media;
-            state.groups[group_index].owner_public_key = resolved_owner.clone();
+        if state.apply_resolved_group_profile(&group.group_id, &resolved_profile, &resolved_owner) {
             state_changed = true;
         }
         if state.known_people != known_people_before {
@@ -4539,11 +4590,20 @@ impl NoiseClient {
                 .then_with(|| left.message.event_id.cmp(&right.message.event_id))
         });
         for message in &messages {
-            state.remember_direct(message.contact.clone());
             let marker = DirectMessageMarker {
                 created_at_millis: message.message.created_at_millis,
                 event_id: message.message.event_id.clone(),
             };
+            let contact_is_missing = !state
+                .direct_contacts
+                .iter()
+                .any(|contact| contact.public_key == message.counterparty_public_key);
+            let message_is_new_activity = latest_activity_before
+                .get(&message.counterparty_public_key)
+                .is_none_or(|latest| &marker > latest);
+            if contact_is_missing || message_is_new_activity {
+                state.remember_direct(message.contact.clone());
+            }
             state
                 .direct_latest_activity
                 .entry(message.counterparty_public_key.clone())
@@ -6949,6 +7009,96 @@ mod tests {
                 .get(&first_id)
                 .is_some_and(|record| record.group.is_some())
         );
+    }
+
+    #[test]
+    fn first_join_activity_persists_current_group_media_everywhere() {
+        let identity = Identity::generate();
+        let credentials = AccountCredentials {
+            noise_id: "123456789012".to_owned(),
+            locator: "ab".repeat(32),
+            vault_key_base64: STANDARD.encode([7_u8; 32]),
+        };
+        let mut state = account_state(&identity, &credentials, test_profile(None), 1, 1);
+        let invited_group =
+            GroupMembership::create_owned("stale invitation", identity.public_key_base64());
+        let group_id = invited_group.group_id.clone();
+        state.add_group(invited_group.clone());
+        let avatar = ProfileImage {
+            blob_id: "11".repeat(32),
+            key_base64: STANDARD.encode([8_u8; 32]),
+            mime_type: "image/png".to_owned(),
+            byte_length: 128,
+            storage: None,
+        };
+        let background = ProfileImage {
+            blob_id: "22".repeat(32),
+            key_base64: STANDARD.encode([9_u8; 32]),
+            mime_type: "image/jpeg".to_owned(),
+            byte_length: 256,
+            storage: None,
+        };
+        let current_profile = GroupProfile {
+            name: "current group".to_owned(),
+            description: "current description".to_owned(),
+            rules: String::new(),
+            avatar: Some(avatar.clone()),
+            background: Some(background.clone()),
+            mobile_background: None,
+            mobile_background_updated: true,
+            accent_color: "#7758ED".to_owned(),
+            members_can_send_messages: true,
+            members_can_send_media: true,
+        };
+        let events = vec![
+            SignedEvent::member_joined(&identity, &invited_group, &state.profile, 1).unwrap(),
+            SignedEvent::group_profile_updated(&identity, &invited_group, &current_profile, 2)
+                .unwrap(),
+        ];
+        let path = std::env::temp_dir().join(format!(
+            "noise-first-join-profile-{}-{}.json",
+            std::process::id(),
+            current_nanos(),
+        ));
+        save_state(&path, &state).unwrap();
+
+        let result = NoiseClient::default()
+            .apply_group_activity(
+                &path,
+                GroupActivityUpdate {
+                    group_id: group_id.clone(),
+                    events,
+                },
+            )
+            .unwrap();
+        let summary_group = result
+            .summary
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .unwrap();
+        let conversation_group = &result.conversation.as_ref().unwrap().group;
+        assert_eq!(summary_group.avatar, Some(avatar.clone()));
+        assert_eq!(summary_group.background, Some(background.clone()));
+        assert_eq!(conversation_group.avatar, Some(avatar.clone()));
+        assert_eq!(conversation_group.background, Some(background.clone()));
+
+        let reloaded = load_state(&path).unwrap();
+        let persisted_group = reloaded
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .unwrap();
+        let membership_group = reloaded
+            .group_memberships
+            .get(&group_id)
+            .and_then(|record| record.group.as_ref())
+            .unwrap();
+        assert_eq!(persisted_group.avatar, Some(avatar.clone()));
+        assert_eq!(persisted_group.background, Some(background.clone()));
+        assert_eq!(membership_group.avatar, Some(avatar));
+        assert_eq!(membership_group.background, Some(background));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

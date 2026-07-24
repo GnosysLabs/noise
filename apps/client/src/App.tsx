@@ -167,6 +167,26 @@ function withCurrentDirectProfile(
   };
 }
 
+function withCurrentGroupProfile(
+  group: GroupSummary,
+  current: GroupSummary,
+): GroupSummary {
+  if (group.group_id !== current.group_id) return group;
+  return {
+    ...group,
+    name: current.name,
+    description: current.description,
+    rules: current.rules,
+    avatar: current.avatar,
+    background: current.background,
+    mobile_background: current.mobile_background,
+    accent_color: current.accent_color,
+    members_can_send_messages: current.members_can_send_messages,
+    members_can_send_media: current.members_can_send_media,
+    owner_public_key: current.owner_public_key,
+  };
+}
+
 const PRESENCE_IDLE_MILLIS = 5 * 60_000;
 const PRESENCE_HEARTBEAT_MILLIS = 20_000;
 const PRESENCE_OBSERVATION_STALE_MILLIS = 70_000;
@@ -308,6 +328,16 @@ const MESSAGE_PAGE_SIZE = 40;
 
 function mediaCacheKey(attachment: MediaAttachment) {
   return attachment.chunks.map((chunk) => chunk.blob_id).join(":");
+}
+
+function mediaFailureIsPermanent(cause: unknown) {
+  const detail = message(cause).toLowerCase();
+  return detail.includes("predates constellation storage")
+    || detail.includes("invalid blob")
+    || detail.includes("invalid size")
+    || detail.includes("does not match")
+    || detail.includes("belongs to a different conversation")
+    || detail.includes("does not belong to a known conversation");
 }
 
 function clearMediaMemoryCache() {
@@ -1151,9 +1181,13 @@ export default function App() {
     void ensureNotificationPermission();
   }, [identityPublicKey]);
 
-  const activeGroup = summary?.groups.find(
+  const summaryActiveGroup = summary?.groups.find(
     (group) => group.group_id === desiredGroupIdRef.current,
   ) ?? summary?.groups.find((group) => group.is_active) ?? null;
+  const activeGroup = summaryActiveGroup
+    && conversation?.group.group_id === summaryActiveGroup.group_id
+    ? withCurrentGroupProfile(summaryActiveGroup, conversation.group)
+    : summaryActiveGroup;
   const activeGroupId = activeGroup?.group_id ?? null;
   const activeDirectPublicKey = summary?.directs.find((direct) => direct.is_active)?.public_key ?? null;
   const markCurrentGroupRead = useCallback(() => {
@@ -1653,10 +1687,15 @@ export default function App() {
   selectedPresenceStatuses.set(summary.identity.public_key, selfPresenceStatus);
   const visibleSummary = activeGroupId ? {
     ...summary,
-    groups: summary.groups.map((group) => ({
-      ...group,
-      is_active: group.group_id === activeGroupId,
-    })),
+    groups: summary.groups.map((group) => {
+      const visible = activeGroup?.group_id === group.group_id
+        ? withCurrentGroupProfile(group, activeGroup)
+        : group;
+      return {
+        ...visible,
+        is_active: group.group_id === activeGroupId,
+      };
+    }),
   } : summary;
 
   return (
@@ -3194,30 +3233,30 @@ function requestMediaSource(attachment: MediaAttachment, scopeId?: string) {
   const generation = mediaCacheGeneration;
   let request: Promise<string>;
   request = (async () => {
-      for (let attempt = 0; attempt < 12; attempt += 1) {
-        try {
-          const data = await noise<AttachmentData>({
-            action: "fetch_attachment",
-            attachment,
-            scope_id: scopeId,
-            relays,
-          });
-          if (!data) throw new Error("media is not available yet");
-          const next = isTauri
-            ? (await import("@tauri-apps/api/core")).convertFileSrc(data.file_path)
-            : data.file_path;
-          if (generation === mediaCacheGeneration) mediaCache.set(cacheKey, next);
-          return next;
-        } catch {
-          if (attempt === 11) throw new Error("media is unavailable");
-          const delay = Math.min(400 * 1.6 ** attempt, 3000);
-          await new Promise<void>((resolve) => window.setTimeout(resolve, delay));
-        }
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      try {
+        const data = await noise<AttachmentData>({
+          action: "fetch_attachment",
+          attachment,
+          scope_id: scopeId,
+          relays,
+        });
+        if (!data) throw new Error("media is not available yet");
+        const next = isTauri
+          ? (await import("@tauri-apps/api/core")).convertFileSrc(data.file_path)
+          : data.file_path;
+        if (generation === mediaCacheGeneration) mediaCache.set(cacheKey, next);
+        return next;
+      } catch (cause) {
+        if (mediaFailureIsPermanent(cause) || attempt === 11) throw cause;
+        const delay = Math.min(400 * 1.6 ** attempt, 3000);
+        await new Promise<void>((resolve) => window.setTimeout(resolve, delay));
       }
-      throw new Error("media is unavailable");
-    })().finally(() => {
-      if (mediaLoadPromises.get(cacheKey) === request) mediaLoadPromises.delete(cacheKey);
-    });
+    }
+    throw new Error("media is unavailable");
+  })().finally(() => {
+    if (mediaLoadPromises.get(cacheKey) === request) mediaLoadPromises.delete(cacheKey);
+  });
   mediaLoadPromises.set(cacheKey, request);
   return request;
 }
@@ -3446,15 +3485,29 @@ function useMediaSource(
     }
     if (!enabled) return;
     let active = true;
+    let retryTimer: number | undefined;
+    let retryRound = 0;
     setFailedKey(null);
-    void requestMediaSource(attachment, scopeId)
-      .then((next) => {
-        if (active) setLoaded({ cacheKey, source: next });
-      })
-      .catch(() => {
-        if (active) setFailedKey(cacheKey);
-      });
-    return () => { active = false; };
+    const load = () => {
+      setFailedKey(null);
+      void requestMediaSource(attachment, scopeId)
+        .then((next) => {
+          if (active) setLoaded({ cacheKey, source: next });
+        })
+        .catch((cause) => {
+          if (!active) return;
+          setFailedKey(cacheKey);
+          if (mediaFailureIsPermanent(cause)) return;
+          const delay = Math.min(5_000 * 1.7 ** retryRound, 30_000);
+          retryRound += 1;
+          retryTimer = window.setTimeout(load, delay);
+        });
+    };
+    load();
+    return () => {
+      active = false;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+    };
   }, [attachment, cacheKey, enabled, scopeId]);
   return { source, failed: failedKey === cacheKey };
 }
@@ -4300,6 +4353,7 @@ function useProfileImageSource(
   image: ProfileImage | null,
   preservePreviousUntilReady = false,
 ) {
+  const storageKey = image?.storage ? JSON.stringify(image.storage) : "";
   const [loaded, setLoaded] = useState<{ blobId: string; source: string } | null>(() => {
     if (!image) return null;
     const source = avatarCache.get(image.blob_id);
@@ -4330,9 +4384,9 @@ function useProfileImageSource(
       try {
         const source = await loadProfileImageSource(target);
         if (active) setLoaded({ blobId: target.blob_id, source });
-      } catch {
-        if (!active || attempt >= 4) return;
-        const delay = [500, 1_200, 2_500, 5_000][attempt] ?? 5_000;
+      } catch (cause) {
+        if (!active || mediaFailureIsPermanent(cause)) return;
+        const delay = [500, 1_200, 2_500, 5_000, 10_000, 20_000][attempt] ?? 30_000;
         retryTimer = window.setTimeout(() => void load(attempt + 1), delay);
       }
     };
@@ -4346,6 +4400,7 @@ function useProfileImageSource(
     image?.key_base64,
     image?.mime_type,
     image?.byte_length,
+    storageKey,
     preservePreviousUntilReady,
   ]);
   return source;
