@@ -7450,7 +7450,11 @@ async function syncGroupActivity(groupId: string): Promise<GroupActivityResult |
       ? result
       : { summary: result, conversation: null };
   } catch (cause) {
-    if (message(cause).includes("unknown variant `sync_group_activity`")) return null;
+    const error = message(cause);
+    if (
+      error.includes("unknown variant `sync_group_activity`")
+      || error.includes("unsupported noise action: sync_group_activity")
+    ) return null;
     throw cause;
   }
 }
