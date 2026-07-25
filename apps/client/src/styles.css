@@ -617,6 +617,8 @@ button:disabled { cursor: default; opacity: 0.48; }
 .profile-album-toolbar { display: flex; min-height: 34px; align-items: center; gap: 10px; }
 .profile-album-toolbar > button { display: inline-flex; align-items: center; gap: 7px; padding: 8px 11px; border-radius: 9px; }
 .profile-album-toolbar > button.primary, .profile-album-queue-heading button.primary { background: var(--accent); color: var(--accent-contrast); box-shadow: 0 5px 18px rgba(var(--accent-rgb),.18); }
+.profile-album-toolbar > button.danger { background: rgba(179,66,76,.12); color: #ff9299; }
+.profile-album-toolbar > button.danger:hover { background: rgba(179,66,76,.2); }
 .profile-album-toolbar > small { color: var(--faint); font-size: 10.5px; }
 .profile-album-queue { display: flex; flex-direction: column; gap: 10px; padding: 11px; border: 1px solid rgba(var(--accent-rgb),.18); border-radius: 12px; background: rgba(var(--accent-rgb),.055); }
 .profile-album-queue-heading { display: flex; min-width: 0; align-items: center; gap: 12px; }

@@ -6324,6 +6324,7 @@ function ProfileAlbumDialog({
   const [pendingUploads, setPendingUploads] = useState<PendingAlbumUpload[]>([]);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [uploadIndex, setUploadIndex] = useState(0);
+  const [clearing, setClearing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const uploadController = useRef<AbortController | null>(null);
@@ -6553,18 +6554,37 @@ function ProfileAlbumDialog({
     }
   }
 
+  async function clearAlbum() {
+    if (!album || uploadProgress !== null || clearing) return;
+    if (!window.confirm("Clear every item from your album? This cannot be undone.")) return;
+    setClearing(true);
+    setError(null);
+    try {
+      await save([]);
+    } catch (cause) {
+      setError(message(cause));
+    } finally {
+      setClearing(false);
+    }
+  }
+
+  const displayedItemCount = data ? items.length : album?.item_count ?? 0;
   const content = (
     <>
       {!embedded && <DialogHeading
         icon={<Images />}
         title={`${person.username}'s album`}
-        detail={`${items.length} of 48 ${items.length === 1 ? "item" : "items"}`}
+        detail={`${displayedItemCount} of 48 ${displayedItemCount === 1 ? "item" : "items"}`}
       />}
       {editable && (
         <div className="profile-album-toolbar">
-          <button className="primary" disabled={uploadProgress !== null || items.length + pendingUploads.length >= 48 || pendingUploads.length >= 10} onClick={() => fileInput.current?.click()}>
+          <button className="primary" disabled={clearing || uploadProgress !== null || items.length + pendingUploads.length >= 48 || pendingUploads.length >= 10} onClick={() => fileInput.current?.click()}>
             <Plus size={15} /> select photos or videos
           </button>
+          {album && <button className="danger" disabled={clearing || uploadProgress !== null} onClick={() => void clearAlbum()}>
+            {clearing ? <LoaderCircle className="spinner" size={14} /> : <Trash2 size={14} />}
+            {clearing ? "clearing album" : "clear album"}
+          </button>}
           <small>{pendingUploads.length
             ? `${pendingUploads.length} of 10 selected`
             : embedded

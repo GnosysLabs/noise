@@ -2713,7 +2713,13 @@ impl NoiseClient {
         let self_public_key = identity.public_key_base64();
         let relays = relay_list(relays)?;
         let old_album = state.profile.album.clone();
-        let old_items = if let Some(album) = old_album.as_ref() {
+        let old_items = if items.is_empty() {
+            // Clearing an album must remain possible even when its metadata
+            // predates the current streaming storage format. The signed
+            // profile update removes the reference; legacy item blobs can
+            // expire from storage independently.
+            Vec::new()
+        } else if let Some(album) = old_album.as_ref() {
             self.open_profile_album(&self_public_key, album)
                 .await?
                 .items
