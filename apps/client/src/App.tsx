@@ -632,6 +632,97 @@ function useComposerUpload(key: string) {
   return { ...state, setAttachment, setProgress, setController };
 }
 
+function hasTransferredFiles(transfer: DataTransfer) {
+  return Array.from(transfer.types).includes("Files");
+}
+
+function firstTransferredFile(files: FileList | null | undefined) {
+  const all = Array.from(files ?? []);
+  return all.find((file) => /^(image|video|audio)\//.test(file.type))
+    ?? all[0]
+    ?? null;
+}
+
+function firstClipboardFile(clipboard: DataTransfer | null) {
+  const listed = firstTransferredFile(clipboard?.files);
+  if (listed) return listed;
+  const itemFiles = Array.from(clipboard?.items ?? [])
+    .filter((item) => item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => Boolean(file));
+  return itemFiles.find((file) => /^(image|video|audio)\//.test(file.type))
+    ?? itemFiles[0]
+    ?? null;
+}
+
+function useComposerMediaIntake(
+  active: boolean,
+  canAccept: boolean,
+  onMedia: (file: File) => void,
+) {
+  const [dragging, setDragging] = useState(false);
+  const onMediaRef = useRef(onMedia);
+  onMediaRef.current = onMedia;
+
+  useEffect(() => {
+    if (!active) {
+      setDragging(false);
+      return;
+    }
+    let dragDepth = 0;
+    const resetDrag = () => {
+      dragDepth = 0;
+      setDragging(false);
+    };
+    const onDragEnter = (event: DragEvent) => {
+      if (!event.dataTransfer || !hasTransferredFiles(event.dataTransfer)) return;
+      event.preventDefault();
+      dragDepth += 1;
+      if (canAccept) setDragging(true);
+    };
+    const onDragOver = (event: DragEvent) => {
+      if (!event.dataTransfer || !hasTransferredFiles(event.dataTransfer)) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = canAccept ? "copy" : "none";
+    };
+    const onDragLeave = (event: DragEvent) => {
+      if (!event.dataTransfer || !hasTransferredFiles(event.dataTransfer)) return;
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (dragDepth === 0) setDragging(false);
+    };
+    const onDrop = (event: DragEvent) => {
+      if (!event.dataTransfer || !hasTransferredFiles(event.dataTransfer)) return;
+      event.preventDefault();
+      resetDrag();
+      if (!canAccept) return;
+      const file = firstTransferredFile(event.dataTransfer.files);
+      if (file) onMediaRef.current(file);
+    };
+    const onPaste = (event: ClipboardEvent) => {
+      const file = firstClipboardFile(event.clipboardData);
+      if (!file) return;
+      event.preventDefault();
+      if (canAccept) onMediaRef.current(file);
+    };
+    window.addEventListener("dragenter", onDragEnter);
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("dragleave", onDragLeave);
+    window.addEventListener("drop", onDrop);
+    window.addEventListener("paste", onPaste);
+    window.addEventListener("blur", resetDrag);
+    return () => {
+      window.removeEventListener("dragenter", onDragEnter);
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("dragleave", onDragLeave);
+      window.removeEventListener("drop", onDrop);
+      window.removeEventListener("paste", onPaste);
+      window.removeEventListener("blur", resetDrag);
+    };
+  }, [active, canAccept]);
+
+  return dragging;
+}
+
 type MediaPreview = {
   dataBase64: string;
   mimeType: "image/jpeg";
@@ -1101,6 +1192,11 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const clearRecoveredRelayError = useCallback(() => {
+    setError((current) =>
+      current && isRelayConnectivityError(current) ? null : current
+    );
+  }, []);
   const [presenceStatuses, setPresenceStatuses] = useState<Map<string, PresenceStatus>>(
     () => new Map(),
   );
@@ -1154,6 +1250,18 @@ export default function App() {
   const lastPresenceActivityAt = useRef(Date.now());
   const selfPresenceActive = useRef(true);
   const [selfPresenceStatus, setSelfPresenceStatus] = useState<PresenceStatus>("online");
+
+  useEffect(() => {
+    if (!error || !isRelayConnectivityError(error)) return;
+    if (summary) {
+      setError(null);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setError((current) => current === error ? null : current);
+    }, 6_000);
+    return () => window.clearTimeout(timer);
+  }, [error, summary]);
 
   const scheduleAccountCacheSync = useCallback(() => {
     if (accountCacheSyncTimer.current !== null) {
@@ -1529,6 +1637,7 @@ export default function App() {
       interruptible,
     });
     if (!inbox) return;
+    clearRecoveredRelayError();
     // The Rust client has already fetched and decrypted these messages. Keep them
     // even if another UI selection changed while that work was in flight, so an
     // unread badge can never point at a thread that still needs another fetch.
@@ -1541,7 +1650,7 @@ export default function App() {
       ?? inbox.summary.directs.find((direct) => direct.is_active)?.public_key;
     const active = inbox.summary.directs.find((direct) => direct.public_key === activePublicKey);
     if (markActiveRead && active?.has_unread) await markDirectRead(active.public_key);
-  }, [applyDirectInbox, markDirectRead]);
+  }, [applyDirectInbox, clearRecoveredRelayError, markDirectRead]);
 
   const refresh = useCallback(async () => {
     if (groupSelectionInFlight.current) return;
@@ -1588,6 +1697,7 @@ export default function App() {
       }
       if (generation !== refreshGeneration.current) return;
       if (latestActivity) {
+        clearRecoveredRelayError();
         setSummary(latestActivity.summary);
         if (latestActivity.conversation) {
           groupConversationCache.current.set(
@@ -1632,6 +1742,7 @@ export default function App() {
       const reconciled = await noise<LocalSummary>({ action: "status" });
       if (generation !== refreshGeneration.current) return;
       if (latestActivity?.conversation) {
+        clearRecoveredRelayError();
         groupConversationCache.current.set(
           activeGroup.group_id,
           latestActivity.conversation,
@@ -1662,7 +1773,7 @@ export default function App() {
     setSummary(local);
     setLoading(false);
     await syncDirectInbox(true);
-  }, [sidebarMode, syncDirectInbox]);
+  }, [clearRecoveredRelayError, sidebarMode, syncDirectInbox]);
 
   const loadOlderGroupHistory = useCallback(async (groupId: string) => {
     try {
@@ -2617,6 +2728,7 @@ export default function App() {
               key={`${selectedConversation.group.group_id}:${effectiveTopicId ?? "general"}`}
               conversation={selectedConversation}
               topic={selectedTopic}
+              active={sidebarMode === "groups" && dialog === null}
               busy={busy || pendingGroupId === selectedConversation.group.group_id}
               hasBackground={Boolean(appBackgroundSource)}
               canEditGroup={selectedConversation.group.owner_public_key === summary.identity.public_key}
@@ -2760,6 +2872,7 @@ export default function App() {
               key={selectedDirectConversation.contact.public_key}
               conversation={selectedDirectConversation}
               contact={selectedDirectContact ?? selectedDirectConversation.contact}
+              active={sidebarMode === "directs" && dialog === null}
               busy={busy}
               self={summary.identity}
               selfPresence={selfPresenceStatus}
@@ -3777,6 +3890,7 @@ function useAutosizeComposer(
 function ConversationPanel({
   conversation,
   topic,
+  active,
   busy,
   hasBackground,
   canEditGroup,
@@ -3803,6 +3917,7 @@ function ConversationPanel({
 }: {
   conversation: Conversation;
   topic: TopicSummary | null;
+  active: boolean;
   busy: boolean;
   hasBackground: boolean;
   canEditGroup: boolean;
@@ -3900,7 +4015,7 @@ function ConversationPanel({
       {member.public_key !== selfPublicKey && <button className="member-actions" aria-label={`actions for ${member.username}`} onClick={(event) => { const rect = event.currentTarget.getBoundingClientRect(); setMemberMenu({ member, x: rect.right, y: rect.bottom + 4 }); }}><MoreHorizontal size={15} /></button>}
     </div>
   );
-  async function chooseMedia(file?: File) {
+  const chooseMedia = useCallback((file?: File) => {
     if (!file) return;
     setAttachmentError(null);
     if (!/^(image|video|audio)\//.test(file.type)) {
@@ -3913,7 +4028,12 @@ function ConversationPanel({
     }
     setAttachment(preparePendingMedia(file));
     if (fileInput.current) fileInput.current.value = "";
-  }
+  }, [setAttachment]);
+  const mediaDragging = useComposerMediaIntake(
+    active,
+    canSendMedia && !busy && uploadProgress === null,
+    chooseMedia,
+  );
   async function chooseMediaFromDevice() {
     if (!isTauri) {
       fileInput.current?.click();
@@ -3953,6 +4073,7 @@ function ConversationPanel({
   }
   return (
     <div className={`conversation group-conversation ${hasBackground ? "has-background" : ""}`}>
+      {mediaDragging && <div className="media-drop-overlay" aria-hidden="true"><Images size={34} /><strong>drop media to attach</strong><span>images, video, or audio</span></div>}
       <header className="chat-header" data-tauri-drag-region>
         <div className="group-identity static" data-tauri-drag-region>
           <Avatar name={conversation.group.name} image={conversation.group.avatar} size={36} square />
@@ -4081,7 +4202,7 @@ function ConversationPanel({
   );
 }
 
-function DirectConversationPanel({ conversation, contact, busy, self, selfPresence, contactPresence, onPerson, onAlbum, onBlock, onDelete, onDownload, onSend }: { conversation: DirectConversation; contact: DirectSummary; busy: boolean; self: IdentitySummary; selfPresence: PresenceStatus; contactPresence: PresenceStatus; onPerson: (person: PersonSummary) => void; onAlbum: (person: PersonSummary) => void; onBlock: (person: PersonSummary) => void; onDelete: () => void; onDownload: (message: MessageSummary) => Promise<boolean>; onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null, signal: AbortSignal) => Promise<boolean> }) {
+function DirectConversationPanel({ conversation, contact, active, busy, self, selfPresence, contactPresence, onPerson, onAlbum, onBlock, onDelete, onDownload, onSend }: { conversation: DirectConversation; contact: DirectSummary; active: boolean; busy: boolean; self: IdentitySummary; selfPresence: PresenceStatus; contactPresence: PresenceStatus; onPerson: (person: PersonSummary) => void; onAlbum: (person: PersonSummary) => void; onBlock: (person: PersonSummary) => void; onDelete: () => void; onDownload: (message: MessageSummary) => Promise<boolean>; onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null, signal: AbortSignal) => Promise<boolean> }) {
   const [draft, setDraft] = useState("");
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const composerUploadKey = `direct:${contact.public_key}`;
@@ -4102,7 +4223,7 @@ function DirectConversationPanel({ conversation, contact, busy, self, selfPresen
     contact.public_key,
     conversation.messages,
   );
-  async function chooseMedia(file?: File) {
+  const chooseMedia = useCallback((file?: File) => {
     if (!file) return;
     setAttachmentError(null);
     if (!/^(image|video|audio)\//.test(file.type)) {
@@ -4115,7 +4236,12 @@ function DirectConversationPanel({ conversation, contact, busy, self, selfPresen
     }
     setAttachment(preparePendingMedia(file));
     if (fileInput.current) fileInput.current.value = "";
-  }
+  }, [setAttachment]);
+  const mediaDragging = useComposerMediaIntake(
+    active,
+    contact.accepts_direct_messages && !busy && uploadProgress === null,
+    chooseMedia,
+  );
   async function chooseMediaFromDevice() {
     if (!isTauri) {
       fileInput.current?.click();
@@ -4156,6 +4282,7 @@ function DirectConversationPanel({ conversation, contact, busy, self, selfPresen
   const person = { public_key: contact.public_key, username: contact.username, bio: contact.bio, avatar: contact.avatar, album: contact.album, accepts_direct_messages: contact.accepts_direct_messages, presence_status: contactPresence };
   return (
     <div className="conversation direct-conversation">
+      {mediaDragging && <div className="media-drop-overlay" aria-hidden="true"><Images size={34} /><strong>drop media to attach</strong><span>images, video, or audio</span></div>}
       <header className="chat-header" data-tauri-drag-region>
         <div className="group-identity static" data-tauri-drag-region>
           <PresenceAvatar name={contact.username} image={contact.avatar} size={36} status={contactPresence} />
@@ -6604,6 +6731,10 @@ async function cancelMediaDownloads() {
 
 function isSupersededLoading(cause: unknown) {
   return message(cause).includes("loading superseded");
+}
+
+function isRelayConnectivityError(error: string) {
+  return error.toLowerCase().includes("no relay was reachable");
 }
 
 async function syncGroupActivity(groupId: string): Promise<GroupActivityResult | null> {
