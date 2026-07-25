@@ -431,6 +431,7 @@ let mediaCacheGeneration = 0;
 
 const INITIAL_MESSAGE_COUNT = 24;
 const MESSAGE_PAGE_SIZE = 40;
+const GENERAL_TOPIC_LOADING_KEY = "__noise_general_topic__";
 type MediaLoadPriority = "visible" | "nearby" | "background";
 const MEDIA_PRIORITY_RANK: Record<MediaLoadPriority, number> = {
   visible: 0,
@@ -2693,25 +2694,22 @@ export default function App() {
   async function selectTopic(topic: TopicSummary | null) {
     if (!activeGroupId || !conversation || conversation.group.group_id !== activeGroupId) return;
     const topicId = topic?.topic_id ?? null;
+    const loadingKey = topicId ?? GENERAL_TOPIC_LOADING_KEY;
     const generation = ++topicSelectionGeneration.current;
-    const hasCachedMessages = topicId
-      ? conversation.messages.some((item) => item.topic_id === topicId)
-      : true;
+    const hasCachedMessages = conversation.messages.some(
+      (item) => (item.topic_id ?? null) === topicId,
+    );
     setActiveTopicId(topicId);
     // Cached topic navigation is complete immediately. Relay reconciliation
     // continues below without dimming an already-usable topic.
     setPendingTopicId(null);
     setError(null);
-    if (!topicId) {
-      setPendingTopicId(null);
-      setLoadingTopicId(null);
-      void markActiveGroupRead(activeGroupId);
-      return;
-    }
-    setLoadingTopicId(hasCachedMessages ? null : topicId);
+    setLoadingTopicId(hasCachedMessages ? null : loadingKey);
     try {
       await cancelBackgroundLoading();
-      const activity = await syncTopicActivity(activeGroupId, topicId);
+      const activity = topicId
+        ? await syncTopicActivity(activeGroupId, topicId)
+        : await syncGroupActivity(activeGroupId);
       if (generation !== topicSelectionGeneration.current
         || desiredGroupIdRef.current !== activeGroupId) return;
       if (activity) {
@@ -2721,7 +2719,11 @@ export default function App() {
           setConversation(activity.conversation);
         }
       }
-      void markActiveTopicRead(activeGroupId, topicId);
+      if (topicId) {
+        void markActiveTopicRead(activeGroupId, topicId);
+      } else {
+        void markActiveGroupRead(activeGroupId);
+      }
     } catch (cause) {
       if (generation === topicSelectionGeneration.current && !isSupersededLoading(cause)) {
         setError(message(cause));
@@ -3072,9 +3074,9 @@ export default function App() {
               key={`${selectedConversation.group.group_id}:${effectiveTopicId ?? "general"}`}
               conversation={selectedConversation}
               topic={selectedTopic}
-              loadingTopic={Boolean(
-                selectedTopic && loadingTopicId === selectedTopic.topic_id
-              )}
+              loadingTopic={
+                loadingTopicId === (selectedTopic?.topic_id ?? GENERAL_TOPIC_LOADING_KEY)
+              }
               active={sidebarMode === "groups" && dialog === null}
               busy={busy || pendingGroupId === selectedConversation.group.group_id}
               hasBackground={Boolean(appBackgroundSource)}
