@@ -7,13 +7,24 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use axum::{
+    Router,
+    body::Body,
+    extract::{Path as AxumPath, State},
+    http::{HeaderMap, Method, Response, StatusCode, header},
+    routing::any,
+};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
+use rand::random;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tauri::Manager;
@@ -22,6 +33,7 @@ use tauri_plugin_notification::NotificationExt;
 
 static NOTIFICATION_WATCHERS_STARTED: AtomicBool = AtomicBool::new(false);
 static NEXT_MEDIA_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+static MEDIA_SERVER_BASE_URL: OnceLock<String> = OnceLock::new();
 
 #[derive(Clone, Default)]
 struct MediaStreamRegistry(Arc<Mutex<HashMap<String, Value>>>);
@@ -158,9 +170,10 @@ fn register_media_stream(
         streams.remove(&oldest);
     }
     streams.insert(id.clone(), request);
-    Ok(format!(
-        "noise-media://localhost/{id}/media.{file_extension}"
-    ))
+    let base_url = MEDIA_SERVER_BASE_URL
+        .get()
+        .ok_or_else(|| "desktop media server is not ready".to_owned())?;
+    Ok(format!("{base_url}/noise-media/{id}/media.{file_extension}"))
 }
 
 #[tauri::command]
@@ -359,32 +372,30 @@ async fn read_prepared_media(
     .map_err(|error| error.to_string())?
 }
 
-fn media_stream_response(
+#[derive(Clone)]
+struct MediaHttpState {
     registry: MediaStreamRegistry,
     app: tauri::AppHandle,
-    request: tauri::http::Request<Vec<u8>>,
-    responder: tauri::UriSchemeResponder,
-) {
-    let id = request
-        .uri()
-        .path()
-        .trim_start_matches('/')
-        .split('/')
-        .next()
-        .unwrap_or_default()
-        .to_owned();
-    let registered = registry
+    token: String,
+}
+
+async fn media_http_response(
+    State(state): State<MediaHttpState>,
+    AxumPath((token, id, _file_name)): AxumPath<(String, String, String)>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if token != state.token {
+        return media_http_error(StatusCode::NOT_FOUND, "media stream is unavailable");
+    }
+    let registered = state
+        .registry
         .0
         .lock()
         .ok()
         .and_then(|streams| streams.get(&id).cloned());
     let Some(mut core_request) = registered else {
-        return responder.respond(
-            tauri::http::Response::builder()
-                .status(tauri::http::StatusCode::NOT_FOUND)
-                .body(b"media stream is unavailable".to_vec())
-                .expect("media protocol response is valid"),
-        );
+        return media_http_error(StatusCode::NOT_FOUND, "media stream is unavailable");
     };
     let total = core_request
         .pointer("/attachment/byte_length")
@@ -395,39 +406,33 @@ fn media_stream_response(
         .and_then(Value::as_str)
         .unwrap_or("application/octet-stream")
         .to_owned();
-    if request.method() == tauri::http::Method::HEAD {
-        return responder.respond(
-            tauri::http::Response::builder()
-                .status(tauri::http::StatusCode::OK)
-                .header(tauri::http::header::CONTENT_TYPE, mime_type)
-                .header(tauri::http::header::CONTENT_LENGTH, total)
-                .header(tauri::http::header::ACCEPT_RANGES, "bytes")
-                .header(tauri::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .body(Vec::new())
-                .expect("media protocol response is valid"),
-        );
+    if method == Method::HEAD {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, mime_type)
+            .header(header::CONTENT_LENGTH, total)
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::empty())
+            .expect("media HTTP response is valid");
     }
-    if total == 0 {
-        return responder.respond(
-            tauri::http::Response::builder()
-                .status(tauri::http::StatusCode::BAD_REQUEST)
-                .body(b"media stream has an invalid length".to_vec())
-                .expect("media protocol response is valid"),
+    if method != Method::GET || total == 0 {
+        return media_http_error(
+            StatusCode::BAD_REQUEST,
+            "media stream request is invalid",
         );
     }
     let (start, end) = requested_media_range(
-        request
-            .headers()
-            .get(tauri::http::header::RANGE)
+        headers
+            .get(header::RANGE)
             .and_then(|value| value.to_str().ok()),
         total,
     );
     let Some(object) = core_request.as_object_mut() else {
-        return responder.respond(
-            tauri::http::Response::builder()
-                .status(tauri::http::StatusCode::BAD_REQUEST)
-                .body(b"media stream request is invalid".to_vec())
-                .expect("media protocol response is valid"),
+        return media_http_error(
+            StatusCode::BAD_REQUEST,
+            "media stream request is invalid",
         );
     };
     object.insert(
@@ -437,77 +442,62 @@ fn media_stream_response(
     object.insert("offset".to_owned(), Value::from(start));
     object.insert("byte_length".to_owned(), Value::from(end - start + 1));
 
-    tauri::async_runtime::spawn(async move {
-        let response = match noise_request_data(&app, core_request).await {
-            Ok(data) => data,
-            Err(error) => {
-                responder.respond(
-                    tauri::http::Response::builder()
-                        .status(tauri::http::StatusCode::BAD_GATEWAY)
-                        .header(tauri::http::header::CONTENT_TYPE, "text/plain")
-                        .body(error.into_bytes())
-                        .expect("media protocol response is valid"),
-                );
-                return;
-            }
-        };
-        let decoded = response
-            .get("data_base64")
-            .and_then(Value::as_str)
-            .and_then(|value| STANDARD.decode(value).ok());
-        let Some(mut body) = decoded else {
-            responder.respond(
-                tauri::http::Response::builder()
-                    .status(tauri::http::StatusCode::BAD_GATEWAY)
-                    .body(b"relay returned an invalid media range".to_vec())
-                    .expect("media protocol response is valid"),
-            );
-            return;
-        };
-        let maximum_length = (end - start + 1) as usize;
-        if body.len() > maximum_length {
-            body.truncate(maximum_length);
-        }
-        if body.is_empty() {
-            responder.respond(
-                tauri::http::Response::builder()
-                    .status(tauri::http::StatusCode::BAD_GATEWAY)
-                    .body(b"relay returned an empty media range".to_vec())
-                    .expect("media protocol response is valid"),
-            );
-            return;
-        }
-        let actual_end = start
-            .saturating_add(body.len() as u64)
-            .saturating_sub(1)
-            .min(total.saturating_sub(1));
-        responder.respond(
-            tauri::http::Response::builder()
-                .status(tauri::http::StatusCode::PARTIAL_CONTENT)
-                .header(tauri::http::header::CONTENT_TYPE, mime_type)
-                .header(tauri::http::header::CONTENT_LENGTH, body.len())
-                .header(tauri::http::header::ACCEPT_RANGES, "bytes")
-                .header(
-                    tauri::http::header::CONTENT_RANGE,
-                    format!("bytes {start}-{actual_end}/{total}"),
-                )
-                .header(tauri::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .header(
-                    tauri::http::header::CACHE_CONTROL,
-                    "private, max-age=31536000",
-                )
-                .body(body)
-                .expect("media protocol response is valid"),
+    let response = match noise_request_data(&state.app, core_request).await {
+        Ok(data) => data,
+        Err(error) => return media_http_error(StatusCode::BAD_GATEWAY, &error),
+    };
+    let decoded = response
+        .get("data_base64")
+        .and_then(Value::as_str)
+        .and_then(|value| STANDARD.decode(value).ok());
+    let Some(mut body) = decoded else {
+        return media_http_error(
+            StatusCode::BAD_GATEWAY,
+            "relay returned an invalid media range",
         );
-    });
+    };
+    let maximum_length = (end - start + 1) as usize;
+    if body.len() > maximum_length {
+        body.truncate(maximum_length);
+    }
+    if body.is_empty() {
+        return media_http_error(
+            StatusCode::BAD_GATEWAY,
+            "relay returned an empty media range",
+        );
+    }
+    let actual_end = start
+        .saturating_add(body.len() as u64)
+        .saturating_sub(1)
+        .min(total.saturating_sub(1));
+    Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header(header::CONTENT_TYPE, mime_type)
+        .header(header::CONTENT_LENGTH, body.len())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{actual_end}/{total}"),
+        )
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(body))
+        .expect("media HTTP response is valid")
+}
+
+fn media_http_error(status: StatusCode, message: &str) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(message.to_owned()))
+        .expect("media HTTP error response is valid")
 }
 
 fn requested_media_range(range: Option<&str>, total: u64) -> (u64, u64) {
-    // WebKit normally needs about a megabyte before it emits the first video
-    // frame. V2 stores that window as four independently encrypted 256 KiB
-    // blocks, which the core fetches concurrently. Returning only one block
-    // made WebKit issue four serial protocol requests and added several relay
-    // round trips to every cold start.
+    // Match the web service worker: standard HTTP lets WebKit overlap range
+    // requests without relying on oversized custom-protocol responses.
     const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
     let requested = range
         .and_then(|value| value.strip_prefix("bytes="))
@@ -1013,20 +1003,45 @@ async fn ensure_native_notification_permission(
 
 fn main() {
     let media_streams = MediaStreamRegistry::default();
-    let protocol_streams = media_streams.clone();
+    let media_listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("desktop media server can bind to localhost");
+    media_listener
+        .set_nonblocking(true)
+        .expect("desktop media server can run asynchronously");
+    let media_address = media_listener
+        .local_addr()
+        .expect("desktop media server has a local address");
+    let media_token = URL_SAFE_NO_PAD.encode(random::<[u8; 32]>());
+    MEDIA_SERVER_BASE_URL
+        .set(format!("http://{media_address}/{media_token}"))
+        .expect("desktop media server is configured once");
+    let server_streams = media_streams.clone();
+    let server_token = media_token.clone();
     tauri::Builder::default()
         .manage(media_streams)
-        .register_asynchronous_uri_scheme_protocol(
-            "noise-media",
-            move |context, request, responder| {
-                media_stream_response(
-                    protocol_streams.clone(),
-                    context.app_handle().clone(),
-                    request,
-                    responder,
-                );
-            },
-        )
+        .setup(move |app| {
+            let state = MediaHttpState {
+                registry: server_streams,
+                app: app.handle().clone(),
+                token: server_token,
+            };
+            let router = Router::new()
+                .route("/{token}/noise-media/{id}/{file_name}", any(media_http_response))
+                .with_state(state);
+            tauri::async_runtime::spawn(async move {
+                let listener = match tokio::net::TcpListener::from_std(media_listener) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        eprintln!("desktop media server could not start: {error}");
+                        return;
+                    }
+                };
+                if let Err(error) = axum::serve(listener, router).await {
+                    eprintln!("desktop media server stopped: {error}");
+                }
+            });
+            Ok(())
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())

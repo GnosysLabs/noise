@@ -1374,6 +1374,12 @@ impl GroupDeletion {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardedFrom {
+    pub public_key: String,
+    pub username: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GroupEventPayload {
@@ -1450,6 +1456,8 @@ pub enum GroupEventPayload {
         attachment: Option<MediaAttachment>,
         #[serde(default)]
         reply_to_message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        forwarded_from: Option<ForwardedFrom>,
     },
     DirectThreadDeleted {
         recipient_public_key: String,
@@ -1466,6 +1474,8 @@ pub enum GroupEventPayload {
         attachment: Option<MediaAttachment>,
         #[serde(default)]
         reply_to_message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        forwarded_from: Option<ForwardedFrom>,
     },
     TopicMessage {
         topic_id: String,
@@ -1474,6 +1484,8 @@ pub enum GroupEventPayload {
         attachment: Option<MediaAttachment>,
         #[serde(default)]
         reply_to_message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        forwarded_from: Option<ForwardedFrom>,
     },
 }
 
@@ -1768,6 +1780,31 @@ impl SignedEvent {
         reply_to_message_id: Option<String>,
         author_sequence: u64,
     ) -> Result<Self, NoiseError> {
+        Self::direct_message_forwarded(
+            identity,
+            mailbox,
+            recipient_public_key,
+            sender_profile,
+            text,
+            attachment,
+            reply_to_message_id,
+            None,
+            author_sequence,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn direct_message_forwarded(
+        identity: &Identity,
+        mailbox: &GroupMembership,
+        recipient_public_key: impl Into<String>,
+        sender_profile: &Profile,
+        text: impl Into<String>,
+        attachment: Option<MediaAttachment>,
+        reply_to_message_id: Option<String>,
+        forwarded_from: Option<ForwardedFrom>,
+        author_sequence: u64,
+    ) -> Result<Self, NoiseError> {
         Self::create_legacy(
             identity,
             mailbox,
@@ -1777,6 +1814,7 @@ impl SignedEvent {
                 text: text.into(),
                 attachment,
                 reply_to_message_id,
+                forwarded_from,
             },
             author_sequence,
         )
@@ -1841,6 +1879,7 @@ impl SignedEvent {
                 text: text.into(),
                 attachment: None,
                 reply_to_message_id,
+                forwarded_from: None,
             },
             author_sequence,
         )
@@ -1871,6 +1910,7 @@ impl SignedEvent {
                 text: text.into(),
                 attachment: Some(attachment),
                 reply_to_message_id,
+                forwarded_from: None,
             },
             author_sequence,
         )
@@ -2213,6 +2253,7 @@ pub struct AcceptedMessage {
     pub text: String,
     pub attachment: Option<MediaAttachment>,
     pub reply_to_message_id: Option<String>,
+    pub forwarded_from: Option<ForwardedFrom>,
     pub topic_id: Option<String>,
     pub created_at_millis: u64,
 }
@@ -2716,6 +2757,7 @@ impl GroupState {
                     text,
                     attachment,
                     reply_to_message_id,
+                    forwarded_from,
                 } => {
                     let Some(member) = state.members.get(&event.author_public_key) else {
                         state.rejected_events += 1;
@@ -2723,6 +2765,9 @@ impl GroupState {
                     };
                     if text.is_empty() && attachment.is_none()
                         || attachment.as_ref().is_some_and(|media| !valid_media(media))
+                        || forwarded_from
+                            .as_ref()
+                            .is_some_and(|source| !valid_forwarded_from(source))
                         || reply_to_message_id.as_ref().is_some_and(|message_id| {
                             !valid_message_id(message_id)
                                 || !state
@@ -2757,6 +2802,7 @@ impl GroupState {
                         text,
                         attachment,
                         reply_to_message_id,
+                        forwarded_from,
                         topic_id: None,
                         created_at_millis: event.created_at_millis,
                     });
@@ -2766,6 +2812,7 @@ impl GroupState {
                     text,
                     attachment,
                     reply_to_message_id,
+                    forwarded_from,
                 } => {
                     let Some(member) = state.members.get(&event.author_public_key) else {
                         state.rejected_events += 1;
@@ -2784,6 +2831,9 @@ impl GroupState {
                         || (topic.locked && !is_owner && !is_moderator)
                         || text.is_empty() && attachment.is_none()
                         || attachment.as_ref().is_some_and(|media| !valid_media(media))
+                        || forwarded_from
+                            .as_ref()
+                            .is_some_and(|source| !valid_forwarded_from(source))
                         || reply_to_message_id.as_ref().is_some_and(|message_id| {
                             !valid_message_id(message_id)
                                 || !state.messages.iter().any(|message| {
@@ -2812,6 +2862,7 @@ impl GroupState {
                         text,
                         attachment,
                         reply_to_message_id,
+                        forwarded_from,
                         topic_id: Some(topic_id),
                         created_at_millis: event.created_at_millis,
                     });
@@ -2901,6 +2952,13 @@ pub fn media_preview_is_valid(media: &MediaAttachment) -> bool {
 
 fn valid_message_id(message_id: &str) -> bool {
     message_id.len() == 64 && message_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_forwarded_from(source: &ForwardedFrom) -> bool {
+    decode_array::<32>(&source.public_key, "forwarded account public key").is_ok()
+        && !source.username.trim().is_empty()
+        && source.username.chars().count() <= 32
+        && !source.username.chars().any(char::is_control)
 }
 
 pub fn valid_reaction_emoji(emoji: &str) -> bool {
@@ -3219,6 +3277,10 @@ mod tests {
                 text: "hello topic".into(),
                 attachment: None,
                 reply_to_message_id: None,
+                forwarded_from: Some(ForwardedFrom {
+                    public_key: public_key.clone(),
+                    username: "alice".into(),
+                }),
             },
             3,
         )
@@ -3237,6 +3299,13 @@ mod tests {
         assert_eq!(state.topics[&topic_id].icon, "📣");
         assert_eq!(state.messages[0].topic_id.as_deref(), Some(topic_id.as_str()));
         assert_eq!(state.messages[0].text, "hello topic");
+        assert_eq!(
+            state.messages[0]
+                .forwarded_from
+                .as_ref()
+                .map(|source| source.username.as_str()),
+            Some("alice")
+        );
         assert_eq!(state.rejected_events, 0);
 
         let mut forged = created;

@@ -1,4 +1,6 @@
-use noise_client::{MediaAttachment, NoiseClient, ProfileAlbum, ProfileAlbumItem, ProfileImage};
+use noise_client::{
+    ForwardedFrom, MediaAttachment, NoiseClient, ProfileAlbum, ProfileAlbumItem, ProfileImage,
+};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use wasm_bindgen::prelude::*;
@@ -234,10 +236,32 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .await
                 .map_err(|error| error.to_string())?,
         ),
+        "upload_media_chunk_to_group" => data(
+            client
+                .upload_media_chunk_to_group(
+                    STATE_PATH,
+                    &required::<String>(&request, "group_id")?,
+                    required::<String>(&request, "data_base64")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
         "upload_direct_media_chunk" => data(
             client
                 .upload_direct_media_chunk(
                     STATE_PATH,
+                    required::<String>(&request, "data_base64")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "upload_direct_media_chunk_to" => data(
+            client
+                .upload_direct_media_chunk_to(
+                    STATE_PATH,
+                    &required::<String>(&request, "public_key")?,
                     required::<String>(&request, "data_base64")?,
                     relays(&request)?,
                 )
@@ -310,6 +334,24 @@ async fn dispatch(request: Value) -> Result<Value, String> {
             }
             .map_err(|error| error.to_string())?;
             data(sent)
+        }
+        "say_to_group" => {
+            let group_id = required::<String>(&request, "group_id")?;
+            let topic_id = optional::<String>(&request, "topic_id")?;
+            data(
+                client
+                    .say_to_group(
+                        STATE_PATH,
+                        &group_id,
+                        topic_id.as_deref(),
+                        required::<String>(&request, "text")?,
+                        optional::<MediaAttachment>(&request, "attachment")?,
+                        optional::<ForwardedFrom>(&request, "forwarded_from")?,
+                        relays(&request)?,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
         }
         "create_topic" => data(
             client
@@ -450,6 +492,20 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                     required::<String>(&request, "text")?,
                     optional::<MediaAttachment>(&request, "attachment")?,
                     optional::<String>(&request, "reply_to_message_id")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "say_direct_to" => data(
+            client
+                .say_direct_to(
+                    STATE_PATH,
+                    &required::<String>(&request, "public_key")?,
+                    required::<String>(&request, "text")?,
+                    optional::<MediaAttachment>(&request, "attachment")?,
+                    None,
+                    optional::<ForwardedFrom>(&request, "forwarded_from")?,
                     relays(&request)?,
                 )
                 .await

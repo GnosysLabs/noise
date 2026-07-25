@@ -37,19 +37,24 @@ pub fn export_web_state(path: &str) -> Option<Vec<u8>> {
 }
 
 use anyhow::{Context, bail};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
+};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use noise_core::{
     AcceptedMessage, AcceptedTopic, AccountCredentials, AccountVault, EncryptedBlob, GroupDeletion,
-    GroupEventPayload, GroupMembership, GroupPresence, GroupProfile, GroupState, HistoryKeyLink,
-    Identity, InviteRecord, InviteRotation, MlsAccountState, MlsControlLog, MlsEpochRecord,
+    GroupEventPayload, GroupMembership, GroupPresence, GroupProfile, GroupState,
+    HistoryKeyLink, Identity, InviteRecord, InviteRotation, MlsAccountState, MlsControlLog, MlsEpochRecord,
     MlsGroupGenesis, MlsJoinRequest, MlsRemovalReason, MlsRemovalRequest, Profile, SignedEvent,
     StorageManifest, derive_account_credentials, direct_mailbox_id, direct_message_id,
     display_frequency, display_noise_id, encode_blob_for_storage, frequency_locator,
     generate_frequency, generate_noise_id, media_preview_is_valid, normalize_frequency,
     profile_media_scope_id, reconstruct_blob_from_storage_payloads, valid_reaction_emoji,
 };
-pub use noise_core::{MediaAttachment, MediaChunk, ProfileAlbum, ProfileAlbumItem, ProfileImage};
+pub use noise_core::{
+    ForwardedFrom, MediaAttachment, MediaChunk, ProfileAlbum, ProfileAlbumItem, ProfileImage,
+};
 pub use noise_transport::LinkPreview;
 use noise_transport::{
     GATEWAY_HEADER, LinkPreviewRequest, OHTTP_RELAY_PATH, OHTTP_REQUEST_MEDIA_TYPE,
@@ -67,6 +72,9 @@ const ONLINE_PRESENCE_REMAINING_MILLIS: u64 = 15_000;
 const RECENT_GROUP_PRESENCE_MILLIS: u64 = 5 * 60_000;
 const EVENT_REPLICA_SETTLE_MILLIS: u64 = 500;
 const RELAY_REQUEST_TIMEOUT_SECS: u64 = 30;
+#[cfg(not(target_arch = "wasm32"))]
+const MEDIA_CHUNK_DOWNLOAD_CONCURRENCY: usize = 8;
+#[cfg(target_arch = "wasm32")]
 const MEDIA_CHUNK_DOWNLOAD_CONCURRENCY: usize = 4;
 const MAX_MEDIA_RANGE_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(any(target_arch = "wasm32", test))]
@@ -309,6 +317,8 @@ pub struct MessageSummary {
     pub attachment: Option<MediaAttachment>,
     pub reply_to_message_id: Option<String>,
     #[serde(default)]
+    pub forwarded_from: Option<ForwardedFrom>,
+    #[serde(default)]
     pub topic_id: Option<String>,
     pub created_at_millis: u64,
     pub reactions: Vec<ReactionSummary>,
@@ -394,6 +404,8 @@ pub struct DirectMessageSummary {
     pub text: String,
     pub attachment: Option<MediaAttachment>,
     pub reply_to_message_id: Option<String>,
+    #[serde(default)]
+    pub forwarded_from: Option<ForwardedFrom>,
     pub created_at_millis: u64,
 }
 
@@ -421,6 +433,8 @@ pub struct GroupWatch {
     pub revision: u64,
     pub changed: bool,
     #[serde(default)]
+    pub deleted: bool,
+    #[serde(default)]
     pub online_public_keys: Vec<String>,
     #[serde(default)]
     pub recently_active_public_keys: Vec<String>,
@@ -433,6 +447,20 @@ struct RelayGroupWatch {
     #[serde(default)]
     presences: Vec<GroupPresence>,
 }
+
+#[derive(Debug)]
+struct EventPublishFailure {
+    details: String,
+    all_relays_deleted: bool,
+}
+
+impl std::fmt::Display for EventPublishFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "no relay accepted the event ({})", self.details)
+    }
+}
+
+impl std::error::Error for EventPublishFailure {}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReplyNotificationSummary {
@@ -2148,9 +2176,12 @@ impl NoiseClient {
         since: Option<u64>,
         relays: Vec<String>,
     ) -> anyhow::Result<GroupWatch> {
-        let state = load_state(path.as_ref())?;
-        let group = state.active_group()?;
-        self.watch_id(group, since, relay_list(relays)?).await
+        let path = path.as_ref();
+        let state = load_state(path)?;
+        let group = state.active_group()?.clone();
+        drop(state);
+        self.watch_group_membership(path, group, since, relay_list(relays)?)
+            .await
     }
 
     pub async fn watch_group_id(
@@ -2160,13 +2191,48 @@ impl NoiseClient {
         since: Option<u64>,
         relays: Vec<String>,
     ) -> anyhow::Result<GroupWatch> {
-        let state = load_state(path.as_ref())?;
+        let path = path.as_ref();
+        let state = load_state(path)?;
         let group = state
             .groups
             .iter()
             .find(|group| group.group_id == group_id)
+            .cloned()
             .context("unknown group")?;
-        self.watch_id(group, since, relay_list(relays)?).await
+        drop(state);
+        self.watch_group_membership(path, group, since, relay_list(relays)?)
+            .await
+    }
+
+    async fn watch_group_membership(
+        &self,
+        path: &Path,
+        group: GroupMembership,
+        since: Option<u64>,
+        relays: Vec<RelayDescriptor>,
+    ) -> anyhow::Result<GroupWatch> {
+        match self.watch_id(&group, since, relays).await {
+            Ok(change) => Ok(change),
+            Err(error) if error.to_string() == "group has been deleted" => {
+                let mut state = load_state(path)?;
+                if state
+                    .groups
+                    .iter()
+                    .any(|candidate| candidate.group_id == group.group_id)
+                {
+                    state.tombstone_group(&group.group_id);
+                    save_state(path, &state)?;
+                }
+                Ok(GroupWatch {
+                    revision: since.unwrap_or_default(),
+                    changed: true,
+                    deleted: true,
+                    online_public_keys: Vec::new(),
+                    recently_active_public_keys: Vec::new(),
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn heartbeat_presence(
@@ -2306,6 +2372,7 @@ impl NoiseClient {
             .unwrap_or_else(|| "initial".to_owned());
         let endpoint = format!("/v1/groups/{}/watch/{revision}", group.group_id);
 
+        let mut deleted_relays = 0usize;
         for index in 0..relays.len() {
             let Ok(response) = self
                 .relay_request(&relays, index, "GET", &endpoint, &[])
@@ -2314,7 +2381,8 @@ impl NoiseClient {
                 continue;
             };
             if response.status == 410 {
-                bail!("group has been deleted")
+                deleted_relays += 1;
+                continue;
             }
             if (200..300).contains(&response.status)
                 && let Ok(change) = serde_json::from_slice::<RelayGroupWatch>(&response.body)
@@ -2345,10 +2413,14 @@ impl NoiseClient {
                 return Ok(GroupWatch {
                     revision: change.revision,
                     changed: change.changed,
+                    deleted: false,
                     online_public_keys,
                     recently_active_public_keys,
                 });
             }
+        }
+        if deleted_relays == relays.len() {
+            bail!("group has been deleted")
         }
         bail!("no relay could hold the conversation watch")
     }
@@ -2443,6 +2515,7 @@ impl NoiseClient {
                 return Ok(GroupWatch {
                     revision: change.revision,
                     changed: change.changed,
+                    deleted: false,
                     online_public_keys,
                     recently_active_public_keys,
                 });
@@ -2533,18 +2606,34 @@ impl NoiseClient {
                 },
                 sequence,
             )?;
-            profile_events.push(event);
+            profile_events.push((group.group_id, event));
         }
         // Persist the profile and consumed sequences before publication. This
         // prevents a partial multi-group publication from reverting the local
         // profile or reusing a sequence for different event bytes.
         save_state(path, &state)?;
         let mut publications = FuturesUnordered::new();
-        for event in &profile_events {
-            publications.push(self.publish_event(&relays, event));
+        for (group_id, event) in &profile_events {
+            publications.push(async {
+                (
+                    group_id.clone(),
+                    self.publish_event_diagnostic(&relays, event).await,
+                )
+            });
         }
-        while let Some(result) = publications.next().await {
-            result?;
+        let mut failures = Vec::new();
+        while let Some((group_id, result)) = publications.next().await {
+            if let Err(failure) = result {
+                if failure.all_relays_deleted {
+                    state.tombstone_group(&group_id);
+                } else {
+                    failures.push(failure.to_string());
+                }
+            }
+        }
+        save_state(path, &state)?;
+        if !failures.is_empty() {
+            bail!("{}", failures.join("; "))
         }
         state.summary()
     }
@@ -2655,6 +2744,7 @@ impl NoiseClient {
         };
         state.profile.album = new_album.clone();
         state.profile_sequence = state.take_sequence();
+        let mut profile_events = Vec::with_capacity(state.groups.len());
         for group in state.groups.clone() {
             let sequence = state.take_sequence();
             let event = create_group_event(
@@ -2666,9 +2756,32 @@ impl NoiseClient {
                 },
                 sequence,
             )?;
-            self.publish_event(&relays, &event).await?;
+            profile_events.push((group.group_id, event));
         }
         save_state(path, &state)?;
+        let mut publications = FuturesUnordered::new();
+        for (group_id, event) in &profile_events {
+            publications.push(async {
+                (
+                    group_id.clone(),
+                    self.publish_event_diagnostic(&relays, event).await,
+                )
+            });
+        }
+        let mut failures = Vec::new();
+        while let Some((group_id, result)) = publications.next().await {
+            if let Err(failure) = result {
+                if failure.all_relays_deleted {
+                    state.tombstone_group(&group_id);
+                } else {
+                    failures.push(failure.to_string());
+                }
+            }
+        }
+        save_state(path, &state)?;
+        if !failures.is_empty() {
+            bail!("{}", failures.join("; "))
+        }
 
         let retained = items
             .iter()
@@ -3151,20 +3264,36 @@ impl NoiseClient {
         }
         let selected = select_media_chunks(attachment, offset, requested_end);
 
-        // WebKit usually asks for the first two media chunks sequentially
-        // before it starts playback. Warm the next chunk alongside the current
-        // request so the second range can join the same in-flight download or
-        // read it directly from cache.
-        if let Some((index, _, _)) = selected.last()
-            && let Some(chunk) = attachment.chunks.get(index + 1).cloned()
-        {
+        // Tauri WebKit consumes custom-protocol ranges mostly serially. Fill a
+        // multi-chunk lookahead while it plays the current response so the
+        // following request is served from the decrypted cache instead of
+        // stalling on another relay round trip.
+        if let Some((index, _, _)) = selected.last() {
+            let lookahead = attachment
+                .chunks
+                .iter()
+                .skip(index + 1)
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>();
             let client = self.clone();
             let cache_path = cache_path.as_ref().to_owned();
             let scope_id = scope_id.clone();
             tokio::spawn(async move {
-                let _ = client
-                    .fetch_attachment_chunk(&cache_path, &scope_id, &chunk)
-                    .await;
+                let mut downloads = futures_util::stream::iter(
+                    lookahead.into_iter().map(|chunk| {
+                        let cache_path = cache_path.clone();
+                        let scope_id = scope_id.clone();
+                        let client = client.clone();
+                        async move {
+                            client
+                                .fetch_attachment_chunk(&cache_path, &scope_id, &chunk)
+                                .await
+                        }
+                    }),
+                )
+                .buffer_unordered(4);
+                while downloads.next().await.is_some() {}
             });
         }
 
@@ -3478,15 +3607,41 @@ impl NoiseClient {
         data_base64: String,
         relays: Vec<String>,
     ) -> anyhow::Result<MediaChunk> {
-        let state = load_state(path.as_ref())?;
+        let path = path.as_ref();
+        let state = load_state(path)?;
         let group_id = state.active_group()?.group_id.clone();
+        self.upload_media_chunk_to_group(path, &group_id, data_base64, relays)
+            .await
+    }
+
+    pub async fn upload_media_chunk_to_group(
+        &self,
+        path: impl AsRef<Path>,
+        group_id: &str,
+        data_base64: String,
+        relays: Vec<String>,
+    ) -> anyhow::Result<MediaChunk> {
+        let state = load_state(path.as_ref())?;
+        if !state.groups.iter().any(|group| group.group_id == group_id) {
+            bail!("unknown group")
+        }
+        self.upload_media_chunk_to_scope(group_id, data_base64, relays)
+            .await
+    }
+
+    async fn upload_media_chunk_to_scope(
+        &self,
+        scope_id: &str,
+        data_base64: String,
+        relays: Vec<String>,
+    ) -> anyhow::Result<MediaChunk> {
         let data = STANDARD
             .decode(data_base64)
             .context("media chunk encoding is invalid")?;
         if data.is_empty() || data.len() > 1024 * 1024 {
             bail!("media chunks must contain between 1 byte and 1 MiB")
         }
-        let (blob, key_base64) = EncryptedBlob::create_for_group(&data, group_id)?;
+        let (blob, key_base64) = EncryptedBlob::create_for_group(&data, scope_id)?;
         let storage = self
             .store_blob_shards(&relay_list(relays)?, &blob, &key_base64)
             .await?;
@@ -4227,6 +4382,33 @@ impl NoiseClient {
         relays: Vec<String>,
     ) -> anyhow::Result<SentMessageResult> {
         let path = path.as_ref();
+        let public_key = load_state(path)?
+            .active_direct_public_key
+            .clone()
+            .context("choose a direct conversation first")?;
+        self.say_direct_to(
+            path,
+            &public_key,
+            text,
+            attachment,
+            reply_to_message_id,
+            None,
+            relays,
+        )
+        .await
+    }
+
+    pub async fn say_direct_to(
+        &self,
+        path: impl AsRef<Path>,
+        public_key: &str,
+        text: impl Into<String>,
+        attachment: Option<MediaAttachment>,
+        reply_to_message_id: Option<String>,
+        forwarded_from: Option<ForwardedFrom>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<SentMessageResult> {
+        let path = path.as_ref();
         let mut state = load_state(path)?;
         let text = text.into();
         if text.trim().is_empty() && attachment.is_none() {
@@ -4238,18 +4420,15 @@ impl NoiseClient {
         if let Some(attachment) = attachment.as_ref() {
             validate_media_reference(attachment)?;
         }
+        validate_forwarded_from(forwarded_from.as_ref())?;
         validate_reply_reference(reply_to_message_id.as_deref())?;
         let contact = state
-            .active_direct_public_key
-            .as_deref()
-            .and_then(|public_key| {
-                state
-                    .direct_contacts
-                    .iter()
-                    .find(|contact| contact.public_key == public_key)
-            })
+            .direct_contacts
+            .iter()
+            .chain(state.known_people.iter())
+            .find(|contact| contact.public_key == public_key)
             .cloned()
-            .context("choose a direct conversation first")?;
+            .context("this person is not known on this device")?;
         if state.is_hidden(&contact.public_key) {
             bail!("you cannot message this person while either of you has the other blocked")
         }
@@ -4262,7 +4441,7 @@ impl NoiseClient {
             identity.direct_mailbox(&contact.public_key, &contact.public_key)?;
         let sender_mailbox = identity.direct_mailbox(&contact.public_key, &self_public_key)?;
         let sequence = state.take_sequence();
-        let recipient_event = SignedEvent::direct_message(
+        let recipient_event = SignedEvent::direct_message_forwarded(
             &identity,
             &recipient_mailbox,
             &contact.public_key,
@@ -4270,9 +4449,10 @@ impl NoiseClient {
             text.clone(),
             attachment.clone(),
             reply_to_message_id.clone(),
+            forwarded_from.clone(),
             sequence,
         )?;
-        let sender_event = SignedEvent::direct_message(
+        let sender_event = SignedEvent::direct_message_forwarded(
             &identity,
             &sender_mailbox,
             &contact.public_key,
@@ -4280,6 +4460,7 @@ impl NoiseClient {
             text,
             attachment,
             reply_to_message_id,
+            forwarded_from,
             sequence,
         )?;
         let sent = SentMessageResult {
@@ -4296,9 +4477,10 @@ impl NoiseClient {
         };
         state
             .direct_latest_activity
-            .entry(contact.public_key)
+            .entry(contact.public_key.clone())
             .and_modify(|latest| *latest = latest.clone().max(marker.clone()))
             .or_insert(marker);
+        state.remember_direct(contact);
         save_state(path, &state)?;
         Ok(sent)
     }
@@ -4309,34 +4491,34 @@ impl NoiseClient {
         data_base64: String,
         relays: Vec<String>,
     ) -> anyhow::Result<MediaChunk> {
-        let state = load_state(path.as_ref())?;
-        let contact = state
+        let path = path.as_ref();
+        let state = load_state(path)?;
+        let public_key = state
             .active_direct_public_key
             .as_deref()
-            .and_then(|public_key| {
-                state
-                    .direct_contacts
-                    .iter()
-                    .find(|contact| contact.public_key == public_key)
-            })
+            .map(str::to_owned)
             .context("choose a direct conversation first")?;
+        self.upload_direct_media_chunk_to(path, &public_key, data_base64, relays)
+            .await
+    }
+
+    pub async fn upload_direct_media_chunk_to(
+        &self,
+        path: impl AsRef<Path>,
+        public_key: &str,
+        data_base64: String,
+        relays: Vec<String>,
+    ) -> anyhow::Result<MediaChunk> {
+        let state = load_state(path.as_ref())?;
+        let contact = state
+            .direct_contacts
+            .iter()
+            .chain(state.known_people.iter())
+            .find(|contact| contact.public_key == public_key)
+            .context("this person is not known on this device")?;
         let scope_id = state.identity()?.direct_scope_id(&contact.public_key)?;
-        let data = STANDARD
-            .decode(data_base64)
-            .context("media chunk encoding is invalid")?;
-        if data.is_empty() || data.len() > 1024 * 1024 {
-            bail!("media chunks must contain between 1 byte and 1 MiB")
-        }
-        let (blob, key_base64) = EncryptedBlob::create_for_group(&data, scope_id)?;
-        let storage = self
-            .store_blob_shards(&relay_list(relays)?, &blob, &key_base64)
-            .await?;
-        Ok(MediaChunk {
-            blob_id: blob.blob_id,
-            key_base64,
-            byte_length: data.len() as u32,
-            storage: Some(storage),
-        })
+        self.upload_media_chunk_to_scope(&scope_id, data_base64, relays)
+            .await
     }
 
     pub async fn delete_direct(
@@ -4480,13 +4662,42 @@ impl NoiseClient {
         reply_to_message_id: Option<String>,
         relays: Vec<String>,
     ) -> anyhow::Result<SentMessageResult> {
+        let group_id = load_state(path)?.active_group()?.group_id.clone();
+        self.send_message_to_group(
+            path,
+            &group_id,
+            text,
+            attachment,
+            reply_to_message_id,
+            None,
+            relays,
+        )
+        .await
+    }
+
+    async fn send_message_to_group(
+        &self,
+        path: &Path,
+        group_id: &str,
+        text: String,
+        attachment: Option<MediaAttachment>,
+        reply_to_message_id: Option<String>,
+        forwarded_from: Option<ForwardedFrom>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<SentMessageResult> {
         if text.trim().is_empty() && attachment.is_none() {
             bail!("message cannot be empty")
         }
         validate_reply_reference(reply_to_message_id.as_deref())?;
+        validate_forwarded_from(forwarded_from.as_ref())?;
         let relays = relay_list(relays)?;
         let mut state = load_state(path)?;
-        let group = state.active_group()?.clone();
+        let group = state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .cloned()
+            .context("unknown group")?;
         let sequence = state.take_sequence();
         let event = create_group_event(
             &state,
@@ -4496,6 +4707,7 @@ impl NoiseClient {
                 text,
                 attachment,
                 reply_to_message_id,
+                forwarded_from,
             },
             sequence,
         )?;
@@ -4712,17 +4924,85 @@ impl NoiseClient {
         relays: Vec<String>,
     ) -> anyhow::Result<SentMessageResult> {
         let path = path.as_ref();
+        let group_id = load_state(path)?.active_group()?.group_id.clone();
+        self.say_topic_to_group(
+            path,
+            &group_id,
+            topic_id,
+            text.into(),
+            attachment,
+            reply_to_message_id,
+            None,
+            relays,
+        )
+        .await
+    }
+
+    pub async fn say_to_group(
+        &self,
+        path: impl AsRef<Path>,
+        group_id: &str,
+        topic_id: Option<&str>,
+        text: impl Into<String>,
+        attachment: Option<MediaAttachment>,
+        forwarded_from: Option<ForwardedFrom>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<SentMessageResult> {
+        let path = path.as_ref();
         let text = text.into();
+        if let Some(topic_id) = topic_id {
+            self.say_topic_to_group(
+                path,
+                group_id,
+                topic_id,
+                text,
+                attachment,
+                None,
+                forwarded_from,
+                relays,
+            )
+            .await
+        } else {
+            self.send_message_to_group(
+                path,
+                group_id,
+                text,
+                attachment,
+                None,
+                forwarded_from,
+                relays,
+            )
+            .await
+        }
+    }
+
+    async fn say_topic_to_group(
+        &self,
+        path: &Path,
+        group_id: &str,
+        topic_id: &str,
+        text: String,
+        attachment: Option<MediaAttachment>,
+        reply_to_message_id: Option<String>,
+        forwarded_from: Option<ForwardedFrom>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<SentMessageResult> {
         if text.trim().is_empty() && attachment.is_none() {
             bail!("message cannot be empty")
         }
         if let Some(attachment) = attachment.as_ref() {
             validate_media_reference(attachment)?;
         }
+        validate_forwarded_from(forwarded_from.as_ref())?;
         validate_reply_reference(reply_to_message_id.as_deref())?;
         let relays = relay_list(relays)?;
         let mut state = load_state(path)?;
-        let group = state.active_group()?.clone();
+        let group = state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .cloned()
+            .context("unknown group")?;
         let identity = state.identity()?;
         let topic = ensure_active_topic(&state, &group, topic_id)?;
         let existing_stream = state
@@ -4751,6 +5031,7 @@ impl NoiseClient {
                 text,
                 attachment,
                 reply_to_message_id,
+                forwarded_from,
             },
             sequence,
         )?;
@@ -4890,6 +5171,7 @@ impl NoiseClient {
                         text: message.text.clone(),
                         attachment: message.attachment.clone(),
                         reply_to_message_id: message.reply_to_message_id.clone(),
+                        forwarded_from: message.forwarded_from.clone(),
                         topic_id: message.topic_id.clone(),
                         created_at_millis: message.created_at_millis,
                         reactions: Vec::new(),
@@ -6118,6 +6400,55 @@ impl NoiseClient {
         self.mark_topic_read(path, group_id, None)
     }
 
+    pub fn mark_entire_group_read(
+        &self,
+        path: impl AsRef<Path>,
+        group_id: &str,
+    ) -> anyhow::Result<LocalSummary> {
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        if !state.groups.iter().any(|group| group.group_id == group_id) {
+            bail!("unknown group")
+        }
+
+        let general_key = topic_activity_key(group_id, None);
+        let mut topic_keys = state
+            .topic_latest_incoming
+            .keys()
+            .chain(state.topic_unread_messages.keys())
+            .chain(state.topic_activity_initialized.iter())
+            .filter(|key| topic_key_belongs_to_group(key, group_id))
+            .cloned()
+            .collect::<HashSet<_>>();
+        topic_keys.insert(general_key);
+
+        let mut changed = false;
+        for topic_key in topic_keys {
+            changed |= state.topic_activity_initialized.insert(topic_key.clone());
+            if let Some(marker) = state.topic_latest_incoming.get(&topic_key).cloned()
+                && state.topic_read_through.get(&topic_key) != Some(&marker)
+            {
+                state.topic_read_through.insert(topic_key.clone(), marker);
+                changed = true;
+            }
+            changed |= state.topic_unread_messages.remove(&topic_key).is_some();
+        }
+
+        changed |= state.group_activity_initialized.insert(group_id.to_owned());
+        if let Some(marker) = state.group_latest_incoming.get(group_id).cloned()
+            && state.group_read_through.get(group_id) != Some(&marker)
+        {
+            state.group_read_through.insert(group_id.to_owned(), marker);
+            changed = true;
+        }
+        changed |= state.group_unread_messages.remove(group_id).is_some();
+
+        if changed {
+            save_state(path, &state)?;
+        }
+        state.summary()
+    }
+
     pub fn mark_topic_read(
         &self,
         path: impl AsRef<Path>,
@@ -6337,6 +6668,7 @@ impl NoiseClient {
                         text: message.text.clone(),
                         attachment: message.attachment.clone(),
                         reply_to_message_id: message.reply_to_message_id.clone(),
+                        forwarded_from: message.forwarded_from.clone(),
                         topic_id: message.topic_id.clone(),
                         created_at_millis: message.created_at_millis,
                         reactions: reactions_by_message
@@ -6407,6 +6739,7 @@ impl NoiseClient {
                         text: message.text,
                         attachment: message.attachment,
                         reply_to_message_id: message.reply_to_message_id,
+                        forwarded_from: message.forwarded_from,
                         topic_id: message.topic_id,
                         created_at_millis: message.created_at_millis,
                         reactions,
@@ -7264,7 +7597,20 @@ impl NoiseClient {
         relays: &[RelayDescriptor],
         event: &SignedEvent,
     ) -> anyhow::Result<()> {
-        let body = serde_json::to_vec(event)?;
+        self.publish_event_diagnostic(relays, event)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    async fn publish_event_diagnostic(
+        &self,
+        relays: &[RelayDescriptor],
+        event: &SignedEvent,
+    ) -> Result<(), EventPublishFailure> {
+        let body = serde_json::to_vec(event).map_err(|error| EventPublishFailure {
+            details: error.to_string(),
+            all_relays_deleted: false,
+        })?;
         let mut publications = FuturesUnordered::new();
         for index in 0..relays.len() {
             let body = body.as_slice();
@@ -7277,6 +7623,7 @@ impl NoiseClient {
             });
         }
         let mut failures = Vec::with_capacity(relays.len());
+        let mut deleted_relays = 0usize;
         while let Some((index, result)) = publications.next().await {
             match result {
                 Ok(response) if (200..300).contains(&response.status) => {
@@ -7285,6 +7632,9 @@ impl NoiseClient {
                     return Ok(());
                 }
                 Ok(response) => {
+                    if response.status == 410 {
+                        deleted_relays += 1;
+                    }
                     let detail = String::from_utf8_lossy(&response.body);
                     let detail = detail.trim();
                     failures.push(if detail.is_empty() {
@@ -7301,7 +7651,10 @@ impl NoiseClient {
                 }
             }
         }
-        bail!("no relay accepted the event ({})", failures.join("; "))
+        Err(EventPublishFailure {
+            details: failures.join("; "),
+            all_relays_deleted: deleted_relays == relays.len(),
+        })
     }
 
     fn storage_relays(
@@ -7997,9 +8350,11 @@ fn decrypt_direct_event(
                     text,
                     attachment,
                     reply_to_message_id,
+                    forwarded_from,
                 }) if recipient_public_key == contact.public_key
                     && valid_direct_profile(&sender_profile)
                     && valid_direct_content(&text, attachment.as_ref())
+                    && validate_forwarded_from(forwarded_from.as_ref()).is_ok()
                     && validate_reply_reference(reply_to_message_id.as_deref()).is_ok() =>
                 {
                     return Some(DecryptedDirectEvent::Message(DecryptedDirectMessage {
@@ -8020,6 +8375,7 @@ fn decrypt_direct_event(
                             text,
                             attachment,
                             reply_to_message_id,
+                            forwarded_from,
                             created_at_millis: event.created_at_millis,
                         },
                     }));
@@ -8048,9 +8404,11 @@ fn decrypt_direct_event(
             text,
             attachment,
             reply_to_message_id,
+            forwarded_from,
         } if recipient_public_key == self_public_key
             && valid_direct_profile(&sender_profile)
             && valid_direct_content(&text, attachment.as_ref())
+            && validate_forwarded_from(forwarded_from.as_ref()).is_ok()
             && validate_reply_reference(reply_to_message_id.as_deref()).is_ok() =>
         {
             let contact = DirectContact {
@@ -8076,6 +8434,7 @@ fn decrypt_direct_event(
                     text,
                     attachment,
                     reply_to_message_id,
+                    forwarded_from,
                     created_at_millis: event.created_at_millis,
                 },
             }))
@@ -8412,6 +8771,7 @@ fn cached_conversation_from_view(
                     text: message.text.clone(),
                     attachment: message.attachment.clone(),
                     reply_to_message_id: message.reply_to_message_id.clone(),
+                    forwarded_from: message.forwarded_from.clone(),
                     topic_id: message.topic_id.clone(),
                     created_at_millis: message.created_at_millis,
                     reactions: reactions_by_message
@@ -8484,6 +8844,7 @@ fn cached_conversation_from_view(
                     text: message.text,
                     attachment: message.attachment,
                     reply_to_message_id: message.reply_to_message_id,
+                    forwarded_from: message.forwarded_from,
                     topic_id: message.topic_id,
                     created_at_millis: message.created_at_millis,
                     reactions,
@@ -9236,6 +9597,18 @@ fn validate_username(username: &str) -> anyhow::Result<()> {
         bail!("display names cannot contain control characters")
     }
     Ok(())
+}
+
+fn validate_forwarded_from(source: Option<&ForwardedFrom>) -> anyhow::Result<()> {
+    let Some(source) = source else {
+        return Ok(());
+    };
+    STANDARD_NO_PAD
+        .decode(&source.public_key)
+        .ok()
+        .filter(|key| key.len() == 32)
+        .context("forwarded account public key is invalid")?;
+    validate_username(&source.username)
 }
 
 fn validate_display_name(username: &str) -> anyhow::Result<()> {

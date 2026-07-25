@@ -10,7 +10,9 @@ use std::{
 };
 
 use futures_util::future::{AbortHandle, Abortable};
-use noise_client::{MediaAttachment, NoiseClient, ProfileAlbum, ProfileAlbumItem, ProfileImage};
+use noise_client::{
+    ForwardedFrom, MediaAttachment, NoiseClient, ProfileAlbum, ProfileAlbumItem, ProfileImage,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
@@ -148,8 +150,20 @@ enum Request {
         data_base64: String,
         relays: Vec<String>,
     },
+    UploadMediaChunkToGroup {
+        state_path: String,
+        group_id: String,
+        data_base64: String,
+        relays: Vec<String>,
+    },
     UploadDirectMediaChunk {
         state_path: String,
+        data_base64: String,
+        relays: Vec<String>,
+    },
+    UploadDirectMediaChunkTo {
+        state_path: String,
+        public_key: String,
         data_base64: String,
         relays: Vec<String>,
     },
@@ -201,6 +215,10 @@ enum Request {
         state_path: String,
         group_id: String,
     },
+    MarkEntireGroupRead {
+        state_path: String,
+        group_id: String,
+    },
     MarkTopicRead {
         state_path: String,
         group_id: String,
@@ -238,6 +256,17 @@ enum Request {
         reply_to_message_id: Option<String>,
         #[serde(default)]
         topic_id: Option<String>,
+        relays: Vec<String>,
+    },
+    SayToGroup {
+        state_path: String,
+        group_id: String,
+        #[serde(default)]
+        topic_id: Option<String>,
+        text: String,
+        attachment: Option<MediaAttachment>,
+        #[serde(default)]
+        forwarded_from: Option<ForwardedFrom>,
         relays: Vec<String>,
     },
     StartDirect {
@@ -297,6 +326,15 @@ enum Request {
         attachment: Option<MediaAttachment>,
         #[serde(default)]
         reply_to_message_id: Option<String>,
+        relays: Vec<String>,
+    },
+    SayDirectTo {
+        state_path: String,
+        public_key: String,
+        text: String,
+        attachment: Option<MediaAttachment>,
+        #[serde(default)]
+        forwarded_from: Option<ForwardedFrom>,
         relays: Vec<String>,
     },
     DeleteDirect {
@@ -640,7 +678,9 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             | Request::FetchAttachmentRange { .. }
             | Request::FetchLinkPreview { .. }
             | Request::UploadMediaChunk { .. }
+            | Request::UploadMediaChunkToGroup { .. }
             | Request::UploadDirectMediaChunk { .. }
+            | Request::UploadDirectMediaChunkTo { .. }
     ) {
         None
     } else {
@@ -939,6 +979,22 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
+        Request::UploadMediaChunkToGroup {
+            state_path,
+            group_id,
+            data_base64,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.upload_media_chunk_to_group(
+                    state_path,
+                    &group_id,
+                    data_base64,
+                    relays,
+                ))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         Request::UploadDirectMediaChunk {
             state_path,
             data_base64,
@@ -946,6 +1002,22 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         } => serde_json::to_value(
             runtime()?
                 .block_on(client.upload_direct_media_chunk(state_path, data_base64, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::UploadDirectMediaChunkTo {
+            state_path,
+            public_key,
+            data_base64,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.upload_direct_media_chunk_to(
+                    state_path,
+                    &public_key,
+                    data_base64,
+                    relays,
+                ))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
@@ -1090,6 +1162,15 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
+        Request::MarkEntireGroupRead {
+            state_path,
+            group_id,
+        } => serde_json::to_value(
+            client
+                .mark_entire_group_read(state_path, &group_id)
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         Request::MarkTopicRead {
             state_path,
             group_id,
@@ -1181,6 +1262,28 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             };
             serde_json::to_value(sent).map_err(|error| error.to_string())
         }
+        Request::SayToGroup {
+            state_path,
+            group_id,
+            topic_id,
+            text,
+            attachment,
+            forwarded_from,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.say_to_group(
+                    state_path,
+                    &group_id,
+                    topic_id.as_deref(),
+                    text,
+                    attachment,
+                    forwarded_from,
+                    relays,
+                ))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         Request::StartDirect {
             state_path,
             public_key,
@@ -1316,6 +1419,27 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                     text,
                     attachment,
                     reply_to_message_id,
+                    relays,
+                ))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::SayDirectTo {
+            state_path,
+            public_key,
+            text,
+            attachment,
+            forwarded_from,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.say_direct_to(
+                    state_path,
+                    &public_key,
+                    text,
+                    attachment,
+                    None,
+                    forwarded_from,
                     relays,
                 ))
                 .map_err(|error| error.to_string())?,

@@ -139,13 +139,22 @@ export type MessageSummary = {
   text: string;
   attachment: MediaAttachment | null;
   reply_to_message_id: string | null;
+  forwarded_from?: {
+    public_key: string;
+    username: string;
+  } | null;
   topic_id?: string | null;
   created_at_millis: number;
   reactions?: ReactionSummary[];
   optimistic?: boolean;
+  upload_progress?: number;
+  upload_error?: string;
   local_attachment?: {
     preview_url: string;
     mime_type: string;
+    poster_url?: string;
+    pixel_width?: number;
+    pixel_height?: number;
   };
 };
 
@@ -229,11 +238,18 @@ export type DirectMessageSummary = {
   text: string;
   attachment: MediaAttachment | null;
   reply_to_message_id: string | null;
+  forwarded_from?: {
+    public_key: string;
+    username: string;
+  } | null;
   created_at_millis: number;
   optimistic?: boolean;
   local_attachment?: {
     preview_url: string;
     mime_type: string;
+    poster_url?: string;
+    pixel_width?: number;
+    pixel_height?: number;
   };
 };
 
@@ -257,6 +273,7 @@ export type DirectInbox = {
 export type GroupWatch = {
   revision: number;
   changed: boolean;
+  deleted?: boolean;
   online_public_keys: string[];
   recently_active_public_keys: string[];
 };
