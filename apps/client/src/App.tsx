@@ -659,10 +659,13 @@ function useComposerMediaIntake(
   active: boolean,
   canAccept: boolean,
   onMedia: (file: File) => void,
+  onNativeMedia: (path: string) => void,
 ) {
   const [dragging, setDragging] = useState(false);
   const onMediaRef = useRef(onMedia);
+  const onNativeMediaRef = useRef(onNativeMedia);
   onMediaRef.current = onMedia;
+  onNativeMediaRef.current = onNativeMedia;
 
   useEffect(() => {
     if (!active) {
@@ -710,7 +713,32 @@ function useComposerMediaIntake(
     window.addEventListener("drop", onDrop);
     window.addEventListener("paste", onPaste);
     window.addEventListener("blur", resetDrag);
+    let unlistenNativeDrop: (() => void) | undefined;
+    if (isTauri) {
+      void import("@tauri-apps/api/window")
+        .then(({ getCurrentWindow }) => getCurrentWindow().onDragDropEvent((event) => {
+          if (event.payload.type === "enter" || event.payload.type === "over") {
+            if (canAccept) setDragging(true);
+            return;
+          }
+          if (event.payload.type === "leave") {
+            resetDrag();
+            return;
+          }
+          resetDrag();
+          if (!canAccept) return;
+          const path = event.payload.paths[0];
+          if (path) onNativeMediaRef.current(path);
+        }))
+        .then((unlisten) => {
+          unlistenNativeDrop = unlisten;
+        })
+        .catch(() => {
+          // Browser drag events remain available if the native listener fails.
+        });
+    }
     return () => {
+      unlistenNativeDrop?.();
       window.removeEventListener("dragenter", onDragEnter);
       window.removeEventListener("dragover", onDragOver);
       window.removeEventListener("dragleave", onDragLeave);
@@ -846,10 +874,7 @@ async function optimizeOutgoingVideo(file: File) {
 
 async function chooseNativePendingMedia() {
   if (!isTauri) return null;
-  const [{ open }, { convertFileSrc, invoke }] = await Promise.all([
-    import("@tauri-apps/plugin-dialog"),
-    import("@tauri-apps/api/core"),
-  ]);
+  const { open } = await import("@tauri-apps/plugin-dialog");
   const selected = await open({
     multiple: false,
     directory: false,
@@ -863,12 +888,18 @@ async function chooseNativePendingMedia() {
     }],
   });
   if (!selected) return null;
+  return pendingMediaFromNativePath(selected);
+}
+
+async function pendingMediaFromNativePath(sourcePath: string) {
+  if (!isTauri) return null;
+  const { convertFileSrc, invoke } = await import("@tauri-apps/api/core");
   const inspected = await invoke<{
     file_path: string;
     file_name: string;
     mime_type: string;
     byte_length: number;
-  }>("inspect_media_upload", { sourcePath: selected });
+  }>("inspect_media_upload", { sourcePath });
   const previewUrl = convertFileSrc(inspected.file_path);
   const file = (async () => {
     const prepared = await invoke<{
@@ -1680,7 +1711,12 @@ export default function App() {
           group_id: activeGroup.group_id,
         }) ?? undefined;
         if (generation !== refreshGeneration.current) return;
-        if (cached) groupConversationCache.current.set(activeGroup.group_id, cached);
+        if (cached) {
+          groupConversationCache.current.set(activeGroup.group_id, cached);
+          setConversation(cached);
+          setSummary(local);
+          setLoading(false);
+        }
       }
 
       // A fresh login must spend its first relay request on the selected
@@ -1728,6 +1764,25 @@ export default function App() {
       }
       if (encryption && encryption.phase !== "active") {
         return;
+      }
+
+      // The first request intentionally unlocks the latest messages. A second,
+      // non-blocking pass repairs the durable group state on installations
+      // affected by v0.1.12 (artwork, membership, and topic definitions).
+      if (latestActivity) {
+        try {
+          const recovered = await syncGroupActivity(activeGroup.group_id);
+          if (generation !== refreshGeneration.current) return;
+          if (recovered) {
+            setSummary(recovered.summary);
+            if (recovered.conversation) {
+              groupConversationCache.current.set(activeGroup.group_id, recovered.conversation);
+              setConversation(recovered.conversation);
+            }
+          }
+        } catch (cause) {
+          if (!isSupersededLoading(cause)) latestActivityError = cause;
+        }
       }
 
       // If the priority fetch needed encryption repair, retry it now that the
@@ -2439,6 +2494,17 @@ export default function App() {
         }
       } else if (!hasCachedConversation) {
         throw new Error("the selected group has no locally available conversation");
+      }
+      if (activity) {
+        const recovered = await syncGroupActivity(group.group_id);
+        if (generation !== refreshGeneration.current) return;
+        if (recovered) {
+          setSummary(recovered.summary);
+          if (recovered.conversation) {
+            groupConversationCache.current.set(group.group_id, recovered.conversation);
+            setConversation(recovered.conversation);
+          }
+        }
       }
 
       if (needsReadBaseline) {
@@ -4033,6 +4099,14 @@ function ConversationPanel({
     active,
     canSendMedia && !busy && uploadProgress === null,
     chooseMedia,
+    (path) => {
+      setAttachmentError(null);
+      void pendingMediaFromNativePath(path)
+        .then((pending) => {
+          if (pending) setAttachment(pending);
+        })
+        .catch((cause) => setAttachmentError(message(cause)));
+    },
   );
   async function chooseMediaFromDevice() {
     if (!isTauri) {
@@ -4241,6 +4315,14 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
     active,
     contact.accepts_direct_messages && !busy && uploadProgress === null,
     chooseMedia,
+    (path) => {
+      setAttachmentError(null);
+      void pendingMediaFromNativePath(path)
+        .then((pending) => {
+          if (pending) setAttachment(pending);
+        })
+        .catch((cause) => setAttachmentError(message(cause)));
+    },
   );
   async function chooseMediaFromDevice() {
     if (!isTauri) {

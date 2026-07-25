@@ -636,10 +636,16 @@ struct GroupEventCache {
     has_older_messages: bool,
     #[serde(default)]
     needs_recent_hydration: bool,
+    #[serde(default = "control_hydration_needed")]
+    needs_control_hydration: bool,
     #[serde(default)]
     topic_streams: HashMap<String, TopicStreamCache>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     portable_conversation: Option<Conversation>,
+}
+
+fn control_hydration_needed() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1113,6 +1119,50 @@ impl ClientState {
         })
     }
 
+    fn portable_group_state_snapshots(&self) -> HashMap<String, GroupEventCache> {
+        let identity_public_key = self.identity().ok().map(|identity| identity.public_key_base64());
+        self.groups
+            .iter()
+            .filter_map(|group| {
+                let mut conversation = self
+                    .group_conversation_cache
+                    .get(&group.group_id)
+                    .cloned()
+                    .or_else(|| {
+                        self.group_event_caches
+                            .get(&group.group_id)
+                            .and_then(|cache| cache.portable_conversation.clone())
+                    })
+                    .or_else(|| {
+                        let identity_public_key = identity_public_key.as_deref()?;
+                        let cache = self.group_event_caches.get(&group.group_id)?;
+                        let view = rebuild_group_state(self, group, &cache.events).ok()?;
+                        view.members.contains_key(identity_public_key).then(|| {
+                            cached_conversation_from_view(self, group, view, identity_public_key)
+                        })
+                    })?;
+                conversation.messages.clear();
+                conversation.reports.clear();
+                conversation.reported_message_event_ids.clear();
+                conversation.has_older_messages = true;
+                Some((
+                    group.group_id.clone(),
+                    GroupEventCache {
+                        events: Vec::new(),
+                        latest_cursor: None,
+                        older_cursor: None,
+                        message_limit: INITIAL_GROUP_MESSAGE_WINDOW,
+                        has_older_messages: true,
+                        needs_recent_hydration: true,
+                        needs_control_hydration: true,
+                        topic_streams: HashMap::new(),
+                        portable_conversation: Some(conversation),
+                    },
+                ))
+            })
+            .collect()
+    }
+
     fn vault_contents(&self) -> AccountVaultContents {
         AccountVaultContents {
             version: 1,
@@ -1129,11 +1179,11 @@ impl ClientState {
                 })
                 .map(|(group_id, log)| (group_id.clone(), log.clone()))
                 .collect(),
-            // Conversation history is relay data and a device-local cache, not
-            // account-recovery material. Keeping even a compact recent feed in
-            // the vault made account backup grow with chat activity and mixed
-            // two unrelated durability boundaries.
-            group_event_caches: HashMap::new(),
+            // Messages remain relay data and a device-local cache. The small
+            // message-free conversation snapshot is account recovery material:
+            // it carries the current group artwork, members, and topic index so
+            // a new device can render the group before paging relay history.
+            group_event_caches: self.portable_group_state_snapshots(),
             groups: self.groups.clone(),
             group_memberships: self.vault_group_memberships(),
             active_group_id: self.active_group_id.clone(),
@@ -1250,6 +1300,7 @@ impl ClientState {
             )
             .context("encrypted account vault contains invalid group history")?;
             compacted.needs_recent_hydration = needs_recent_hydration;
+            compacted.needs_control_hydration = cache.needs_control_hydration;
             compacted.portable_conversation = portable_conversation;
             state.group_event_caches.insert(group_id, compacted);
         }
@@ -5725,6 +5776,21 @@ impl NoiseClient {
                 topic_update: None,
             });
         }
+        if state
+            .group_event_caches
+            .get(group_id)
+            .is_some_and(|cache| cache.needs_control_hydration)
+        {
+            let events = self.fetch_events(&group, relays).await?;
+            return Ok(GroupActivityUpdate {
+                group_id: group_id.to_owned(),
+                events,
+                full_snapshot: true,
+                older_cursor: None,
+                has_older_messages: false,
+                topic_update: None,
+            });
+        }
         if let Some(cache) = state.group_event_caches.get(group_id)
             && let Some(mut cursor) = cache.latest_cursor.clone()
         {
@@ -5768,6 +5834,19 @@ impl NoiseClient {
                 }
             }
         }
+        if let Some(page) = self
+            .fetch_group_event_page(group_id, None, GroupEventPageRequest::Latest, &relays)
+            .await?
+        {
+            return Ok(GroupActivityUpdate {
+                group_id: group_id.to_owned(),
+                events: page.events,
+                full_snapshot: false,
+                older_cursor: page.continuation_cursor,
+                has_older_messages: page.has_more,
+                topic_update: None,
+            });
+        }
         let events = self.fetch_events(&group, relays).await?;
         Ok(GroupActivityUpdate {
             group_id: group_id.to_owned(),
@@ -5795,6 +5874,10 @@ impl NoiseClient {
         let identity_public_key = state.identity()?.public_key_base64();
         let group_id = group.group_id.clone();
         let existing_cache = state.group_event_caches.get(&group_id).cloned();
+        let full_snapshot = update.full_snapshot;
+        let portable_group_state = existing_cache
+            .as_ref()
+            .and_then(|cache| cache.portable_conversation.clone());
         let message_limit = existing_cache
             .as_ref()
             .map_or(INITIAL_GROUP_MESSAGE_WINDOW, |cache| cache.message_limit);
@@ -5824,7 +5907,7 @@ impl NoiseClient {
             stream.has_older_messages = topic_update.has_older_messages;
             stream.message_limit = topic_update.message_limit.max(1);
         }
-        let mut events = if update.full_snapshot {
+        let mut events = if full_snapshot {
             Vec::new()
         } else {
             existing_cache
@@ -5833,7 +5916,7 @@ impl NoiseClient {
                 .unwrap_or_default()
         };
         events.extend(update.events);
-        let cache = compact_group_event_cache(
+        let mut cache = compact_group_event_cache(
             &state,
             &group,
             events,
@@ -5852,8 +5935,21 @@ impl NoiseClient {
                     .is_some_and(|cache| cache.has_older_messages),
             topic_streams,
         )?;
+        cache.needs_control_hydration = !full_snapshot
+            && existing_cache
+                .as_ref()
+                .map_or(true, |cache| cache.needs_control_hydration);
+        if !full_snapshot {
+            cache.portable_conversation = portable_group_state.clone();
+        }
         let view = rebuild_group_state(&state, &group, &cache.events)?;
-        let is_member = view.members.contains_key(&identity_public_key);
+        let is_member = view.members.contains_key(&identity_public_key)
+            || portable_group_state.as_ref().is_some_and(|conversation| {
+                conversation
+                    .members
+                    .iter()
+                    .any(|member| member.public_key == identity_public_key)
+            });
         let mut state_changed = existing_cache.as_ref() != Some(&cache)
             || is_member
                 && state.record_group_activity(&group_id, &view.messages, &identity_public_key);
@@ -5868,7 +5964,9 @@ impl NoiseClient {
                 .map(|group| group.owner_public_key.clone())
                 .unwrap_or_default()
         });
-        if state.apply_resolved_group_profile(&group_id, &view.profile, &resolved_owner) {
+        if !cache.needs_control_hydration
+            && state.apply_resolved_group_profile(&group_id, &view.profile, &resolved_owner)
+        {
             state_changed = true;
         }
         let known_people_before = state.known_people.clone();
@@ -5891,6 +5989,11 @@ impl NoiseClient {
         let conversation = is_member.then(|| {
             let mut conversation =
                 cached_conversation_from_view(&state, &group, view, &identity_public_key);
+            if let Some(portable) = portable_group_state.as_ref()
+                && cache.needs_control_hydration
+            {
+                merge_portable_group_state(&mut conversation, portable);
+            }
             conversation.has_older_messages = cache.has_older_messages;
             let blocked = state.active_hidden_keys();
             filter_conversation_for_blocks(&mut conversation, &blocked);
@@ -6798,6 +6901,10 @@ impl NoiseClient {
                 continue;
             };
             let local = state.group_event_caches.get(&group_id).cloned();
+            let needs_control_hydration = remote_cache.needs_control_hydration
+                || local
+                    .as_ref()
+                    .is_some_and(|cache| cache.needs_control_hydration);
             let mut remote_portable_conversation = remote_cache.portable_conversation;
             if remote_portable_conversation
                 .as_ref()
@@ -6878,6 +6985,7 @@ impl NoiseClient {
                 cache.needs_recent_hydration = true;
                 cache.portable_conversation = remote_portable_conversation;
             }
+            cache.needs_control_hydration = needs_control_hydration;
             state.group_event_caches.insert(group_id, cache);
         }
         state
@@ -7994,6 +8102,55 @@ fn strip_conversation_media_previews(conversation: &mut Conversation) {
     }
 }
 
+fn merge_portable_group_state(conversation: &mut Conversation, portable: &Conversation) {
+    let is_active = conversation.group.is_active;
+    let unread_count = conversation.group.unread_count;
+    let read_state_initialized = conversation.group.read_state_initialized;
+    let frequency = conversation
+        .group
+        .frequency
+        .clone()
+        .or_else(|| portable.group.frequency.clone());
+    conversation.group = portable.group.clone();
+    conversation.group.is_active = is_active;
+    conversation.group.unread_count = unread_count;
+    conversation.group.read_state_initialized = read_state_initialized;
+    conversation.group.frequency = frequency;
+
+    let current_topics = std::mem::take(&mut conversation.topics)
+        .into_iter()
+        .map(|topic| (topic.topic_id.clone(), topic))
+        .collect::<HashMap<_, _>>();
+    conversation.topics = portable
+        .topics
+        .iter()
+        .map(|topic| {
+            current_topics
+                .get(&topic.topic_id)
+                .cloned()
+                .unwrap_or_else(|| topic.clone())
+        })
+        .collect();
+    conversation.topics.extend(
+        current_topics
+            .into_iter()
+            .filter(|(topic_id, _)| {
+                !portable
+                    .topics
+                    .iter()
+                    .any(|topic| topic.topic_id == *topic_id)
+            })
+            .map(|(_, topic)| topic),
+    );
+
+    if conversation.members.is_empty() {
+        conversation.members = portable.members.clone();
+    }
+    if conversation.banned_members.is_empty() {
+        conversation.banned_members = portable.banned_members.clone();
+    }
+}
+
 fn topic_summaries(
     state: &ClientState,
     group_id: &str,
@@ -8389,6 +8546,7 @@ fn compact_group_event_cache(
         message_limit: message_limit.max(1),
         has_older_messages,
         needs_recent_hydration: false,
+        needs_control_hydration: false,
         topic_streams,
         portable_conversation: None,
     })
