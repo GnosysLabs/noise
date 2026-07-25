@@ -119,6 +119,14 @@ export type MediaAttachment = {
   pixel_height?: number | null;
 };
 
+export type LinkPreview = {
+  url: string;
+  title: string;
+  description: string | null;
+  site_name: string | null;
+  image_data_url: string | null;
+};
+
 export type MessageSummary = {
   event_id: string;
   message_id: string;
@@ -131,6 +139,7 @@ export type MessageSummary = {
   text: string;
   attachment: MediaAttachment | null;
   reply_to_message_id: string | null;
+  topic_id?: string | null;
   created_at_millis: number;
   reactions?: ReactionSummary[];
   optimistic?: boolean;
@@ -138,6 +147,19 @@ export type MessageSummary = {
     preview_url: string;
     mime_type: string;
   };
+};
+
+export type TopicSummary = {
+  topic_id: string;
+  name: string;
+  icon: string;
+  stream_locator: string;
+  locked: boolean;
+  archived: boolean;
+  created_by_public_key: string;
+  created_at_millis: number;
+  unread_count: number;
+  has_older_messages: boolean;
 };
 
 export type ReactionSummary = {
@@ -149,12 +171,15 @@ export type ReactionSummary = {
 
 export type Conversation = {
   group: GroupSummary;
+  topics: TopicSummary[];
+  general_unread_count: number;
   members: MemberSummary[];
   banned_members: BannedMemberSummary[];
   messages: MessageSummary[];
   reports: ReportSummary[];
   reported_message_event_ids: string[];
   rejected_events: number;
+  has_older_messages: boolean;
 };
 
 export type GroupActivityResult = {
@@ -265,6 +290,14 @@ export type AvatarData = {
 export type AttachmentData = {
   mime_type: string;
   file_path: string;
+};
+
+export type AttachmentRangeData = {
+  mime_type: string;
+  data_base64: string;
+  offset: number;
+  byte_length: number;
+  total_byte_length: number;
 };
 
 export type NoiseRequest = Record<string, unknown> & { action: string };

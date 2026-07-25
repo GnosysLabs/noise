@@ -1,6 +1,9 @@
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import { initWebMediaStreams } from "./mediaStream";
 import "./styles.css";
+
+initWebMediaStreams();
 
 function isMobileBrowser() {
   if ("__TAURI_INTERNALS__" in window) return false;

@@ -9,7 +9,10 @@
     "core:window:allow-show",
     "core:window:allow-unminimize",
     "core:window:allow-set-focus",
+    "dialog:allow-open",
     "notification:default",
+    "opener:allow-default-urls",
+    "opener:allow-open-url",
     "process:allow-restart",
     "updater:default"
   ]

@@ -1,6 +1,7 @@
 mod config;
 mod discovery;
 mod identity;
+mod link_preview;
 mod privacy;
 mod shard_store;
 mod store;
@@ -14,7 +15,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, bail};
@@ -30,19 +31,18 @@ use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use noise_core::{
     AccountVault, GroupDeletion, GroupPresence, InviteRecord, InviteRotation, MlsControlLog,
-    MlsEpochRecord, MlsGroupGenesis, MlsJoinRequest, MlsRemovalRequest, ShardDeletion, SignedEvent,
-    StorageShard,
+    MlsEpochRecord, MlsGroupGenesis, MlsJoinRequest, MlsRemovalRequest, SignedEvent, StorageShard,
 };
 use noise_transport::{
-    GATEWAY_HEADER, OHTTP_GATEWAY_PATH, OHTTP_KEYS_MEDIA_TYPE, OHTTP_KEYS_PATH, OHTTP_RELAY_PATH,
-    OHTTP_REQUEST_MEDIA_TYPE, OHTTP_RESPONSE_MEDIA_TYPE, PlainRequest, RELAY_DIRECTORY_PATH,
-    RELAY_PROTOCOL_VERSION, RelayDescriptor, SIGNED_RELAY_DESCRIPTOR_PATH, SignedRelayDescriptor,
-    encode_response,
+    GATEWAY_HEADER, LinkPreview, LinkPreviewRequest, OHTTP_GATEWAY_PATH, OHTTP_KEYS_MEDIA_TYPE,
+    OHTTP_KEYS_PATH, OHTTP_RELAY_PATH, OHTTP_REQUEST_MEDIA_TYPE, OHTTP_RESPONSE_MEDIA_TYPE,
+    PlainRequest, RELAY_DIRECTORY_PATH, RELAY_PROTOCOL_VERSION, RelayDescriptor,
+    SIGNED_RELAY_DESCRIPTOR_PATH, SignedRelayDescriptor, encode_response,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpListener,
-    sync::{Mutex, RwLock, watch},
+    sync::{Mutex, RwLock, Semaphore, watch},
     time::{sleep, timeout},
 };
 use tower_http::cors::CorsLayer;
@@ -62,6 +62,9 @@ const MAX_DISCOVERED_RELAYS_PER_TARGET: usize = 16;
 const MAX_GROUP_PRESENCE_MILLIS: u64 = 60_000;
 const RECENT_GROUP_PRESENCE_MILLIS: u64 = 5 * 60_000;
 const MAX_GROUP_PRESENCES: usize = 100_000;
+const GROUP_EVENT_PAGE_SIZE: usize = 128;
+const LINK_PREVIEW_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const MAX_LINK_PREVIEW_CACHE_ENTRIES: usize = 128;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -149,6 +152,8 @@ struct AppState {
     group_changes: Arc<RwLock<HashMap<String, watch::Sender<u64>>>>,
     group_presences: Arc<RwLock<HashMap<String, HashMap<String, GroupPresence>>>>,
     account_changes: Arc<RwLock<HashMap<String, watch::Sender<u64>>>>,
+    link_previews: Arc<RwLock<HashMap<String, CachedLinkPreview>>>,
+    link_preview_slots: Arc<Semaphore>,
     mutations: Arc<Mutex<()>>,
     peers: Arc<Vec<String>>,
     client: reqwest::Client,
@@ -163,6 +168,12 @@ struct AppState {
     allow_local_discovery: bool,
     mask_targets: Arc<HashSet<String>>,
     public_url: Option<String>,
+}
+
+#[derive(Clone)]
+struct CachedLinkPreview {
+    fetched_at: Instant,
+    preview: Option<LinkPreview>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -182,6 +193,12 @@ struct Snapshot {
     mls_geneses: Vec<MlsGroupGenesis>,
     #[serde(default)]
     mls_epochs: Vec<MlsEpochRecord>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GroupEventPage {
+    events: Vec<SignedEvent>,
+    has_more: bool,
 }
 
 #[derive(Serialize)]
@@ -562,6 +579,8 @@ async fn main() -> anyhow::Result<()> {
         group_changes: Arc::new(RwLock::new(HashMap::new())),
         group_presences: Arc::new(RwLock::new(HashMap::new())),
         account_changes: Arc::new(RwLock::new(HashMap::new())),
+        link_previews: Arc::new(RwLock::new(HashMap::new())),
+        link_preview_slots: Arc::new(Semaphore::new(8)),
         mutations: Arc::new(Mutex::new(())),
         peers: Arc::new(peers),
         client,
@@ -591,6 +610,30 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/invite-rotations", post(publish_invite_rotation))
         .route("/v1/events", post(publish_event))
         .route("/v1/groups/{group_id}/events", get(group_events))
+        .route(
+            "/v2/groups/{group_id}/events/latest",
+            get(latest_group_event_page),
+        )
+        .route(
+            "/v2/groups/{group_id}/events/before/{created_at_millis}/{event_id}",
+            get(older_group_event_page),
+        )
+        .route(
+            "/v2/groups/{group_id}/events/after/{created_at_millis}/{event_id}",
+            get(newer_group_event_page),
+        )
+        .route(
+            "/v3/groups/{group_id}/streams/{stream_locator}/events/latest",
+            get(latest_stream_event_page),
+        )
+        .route(
+            "/v3/groups/{group_id}/streams/{stream_locator}/events/before/{created_at_millis}/{event_id}",
+            get(older_stream_event_page),
+        )
+        .route(
+            "/v3/groups/{group_id}/streams/{stream_locator}/events/after/{created_at_millis}/{event_id}",
+            get(newer_stream_event_page),
+        )
         .route("/v2/mls/join-requests", post(publish_mls_join_request))
         .route(
             "/v2/mls/groups/{group_id}/join-requests",
@@ -609,8 +652,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v2/mls/groups/{group_id}", get(group_mls_control_log))
         .route("/v1/groups/{group_id}/watch/{since}", get(group_watch))
         .route("/v1/groups/{group_id}/presence", post(publish_presence))
-        .route("/v3/shards", post(publish_shard))
-        .route("/v3/shards/{shard_id}", get(get_shard).delete(delete_shard))
+        .route("/v4/shards", post(publish_shard))
+        .route("/v4/shards/{shard_id}", get(get_shard).delete(delete_shard))
         .route("/v1/group-deletions", post(publish_group_deletion))
         .route("/v1/snapshot", get(snapshot))
         .route(OHTTP_KEYS_PATH, get(ohttp_keys))
@@ -831,6 +874,169 @@ async fn group_events(
             .then_with(|| left.event_id.cmp(&right.event_id))
     });
     Ok(Json(events))
+}
+
+async fn latest_group_event_page(
+    State(state): State<AppState>,
+    Path(group_id): Path<String>,
+) -> Result<Json<GroupEventPage>, StatusCode> {
+    group_event_page(&state, &group_id, None, GroupEventPageCursor::Latest)
+        .await
+        .map(Json)
+}
+
+async fn older_group_event_page(
+    State(state): State<AppState>,
+    Path((group_id, created_at_millis, event_id)): Path<(String, u64, String)>,
+) -> Result<Json<GroupEventPage>, StatusCode> {
+    group_event_page(
+        &state,
+        &group_id,
+        None,
+        GroupEventPageCursor::Before(created_at_millis, event_id.as_str()),
+    )
+    .await
+    .map(Json)
+}
+
+async fn newer_group_event_page(
+    State(state): State<AppState>,
+    Path((group_id, created_at_millis, event_id)): Path<(String, u64, String)>,
+) -> Result<Json<GroupEventPage>, StatusCode> {
+    group_event_page(
+        &state,
+        &group_id,
+        None,
+        GroupEventPageCursor::After(created_at_millis, event_id.as_str()),
+    )
+    .await
+    .map(Json)
+}
+
+async fn latest_stream_event_page(
+    State(state): State<AppState>,
+    Path((group_id, stream_locator)): Path<(String, String)>,
+) -> Result<Json<GroupEventPage>, StatusCode> {
+    validate_stream_locator(&stream_locator)?;
+    group_event_page(
+        &state,
+        &group_id,
+        Some(&stream_locator),
+        GroupEventPageCursor::Latest,
+    )
+    .await
+    .map(Json)
+}
+
+async fn older_stream_event_page(
+    State(state): State<AppState>,
+    Path((group_id, stream_locator, created_at_millis, event_id)): Path<(
+        String,
+        String,
+        u64,
+        String,
+    )>,
+) -> Result<Json<GroupEventPage>, StatusCode> {
+    validate_stream_locator(&stream_locator)?;
+    group_event_page(
+        &state,
+        &group_id,
+        Some(&stream_locator),
+        GroupEventPageCursor::Before(created_at_millis, event_id.as_str()),
+    )
+    .await
+    .map(Json)
+}
+
+async fn newer_stream_event_page(
+    State(state): State<AppState>,
+    Path((group_id, stream_locator, created_at_millis, event_id)): Path<(
+        String,
+        String,
+        u64,
+        String,
+    )>,
+) -> Result<Json<GroupEventPage>, StatusCode> {
+    validate_stream_locator(&stream_locator)?;
+    group_event_page(
+        &state,
+        &group_id,
+        Some(&stream_locator),
+        GroupEventPageCursor::After(created_at_millis, event_id.as_str()),
+    )
+    .await
+    .map(Json)
+}
+
+fn validate_stream_locator(stream_locator: &str) -> Result<(), StatusCode> {
+    if stream_locator.len() != 64
+        || !stream_locator
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum GroupEventPageCursor<'a> {
+    Latest,
+    Before(u64, &'a str),
+    After(u64, &'a str),
+}
+
+async fn group_event_page(
+    state: &AppState,
+    group_id: &str,
+    stream_locator: Option<&str>,
+    cursor: GroupEventPageCursor<'_>,
+) -> Result<GroupEventPage, StatusCode> {
+    if state.deletions.read().await.contains_key(group_id) {
+        return Err(StatusCode::GONE);
+    }
+    let mut events = state
+        .events
+        .read()
+        .await
+        .values()
+        .filter(|event| {
+            if event.group_id != group_id {
+                return false;
+            }
+            if event.stream_locator.as_deref() != stream_locator {
+                return false;
+            }
+            let key = (event.created_at_millis, event.event_id.as_str());
+            match cursor {
+                GroupEventPageCursor::Latest => true,
+                GroupEventPageCursor::Before(created_at_millis, event_id) => {
+                    key < (created_at_millis, event_id)
+                }
+                GroupEventPageCursor::After(created_at_millis, event_id) => {
+                    key > (created_at_millis, event_id)
+                }
+            }
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    events.sort_by(|left, right| {
+        left.created_at_millis
+            .cmp(&right.created_at_millis)
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
+    let has_more = events.len() > GROUP_EVENT_PAGE_SIZE;
+    if events.len() > GROUP_EVENT_PAGE_SIZE {
+        match cursor {
+            GroupEventPageCursor::Latest | GroupEventPageCursor::Before(_, _) => {
+                events.drain(..events.len() - GROUP_EVENT_PAGE_SIZE);
+            }
+            GroupEventPageCursor::After(_, _) => {
+                events.truncate(GROUP_EVENT_PAGE_SIZE);
+            }
+        }
+    }
+    Ok(GroupEventPage { events, has_more })
 }
 
 async fn publish_mls_join_request(
@@ -1081,10 +1287,9 @@ async fn active_group_presences(state: &AppState, group_id: &str) -> Vec<GroupPr
 
 async fn publish_shard(
     State(state): State<AppState>,
-    Json(shard): Json<StorageShard>,
+    body: Bytes,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    shard
-        .verify()
+    let shard = StorageShard::from_binary_upload(&body)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     match insert_shard(&state, shard).await {
         Ok(true) => Ok(StatusCode::CREATED),
@@ -1119,7 +1324,7 @@ async fn publish_group_deletion(
 async fn get_shard(
     State(state): State<AppState>,
     Path(shard_id): Path<String>,
-) -> Result<Json<StorageShard>, StatusCode> {
+) -> Result<Response, StatusCode> {
     let metadata = match state.store.shard_metadata(&shard_id).await {
         Ok(Some(metadata)) => metadata,
         Ok(None) => return Err(StatusCode::NOT_FOUND),
@@ -1138,7 +1343,17 @@ async fn get_shard(
         )
         .await
     {
-        Ok(Some(shard)) => Ok(Json(shard)),
+        Ok(Some(shard)) => {
+            let payload = shard
+                .payload()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            Ok((
+                StatusCode::OK,
+                [(CONTENT_TYPE, "application/octet-stream")],
+                payload,
+            )
+                .into_response())
+        }
         Ok(None) => {
             eprintln!("indexed storage shard {shard_id} is missing from object storage");
             Err(StatusCode::NOT_FOUND)
@@ -1153,7 +1368,7 @@ async fn get_shard(
 async fn delete_shard(
     State(state): State<AppState>,
     Path(shard_id): Path<String>,
-    Json(deletion): Json<ShardDeletion>,
+    token: Bytes,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let metadata = state
         .store
@@ -1161,14 +1376,6 @@ async fn delete_shard(
         .await
         .map_err(storage_error)?
         .ok_or((StatusCode::NOT_FOUND, "storage shard is unavailable".into()))?;
-    let token = STANDARD_NO_PAD
-        .decode(&deletion.delete_token_base64)
-        .map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                "invalid shard deletion token".into(),
-            )
-        })?;
     if token.len() != 32 || blake3::hash(&token).to_hex().as_str() != metadata.delete_token_hash {
         return Err((
             StatusCode::FORBIDDEN,
@@ -1487,6 +1694,50 @@ async fn dispatch_private_request(
     }
 
     match (request.method.as_str(), request.path.as_str()) {
+        ("POST", "/v1/link-preview") => {
+            let Ok(request) = serde_json::from_slice::<LinkPreviewRequest>(&request.body) else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid link preview request");
+            };
+            if let Some(cached) = state.link_previews.read().await.get(&request.url)
+                && cached.fetched_at.elapsed() < LINK_PREVIEW_CACHE_TTL
+            {
+                return cached.preview.as_ref().map_or_else(
+                    || (StatusCode::NOT_FOUND, Vec::new()),
+                    |preview| private_json(StatusCode::OK, preview),
+                );
+            }
+            let Ok(_permit) = state.link_preview_slots.clone().try_acquire_owned() else {
+                return private_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "link preview service is busy",
+                );
+            };
+            let preview = match link_preview::fetch(&request).await {
+                Ok(preview) => preview,
+                Err(_) => return private_error(StatusCode::BAD_GATEWAY, "link preview failed"),
+            };
+            let mut cache = state.link_previews.write().await;
+            cache.retain(|_, cached| cached.fetched_at.elapsed() < LINK_PREVIEW_CACHE_TTL);
+            if cache.len() >= MAX_LINK_PREVIEW_CACHE_ENTRIES
+                && let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, cached)| cached.fetched_at)
+                    .map(|(url, _)| url.clone())
+            {
+                cache.remove(&oldest);
+            }
+            cache.insert(
+                request.url,
+                CachedLinkPreview {
+                    fetched_at: Instant::now(),
+                    preview: preview.clone(),
+                },
+            );
+            preview.as_ref().map_or_else(
+                || (StatusCode::NOT_FOUND, Vec::new()),
+                |preview| private_json(StatusCode::OK, preview),
+            )
+        }
         ("POST", "/v1/accounts") => {
             let Ok(vault) = serde_json::from_slice::<AccountVault>(&request.body) else {
                 return private_error(StatusCode::BAD_REQUEST, "invalid account vault");
@@ -1668,13 +1919,10 @@ async fn dispatch_private_request(
                 }
             }
         }
-        ("POST", "/v3/shards") => {
-            let Ok(shard) = serde_json::from_slice::<StorageShard>(&request.body) else {
+        ("POST", "/v4/shards") => {
+            let Ok(shard) = StorageShard::from_binary_upload(&request.body) else {
                 return private_error(StatusCode::BAD_REQUEST, "invalid storage shard");
             };
-            if let Err(error) = shard.verify() {
-                return private_error(StatusCode::BAD_REQUEST, &error.to_string());
-            }
             match insert_shard(state, shard).await {
                 Ok(true) => (StatusCode::CREATED, Vec::new()),
                 Ok(false) => (StatusCode::ACCEPTED, Vec::new()),
@@ -1784,8 +2032,8 @@ async fn dispatch_private_request(
                 None => private_error(StatusCode::NOT_FOUND, "nothing here"),
             }
         }
-        ("GET", path) if path.starts_with("/v3/shards/") => {
-            let shard_id = path.trim_start_matches("/v3/shards/");
+        ("GET", path) if path.starts_with("/v4/shards/") => {
+            let shard_id = path.trim_start_matches("/v4/shards/");
             let metadata = match state.store.shard_metadata(shard_id).await {
                 Ok(Some(metadata)) => metadata,
                 Ok(None) => {
@@ -1809,7 +2057,16 @@ async fn dispatch_private_request(
                 )
                 .await
             {
-                Ok(Some(shard)) => private_json(StatusCode::OK, &shard),
+                Ok(Some(shard)) => match shard.payload() {
+                    Ok(payload) => (StatusCode::OK, payload),
+                    Err(error) => {
+                        eprintln!("could not decode storage shard {shard_id}: {error:#}");
+                        private_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "shard storage is unavailable",
+                        )
+                    }
+                },
                 Ok(None) => {
                     eprintln!("indexed storage shard {shard_id} is missing from object storage");
                     private_error(StatusCode::NOT_FOUND, "shard is unavailable")
@@ -1823,11 +2080,8 @@ async fn dispatch_private_request(
                 }
             }
         }
-        ("DELETE", path) if path.starts_with("/v3/shards/") => {
-            let shard_id = path.trim_start_matches("/v3/shards/");
-            let Ok(deletion) = serde_json::from_slice::<ShardDeletion>(&request.body) else {
-                return private_error(StatusCode::BAD_REQUEST, "invalid shard deletion");
-            };
+        ("DELETE", path) if path.starts_with("/v4/shards/") => {
+            let shard_id = path.trim_start_matches("/v4/shards/");
             let metadata = match state.store.shard_metadata(shard_id).await {
                 Ok(Some(metadata)) => metadata,
                 Ok(None) => {
@@ -1841,11 +2095,8 @@ async fn dispatch_private_request(
                     );
                 }
             };
-            let Ok(token) = STANDARD_NO_PAD.decode(&deletion.delete_token_base64) else {
-                return private_error(StatusCode::BAD_REQUEST, "invalid shard deletion token");
-            };
-            if token.len() != 32
-                || blake3::hash(&token).to_hex().as_str() != metadata.delete_token_hash
+            if request.body.len() != 32
+                || blake3::hash(&request.body).to_hex().as_str() != metadata.delete_token_hash
             {
                 return private_error(StatusCode::FORBIDDEN, "shard deletion token was rejected");
             }
@@ -1858,6 +2109,174 @@ async fn dispatch_private_request(
                         "shard storage is unavailable",
                     )
                 }
+            }
+        }
+        ("GET", path)
+            if path.starts_with("/v3/groups/") && path.ends_with("/events/latest") =>
+        {
+            let Some((group_id, stream_path)) = path
+                .trim_start_matches("/v3/groups/")
+                .split_once("/streams/")
+            else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid topic stream");
+            };
+            let stream_locator = stream_path.trim_end_matches("/events/latest");
+            if validate_stream_locator(stream_locator).is_err() {
+                return private_error(StatusCode::BAD_REQUEST, "invalid topic stream");
+            }
+            match group_event_page(
+                state,
+                group_id,
+                Some(stream_locator),
+                GroupEventPageCursor::Latest,
+            )
+            .await
+            {
+                Ok(page) => private_json(StatusCode::OK, &page),
+                Err(StatusCode::GONE) => private_error(StatusCode::GONE, "group has been deleted"),
+                Err(status) => private_error(status, "could not read topic history"),
+            }
+        }
+        ("GET", path)
+            if path.starts_with("/v3/groups/") && path.contains("/events/before/") =>
+        {
+            let Some((group_id, stream_path)) = path
+                .trim_start_matches("/v3/groups/")
+                .split_once("/streams/")
+            else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid topic stream");
+            };
+            let Some((stream_locator, cursor)) = stream_path.split_once("/events/before/") else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid topic history cursor");
+            };
+            let Some((created_at_millis, event_id)) = cursor.split_once('/') else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid topic history cursor");
+            };
+            let Ok(created_at_millis) = created_at_millis.parse::<u64>() else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid topic history cursor");
+            };
+            if validate_stream_locator(stream_locator).is_err()
+                || event_id.len() != 64
+                || !event_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return private_error(StatusCode::BAD_REQUEST, "invalid topic history cursor");
+            }
+            match group_event_page(
+                state,
+                group_id,
+                Some(stream_locator),
+                GroupEventPageCursor::Before(created_at_millis, event_id),
+            )
+            .await
+            {
+                Ok(page) => private_json(StatusCode::OK, &page),
+                Err(StatusCode::GONE) => private_error(StatusCode::GONE, "group has been deleted"),
+                Err(status) => private_error(status, "could not read topic history"),
+            }
+        }
+        ("GET", path)
+            if path.starts_with("/v3/groups/") && path.contains("/events/after/") =>
+        {
+            let Some((group_id, stream_path)) = path
+                .trim_start_matches("/v3/groups/")
+                .split_once("/streams/")
+            else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid topic stream");
+            };
+            let Some((stream_locator, cursor)) = stream_path.split_once("/events/after/") else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid topic history cursor");
+            };
+            let Some((created_at_millis, event_id)) = cursor.split_once('/') else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid topic history cursor");
+            };
+            let Ok(created_at_millis) = created_at_millis.parse::<u64>() else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid topic history cursor");
+            };
+            if validate_stream_locator(stream_locator).is_err()
+                || event_id.len() != 64
+                || !event_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return private_error(StatusCode::BAD_REQUEST, "invalid topic history cursor");
+            }
+            match group_event_page(
+                state,
+                group_id,
+                Some(stream_locator),
+                GroupEventPageCursor::After(created_at_millis, event_id),
+            )
+            .await
+            {
+                Ok(page) => private_json(StatusCode::OK, &page),
+                Err(StatusCode::GONE) => private_error(StatusCode::GONE, "group has been deleted"),
+                Err(status) => private_error(status, "could not read topic history"),
+            }
+        }
+        ("GET", path) if path.starts_with("/v2/groups/") && path.ends_with("/events/latest") => {
+            let group_id = path
+                .trim_start_matches("/v2/groups/")
+                .trim_end_matches("/events/latest");
+            match group_event_page(state, group_id, None, GroupEventPageCursor::Latest).await {
+                Ok(page) => private_json(StatusCode::OK, &page),
+                Err(StatusCode::GONE) => private_error(StatusCode::GONE, "group has been deleted"),
+                Err(status) => private_error(status, "could not read group history"),
+            }
+        }
+        ("GET", path) if path.starts_with("/v2/groups/") && path.contains("/events/before/") => {
+            let Some((group_id, cursor)) = path
+                .trim_start_matches("/v2/groups/")
+                .split_once("/events/before/")
+            else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid group history cursor");
+            };
+            let Some((created_at_millis, event_id)) = cursor.split_once('/') else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid group history cursor");
+            };
+            let Ok(created_at_millis) = created_at_millis.parse::<u64>() else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid group history cursor");
+            };
+            if event_id.len() != 64 || !event_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return private_error(StatusCode::BAD_REQUEST, "invalid group history cursor");
+            }
+            match group_event_page(
+                state,
+                group_id,
+                None,
+                GroupEventPageCursor::Before(created_at_millis, event_id),
+            )
+            .await
+            {
+                Ok(page) => private_json(StatusCode::OK, &page),
+                Err(StatusCode::GONE) => private_error(StatusCode::GONE, "group has been deleted"),
+                Err(status) => private_error(status, "could not read group history"),
+            }
+        }
+        ("GET", path) if path.starts_with("/v2/groups/") && path.contains("/events/after/") => {
+            let Some((group_id, cursor)) = path
+                .trim_start_matches("/v2/groups/")
+                .split_once("/events/after/")
+            else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid group history cursor");
+            };
+            let Some((created_at_millis, event_id)) = cursor.split_once('/') else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid group history cursor");
+            };
+            let Ok(created_at_millis) = created_at_millis.parse::<u64>() else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid group history cursor");
+            };
+            if event_id.len() != 64 || !event_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return private_error(StatusCode::BAD_REQUEST, "invalid group history cursor");
+            }
+            match group_event_page(
+                state,
+                group_id,
+                None,
+                GroupEventPageCursor::After(created_at_millis, event_id),
+            )
+            .await
+            {
+                Ok(page) => private_json(StatusCode::OK, &page),
+                Err(StatusCode::GONE) => private_error(StatusCode::GONE, "group has been deleted"),
+                Err(status) => private_error(status, "could not read group history"),
             }
         }
         ("GET", path) if path.starts_with("/v1/groups/") && path.ends_with("/events") => {
@@ -2284,12 +2703,20 @@ async fn insert_event(state: &AppState, event: SignedEvent) -> anyhow::Result<In
 async fn validate_mls_event(state: &AppState, event: &SignedEvent) -> anyhow::Result<()> {
     let has_genesis = state.mls_geneses.read().await.contains_key(&event.group_id);
     if !has_genesis {
-        if event.encryption_version == 1 && event.epoch.is_none() {
+        if event.encryption_version == 1
+            && event.epoch.is_none()
+            && event.stream_locator.is_none()
+        {
             return Ok(());
         }
         bail!("group has not enabled MLS encryption")
     }
-    if event.encryption_version != 2 {
+    let valid_envelope = match (event.encryption_version, event.stream_locator.as_deref()) {
+        (2, None) => true,
+        (3, Some(stream_locator)) => validate_stream_locator(stream_locator).is_ok(),
+        _ => false,
+    };
+    if !valid_envelope {
         bail!("legacy events are closed after MLS cutover")
     }
     let epoch = event.epoch.context("MLS event has no epoch")?;

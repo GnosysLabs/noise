@@ -1,6 +1,6 @@
 [package]
 name = "noise-relay"
-version = "0.1.1"
+version = "0.1.4"
 edition.workspace = true
 
 [dependencies]
@@ -10,12 +10,14 @@ base64.workspace = true
 blake3.workspace = true
 clap.workspace = true
 ed25519-dalek.workspace = true
+image.workspace = true
 noise-core = { path = "../noise-core" }
 noise-transport = { path = "../noise-transport" }
 ohttp.workspace = true
 object_store.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+scraper.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true

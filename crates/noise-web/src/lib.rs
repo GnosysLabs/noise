@@ -204,6 +204,26 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .await
                 .map_err(|error| error.to_string())?,
         ),
+        "fetch_attachment_range" => data(
+            client
+                .fetch_attachment_range(
+                    STATE_PATH,
+                    CACHE_PATH,
+                    optional::<String>(&request, "scope_id")?,
+                    &required::<MediaAttachment>(&request, "attachment")?,
+                    required::<u64>(&request, "offset")?,
+                    required::<u64>(&request, "byte_length")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "fetch_link_preview" => data(
+            client
+                .fetch_link_preview(required::<String>(&request, "url")?, relays(&request)?)
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
         "upload_media_chunk" => data(
             client
                 .upload_media_chunk(
@@ -266,8 +286,20 @@ async fn dispatch(request: Value) -> Result<Value, String> {
             let text = required::<String>(&request, "text")?;
             let attachment = optional::<MediaAttachment>(&request, "attachment")?;
             let reply_to = optional::<String>(&request, "reply_to_message_id")?;
+            let topic_id = optional::<String>(&request, "topic_id")?;
             let relay_list = relays(&request)?;
-            let sent = if let Some(attachment) = attachment {
+            let sent = if let Some(topic_id) = topic_id {
+                client
+                    .say_topic(
+                        STATE_PATH,
+                        &topic_id,
+                        text,
+                        attachment,
+                        reply_to,
+                        relay_list,
+                    )
+                    .await
+            } else if let Some(attachment) = attachment {
                 client
                     .say_with_attachment_reply(STATE_PATH, text, attachment, reply_to, relay_list)
                     .await
@@ -279,6 +311,70 @@ async fn dispatch(request: Value) -> Result<Value, String> {
             .map_err(|error| error.to_string())?;
             data(sent)
         }
+        "create_topic" => data(
+            client
+                .create_topic(
+                    STATE_PATH,
+                    required::<String>(&request, "name")?,
+                    required::<String>(&request, "icon")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "update_topic" => data(
+            client
+                .update_topic(
+                    STATE_PATH,
+                    &required::<String>(&request, "topic_id")?,
+                    required::<String>(&request, "name")?,
+                    required::<String>(&request, "icon")?,
+                    required::<bool>(&request, "locked")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "archive_topic" => data(
+            client
+                .archive_topic(
+                    STATE_PATH,
+                    &required::<String>(&request, "topic_id")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "reorder_topics" => data(
+            client
+                .reorder_topics(
+                    STATE_PATH,
+                    required::<Vec<String>>(&request, "topic_ids")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "sync_topic_activity" => data(
+            client
+                .sync_topic_activity(
+                    STATE_PATH,
+                    &required::<String>(&request, "group_id")?,
+                    &required::<String>(&request, "topic_id")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "mark_topic_read" => data(
+            client
+                .mark_topic_read(
+                    STATE_PATH,
+                    &required::<String>(&request, "group_id")?,
+                    Some(&required::<String>(&request, "topic_id")?),
+                )
+                .map_err(|error| error.to_string())?,
+        ),
         "start_direct" => data(
             client
                 .start_direct(
@@ -462,6 +558,27 @@ async fn dispatch(request: Value) -> Result<Value, String> {
         "cached_conversation" => data(
             client
                 .cached_conversation(STATE_PATH, &required::<String>(&request, "group_id")?)
+                .map_err(|error| error.to_string())?,
+        ),
+        "load_older_group_history" => data(
+            client
+                .load_older_group_history(
+                    STATE_PATH,
+                    &required::<String>(&request, "group_id")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "load_older_topic_history" => data(
+            client
+                .load_older_topic_history(
+                    STATE_PATH,
+                    &required::<String>(&request, "group_id")?,
+                    &required::<String>(&request, "topic_id")?,
+                    relays(&request)?,
+                )
+                .await
                 .map_err(|error| error.to_string())?,
         ),
         "watch_group" => data(

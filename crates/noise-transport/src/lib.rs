@@ -270,6 +270,22 @@ pub struct PlainResponse {
     pub body: Vec<u8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkPreviewRequest {
+    pub url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkPreview {
+    pub url: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub site_name: Option<String>,
+    pub image_data_url: Option<String>,
+}
+
 pub fn encode_request(
     method: &str,
     scheme: &str,
