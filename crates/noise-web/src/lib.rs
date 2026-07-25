@@ -397,6 +397,16 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .await
                 .map_err(|error| error.to_string())?,
         ),
+        "sync_group_activity" => data(
+            client
+                .sync_group_activity(
+                    STATE_PATH,
+                    &required::<String>(&request, "group_id")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
         "sync_topic_activity" => data(
             client
                 .sync_topic_activity(
@@ -406,6 +416,16 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                     relays(&request)?,
                 )
                 .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "mark_group_read" => data(
+            client
+                .mark_group_read(STATE_PATH, &required::<String>(&request, "group_id")?)
+                .map_err(|error| error.to_string())?,
+        ),
+        "mark_entire_group_read" => data(
+            client
+                .mark_entire_group_read(STATE_PATH, &required::<String>(&request, "group_id")?)
                 .map_err(|error| error.to_string())?,
         ),
         "mark_topic_read" => data(
