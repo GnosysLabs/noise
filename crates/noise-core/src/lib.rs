@@ -456,6 +456,10 @@ pub struct MediaChunk {
 }
 
 pub const MAX_STORAGE_SHARDS: usize = 12;
+pub const STREAMING_STORAGE_VERSION: u8 = 2;
+const STREAMING_BLOB_MAGIC: &[u8; 4] = b"NSB2";
+const STREAMING_SHARD_MAGIC: &[u8; 4] = b"NSS2";
+const STORAGE_ID_BYTES: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageManifest {
@@ -497,12 +501,6 @@ pub struct StorageShard {
     pub delete_token_hash: String,
     #[serde(rename = "b", alias = "payload_base64")]
     pub payload_base64: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShardDeletion {
-    #[serde(rename = "t", alias = "delete_token_base64")]
-    pub delete_token_base64: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -581,6 +579,58 @@ impl EncryptedBlob {
             .decrypt(XNonce::from_slice(&nonce), ciphertext.as_ref())
             .map_err(|_| NoiseError::Crypto)
     }
+
+    fn streaming_bytes(&self) -> Result<Vec<u8>, NoiseError> {
+        self.verify()?;
+        let group_id = self.group_id.as_deref().unwrap_or_default().as_bytes();
+        let group_id_length: u16 = group_id
+            .len()
+            .try_into()
+            .map_err(|_| NoiseError::InvalidStorageManifest)?;
+        let nonce = decode_array::<24>(&self.nonce_base64, "blob nonce")?;
+        let ciphertext = decode(&self.ciphertext_base64, "blob ciphertext")?;
+        let mut encoded =
+            Vec::with_capacity(4 + 2 + group_id.len() + nonce.len() + ciphertext.len());
+        encoded.extend_from_slice(STREAMING_BLOB_MAGIC);
+        encoded.extend_from_slice(&group_id_length.to_be_bytes());
+        encoded.extend_from_slice(group_id);
+        encoded.extend_from_slice(&nonce);
+        encoded.extend_from_slice(&ciphertext);
+        Ok(encoded)
+    }
+
+    fn from_streaming_bytes(object_id: &str, encoded: &[u8]) -> Result<Self, NoiseError> {
+        if encoded.len() < 4 + 2 + 24 + 16 || &encoded[..4] != STREAMING_BLOB_MAGIC {
+            return Err(NoiseError::InvalidStorageManifest);
+        }
+        let group_id_length = usize::from(u16::from_be_bytes([encoded[4], encoded[5]]));
+        let nonce_start = 6_usize
+            .checked_add(group_id_length)
+            .ok_or(NoiseError::InvalidStorageManifest)?;
+        let ciphertext_start = nonce_start
+            .checked_add(24)
+            .ok_or(NoiseError::InvalidStorageManifest)?;
+        if ciphertext_start + 16 > encoded.len() {
+            return Err(NoiseError::InvalidStorageManifest);
+        }
+        let group_id = if group_id_length == 0 {
+            None
+        } else {
+            Some(
+                std::str::from_utf8(&encoded[6..nonce_start])
+                    .map_err(|_| NoiseError::InvalidStorageManifest)?
+                    .to_owned(),
+            )
+        };
+        let blob = Self {
+            blob_id: object_id.to_owned(),
+            group_id,
+            nonce_base64: STANDARD_NO_PAD.encode(&encoded[nonce_start..ciphertext_start]),
+            ciphertext_base64: STANDARD_NO_PAD.encode(&encoded[ciphertext_start..]),
+        };
+        blob.verify()?;
+        Ok(blob)
+    }
 }
 
 impl StorageShard {
@@ -600,13 +650,50 @@ impl StorageShard {
         }
         Ok(())
     }
+
+    pub fn payload(&self) -> Result<Vec<u8>, NoiseError> {
+        self.verify()?;
+        decode(&self.payload_base64, "storage shard")
+    }
+
+    pub fn binary_upload(&self) -> Result<Vec<u8>, NoiseError> {
+        let payload = self.payload()?;
+        let mut encoded =
+            Vec::with_capacity(STREAMING_SHARD_MAGIC.len() + STORAGE_ID_BYTES * 3 + payload.len());
+        encoded.extend_from_slice(STREAMING_SHARD_MAGIC);
+        encoded.extend_from_slice(self.shard_id.as_bytes());
+        encoded.extend_from_slice(self.payload_hash.as_bytes());
+        encoded.extend_from_slice(self.delete_token_hash.as_bytes());
+        encoded.extend_from_slice(&payload);
+        Ok(encoded)
+    }
+
+    pub fn from_binary_upload(encoded: &[u8]) -> Result<Self, NoiseError> {
+        const HEADER_BYTES: usize = 4 + STORAGE_ID_BYTES * 3;
+        if encoded.len() <= HEADER_BYTES || &encoded[..4] != STREAMING_SHARD_MAGIC {
+            return Err(NoiseError::InvalidStorageManifest);
+        }
+        let read_id = |start: usize| -> Result<String, NoiseError> {
+            std::str::from_utf8(&encoded[start..start + STORAGE_ID_BYTES])
+                .map(str::to_owned)
+                .map_err(|_| NoiseError::InvalidStorageManifest)
+        };
+        let shard = Self {
+            shard_id: read_id(4)?,
+            payload_hash: read_id(4 + STORAGE_ID_BYTES)?,
+            delete_token_hash: read_id(4 + STORAGE_ID_BYTES * 2)?,
+            payload_base64: STANDARD_NO_PAD.encode(&encoded[HEADER_BYTES..]),
+        };
+        shard.verify()?;
+        Ok(shard)
+    }
 }
 
 impl StorageManifest {
     pub fn verify(&self, object_id: &str) -> Result<(), NoiseError> {
         let data_shards = usize::from(self.data_shards);
         let total_shards = usize::from(self.total_shards);
-        if self.version != 1
+        if !matches!(self.version, 1 | STREAMING_STORAGE_VERSION)
             || self.object_id != object_id
             || !valid_hex_id(&self.object_id)
             || self.encoded_byte_length == 0
@@ -657,7 +744,7 @@ pub fn encode_blob_for_storage(
     // converges on the target 8-of-12 profile without changing the protocol.
     let data_shards = (total_shards * 2 / 3).max(1);
     let parity_shards = total_shards - data_shards;
-    let encoded = serde_json::to_vec(blob)?;
+    let encoded = blob.streaming_bytes()?;
     let shard_byte_length = encoded.len().div_ceil(data_shards);
     let mut shards = vec![vec![0_u8; shard_byte_length]; total_shards];
     for (index, chunk) in encoded.chunks(shard_byte_length).enumerate() {
@@ -690,7 +777,7 @@ pub fn encode_blob_for_storage(
         });
     }
     let manifest = StorageManifest {
-        version: 1,
+        version: STREAMING_STORAGE_VERSION,
         object_id: blob.blob_id.clone(),
         encoded_byte_length: encoded
             .len()
@@ -707,30 +794,31 @@ pub fn encode_blob_for_storage(
     Ok((manifest, stored))
 }
 
-pub fn reconstruct_blob_from_storage(
+pub fn reconstruct_blob_from_storage_payloads(
     manifest: &StorageManifest,
-    shards: &[StorageShard],
+    shards: &[(String, Vec<u8>)],
 ) -> Result<EncryptedBlob, NoiseError> {
     manifest.verify(&manifest.object_id)?;
+    if manifest.version != STREAMING_STORAGE_VERSION {
+        return Err(NoiseError::InvalidStorageManifest);
+    }
     let data_shards = usize::from(manifest.data_shards);
     let total_shards = usize::from(manifest.total_shards);
     let mut available = vec![None; total_shards];
-    for shard in shards {
+    for (shard_id, payload) in shards {
         let Some(placement) = manifest
             .placements
             .iter()
-            .find(|placement| placement.shard_id == shard.shard_id)
+            .find(|placement| placement.shard_id == *shard_id)
         else {
             continue;
         };
-        if shard.verify().is_err() || shard.payload_hash != placement.payload_hash {
+        if payload.len() != manifest.shard_byte_length as usize
+            || blake3::hash(payload).to_hex().as_str() != placement.payload_hash
+        {
             continue;
         }
-        let payload = decode(&shard.payload_base64, "storage shard")?;
-        if payload.len() != manifest.shard_byte_length as usize {
-            continue;
-        }
-        available[usize::from(placement.shard_index)] = Some(payload);
+        available[usize::from(placement.shard_index)] = Some(payload.clone());
     }
     if available.iter().filter(|shard| shard.is_some()).count() < data_shards {
         return Err(NoiseError::InsufficientStorageShards);
@@ -750,27 +838,20 @@ pub fn reconstruct_blob_from_storage(
         );
     }
     encoded.truncate(manifest.encoded_byte_length as usize);
-    let blob: EncryptedBlob = serde_json::from_slice(&encoded)?;
-    blob.verify()?;
-    if blob.blob_id != manifest.object_id {
-        return Err(NoiseError::BlobMismatch);
-    }
-    Ok(blob)
+    EncryptedBlob::from_streaming_bytes(&manifest.object_id, &encoded)
 }
 
-pub fn shard_deletion(key_base64: &str, shard_id: &str) -> Result<ShardDeletion, NoiseError> {
+pub fn shard_deletion_bytes(key_base64: &str, shard_id: &str) -> Result<Vec<u8>, NoiseError> {
     if !valid_hex_id(shard_id) {
         return Err(NoiseError::InvalidStorageManifest);
     }
     let key = decode_array::<32>(key_base64, "blob key")?;
-    Ok(ShardDeletion {
-        delete_token_base64: STANDARD_NO_PAD.encode(storage_delete_token(&key, shard_id)),
-    })
+    Ok(storage_delete_token(&key, shard_id).to_vec())
 }
 
 fn storage_shard_id(key: &[u8; 32], object_id: &str, shard_index: u8) -> String {
     let mut hasher = blake3::Hasher::new_keyed(key);
-    hasher.update(b"noise-storage-shard-v1");
+    hasher.update(b"noise-storage-shard-v2");
     hasher.update(object_id.as_bytes());
     hasher.update(&[shard_index]);
     hasher.finalize().to_hex().to_string()
@@ -1313,6 +1394,26 @@ pub enum GroupEventPayload {
     GroupProfileUpdated {
         profile: GroupProfile,
     },
+    TopicCreated {
+        topic_id: String,
+        name: String,
+        #[serde(default = "default_topic_icon")]
+        icon: String,
+        stream_locator: String,
+    },
+    TopicUpdated {
+        topic_id: String,
+        name: String,
+        #[serde(default)]
+        icon: Option<String>,
+        locked: bool,
+    },
+    TopicsReordered {
+        topic_ids: Vec<String>,
+    },
+    TopicArchived {
+        topic_id: String,
+    },
     ModeratorSet {
         member_public_key: String,
         enabled: bool,
@@ -1366,6 +1467,14 @@ pub enum GroupEventPayload {
         #[serde(default)]
         reply_to_message_id: Option<String>,
     },
+    TopicMessage {
+        topic_id: String,
+        text: String,
+        #[serde(default)]
+        attachment: Option<MediaAttachment>,
+        #[serde(default)]
+        reply_to_message_id: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1379,6 +1488,8 @@ pub struct SignedEvent {
     pub encryption_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_locator: Option<String>,
     pub nonce_base64: String,
     pub ciphertext_base64: String,
     pub signature_base64: String,
@@ -1411,11 +1522,36 @@ struct UnsignedEventV2<'a> {
 }
 
 #[derive(Serialize)]
+struct UnsignedEventV3<'a> {
+    encryption_version: u32,
+    epoch: u64,
+    group_id: &'a str,
+    stream_locator: &'a str,
+    author_public_key: &'a str,
+    author_sequence: u64,
+    created_at_millis: u64,
+    nonce_base64: &'a str,
+    ciphertext_base64: &'a str,
+}
+
+#[derive(Serialize)]
 struct EventAadV2<'a> {
     context: &'static str,
     encryption_version: u32,
     epoch: u64,
     group_id: &'a str,
+    author_public_key: &'a str,
+    author_sequence: u64,
+    created_at_millis: u64,
+}
+
+#[derive(Serialize)]
+struct EventAadV3<'a> {
+    context: &'static str,
+    encryption_version: u32,
+    epoch: u64,
+    group_id: &'a str,
+    stream_locator: &'a str,
     author_public_key: &'a str,
     author_sequence: u64,
     created_at_millis: u64,
@@ -1768,6 +1904,7 @@ impl SignedEvent {
             created_at_millis: now_millis(),
             encryption_version: 1,
             epoch: None,
+            stream_locator: None,
             nonce_base64: STANDARD_NO_PAD.encode(nonce),
             ciphertext_base64: STANDARD_NO_PAD.encode(ciphertext),
             signature_base64: String::new(),
@@ -1819,6 +1956,62 @@ impl SignedEvent {
             created_at_millis,
             encryption_version: 2,
             epoch: Some(epoch),
+            stream_locator: None,
+            nonce_base64: STANDARD_NO_PAD.encode(nonce),
+            ciphertext_base64: STANDARD_NO_PAD.encode(ciphertext),
+            signature_base64: String::new(),
+        };
+        let signing_bytes = event.signing_bytes()?;
+        event.signature_base64 = identity.sign(&signing_bytes);
+        event.event_id = event.calculate_id(&signing_bytes)?;
+        Ok(event)
+    }
+
+    pub fn create_for_epoch_in_stream(
+        identity: &Identity,
+        group_id: impl Into<String>,
+        archive_key_base64: &str,
+        epoch: u64,
+        stream_locator: impl Into<String>,
+        payload: GroupEventPayload,
+        author_sequence: u64,
+    ) -> Result<Self, NoiseError> {
+        let group_id = group_id.into();
+        let stream_locator = stream_locator.into();
+        if !valid_hex_id(&group_id) || !valid_hex_id(&stream_locator) {
+            return Err(NoiseError::GroupMismatch);
+        }
+        let archive_key = decode_array::<32>(archive_key_base64, "archive key")?;
+        let nonce: [u8; 24] = random();
+        let author_public_key = identity.public_key_base64();
+        let created_at_millis = now_millis();
+        let aad = event_aad_v3(
+            &group_id,
+            &stream_locator,
+            &author_public_key,
+            author_sequence,
+            created_at_millis,
+            epoch,
+        )?;
+        let plaintext = serde_json::to_vec(&payload)?;
+        let ciphertext = XChaCha20Poly1305::new((&archive_key).into())
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| NoiseError::Crypto)?;
+        let mut event = Self {
+            event_id: String::new(),
+            group_id,
+            author_public_key,
+            author_sequence,
+            created_at_millis,
+            encryption_version: 3,
+            epoch: Some(epoch),
+            stream_locator: Some(stream_locator),
             nonce_base64: STANDARD_NO_PAD.encode(nonce),
             ciphertext_base64: STANDARD_NO_PAD.encode(ciphertext),
             signature_base64: String::new(),
@@ -1844,7 +2037,7 @@ impl SignedEvent {
 
     pub fn decrypt(&self, group: &GroupMembership) -> Result<GroupEventPayload, NoiseError> {
         self.verify()?;
-        if self.encryption_version != 1 || self.epoch.is_some() {
+        if self.encryption_version != 1 || self.epoch.is_some() || self.stream_locator.is_some() {
             return Err(NoiseError::InvalidMlsState);
         }
         if self.group_id != group.group_id {
@@ -1871,20 +2064,31 @@ impl SignedEvent {
         archive_key_base64: &str,
     ) -> Result<GroupEventPayload, NoiseError> {
         self.verify()?;
-        if self.encryption_version != 2 || self.group_id != expected_group_id {
+        if !matches!(self.encryption_version, 2 | 3) || self.group_id != expected_group_id {
             return Err(NoiseError::GroupMismatch);
         }
         let epoch = self.epoch.ok_or(NoiseError::InvalidMlsState)?;
         let archive_key = decode_array::<32>(archive_key_base64, "archive key")?;
         let nonce = decode_array::<24>(&self.nonce_base64, "message nonce")?;
         let ciphertext = decode(&self.ciphertext_base64, "message ciphertext")?;
-        let aad = event_aad_v2(
-            &self.group_id,
-            &self.author_public_key,
-            self.author_sequence,
-            self.created_at_millis,
-            epoch,
-        )?;
+        let aad = match (self.encryption_version, self.stream_locator.as_deref()) {
+            (2, None) => event_aad_v2(
+                &self.group_id,
+                &self.author_public_key,
+                self.author_sequence,
+                self.created_at_millis,
+                epoch,
+            )?,
+            (3, Some(stream_locator)) if valid_hex_id(stream_locator) => event_aad_v3(
+                &self.group_id,
+                stream_locator,
+                &self.author_public_key,
+                self.author_sequence,
+                self.created_at_millis,
+                epoch,
+            )?,
+            _ => return Err(NoiseError::InvalidMlsState),
+        };
         let plaintext = XChaCha20Poly1305::new((&archive_key).into())
             .decrypt(
                 XNonce::from_slice(&nonce),
@@ -1898,8 +2102,12 @@ impl SignedEvent {
     }
 
     fn signing_bytes(&self) -> Result<Vec<u8>, NoiseError> {
-        match (self.encryption_version, self.epoch) {
-            (1, None) => Ok(serde_json::to_vec(&UnsignedEventV1 {
+        match (
+            self.encryption_version,
+            self.epoch,
+            self.stream_locator.as_deref(),
+        ) {
+            (1, None, None) => Ok(serde_json::to_vec(&UnsignedEventV1 {
                 group_id: &self.group_id,
                 author_public_key: &self.author_public_key,
                 author_sequence: self.author_sequence,
@@ -1907,7 +2115,7 @@ impl SignedEvent {
                 nonce_base64: &self.nonce_base64,
                 ciphertext_base64: &self.ciphertext_base64,
             })?),
-            (2, Some(epoch)) => Ok(serde_json::to_vec(&UnsignedEventV2 {
+            (2, Some(epoch), None) => Ok(serde_json::to_vec(&UnsignedEventV2 {
                 encryption_version: self.encryption_version,
                 epoch,
                 group_id: &self.group_id,
@@ -1917,6 +2125,19 @@ impl SignedEvent {
                 nonce_base64: &self.nonce_base64,
                 ciphertext_base64: &self.ciphertext_base64,
             })?),
+            (3, Some(epoch), Some(stream_locator)) if valid_hex_id(stream_locator) => {
+                Ok(serde_json::to_vec(&UnsignedEventV3 {
+                    encryption_version: self.encryption_version,
+                    epoch,
+                    group_id: &self.group_id,
+                    stream_locator,
+                    author_public_key: &self.author_public_key,
+                    author_sequence: self.author_sequence,
+                    created_at_millis: self.created_at_millis,
+                    nonce_base64: &self.nonce_base64,
+                    ciphertext_base64: &self.ciphertext_base64,
+                })?)
+            }
             _ => Err(NoiseError::InvalidMlsState),
         }
     }
@@ -1948,6 +2169,26 @@ fn event_aad_v2(
     })?)
 }
 
+fn event_aad_v3(
+    group_id: &str,
+    stream_locator: &str,
+    author_public_key: &str,
+    author_sequence: u64,
+    created_at_millis: u64,
+    epoch: u64,
+) -> Result<Vec<u8>, NoiseError> {
+    Ok(serde_json::to_vec(&EventAadV3 {
+        context: "xyz.gnosyslabs.noise.group-event.v3",
+        encryption_version: 3,
+        epoch,
+        group_id,
+        stream_locator,
+        author_public_key,
+        author_sequence,
+        created_at_millis,
+    })?)
+}
+
 #[derive(Clone, Debug)]
 pub struct MemberState {
     pub public_key: String,
@@ -1972,6 +2213,20 @@ pub struct AcceptedMessage {
     pub text: String,
     pub attachment: Option<MediaAttachment>,
     pub reply_to_message_id: Option<String>,
+    pub topic_id: Option<String>,
+    pub created_at_millis: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct AcceptedTopic {
+    pub topic_id: String,
+    pub name: String,
+    pub icon: String,
+    pub stream_locator: String,
+    pub locked: bool,
+    pub archived: bool,
+    pub sort_index: usize,
+    pub created_by_public_key: String,
     pub created_at_millis: u64,
 }
 
@@ -2002,6 +2257,7 @@ pub struct GroupState {
     pub moderators: HashSet<String>,
     pub banned_members: HashSet<String>,
     pub banned_profiles: HashMap<String, MemberState>,
+    pub topics: HashMap<String, AcceptedTopic>,
     pub messages: Vec<AcceptedMessage>,
     pub reactions: Vec<AcceptedReaction>,
     pub reports: Vec<AcceptedReport>,
@@ -2044,7 +2300,7 @@ impl GroupState {
             }
             let payload = match (event.encryption_version, event.epoch) {
                 (1, None) => event.decrypt(group),
-                (2, Some(epoch))
+                (2 | 3, Some(epoch))
                     if epoch_members
                         .get(&epoch)
                         .is_some_and(|members| members.contains(&event.author_public_key)) =>
@@ -2131,6 +2387,130 @@ impl GroupState {
                         profile.mobile_background = state.profile.mobile_background.clone();
                     }
                     state.profile = profile;
+                }
+                GroupEventPayload::TopicCreated {
+                    topic_id,
+                    name,
+                    icon,
+                    stream_locator,
+                } => {
+                    let sort_index = state
+                        .topics
+                        .values()
+                        .map(|topic| topic.sort_index)
+                        .max()
+                        .map_or(0, |index| index.saturating_add(1));
+                    let is_owner =
+                        state.owner_public_key.as_deref() == Some(event.author_public_key.as_str());
+                    let can_moderate =
+                        is_owner || state.moderators.contains(&event.author_public_key);
+                    let is_active = state.members.contains_key(&event.author_public_key);
+                    if !can_moderate
+                        || !is_active
+                        || event.stream_locator.is_some()
+                        || !valid_hex_id(&topic_id)
+                        || !valid_topic_name(&name)
+                        || !valid_reaction_emoji(&icon)
+                        || !valid_hex_id(&stream_locator)
+                        || state.topics.contains_key(&topic_id)
+                        || state
+                            .topics
+                            .values()
+                            .any(|topic| topic.stream_locator == stream_locator)
+                    {
+                        state.rejected_events += 1;
+                        continue;
+                    }
+                    state.topics.insert(
+                        topic_id.clone(),
+                        AcceptedTopic {
+                            topic_id,
+                            name: name.trim().to_owned(),
+                            icon,
+                            stream_locator,
+                            locked: false,
+                            archived: false,
+                            sort_index,
+                            created_by_public_key: event.author_public_key.clone(),
+                            created_at_millis: event.created_at_millis,
+                        },
+                    );
+                }
+                GroupEventPayload::TopicUpdated {
+                    topic_id,
+                    name,
+                    icon,
+                    locked,
+                } => {
+                    let is_owner =
+                        state.owner_public_key.as_deref() == Some(event.author_public_key.as_str());
+                    let can_moderate =
+                        is_owner || state.moderators.contains(&event.author_public_key);
+                    let is_active = state.members.contains_key(&event.author_public_key);
+                    let Some(topic) = state.topics.get_mut(&topic_id) else {
+                        state.rejected_events += 1;
+                        continue;
+                    };
+                    if !can_moderate
+                        || !is_active
+                        || topic.archived
+                        || event.stream_locator.is_some()
+                        || !valid_topic_name(&name)
+                        || icon.as_deref().is_some_and(|icon| !valid_reaction_emoji(icon))
+                    {
+                        state.rejected_events += 1;
+                        continue;
+                    }
+                    topic.name = name.trim().to_owned();
+                    if let Some(icon) = icon {
+                        topic.icon = icon;
+                    }
+                    topic.locked = locked;
+                }
+                GroupEventPayload::TopicsReordered { topic_ids } => {
+                    let is_owner =
+                        state.owner_public_key.as_deref() == Some(event.author_public_key.as_str());
+                    let active_topic_ids = state
+                        .topics
+                        .values()
+                        .filter(|topic| !topic.archived)
+                        .map(|topic| topic.topic_id.clone())
+                        .collect::<HashSet<_>>();
+                    let requested_topic_ids = topic_ids.iter().cloned().collect::<HashSet<_>>();
+                    if !is_owner
+                        || event.stream_locator.is_some()
+                        || topic_ids.len() != requested_topic_ids.len()
+                        || requested_topic_ids != active_topic_ids
+                    {
+                        state.rejected_events += 1;
+                        continue;
+                    }
+                    for (sort_index, topic_id) in topic_ids.into_iter().enumerate() {
+                        if let Some(topic) = state.topics.get_mut(&topic_id) {
+                            topic.sort_index = sort_index;
+                        }
+                    }
+                }
+                GroupEventPayload::TopicArchived { topic_id } => {
+                    let is_owner =
+                        state.owner_public_key.as_deref() == Some(event.author_public_key.as_str());
+                    let can_moderate =
+                        is_owner || state.moderators.contains(&event.author_public_key);
+                    let is_active = state.members.contains_key(&event.author_public_key);
+                    let Some(topic) = state.topics.get_mut(&topic_id) else {
+                        state.rejected_events += 1;
+                        continue;
+                    };
+                    if !can_moderate
+                        || !is_active
+                        || topic.archived
+                        || event.stream_locator.is_some()
+                    {
+                        state.rejected_events += 1;
+                        continue;
+                    }
+                    topic.archived = true;
+                    topic.locked = true;
                 }
                 GroupEventPayload::ModeratorSet {
                     member_public_key,
@@ -2377,6 +2757,62 @@ impl GroupState {
                         text,
                         attachment,
                         reply_to_message_id,
+                        topic_id: None,
+                        created_at_millis: event.created_at_millis,
+                    });
+                }
+                GroupEventPayload::TopicMessage {
+                    topic_id,
+                    text,
+                    attachment,
+                    reply_to_message_id,
+                } => {
+                    let Some(member) = state.members.get(&event.author_public_key) else {
+                        state.rejected_events += 1;
+                        continue;
+                    };
+                    let Some(topic) = state.topics.get(&topic_id) else {
+                        state.rejected_events += 1;
+                        continue;
+                    };
+                    let is_owner =
+                        state.owner_public_key.as_deref() == Some(event.author_public_key.as_str());
+                    let is_moderator = state.moderators.contains(&event.author_public_key);
+                    if event.encryption_version != 3
+                        || event.stream_locator.as_deref() != Some(topic.stream_locator.as_str())
+                        || topic.archived
+                        || (topic.locked && !is_owner && !is_moderator)
+                        || text.is_empty() && attachment.is_none()
+                        || attachment.as_ref().is_some_and(|media| !valid_media(media))
+                        || reply_to_message_id.as_ref().is_some_and(|message_id| {
+                            !valid_message_id(message_id)
+                                || !state.messages.iter().any(|message| {
+                                    message.message_id == *message_id
+                                        && message.topic_id.as_deref() == Some(topic_id.as_str())
+                                })
+                        })
+                        || !is_owner
+                            && !is_moderator
+                            && ((!text.is_empty() && !state.profile.members_can_send_messages)
+                                || (attachment.is_some()
+                                    && !state.profile.members_can_send_media))
+                    {
+                        state.rejected_events += 1;
+                        continue;
+                    }
+                    state.messages.push(AcceptedMessage {
+                        event_id: event.event_id.clone(),
+                        message_id: event.event_id.clone(),
+                        author_public_key: event.author_public_key.clone(),
+                        username: member.username.clone(),
+                        bio: member.bio.clone(),
+                        avatar: member.avatar.clone(),
+                        album: member.album.clone(),
+                        accepts_direct_messages: member.accepts_direct_messages,
+                        text,
+                        attachment,
+                        reply_to_message_id,
+                        topic_id: Some(topic_id),
                         created_at_millis: event.created_at_millis,
                     });
                 }
@@ -2398,6 +2834,11 @@ fn retain_related_for_existing_messages(state: &mut GroupState) {
     state
         .reactions
         .retain(|reaction| message_ids.contains(reaction.message_event_id.as_str()));
+}
+
+fn valid_topic_name(name: &str) -> bool {
+    let length = name.trim().chars().count();
+    (1..=80).contains(&length)
 }
 
 fn valid_media(media: &MediaAttachment) -> bool {
@@ -2467,6 +2908,10 @@ pub fn valid_reaction_emoji(emoji: &str) -> bool {
         && emoji.chars().count() <= 32
         && !emoji.chars().any(|character| character.is_control())
         && UnicodeSegmentation::graphemes(emoji, true).count() == 1
+}
+
+fn default_topic_icon() -> String {
+    "💬".to_owned()
 }
 
 fn valid_group_profile(profile: &GroupProfile) -> bool {
@@ -2664,9 +3109,22 @@ mod tests {
             .map(|index| format!("https://relay-{index}.example"))
             .collect::<Vec<_>>();
         let (manifest, shards) = encode_blob_for_storage(&blob, &key, &relays).unwrap();
+        assert_eq!(manifest.version, STREAMING_STORAGE_VERSION);
         assert_eq!(manifest.data_shards, 8);
         assert_eq!(manifest.total_shards, 12);
-        let recovered = reconstruct_blob_from_storage(&manifest, &shards[4..]).unwrap();
+        assert!(
+            usize::try_from(manifest.encoded_byte_length).unwrap() < plaintext.len() + 128,
+            "v2 must not base64-expand encrypted media before erasure coding"
+        );
+        assert_eq!(
+            shards[0].binary_upload().unwrap().len(),
+            usize::try_from(manifest.shard_byte_length).unwrap() + 4 + STORAGE_ID_BYTES * 3
+        );
+        let payloads = shards[4..]
+            .iter()
+            .map(|shard| (shard.shard_id.clone(), shard.payload().unwrap()))
+            .collect::<Vec<_>>();
+        let recovered = reconstruct_blob_from_storage_payloads(&manifest, &payloads).unwrap();
         assert_eq!(recovered.open(&key).unwrap(), plaintext);
     }
 
@@ -2718,6 +3176,72 @@ mod tests {
         let image = b"encrypted profile image";
         let (blob, key) = EncryptedBlob::create(image).unwrap();
         assert_eq!(blob.open(&key).unwrap(), image);
+    }
+
+    #[test]
+    fn topic_streams_are_signed_partitioned_and_rebuilt() {
+        let identity = Identity::generate();
+        let public_key = identity.public_key_base64();
+        let group = GroupMembership::create_owned("topics", public_key.clone());
+        let profile = Profile {
+            username: "alice".into(),
+            bio: String::new(),
+            avatar: None,
+            album: None,
+            accepts_direct_messages: true,
+        };
+        let joined = SignedEvent::member_joined(&identity, &group, &profile, 1).unwrap();
+        let archive_key = STANDARD_NO_PAD.encode([7u8; 32]);
+        let topic_id = "a".repeat(64);
+        let stream_locator = "b".repeat(64);
+        let created = SignedEvent::create_for_epoch(
+            &identity,
+            group.group_id.clone(),
+            &archive_key,
+            1,
+            GroupEventPayload::TopicCreated {
+                topic_id: topic_id.clone(),
+                name: "Announcements".into(),
+                icon: "📣".into(),
+                stream_locator: stream_locator.clone(),
+            },
+            2,
+        )
+        .unwrap();
+        let message = SignedEvent::create_for_epoch_in_stream(
+            &identity,
+            group.group_id.clone(),
+            &archive_key,
+            1,
+            stream_locator.clone(),
+            GroupEventPayload::TopicMessage {
+                topic_id: topic_id.clone(),
+                text: "hello topic".into(),
+                attachment: None,
+                reply_to_message_id: None,
+            },
+            3,
+        )
+        .unwrap();
+        let mut epoch_keys = HashMap::new();
+        epoch_keys.insert(1, archive_key);
+        let mut epoch_members = HashMap::new();
+        epoch_members.insert(1, HashSet::from([public_key]));
+        let state = GroupState::rebuild_with_epoch_keys(
+            &group,
+            &[joined, created.clone(), message],
+            &epoch_keys,
+            &epoch_members,
+        );
+        assert_eq!(state.topics[&topic_id].name, "Announcements");
+        assert_eq!(state.topics[&topic_id].icon, "📣");
+        assert_eq!(state.messages[0].topic_id.as_deref(), Some(topic_id.as_str()));
+        assert_eq!(state.messages[0].text, "hello topic");
+        assert_eq!(state.rejected_events, 0);
+
+        let mut forged = created;
+        forged.stream_locator = Some(stream_locator);
+        assert!(forged.verify().is_err());
     }
 
     #[test]

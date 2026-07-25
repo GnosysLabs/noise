@@ -39,6 +39,8 @@ const browserConcurrentActions = new Set([
   "cached_conversation",
   "fetch_avatar",
   "fetch_attachment",
+  "fetch_attachment_range",
+  "fetch_link_preview",
   "fetch_profile_album",
   "heartbeat_presence",
   "reply_notification_snapshot",
@@ -119,6 +121,19 @@ export async function noise<T>(request: NoiseRequest): Promise<T | null> {
   });
   if (!response.ok) throw new Error(response.error ?? "unknown noise core error");
   return response.data ?? null;
+}
+
+export async function registerMediaStream(request: NoiseRequest) {
+  if (!isTauri) return null;
+  startRelayDiscovery();
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<string>("register_media_stream", {
+    request: {
+      ...request,
+      relays,
+      mask_relays: rotateMaskRelays(),
+    },
+  });
 }
 
 export async function prepareImage(file: File): Promise<string> {

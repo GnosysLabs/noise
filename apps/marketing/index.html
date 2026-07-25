@@ -3,288 +3,254 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#09080c" />
+    <meta name="theme-color" content="#d7ff38" />
     <meta
       name="description"
-      content="Noise is a private, group-first messenger. No public directory, phone number, or email—just a frequency and the people you choose."
+      content="Noise is a private place for your people. Start a group, pass the frequency, and make the internet feel human again."
     />
     <meta property="og:type" content="website" />
-    <meta property="og:site_name" content="Noise" />
-    <meta property="og:title" content="Noise — Private groups, on your frequency." />
+    <meta property="og:site_name" content="noise" />
+    <meta property="og:title" content="noise: The group is the whole point." />
     <meta
       property="og:description"
-      content="A private, group-first messenger built around the people you actually choose."
+      content="No followers. No feed. Just your people making something together."
     />
     <meta property="og:url" content="https://makenoise.chat/" />
-    <meta property="og:image" content="https://makenoise.chat/og.png" />
+    <meta property="og:image" content="https://makenoise.chat/og.png?v=wordmark-20260724" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="Noise — Private groups, on your frequency." />
+    <meta name="twitter:title" content="noise: The group is the whole point." />
     <meta
       name="twitter:description"
-      content="A private, group-first messenger built around the people you actually choose."
+      content="No followers. No feed. Just your people making something together."
     />
-    <meta name="twitter:image" content="https://makenoise.chat/og.png" />
-    <link rel="icon" href="/noise.svg" type="image/svg+xml" />
-    <link rel="preload" href="/noise.svg" as="image" />
-    <title>Noise — Private groups, on your frequency.</title>
+    <meta name="twitter:image" content="https://makenoise.chat/og.png?v=wordmark-20260724" />
+    <link rel="icon" href="/noise.svg?v=20260724" type="image/svg+xml" />
+    <title>noise: The group is the whole point.</title>
     <script type="module" src="/src.js"></script>
   </head>
   <body>
-    <a class="skip-link" href="#main">Skip to content</a>
+    <a class="skip-link" href="#main">Skip to the good part</a>
 
     <header class="site-header" data-header>
       <a class="wordmark" href="#" aria-label="Noise home">
-        <img src="/noise.svg" alt="" width="32" height="32" />
-        <span>noise</span>
+        <img class="wordmark-symbol" src="/noise-wave.png" alt="" />
+        <span class="wordmark-text">noise</span>
       </a>
 
       <nav aria-label="Main navigation">
-        <a href="#why-noise">Why Noise</a>
-        <a href="#groups">Groups</a>
-        <a href="#network">Network</a>
-        <a href="https://github.com/GnosysLabs/noise" target="_blank" rel="noreferrer">GitHub</a>
+        <a href="#groups">THE POINT</a>
+        <a href="#inside">YOUR ROOM</a>
+        <a href="#privacy">NO BIG BROTHER</a>
+        <a href="https://github.com/GnosysLabs/noise" target="_blank" rel="noreferrer">SOURCE ↗</a>
       </nav>
 
-      <a class="nav-cta" href="https://app.makenoise.chat">Open Noise <span>↗</span></a>
+      <a class="nav-cta" href="https://app.makenoise.chat">START A GROUP ↗</a>
     </header>
 
     <main id="main">
       <section class="hero">
-        <div class="hero-grid-lines" aria-hidden="true"></div>
+        <div class="hero-scribble" aria-hidden="true">BE LOUD<br />TOGETHER</div>
         <div class="hero-copy">
-          <div class="eyebrow"><i></i> private groups. no audience.</div>
-          <h1>Make some <em>noise.</em></h1>
-          <p>
-            A private, group-first messenger built around the people you actually choose.
-            No public directory. No phone number. No email.
+          <p class="eyebrow">A MESSENGER FOR ACTUAL PEOPLE</p>
+          <h1>
+            THE GROUP
+            <span>IS THE</span>
+            WHOLE POINT.
+          </h1>
+          <p class="hero-intro">
+            No followers. No feed. No personal brand. Just your people talking,
+            sharing, plotting, laughing, and making something together.
           </p>
-
-          <div class="hero-downloads" aria-label="Download Noise">
-            <a
-              class="download-button mac-download"
-              data-download="mac"
-              href="https://github.com/GnosysLabs/noise/releases/latest"
-            >
-              <img
-                class="platform-mark apple-mark"
-                src="/apple.svg"
-                alt=""
-                width="25"
-                height="25"
-                aria-hidden="true"
-              />
-              <span><small>Download for</small><strong>macOS</strong></span>
-              <b>↓</b>
+          <div class="hero-actions">
+            <a class="button button-black" href="https://app.makenoise.chat">
+              MAKE A GROUP <span>↗</span>
             </a>
-            <button class="download-button windows-download" data-windows-open type="button">
-              <span class="windows-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
-              <span><small>Download for</small><strong>Windows</strong></span>
-              <b>↓</b>
-            </button>
-            <a class="web-button" href="https://app.makenoise.chat">Use the web app <span>↗</span></a>
+            <a class="button button-paper" href="#download">GET THE APP <span>↓</span></a>
           </div>
-          <small class="platform-note">macOS Apple silicon · Windows 10/11 64-bit · early alpha</small>
+          <small class="alpha-tag">EARLY ALPHA / BRING YOUR FRIENDS</small>
         </div>
 
-        <div class="signal-field" aria-label="A private Noise group frequency">
-          <div class="signal-field-header">
-            <span>NOISE / PRIVATE GROUP</span>
-            <span>12 DIGITS</span>
-          </div>
-          <div class="signal-frequency">
-            <span>4021</span><i></i><span>7738</span><i></i><span>1964</span>
-          </div>
-          <div class="waveform" aria-hidden="true">
-            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
-            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
-            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
-            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
-          </div>
-          <div class="signal-field-footer">
-            <span><b></b> ENCRYPTED ON DEVICE</span>
-            <span>SHARE PERSON TO PERSON</span>
-            <span>NO PUBLIC INDEX</span>
-          </div>
-        </div>
-      </section>
-
-      <section class="manifesto section-shell" id="why-noise">
-        <p class="section-kicker">Why Noise</p>
-        <h2>The internet made everything discoverable. <em>We made belonging intentional again.</em></h2>
-        <div class="manifesto-copy">
-          <p>
-            Noise is not a feed and your group is not content. There are no recommendations,
-            follower counts, or strangers wandering in from search.
-          </p>
-          <p>
-            Create a group, share its 12-digit frequency, and let it travel the old-fashioned way:
-            person to person.
-          </p>
-        </div>
-      </section>
-
-      <section class="principles section-shell" aria-label="Noise principles">
-        <article>
-          <div class="principle-index">01</div>
-          <div class="principle-title">
-            <p>Groups are the product</p>
-            <h3>Built for the whole room.</h3>
-          </div>
-          <p class="principle-copy">
-            Large private communities are the starting point—not an afterthought bolted onto
-            one-to-one chat.
-          </p>
-          <div class="principle-proof">
-            <span>GROUP SIZE</span>
-            <strong>50K<span>target</span></strong>
-          </div>
-        </article>
-
-        <article>
-          <div class="principle-index">02</div>
-          <div class="principle-title">
-            <p>Identity without PII</p>
-            <h3>Known without being exposed.</h3>
-          </div>
-          <p class="principle-copy">
-            A Noise ID and password are enough. Your display name, avatar, and bio stay
-            separate from phone numbers and email addresses.
-          </p>
-          <div class="principle-proof signature-proof">
-            <span>NOISE SIGNATURE</span>
-            <strong>3A9F71-0C8K2M</strong>
-          </div>
-        </article>
-
-        <article>
-          <div class="principle-index">03</div>
-          <div class="principle-title">
-            <p>Private in transit</p>
-            <h3>Encrypted before it leaves.</h3>
-          </div>
-          <p class="principle-copy">
-            Message and media payloads are encrypted on your device before replaceable relays
-            carry them across the network.
-          </p>
-          <div class="principle-proof route-proof" aria-hidden="true">
-            <span class="route-node active"></span><i></i><span class="route-node"></span><i></i><span class="route-node"></span>
-          </div>
-        </article>
-      </section>
-
-      <section class="groups-showcase" id="groups">
-        <div class="section-shell showcase-heading">
-          <p class="section-kicker">Groups, properly</p>
-          <h2>The room is the product.</h2>
-          <p>
-            Every group can have its own identity, culture, rules, and visual world.
-            Noise gives communities real tools without turning them into public content.
-          </p>
-        </div>
-
-        <div class="capability-grid section-shell">
-          <article class="capability-wide">
-            <span>01 / IDENTITY</span>
-            <h3>Make the room unmistakably yours.</h3>
-            <p>Group icon, background, description, rules, and accent color.</p>
-            <div class="accent-line" aria-hidden="true">
-              <i></i><i></i><i></i><i></i><i></i><i></i>
+        <div class="group-collage" aria-label="The kinds of groups that belong on Noise">
+          <article class="group-card card-band">
+            <span class="card-tape" aria-hidden="true"></span>
+            <small>FREQ. 4021 7738 1964</small>
+            <h2>BAND<br />PRACTICE</h2>
+            <p>tonight 8ish. bring the busted amp.</p>
+            <div class="fake-reactions" aria-hidden="true"><span>⚡ 6</span><span>NO WAY 3</span></div>
+          </article>
+          <article class="group-card card-neighbors">
+            <small>13 PEOPLE / PRIVATE</small>
+            <h2>THE<br />CREW</h2>
+            <p>who has the ladder?</p>
+            <b class="card-stamp">PEOPLE<br />HELPING<br />PEOPLE</b>
+          </article>
+          <article class="group-card card-friends">
+            <span class="card-tape" aria-hidden="true"></span>
+            <small>SINCE FOREVER</small>
+            <h2>THE OLD<br />FRIENDS</h2>
+            <p>same idiots. new plans.</p>
+            <div class="friend-dots" aria-hidden="true">
+              <i>A</i><i>K</i><i>M</i><i>J</i><i>+8</i>
             </div>
           </article>
-          <article>
-            <span>02 / CONVERSATION</span>
-            <h3>Replies.<br />Reactions.<br />Real context.</h3>
-            <p>Fast group chat that feels like chat—not a forum wearing a messenger costume.</p>
+          <p class="collage-note">NOT CONTENT.<br /><strong>A PLACE.</strong></p>
+        </div>
+      </section>
+
+      <div class="shout-strip" aria-hidden="true">
+        <div class="shout-track">
+          <div class="shout-set">
+            <span>NO ALGORITHM</span><b>✦</b><span>NO AUDIENCE</span><b>✦</b>
+            <span>MEET NEW PEOPLE</span><b>✦</b><span>FIND YOUR PEOPLE</span><b>✦</b>
+            <span>NO ALGORITHM</span><b>✦</b><span>NO AUDIENCE</span><b>✦</b>
+            <span>MEET NEW PEOPLE</span><b>✦</b><span>FIND YOUR PEOPLE</span><b>✦</b>
+          </div>
+          <div class="shout-set">
+            <span>NO ALGORITHM</span><b>✦</b><span>NO AUDIENCE</span><b>✦</b>
+            <span>MEET NEW PEOPLE</span><b>✦</b><span>FIND YOUR PEOPLE</span><b>✦</b>
+            <span>NO ALGORITHM</span><b>✦</b><span>NO AUDIENCE</span><b>✦</b>
+            <span>MEET NEW PEOPLE</span><b>✦</b><span>FIND YOUR PEOPLE</span><b>✦</b>
+          </div>
+        </div>
+      </div>
+
+      <section class="manifesto paper-section" id="groups">
+        <p class="section-label">THE POINT / 01</p>
+        <div class="manifesto-grid">
+          <h2>SOCIAL MEDIA<br />FORGOT THE<br /><mark>SOCIAL</mark> PART.</h2>
+          <div class="manifesto-copy">
+            <p class="big-copy">
+              The best part of the internet was never going viral. It was finding
+              your weird little corner and filling it with people who get it.
+            </p>
+            <p>
+              Noise starts with the group. Not the profile, not the post, not the
+              follower count. Make a room for the people already in your life and
+              the people you’re just getting to know.
+            </p>
+            <p class="scribbled-copy">LESS SCROLLING.<br />MORE BELONGING.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="rooms" id="inside">
+        <div class="rooms-heading">
+          <p class="section-label">YOUR ROOM / 02</p>
+          <h2>MAKE IT<br />FEEL LIKE <em>YOURS.</em></h2>
+          <p>
+            Every group gets its own look, rules, jokes, history, and beautiful
+            mess. It should feel like walking into a room your friends made.
+          </p>
+        </div>
+
+        <div class="room-grid">
+          <article class="room-card room-card-yellow">
+            <span>01</span>
+            <h3>SET THE<br />WHOLE MOOD.</h3>
+            <p>Group icon. Background. Accent color. Rules. Make it unmistakable.</p>
+            <b class="sticker">YOUR WALLS<br />YOUR POSTERS</b>
           </article>
-          <article>
-            <span>03 / MEDIA</span>
-            <h3>Share the moment, not a filename.</h3>
-            <p>Adaptive media, video previews, galleries, and encrypted distributed storage.</p>
-          </article>
-          <article>
-            <span>04 / CONTROL</span>
-            <h3>Govern the room.</h3>
-            <p>Founders, moderators, member permissions, reports, bans, and message deletion.</p>
-          </article>
-          <article class="capability-wide capability-dm">
-            <span>05 / DIRECT MESSAGES</span>
-            <h3>The group comes first. Private conversation is one click away.</h3>
-            <p>Start an encrypted DM from a shared group profile—without making yourself searchable.</p>
-            <div class="dm-path" aria-hidden="true">
-              <b>GROUP</b><i></i><em>PRIVATE</em><i></i><b>DM</b>
+          <article class="room-card room-card-paper">
+            <span>02</span>
+            <h3>ACTUALLY<br />TALK.</h3>
+            <p>Replies, reactions, photos, videos, and enough context to keep up.</p>
+            <div class="message-scraps" aria-hidden="true">
+              <i>you coming?</i><i>obviously</i><i>bring snacks</i>
             </div>
+          </article>
+          <article class="room-card room-card-red">
+            <span>03</span>
+            <h3>KEEP THE<br />VIBE INTACT.</h3>
+            <p>Founders and moderators get real tools. Your room. Your rules.</p>
+            <b class="stamp-circle">NEW<br />FACES<br />WELCOME</b>
+          </article>
+          <article class="room-card room-card-black">
+            <span>04</span>
+            <h3>GO ONE<br />ON ONE.</h3>
+            <p>Start a private message with someone from the group. No search required.</p>
+            <b class="arrow-scribble" aria-hidden="true">GROUP → DM</b>
           </article>
         </div>
       </section>
 
-      <section class="privacy section-shell">
-        <div class="privacy-heading">
-          <p class="section-kicker">Private by design</p>
-          <h2>Less data.<br />Less exposure.</h2>
+      <section class="uses paper-section">
+        <p class="section-label">WHAT IS IT FOR? / WHATEVER YOU’RE INTO</p>
+        <div class="uses-grid">
+          <h2>A PLACE FOR&hellip;</h2>
+          <ul>
+            <li><span>01</span>THE BAND</li>
+            <li><span>02</span>THE BLOCK</li>
+            <li><span>03</span>THE CREW</li>
+            <li><span>04</span>THE RAID</li>
+            <li><span>05</span>THE UNION</li>
+            <li><span>06</span>THE CLUB</li>
+            <li><span>07</span>THE PEOPLE WHO SHOW UP</li>
+          </ul>
+        </div>
+        <p class="uses-note">IF IT MATTERS TO YOU, IT BELONGS HERE.</p>
+      </section>
+
+      <section class="privacy" id="privacy">
+        <div class="privacy-intro">
+          <p class="section-label">NO BIG BROTHER / 03</p>
+          <h2>PRIVATE<br />WITHOUT THE<br /><span>TRACKING.</span></h2>
           <p>
-            Privacy should feel like the absence of friction—not a settings maze you have
-            to understand before saying hello.
+            You shouldn’t need a threat-model spreadsheet to talk to your friends.
+            We cut out the creepy stuff and made the important stuff automatic.
           </p>
         </div>
         <div class="privacy-list">
           <article>
-            <span>01</span>
-            <h3>No phone number</h3>
-            <p>Your contacts do not become a social graph waiting to leak.</p>
+            <b>NO PHONE NUMBER.</b>
+            <p>Your contacts don’t become somebody else’s social graph.</p>
           </article>
           <article>
-            <span>02</span>
-            <h3>No email address</h3>
-            <p>Your account begins with a Noise ID, not another piece of personal data.</p>
+            <b>NO EMAIL ADDRESS.</b>
+            <p>All you need is a Noise ID and a password.</p>
           </article>
           <article>
-            <span>03</span>
-            <h3>No public search</h3>
-            <p>People join groups because someone chose to share the frequency.</p>
+            <b>NO PUBLIC DIRECTORY.</b>
+            <p>Groups spread person to person with a 12-digit frequency.</p>
           </article>
           <article>
-            <span>04</span>
-            <h3>Open source</h3>
-            <p>The code is public. The privacy model does not depend on a secret promise.</p>
+            <b>NO READING OVER OUR SHOULDER.</b>
+            <p>Messages and media are encrypted on your device before they leave.</p>
           </article>
+        </div>
+        <aside class="frequency-poster" aria-label="A sample private group frequency">
+          <small>PASS THIS TO YOUR PEOPLE</small>
+          <strong>4021<br />7738<br />1964</strong>
+          <span>ONE GROUP. TWELVE DIGITS. ZERO SEARCH.</span>
+        </aside>
+      </section>
+
+      <section class="network-note">
+        <span class="network-tape" aria-hidden="true"></span>
+        <p class="section-label">THE BORING TECH BIT / IT MATTERS</p>
+        <h2>YOUR GROUP DOESN’T BELONG TO A SERVER COMPANY.</h2>
+        <p>
+          Noise is open source and carried by independent relays. That means there
+          isn’t one company, one machine, or one kill switch holding everyone’s
+          conversations hostage.
+        </p>
+        <div>
+          <a href="https://github.com/GnosysLabs/noise#run-a-relay">RUN A RELAY ↗</a>
+          <a href="https://github.com/GnosysLabs/noise">READ THE SOURCE ↗</a>
         </div>
       </section>
 
-      <section class="network" id="network">
-        <div class="network-plane" aria-hidden="true">
-          <i class="node n1"></i><i class="node n2"></i><i class="node n3"></i>
-          <i class="node n4"></i><i class="node n5"></i><i class="node n6"></i>
-          <span class="network-ring r1"></span><span class="network-ring r2"></span>
-          <span class="network-ring r3"></span>
-        </div>
-        <div class="section-shell network-content">
-          <p class="section-kicker">Strength in numbers</p>
-          <h2>No central switch<br />to flip off.</h2>
-          <p>
-            Noise uses independently operated relays instead of one central server.
-            More relays mean more paths, more storage, and less dependence on any single
-            company, provider, or machine.
-          </p>
-          <div class="network-actions">
-            <a class="button primary" href="https://github.com/GnosysLabs/noise#run-a-relay">
-              Run a relay <span>↗</span>
-            </a>
-            <a class="text-link" href="https://github.com/GnosysLabs/noise">Explore the code →</a>
-          </div>
-          <div class="network-facts">
-            <span><b>one</b><small>relay binary</small></span>
-            <span><b>opaque</b><small>encrypted shards</small></span>
-            <span><b>open</b><small>protocol and source</small></span>
-          </div>
-        </div>
-      </section>
-
-      <section class="download section-shell" id="download">
-        <div class="download-heading">
-          <img src="/noise.svg" alt="" width="70" height="70" />
-          <p class="section-kicker">Early alpha</p>
-          <h2>Find your frequency.</h2>
-          <p>Start on the web, or bring Noise home with the desktop app.</p>
+      <section class="download" id="download">
+        <p class="download-graffiti" aria-hidden="true">YOUR PEOPLE<br />ARE WAITING</p>
+        <div class="download-copy">
+          <p class="section-label">GET IN / 04</p>
+          <h2>
+            MAKE SOME<br />
+            <mark class="wordmark download-wordmark">
+              <img class="wordmark-symbol" src="/noise-wave.png" alt="" />
+              <span class="wordmark-text">noise</span>
+            </mark>
+          </h2>
+          <p>Start the group. Pass the frequency. See what happens.</p>
         </div>
         <div class="download-options">
           <a
@@ -292,23 +258,23 @@
             data-download="mac"
             href="https://github.com/GnosysLabs/noise/releases/latest"
           >
-            <span><small>01</small><strong>macOS</strong></span>
-            <p>Apple silicon</p>
-            <b>Download ↓</b>
+            <small>APPLE SILICON</small>
+            <strong>MACOS</strong>
+            <b>DOWNLOAD ↓</b>
           </a>
           <button class="download-option" data-windows-open type="button">
-            <span><small>02</small><strong>Windows</strong></span>
-            <p>Windows 10/11 · 64-bit</p>
-            <b>Download ↓</b>
+            <small>WINDOWS 10 / 11</small>
+            <strong>WINDOWS</strong>
+            <b>DOWNLOAD ↓</b>
           </button>
-          <a class="download-option" href="https://app.makenoise.chat">
-            <span><small>03</small><strong>Web</strong></span>
-            <p>No installation</p>
-            <b>Open ↗</b>
+          <a class="download-option download-option-web" href="https://app.makenoise.chat">
+            <small>NO INSTALL</small>
+            <strong>WEB</strong>
+            <b>OPEN ↗</b>
           </a>
         </div>
         <small class="alpha-note">
-          Noise is early alpha software. Use it, stress it, and help shape what it becomes.
+          Noise is early alpha. Bring your friends, break things, tell us what sucks.
         </small>
       </section>
     </main>
@@ -316,37 +282,33 @@
     <footer>
       <div class="footer-brand">
         <a class="wordmark" href="#">
-          <img src="/noise.svg" alt="" width="32" height="32" />
-          <span>noise</span>
+          <img class="wordmark-symbol" src="/noise-wave.png" alt="" />
+          <span class="wordmark-text">noise</span>
         </a>
-        <p>Private groups, on your frequency.</p>
+        <p>THE GROUP IS THE WHOLE POINT.</p>
       </div>
       <div class="footer-links">
         <div>
-          <strong>Product</strong>
+          <strong>GET IN</strong>
           <a href="https://app.makenoise.chat">Web app</a>
           <a href="#download">Downloads</a>
         </div>
         <div>
-          <strong>Network</strong>
+          <strong>GET INVOLVED</strong>
           <a href="https://github.com/GnosysLabs/noise#run-a-relay">Run a relay</a>
-          <a href="https://github.com/GnosysLabs/noise/blob/main/docs/PROTOCOL.md">Protocol</a>
-        </div>
-        <div>
-          <strong>Open source</strong>
           <a href="https://github.com/GnosysLabs/noise">GitHub</a>
           <a href="https://github.com/GnosysLabs/noise/issues">Issues</a>
         </div>
         <div>
-          <strong>Legal</strong>
+          <strong>THE FINE PRINT</strong>
           <a href="/privacy/">Privacy</a>
           <a href="/terms/">Terms</a>
           <a href="mailto:admin@gnosyslabs.xyz">Contact</a>
         </div>
       </div>
       <div class="footer-bottom">
-        <span>© <span data-year></span> Gnosys Labs</span>
-        <span>Built out loud.</span>
+        <span>© <span data-year></span> GNOSYS LABS</span>
+        <span>BUILT OUT LOUD.</span>
       </div>
     </footer>
 
@@ -359,54 +321,31 @@
         aria-describedby="windows-modal-description"
       >
         <button class="modal-close" data-windows-close type="button" aria-label="Close">×</button>
-        <div class="modal-platform">
-          <span class="windows-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
-          Windows alpha
-        </div>
-        <h2 id="windows-modal-title">Windows may show a SmartScreen warning.</h2>
+        <p class="modal-platform">WINDOWS ALPHA / ONE THING FIRST</p>
+        <h2 id="windows-modal-title">WINDOWS MIGHT TRY TO SCARE YOU.</h2>
         <p id="windows-modal-description">
-          Noise is new, so its installer may not have enough download reputation yet.
-          SmartScreen can warn about an <strong>unrecognized app</strong> even when it has
-          not detected malware.
+          Noise is new, so SmartScreen may call it an <strong>unrecognized app</strong>.
+          That means the installer is still building download reputation. It does
+          not mean that Windows found malware.
         </p>
-
         <div class="smartscreen-steps">
-          <article>
-            <span>01</span>
-            <div><strong>Open the downloaded installer.</strong><p>If Windows says “Windows protected your PC,” stay on that screen.</p></div>
-          </article>
-          <article>
-            <span>02</span>
-            <div><strong>Click “More info.”</strong><p>Windows will reveal the filename and the option to continue.</p></div>
-          </article>
-          <article>
-            <span>03</span>
-            <div><strong>Click “Run anyway.”</strong><p>The normal Noise setup will begin.</p></div>
-          </article>
+          <article><span>01</span><div><strong>OPEN THE INSTALLER.</strong><p>Stay on the “Windows protected your PC” screen.</p></div></article>
+          <article><span>02</span><div><strong>CLICK “MORE INFO.”</strong><p>Windows will show the filename and another option.</p></div></article>
+          <article><span>03</span><div><strong>CLICK “RUN ANYWAY.”</strong><p>The normal Noise setup will begin.</p></div></article>
         </div>
-
         <div class="modal-note">
-          <span>Why this happens</span>
-          <p>
-            SmartScreen uses reputation signals including download history and file signing.
-            A warning does not automatically mean the file is malicious. Noise is open source,
-            and every release is published from the public repository.
-          </p>
+          <strong>WHY THIS HAPPENS</strong>
+          <p>SmartScreen leans on download history and signing reputation. Noise is open source, and every release comes from the public repository.</p>
         </div>
-
         <div class="modal-actions">
-          <button data-windows-close type="button">Not now</button>
+          <button data-windows-close type="button">NOT NOW</button>
           <a
-            class="button primary"
+            class="button button-yellow"
             data-download="windows"
             href="https://github.com/GnosysLabs/noise/releases/latest"
-          >
-            Download for Windows <span>↓</span>
-          </a>
+          >DOWNLOAD FOR WINDOWS ↓</a>
         </div>
-        <small>
-          On managed work or school PCs, policy may remove the “Run anyway” option.
-        </small>
+        <small>Managed work or school PCs may remove the “Run anyway” option.</small>
       </section>
     </div>
   </body>

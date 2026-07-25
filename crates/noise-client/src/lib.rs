@@ -1,12 +1,20 @@
 #[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(any(target_arch = "wasm32", test))]
+use std::rc::Rc;
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+};
+#[cfg(not(target_arch = "wasm32"))]
+use std::{
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -32,20 +40,20 @@ use anyhow::{Context, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use noise_core::{
-    AcceptedMessage, AccountCredentials, AccountVault, EncryptedBlob, GroupDeletion,
+    AcceptedMessage, AcceptedTopic, AccountCredentials, AccountVault, EncryptedBlob, GroupDeletion,
     GroupEventPayload, GroupMembership, GroupPresence, GroupProfile, GroupState, HistoryKeyLink,
     Identity, InviteRecord, InviteRotation, MlsAccountState, MlsControlLog, MlsEpochRecord,
     MlsGroupGenesis, MlsJoinRequest, MlsRemovalReason, MlsRemovalRequest, Profile, SignedEvent,
-    StorageManifest, StorageShard, derive_account_credentials, direct_mailbox_id,
-    direct_message_id, display_frequency, display_noise_id, encode_blob_for_storage,
-    frequency_locator, generate_frequency, generate_noise_id, media_preview_is_valid,
-    normalize_frequency, profile_media_scope_id, reconstruct_blob_from_storage,
-    valid_reaction_emoji,
+    StorageManifest, derive_account_credentials, direct_mailbox_id, direct_message_id,
+    display_frequency, display_noise_id, encode_blob_for_storage, frequency_locator,
+    generate_frequency, generate_noise_id, media_preview_is_valid, normalize_frequency,
+    profile_media_scope_id, reconstruct_blob_from_storage_payloads, valid_reaction_emoji,
 };
 pub use noise_core::{MediaAttachment, MediaChunk, ProfileAlbum, ProfileAlbumItem, ProfileImage};
+pub use noise_transport::LinkPreview;
 use noise_transport::{
-    GATEWAY_HEADER, OHTTP_RELAY_PATH, OHTTP_REQUEST_MEDIA_TYPE, OHTTP_RESPONSE_MEDIA_TYPE,
-    PlainResponse, RelayDescriptor, decode_response, encode_request,
+    GATEWAY_HEADER, LinkPreviewRequest, OHTTP_RELAY_PATH, OHTTP_REQUEST_MEDIA_TYPE,
+    OHTTP_RESPONSE_MEDIA_TYPE, PlainResponse, RelayDescriptor, decode_response, encode_request,
 };
 use ohttp::ClientRequest;
 use serde::{Deserialize, Serialize};
@@ -59,6 +67,12 @@ const ONLINE_PRESENCE_REMAINING_MILLIS: u64 = 15_000;
 const RECENT_GROUP_PRESENCE_MILLIS: u64 = 5 * 60_000;
 const EVENT_REPLICA_SETTLE_MILLIS: u64 = 500;
 const RELAY_REQUEST_TIMEOUT_SECS: u64 = 30;
+const MEDIA_CHUNK_DOWNLOAD_CONCURRENCY: usize = 4;
+const MAX_MEDIA_RANGE_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(any(target_arch = "wasm32", test))]
+const WEB_MEDIA_CHUNK_CACHE_BYTES: usize = 96 * 1024 * 1024;
+const INITIAL_GROUP_MESSAGE_WINDOW: usize = 30;
+const GROUP_EVENT_PAGE_SIZE: usize = 128;
 
 #[derive(Clone)]
 pub struct NoiseClient {
@@ -69,6 +83,18 @@ pub struct NoiseClient {
 pub struct GroupActivityUpdate {
     group_id: String,
     events: Vec<SignedEvent>,
+    full_snapshot: bool,
+    older_cursor: Option<GroupEventCursor>,
+    has_older_messages: bool,
+    topic_update: Option<TopicActivityUpdate>,
+}
+
+struct TopicActivityUpdate {
+    topic_id: String,
+    latest_cursor: Option<GroupEventCursor>,
+    older_cursor: Option<GroupEventCursor>,
+    has_older_messages: bool,
+    message_limit: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -80,11 +106,7 @@ pub struct GroupActivityResult {
 impl Default for NoiseClient {
     fn default() -> Self {
         #[cfg(not(target_arch = "wasm32"))]
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(40))
-            .build()
-            .expect("noise HTTP configuration is valid");
+        let http = shared_http_client();
         #[cfg(target_arch = "wasm32")]
         let http = reqwest::Client::builder()
             .build()
@@ -95,6 +117,98 @@ impl Default for NoiseClient {
         }
     }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+fn shared_http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(40))
+                .build()
+                .expect("noise HTTP configuration is valid")
+        })
+        .clone()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn active_media_chunk_downloads()
+-> &'static Mutex<HashMap<PathBuf, tokio::sync::watch::Sender<bool>>> {
+    static DOWNLOADS: OnceLock<Mutex<HashMap<PathBuf, tokio::sync::watch::Sender<bool>>>> =
+        OnceLock::new();
+    DOWNLOADS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// In-memory LRU for decrypted media chunks. The browser build has no disk
+/// cache, so range requests served to the video element read chunks from here.
+#[cfg(any(target_arch = "wasm32", test))]
+struct MediaChunkLru {
+    chunks: HashMap<String, (Rc<Vec<u8>>, u64)>,
+    total_bytes: usize,
+    sequence: u64,
+    capacity_bytes: usize,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl MediaChunkLru {
+    fn new(capacity_bytes: usize) -> Self {
+        Self {
+            chunks: HashMap::new(),
+            total_bytes: 0,
+            sequence: 0,
+            capacity_bytes,
+        }
+    }
+
+    fn get(&mut self, blob_id: &str, byte_length: u64) -> Option<Rc<Vec<u8>>> {
+        let (data, sequence) = self.chunks.get_mut(blob_id)?;
+        if data.len() as u64 != byte_length {
+            return None;
+        }
+        self.sequence += 1;
+        *sequence = self.sequence;
+        Some(data.clone())
+    }
+
+    fn insert(&mut self, blob_id: String, data: Rc<Vec<u8>>) {
+        if let Some((previous, _)) = self.chunks.remove(&blob_id) {
+            self.total_bytes -= previous.len();
+        }
+        self.sequence += 1;
+        self.total_bytes += data.len();
+        self.chunks.insert(blob_id, (data, self.sequence));
+        while self.total_bytes > self.capacity_bytes && !self.chunks.is_empty() {
+            let Some((oldest, _)) = self
+                .chunks
+                .iter()
+                .min_by_key(|(_, (_, sequence))| *sequence)
+                .map(|(blob_id, entry)| (blob_id.clone(), entry.0.len()))
+            else {
+                break;
+            };
+            if let Some((data, _)) = self.chunks.remove(&oldest) {
+                self.total_bytes -= data.len();
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+use futures_util::FutureExt as _;
+#[cfg(target_arch = "wasm32")]
+type WebChunkDownload = futures_util::future::Shared<
+    futures_util::future::LocalBoxFuture<'static, Result<Rc<Vec<u8>>, String>>,
+>;
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static WEB_MEDIA_CHUNKS: RefCell<MediaChunkLru> =
+        RefCell::new(MediaChunkLru::new(WEB_MEDIA_CHUNK_CACHE_BYTES));
+    static WEB_MEDIA_CHUNK_DOWNLOADS: RefCell<HashMap<String, WebChunkDownload>> =
+        RefCell::new(HashMap::new());
+}
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IdentitySummary {
@@ -107,7 +221,7 @@ pub struct IdentitySummary {
     pub accepts_direct_messages: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupSummary {
     pub group_id: String,
     pub name: String,
@@ -169,7 +283,7 @@ pub struct GroupEncryptionStatus {
     pub missing_member_public_keys: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberSummary {
     pub public_key: String,
     pub username: String,
@@ -180,7 +294,7 @@ pub struct MemberSummary {
     pub is_moderator: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageSummary {
     pub event_id: String,
     pub message_id: String,
@@ -193,11 +307,29 @@ pub struct MessageSummary {
     pub text: String,
     pub attachment: Option<MediaAttachment>,
     pub reply_to_message_id: Option<String>,
+    #[serde(default)]
+    pub topic_id: Option<String>,
     pub created_at_millis: u64,
     pub reactions: Vec<ReactionSummary>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicSummary {
+    pub topic_id: String,
+    pub name: String,
+    #[serde(default = "default_topic_icon")]
+    pub icon: String,
+    pub stream_locator: String,
+    pub locked: bool,
+    pub archived: bool,
+    pub created_by_public_key: String,
+    pub created_at_millis: u64,
+    pub unread_count: usize,
+    #[serde(default)]
+    pub has_older_messages: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReactionSummary {
     pub emoji: String,
     pub count: usize,
@@ -212,18 +344,24 @@ pub struct SentMessageResult {
     pub created_at_millis: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Conversation {
     pub group: GroupSummary,
+    #[serde(default)]
+    pub topics: Vec<TopicSummary>,
+    #[serde(default)]
+    pub general_unread_count: usize,
     pub members: Vec<MemberSummary>,
     pub banned_members: Vec<BannedMemberSummary>,
     pub messages: Vec<MessageSummary>,
     pub reports: Vec<ReportSummary>,
     pub reported_message_event_ids: Vec<String>,
     pub rejected_events: usize,
+    #[serde(default)]
+    pub has_older_messages: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReportSummary {
     pub report_event_id: String,
     pub reporter_public_key: String,
@@ -234,7 +372,7 @@ pub struct ReportSummary {
     pub message: MessageSummary,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BannedMemberSummary {
     pub public_key: String,
     pub username: String,
@@ -324,6 +462,15 @@ pub struct AttachmentData {
     pub file_path: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AttachmentRangeData {
+    pub mime_type: String,
+    pub data_base64: String,
+    pub offset: u64,
+    pub byte_length: u64,
+    pub total_byte_length: u64,
+}
+
 struct DecryptedDirectMessage {
     counterparty_public_key: String,
     contact: DirectContact,
@@ -369,6 +516,8 @@ struct ClientState {
     mls_local_geneses: HashMap<String, MlsGroupGenesis>,
     #[serde(default)]
     mls_control_logs: HashMap<String, MlsControlLog>,
+    #[serde(default)]
+    group_event_caches: HashMap<String, GroupEventCache>,
     groups: Vec<GroupMembership>,
     #[serde(default)]
     group_memberships: HashMap<String, GroupMembershipRecord>,
@@ -402,6 +551,14 @@ struct ClientState {
     #[serde(default)]
     group_unread_messages: HashMap<String, Vec<MessageMarker>>,
     #[serde(default)]
+    topic_read_through: HashMap<String, MessageMarker>,
+    #[serde(default)]
+    topic_unread_messages: HashMap<String, Vec<MessageMarker>>,
+    #[serde(default)]
+    topic_latest_incoming: HashMap<String, MessageMarker>,
+    #[serde(default)]
+    topic_activity_initialized: HashSet<String>,
+    #[serde(default)]
     group_activity_initialized: HashSet<String>,
     #[serde(default)]
     group_conversation_cache: HashMap<String, Conversation>,
@@ -430,6 +587,10 @@ struct AccountVaultContents {
     identity_secret_base64: String,
     #[serde(default)]
     mls_group_states: HashMap<String, MlsAccountState>,
+    #[serde(default)]
+    mls_control_logs: HashMap<String, MlsControlLog>,
+    #[serde(default)]
+    group_event_caches: HashMap<String, GroupEventCache>,
     groups: Vec<GroupMembership>,
     #[serde(default)]
     group_memberships: HashMap<String, GroupMembershipRecord>,
@@ -452,9 +613,83 @@ struct AccountVaultContents {
     #[serde(default)]
     group_latest_activity: HashMap<String, MessageMarker>,
     #[serde(default)]
+    topic_read_through: HashMap<String, MessageMarker>,
+    #[serde(default)]
+    topic_activity_initialized: HashSet<String>,
+    #[serde(default)]
     group_activity_initialized: HashSet<String>,
     group_frequencies: HashMap<String, String>,
     next_author_sequence: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct GroupEventCache {
+    #[serde(default)]
+    events: Vec<SignedEvent>,
+    #[serde(default)]
+    latest_cursor: Option<GroupEventCursor>,
+    #[serde(default)]
+    older_cursor: Option<GroupEventCursor>,
+    #[serde(default = "initial_group_message_window")]
+    message_limit: usize,
+    #[serde(default)]
+    has_older_messages: bool,
+    #[serde(default)]
+    needs_recent_hydration: bool,
+    #[serde(default)]
+    topic_streams: HashMap<String, TopicStreamCache>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    portable_conversation: Option<Conversation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TopicStreamCache {
+    #[serde(default)]
+    latest_cursor: Option<GroupEventCursor>,
+    #[serde(default)]
+    older_cursor: Option<GroupEventCursor>,
+    #[serde(default = "initial_group_message_window")]
+    message_limit: usize,
+    #[serde(default)]
+    has_older_messages: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct GroupEventCursor {
+    created_at_millis: u64,
+    event_id: String,
+}
+
+impl GroupEventCursor {
+    fn from_event(event: &SignedEvent) -> Self {
+        Self {
+            created_at_millis: event.created_at_millis,
+            event_id: event.event_id.clone(),
+        }
+    }
+
+    fn key(&self) -> (u64, &str) {
+        (self.created_at_millis, self.event_id.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GroupEventPage {
+    events: Vec<SignedEvent>,
+    has_more: bool,
+    #[serde(default, skip)]
+    continuation_cursor: Option<GroupEventCursor>,
+}
+
+#[derive(Clone, Copy)]
+enum GroupEventPageRequest<'a> {
+    Latest,
+    Before(&'a GroupEventCursor),
+    After(&'a GroupEventCursor),
+}
+
+fn initial_group_message_window() -> usize {
+    INITIAL_GROUP_MESSAGE_WINDOW
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -507,6 +742,15 @@ struct MessageMarker {
 }
 
 type DirectMessageMarker = MessageMarker;
+
+fn topic_activity_key(group_id: &str, topic_id: Option<&str>) -> String {
+    format!("{group_id}:{}", topic_id.unwrap_or("general"))
+}
+
+fn topic_key_belongs_to_group(key: &str, group_id: &str) -> bool {
+    key.strip_prefix(group_id)
+        .is_some_and(|suffix| suffix.starts_with(':'))
+}
 
 fn merge_read_markers(
     current: &mut HashMap<String, MessageMarker>,
@@ -747,6 +991,7 @@ impl ClientState {
             self.group_frequencies.remove(&group_id);
             self.forget_group_activity(&group_id);
             self.group_conversation_cache.remove(&group_id);
+            self.group_event_caches.remove(&group_id);
             self.mls_join_requests.remove(&group_id);
             self.mls_local_geneses.remove(&group_id);
             self.mls_control_logs.remove(&group_id);
@@ -875,6 +1120,20 @@ impl ClientState {
             profile_sequence: self.profile_sequence,
             identity_secret_base64: self.identity_secret_base64.clone(),
             mls_group_states: self.vault_mls_group_states(),
+            mls_control_logs: self
+                .mls_control_logs
+                .iter()
+                .filter(|(group_id, log)| {
+                    self.groups.iter().any(|group| group.group_id == **group_id)
+                        && log.verify().is_ok()
+                })
+                .map(|(group_id, log)| (group_id.clone(), log.clone()))
+                .collect(),
+            // Conversation history is relay data and a device-local cache, not
+            // account-recovery material. Keeping even a compact recent feed in
+            // the vault made account backup grow with chat activity and mixed
+            // two unrelated durability boundaries.
+            group_event_caches: HashMap::new(),
             groups: self.groups.clone(),
             group_memberships: self.vault_group_memberships(),
             active_group_id: self.active_group_id.clone(),
@@ -889,6 +1148,8 @@ impl ClientState {
             direct_latest_activity: self.direct_latest_activity.clone(),
             group_read_through: self.group_read_through.clone(),
             group_latest_activity: self.group_latest_activity.clone(),
+            topic_read_through: self.topic_read_through.clone(),
+            topic_activity_initialized: self.topic_activity_initialized.clone(),
             group_activity_initialized: self.group_activity_initialized.clone(),
             group_frequencies: self.group_frequencies.clone(),
             next_author_sequence: self.next_author_sequence,
@@ -919,7 +1180,8 @@ impl ClientState {
             mls_recovery_dirty: false,
             mls_join_requests: HashMap::new(),
             mls_local_geneses: HashMap::new(),
-            mls_control_logs: HashMap::new(),
+            mls_control_logs: contents.mls_control_logs,
+            group_event_caches: contents.group_event_caches,
             groups: contents.groups,
             group_memberships: contents.group_memberships,
             active_group_id: contents.active_group_id,
@@ -937,6 +1199,10 @@ impl ClientState {
             group_latest_activity: contents.group_latest_activity,
             group_read_through: contents.group_read_through,
             group_unread_messages: HashMap::new(),
+            topic_read_through: contents.topic_read_through,
+            topic_unread_messages: HashMap::new(),
+            topic_latest_incoming: HashMap::new(),
+            topic_activity_initialized: contents.topic_activity_initialized,
             group_activity_initialized: contents.group_activity_initialized,
             group_conversation_cache: HashMap::new(),
             group_frequencies: contents.group_frequencies,
@@ -945,6 +1211,48 @@ impl ClientState {
         };
         state.ensure_group_membership_records();
         state.identity()?;
+        for (group_id, log) in &state.mls_control_logs {
+            if log.genesis.group_id != *group_id || log.verify().is_err() {
+                bail!("encrypted account vault contains invalid group encryption history")
+            }
+        }
+        let raw_event_caches = std::mem::take(&mut state.group_event_caches);
+        for (group_id, cache) in raw_event_caches {
+            let Some(group) = state
+                .groups
+                .iter()
+                .find(|group| group.group_id == group_id)
+                .cloned()
+            else {
+                continue;
+            };
+            let mut portable_conversation = cache.portable_conversation;
+            if portable_conversation.as_ref().is_some_and(|conversation| {
+                conversation.group.group_id != group_id
+                    || conversation.messages.len() > INITIAL_GROUP_MESSAGE_WINDOW
+            }) {
+                bail!("encrypted account vault contains invalid cached conversation")
+            }
+            if let Some(conversation) = portable_conversation.as_mut() {
+                strip_conversation_media_previews(conversation);
+            }
+            let needs_recent_hydration =
+                cache.needs_recent_hydration && portable_conversation.is_some();
+            let mut compacted = compact_group_event_cache(
+                &state,
+                &group,
+                cache.events,
+                cache.message_limit.max(INITIAL_GROUP_MESSAGE_WINDOW),
+                cache.latest_cursor,
+                cache.older_cursor,
+                cache.has_older_messages,
+                cache.topic_streams,
+            )
+            .context("encrypted account vault contains invalid group history")?;
+            compacted.needs_recent_hydration = needs_recent_hydration;
+            compacted.portable_conversation = portable_conversation;
+            state.group_event_caches.insert(group_id, compacted);
+        }
         state.apply_block_filters();
         Ok(state)
     }
@@ -976,10 +1284,53 @@ impl ClientState {
     }
 
     fn group_unread_count(&self, group_id: &str) -> usize {
-        self.group_unread_messages
-            .get(group_id)
+        let topic_count = self
+            .topic_unread_messages
+            .iter()
+            .filter(|(key, _)| topic_key_belongs_to_group(key, group_id))
+            .map(|(_, unread)| unread.len())
+            .sum::<usize>();
+        if self
+            .topic_activity_initialized
+            .iter()
+            .any(|key| topic_key_belongs_to_group(key, group_id))
+        {
+            topic_count
+        } else {
+            self.group_unread_messages
+                .get(group_id)
+                .map(Vec::len)
+                .unwrap_or_default()
+        }
+    }
+
+    fn topic_unread_count(&self, group_id: &str, topic_id: Option<&str>) -> usize {
+        self.topic_unread_messages
+            .get(&topic_activity_key(group_id, topic_id))
             .map(Vec::len)
             .unwrap_or_default()
+    }
+
+    fn topic_read_state_initialized(&self, group_id: &str, topic_id: Option<&str>) -> bool {
+        self.topic_activity_initialized
+            .contains(&topic_activity_key(group_id, topic_id))
+    }
+
+    fn merge_topic_read_through(
+        &mut self,
+        incoming: &HashMap<String, MessageMarker>,
+    ) -> bool {
+        let changed = merge_read_markers(&mut self.topic_read_through, incoming);
+        if changed {
+            for (topic_key, marker) in &self.topic_read_through {
+                if let Some(unread) = self.topic_unread_messages.get_mut(topic_key) {
+                    unread.retain(|candidate| candidate > marker);
+                }
+            }
+            self.topic_unread_messages
+                .retain(|_, unread| !unread.is_empty());
+        }
+        changed
     }
 
     fn merge_group_read_through(&mut self, incoming: &HashMap<String, MessageMarker>) -> bool {
@@ -1002,6 +1353,10 @@ impl ClientState {
         messages: &[AcceptedMessage],
         self_public_key: &str,
     ) -> bool {
+        let topic_read_before = self.topic_read_through.clone();
+        let topic_unread_before = self.topic_unread_messages.clone();
+        let topic_latest_before = self.topic_latest_incoming.clone();
+        let topic_initialized_before = self.topic_activity_initialized.clone();
         let before = (
             self.group_latest_activity.get(group_id).cloned(),
             self.group_latest_incoming.get(group_id).cloned(),
@@ -1064,6 +1419,54 @@ impl ClientState {
             }
         }
 
+        let mut incoming_by_topic = HashMap::<String, Vec<MessageMarker>>::new();
+        for message in messages
+            .iter()
+            .filter(|message| message.author_public_key != self_public_key)
+            .filter(|message| !self.is_hidden(&message.author_public_key))
+        {
+            incoming_by_topic
+                .entry(topic_activity_key(group_id, message.topic_id.as_deref()))
+                .or_default()
+                .push(MessageMarker {
+                    created_at_millis: message.created_at_millis,
+                    event_id: message.event_id.clone(),
+                });
+        }
+        for (topic_key, mut topic_incoming) in incoming_by_topic {
+            topic_incoming.sort();
+            topic_incoming.dedup();
+            if let Some(latest) = topic_incoming.last().cloned() {
+                self.topic_latest_incoming
+                    .insert(topic_key.clone(), latest.clone());
+            }
+            if self.topic_activity_initialized.insert(topic_key.clone()) {
+                let initial_read = if topic_key == topic_activity_key(group_id, None) {
+                    self.group_read_through
+                        .get(group_id)
+                        .cloned()
+                        .or_else(|| topic_incoming.last().cloned())
+                } else {
+                    topic_incoming.last().cloned()
+                };
+                if let Some(marker) = initial_read {
+                    self.topic_read_through.insert(topic_key.clone(), marker);
+                }
+                self.topic_unread_messages.remove(&topic_key);
+            } else {
+                let read_through = self.topic_read_through.get(&topic_key);
+                let unread = topic_incoming
+                    .into_iter()
+                    .filter(|marker| read_through.is_none_or(|read| marker > read))
+                    .collect::<Vec<_>>();
+                if unread.is_empty() {
+                    self.topic_unread_messages.remove(&topic_key);
+                } else {
+                    self.topic_unread_messages.insert(topic_key, unread);
+                }
+            }
+        }
+
         before
             != (
                 self.group_latest_activity.get(group_id).cloned(),
@@ -1072,6 +1475,10 @@ impl ClientState {
                 self.group_unread_messages.get(group_id).cloned(),
                 self.group_activity_initialized.contains(group_id),
             )
+            || topic_read_before != self.topic_read_through
+            || topic_unread_before != self.topic_unread_messages
+            || topic_latest_before != self.topic_latest_incoming
+            || topic_initialized_before != self.topic_activity_initialized
     }
 
     fn forget_group_activity(&mut self, group_id: &str) {
@@ -1080,6 +1487,14 @@ impl ClientState {
         self.group_read_through.remove(group_id);
         self.group_unread_messages.remove(group_id);
         self.group_activity_initialized.remove(group_id);
+        self.topic_read_through
+            .retain(|key, _| !topic_key_belongs_to_group(key, group_id));
+        self.topic_unread_messages
+            .retain(|key, _| !topic_key_belongs_to_group(key, group_id));
+        self.topic_latest_incoming
+            .retain(|key, _| !topic_key_belongs_to_group(key, group_id));
+        self.topic_activity_initialized
+            .retain(|key| !topic_key_belongs_to_group(key, group_id));
     }
 
     fn is_blocked(&self, public_key: &str) -> bool {
@@ -1446,6 +1861,7 @@ impl NoiseClient {
             mls_join_requests: HashMap::new(),
             mls_local_geneses: HashMap::new(),
             mls_control_logs: HashMap::new(),
+            group_event_caches: HashMap::new(),
             groups: Vec::new(),
             group_memberships: HashMap::new(),
             active_group_id: None,
@@ -1463,6 +1879,10 @@ impl NoiseClient {
             group_latest_activity: HashMap::new(),
             group_read_through: HashMap::new(),
             group_unread_messages: HashMap::new(),
+            topic_read_through: HashMap::new(),
+            topic_unread_messages: HashMap::new(),
+            topic_latest_incoming: HashMap::new(),
+            topic_activity_initialized: HashSet::new(),
             group_activity_initialized: HashSet::new(),
             group_conversation_cache: HashMap::new(),
             group_frequencies: HashMap::new(),
@@ -1583,12 +2003,9 @@ impl NoiseClient {
         if changed || state.mls_recovery_dirty {
             save_state(path, &state)?;
         }
-        if state.mls_recovery_dirty {
-            self.publish_account_state(&mut state, &relays)
-                .await
-                .context("could not save automatic encrypted-group recovery")?;
-            save_state(path, &state)?;
-        }
+        // Recovery snapshots are durable locally and the client schedules an
+        // account sync independently. A remote vault write must never block
+        // reading account state or opening a group.
         state.summary()
     }
 
@@ -1599,13 +2016,14 @@ impl NoiseClient {
     ) -> anyhow::Result<()> {
         let path = path.as_ref();
         let cache_path = cache_path.as_ref();
-        let media_directory = cache_path.join("media");
-        if media_directory.exists() {
-            fs::remove_dir_all(&media_directory)
-                .with_context(|| format!("could not erase {}", media_directory.display()))?;
+        remove_state(path)?;
+        for directory in ["media", "media-chunks", "outgoing"].map(|name| cache_path.join(name)) {
+            if directory.exists() {
+                fs::remove_dir_all(&directory)
+                    .with_context(|| format!("could not erase {}", directory.display()))?;
+            }
         }
         purge_profile_image_cache(cache_path)?;
-        remove_state(path)?;
         Ok(())
     }
 
@@ -1619,10 +2037,28 @@ impl NoiseClient {
         group_id: &str,
     ) -> anyhow::Result<Option<Conversation>> {
         let state = load_state(path.as_ref())?;
-        if !state.groups.iter().any(|group| group.group_id == group_id) {
-            bail!("unknown group")
-        }
+        let group = state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .context("unknown group")?;
         let mut cached = state.group_conversation_cache.get(group_id).cloned();
+        if cached.is_none()
+            && let Some(event_cache) = state.group_event_caches.get(group_id)
+        {
+            if let Some(portable) = event_cache.portable_conversation.as_ref() {
+                cached = Some(portable.clone());
+            } else {
+                let identity_public_key = state.identity()?.public_key_base64();
+                let view = rebuild_group_state(&state, group, &event_cache.events)?;
+                if view.members.contains_key(&identity_public_key) {
+                    let mut conversation =
+                        cached_conversation_from_view(&state, group, view, &identity_public_key);
+                    conversation.has_older_messages = event_cache.has_older_messages;
+                    cached = Some(conversation);
+                }
+            }
+        }
         if let Some(conversation) = cached.as_mut() {
             let blocked = state.active_hidden_keys();
             filter_conversation_for_blocks(conversation, &blocked);
@@ -2033,6 +2469,7 @@ impl NoiseClient {
         state.profile.accepts_direct_messages = accepts_direct_messages;
         state.profile_sequence = state.take_sequence();
         let identity = state.identity()?;
+        let mut profile_events = Vec::with_capacity(state.groups.len());
         for group in state.groups.clone() {
             let sequence = state.take_sequence();
             let event = create_group_event(
@@ -2044,9 +2481,19 @@ impl NoiseClient {
                 },
                 sequence,
             )?;
-            self.publish_event(&relays, &event).await?;
+            profile_events.push(event);
         }
+        // Persist the profile and consumed sequences before publication. This
+        // prevents a partial multi-group publication from reverting the local
+        // profile or reusing a sequence for different event bytes.
         save_state(path, &state)?;
+        let mut publications = FuturesUnordered::new();
+        for event in &profile_events {
+            publications.push(self.publish_event(&relays, event));
+        }
+        while let Some(result) = publications.next().await {
+            result?;
+        }
         state.summary()
     }
 
@@ -2253,17 +2700,42 @@ impl NoiseClient {
             .context("active group is missing from local state")?;
         let current_group = state.groups[group_index].clone();
         let identity = state.identity()?;
-        let events = self.fetch_events(&current_group, relays.clone()).await?;
-        let view = rebuild_group_state(&state, &current_group, &events)?;
-        if view.owner_public_key.as_deref() != Some(identity.public_key_base64().as_str()) {
+        let (current_profile, owner_public_key) = if current_group.owner_public_key.is_empty() {
+            // Legacy memberships did not persist the founder or complete profile,
+            // so they still need one reconciliation before they can be edited.
+            let events = self.fetch_events(&current_group, relays.clone()).await?;
+            let view = rebuild_group_state(&state, &current_group, &events)?;
+            let owner_public_key = view
+                .owner_public_key
+                .clone()
+                .context("group founder is missing")?;
+            (view.profile, owner_public_key)
+        } else {
+            (
+                GroupProfile {
+                    name: current_group.name.clone(),
+                    description: current_group.description.clone(),
+                    rules: current_group.rules.clone(),
+                    avatar: current_group.avatar.clone(),
+                    background: current_group.background.clone(),
+                    mobile_background: current_group.mobile_background.clone(),
+                    mobile_background_updated: true,
+                    accent_color: current_group.accent_color.clone(),
+                    members_can_send_messages: current_group.members_can_send_messages,
+                    members_can_send_media: current_group.members_can_send_media,
+                },
+                current_group.owner_public_key.clone(),
+            )
+        };
+        if owner_public_key != identity.public_key_base64() {
             bail!("only the group founder can edit its identity right now")
         }
         let members_can_send_messages =
-            members_can_send_messages.unwrap_or(view.profile.members_can_send_messages);
+            members_can_send_messages.unwrap_or(current_profile.members_can_send_messages);
         let members_can_send_media =
-            members_can_send_media.unwrap_or(view.profile.members_can_send_media);
+            members_can_send_media.unwrap_or(current_profile.members_can_send_media);
         let accent_color = normalize_group_accent_color(
-            accent_color.unwrap_or_else(|| view.profile.accent_color.clone()),
+            accent_color.unwrap_or_else(|| current_profile.accent_color.clone()),
         )?;
 
         let avatar = if remove_avatar {
@@ -2293,7 +2765,7 @@ impl NoiseClient {
                 storage: Some(storage),
             })
         } else {
-            current_group.avatar.clone()
+            current_profile.avatar.clone()
         };
 
         let background = if remove_background {
@@ -2324,7 +2796,7 @@ impl NoiseClient {
                 storage: Some(storage),
             })
         } else {
-            current_group.background.clone()
+            current_profile.background.clone()
         };
 
         let mobile_background = if remove_mobile_background {
@@ -2355,16 +2827,9 @@ impl NoiseClient {
                 storage: Some(storage),
             })
         } else {
-            current_group.mobile_background.clone()
+            current_profile.mobile_background.clone()
         };
 
-        let owner_public_key = if current_group.owner_public_key.is_empty() {
-            view.owner_public_key
-                .clone()
-                .context("group founder is missing")?
-        } else {
-            current_group.owner_public_key.clone()
-        };
         let resolved_profile = GroupProfile {
             name,
             description,
@@ -2501,53 +2966,20 @@ impl NoiseClient {
     ) -> anyhow::Result<AttachmentData> {
         validate_media_reference(attachment)?;
         let state = load_state(path.as_ref())?;
-        let identity = state.identity()?;
-        let scope_id = if let Some(scope_id) = scope_id {
-            let allowed = state.groups.iter().any(|group| group.group_id == scope_id)
-                || state.direct_contacts.iter().any(|contact| {
-                    identity
-                        .direct_scope_id(&contact.public_key)
-                        .ok()
-                        .as_deref()
-                        == Some(scope_id.as_str())
-                })
-                || profile_media_scope_id(&identity.public_key_base64())
-                    .ok()
-                    .as_deref()
-                    == Some(scope_id.as_str())
-                || state
-                    .direct_contacts
-                    .iter()
-                    .chain(state.known_people.iter())
-                    .filter(|person| !state.is_hidden(&person.public_key))
-                    .any(|person| {
-                        profile_media_scope_id(&person.public_key).ok().as_deref()
-                            == Some(scope_id.as_str())
-                    });
-            if !allowed {
-                bail!("media does not belong to a known conversation")
-            }
-            scope_id
-        } else {
-            state.active_group()?.group_id.clone()
-        };
+        let scope_id = resolve_media_scope(&state, scope_id)?;
         let _relays = relay_list(relays)?;
         #[cfg(target_arch = "wasm32")]
         {
             let mut output = Vec::with_capacity(attachment.byte_length as usize);
-            for chunk in &attachment.chunks {
-                let storage = chunk.storage.as_ref().context(
-                    "this media predates constellation storage and is no longer available",
-                )?;
-                let blob = self.reconstruct_blob(storage, &chunk.key_base64).await?;
-                if blob.group_id.as_deref() != Some(scope_id.as_str()) {
-                    bail!("media chunk belongs to a different conversation")
-                }
-                let plaintext = blob.open(&chunk.key_base64)?;
-                if plaintext.len() != chunk.byte_length as usize {
-                    bail!("media chunk does not match its manifest")
-                }
-                output.extend_from_slice(&plaintext);
+            let mut chunks = futures_util::stream::iter(attachment.chunks.iter().cloned().map(
+                |chunk| {
+                    let scope_id = scope_id.clone();
+                    async move { self.fetch_attachment_chunk(&scope_id, &chunk).await }
+                },
+            ))
+            .buffered(MEDIA_CHUNK_DOWNLOAD_CONCURRENCY);
+            while let Some(plaintext) = chunks.next().await {
+                output.extend_from_slice(&plaintext?);
             }
             if output.len() as u64 != attachment.byte_length {
                 bail!("media does not match its manifest")
@@ -2580,20 +3012,19 @@ impl NoiseClient {
             let temporary = file_path.with_extension(format!("{extension}.part"));
             let mut output =
                 fs::File::create(&temporary).context("could not create media cache file")?;
-            for chunk in &attachment.chunks {
-                let storage = chunk.storage.as_ref().context(
-                    "this media predates constellation storage and is no longer available",
-                )?;
-                let blob = self.reconstruct_blob(storage, &chunk.key_base64).await?;
-                if blob.group_id.as_deref() != Some(scope_id.as_str()) {
-                    bail!("media chunk belongs to a different conversation")
-                }
-                let plaintext = blob.open(&chunk.key_base64)?;
-                if plaintext.len() != chunk.byte_length as usize {
-                    bail!("media chunk does not match its manifest")
-                }
+            let mut chunks = futures_util::stream::iter(attachment.chunks.iter().cloned())
+                .map(|chunk| {
+                    let scope_id = scope_id.clone();
+                    let cache_path = cache_path.as_ref().to_owned();
+                    async move {
+                        self.fetch_attachment_chunk(&cache_path, &scope_id, &chunk)
+                            .await
+                    }
+                })
+                .buffered(MEDIA_CHUNK_DOWNLOAD_CONCURRENCY);
+            while let Some(plaintext) = chunks.next().await {
                 output
-                    .write_all(&plaintext)
+                    .write_all(&plaintext?)
                     .context("could not write media cache file")?;
             }
             output
@@ -2615,6 +3046,378 @@ impl NoiseClient {
                 file_path: file_path.to_string_lossy().into_owned(),
             })
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn fetch_attachment_range(
+        &self,
+        path: impl AsRef<Path>,
+        cache_path: impl AsRef<Path>,
+        scope_id: Option<String>,
+        attachment: &MediaAttachment,
+        offset: u64,
+        byte_length: u64,
+        relays: Vec<String>,
+    ) -> anyhow::Result<AttachmentRangeData> {
+        validate_media_reference(attachment)?;
+        if byte_length == 0 || byte_length > MAX_MEDIA_RANGE_BYTES {
+            bail!("media range length is invalid")
+        }
+        if offset >= attachment.byte_length {
+            bail!("media range starts beyond the attachment")
+        }
+        let state = load_state(path.as_ref())?;
+        let scope_id = resolve_media_scope(&state, scope_id)?;
+        let _relays = relay_list(relays)?;
+        let requested_end = offset
+            .saturating_add(byte_length)
+            .min(attachment.byte_length);
+        let extension = media_extension(&attachment.mime_type);
+        let complete_file = cache_path
+            .as_ref()
+            .join("media")
+            .join(&scope_id)
+            .join(format!("{}.{}", attachment.chunks[0].blob_id, extension));
+        if complete_file
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() == attachment.byte_length)
+        {
+            let mut file =
+                fs::File::open(&complete_file).context("could not read cached media range")?;
+            file.seek(SeekFrom::Start(offset))
+                .context("could not seek cached media")?;
+            let mut output = vec![0_u8; (requested_end - offset) as usize];
+            file.read_exact(&mut output)
+                .context("could not read cached media range")?;
+            return Ok(AttachmentRangeData {
+                mime_type: attachment.mime_type.clone(),
+                data_base64: STANDARD.encode(&output),
+                offset,
+                byte_length: output.len() as u64,
+                total_byte_length: attachment.byte_length,
+            });
+        }
+        let selected = select_media_chunks(attachment, offset, requested_end);
+
+        // WebKit usually asks for the first two media chunks sequentially
+        // before it starts playback. Warm the next chunk alongside the current
+        // request so the second range can join the same in-flight download or
+        // read it directly from cache.
+        if let Some((index, _, _)) = selected.last()
+            && let Some(chunk) = attachment.chunks.get(index + 1).cloned()
+        {
+            let client = self.clone();
+            let cache_path = cache_path.as_ref().to_owned();
+            let scope_id = scope_id.clone();
+            tokio::spawn(async move {
+                let _ = client
+                    .fetch_attachment_chunk(&cache_path, &scope_id, &chunk)
+                    .await;
+            });
+        }
+
+        let mut downloaded =
+            futures_util::stream::iter(selected.into_iter().map(|(index, start, chunk)| {
+                let cache_path = cache_path.as_ref().to_owned();
+                let scope_id = scope_id.clone();
+                async move {
+                    let plaintext = self
+                        .fetch_attachment_chunk(&cache_path, &scope_id, &chunk)
+                        .await?;
+                    Ok::<_, anyhow::Error>((index, start, plaintext))
+                }
+            }))
+            .buffer_unordered(MEDIA_CHUNK_DOWNLOAD_CONCURRENCY);
+        let mut chunks = Vec::new();
+        while let Some(chunk) = downloaded.next().await {
+            chunks.push(chunk?);
+        }
+        chunks.sort_by_key(|(index, _, _)| *index);
+
+        let mut output = Vec::with_capacity((requested_end - offset) as usize);
+        for (_, start, plaintext) in chunks {
+            let end = start + plaintext.len() as u64;
+            let slice_start = offset.saturating_sub(start) as usize;
+            let slice_end = (requested_end.min(end) - start) as usize;
+            output.extend_from_slice(&plaintext[slice_start..slice_end]);
+        }
+        if output.len() as u64 != requested_end - offset {
+            bail!("media range does not match its manifest")
+        }
+        Ok(AttachmentRangeData {
+            mime_type: attachment.mime_type.clone(),
+            data_base64: STANDARD.encode(&output),
+            offset,
+            byte_length: output.len() as u64,
+            total_byte_length: attachment.byte_length,
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn fetch_attachment_chunk(
+        &self,
+        cache_path: &Path,
+        scope_id: &str,
+        chunk: &MediaChunk,
+    ) -> anyhow::Result<Vec<u8>> {
+        let cache_directory = cache_path.join("media-chunks").join(scope_id);
+        fs::create_dir_all(&cache_directory).context("could not create media chunk cache")?;
+        let file_path = cache_directory.join(format!("{}.chunk", chunk.blob_id));
+        loop {
+            if let Ok(bytes) = fs::read(&file_path)
+                && bytes.len() == chunk.byte_length as usize
+            {
+                return Ok(bytes);
+            }
+
+            let mut follower = {
+                let mut active = active_media_chunk_downloads()
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("media download registry is unavailable"))?;
+                if let Some(download) = active.get(&file_path) {
+                    Some(download.subscribe())
+                } else {
+                    let (download, _) = tokio::sync::watch::channel(false);
+                    active.insert(file_path.clone(), download);
+                    None
+                }
+            };
+            let Some(follower) = follower.as_mut() else {
+                break;
+            };
+            let _ = follower.wait_for(|finished| *finished).await;
+        }
+
+        let result = async {
+            let storage = chunk
+                .storage
+                .as_ref()
+                .context("this media predates constellation storage and is no longer available")?;
+            let blob = self.reconstruct_blob(storage, &chunk.key_base64).await?;
+            if blob.group_id.as_deref() != Some(scope_id) {
+                bail!("media chunk belongs to a different conversation")
+            }
+            let plaintext = blob.open(&chunk.key_base64)?;
+            if plaintext.len() != chunk.byte_length as usize {
+                bail!("media chunk does not match its manifest")
+            }
+
+            static TEMPORARY_ID: AtomicU64 = AtomicU64::new(1);
+            let temporary = cache_directory.join(format!(
+                "{}.{}.part",
+                chunk.blob_id,
+                TEMPORARY_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::write(&temporary, &plaintext).context("could not cache decrypted media chunk")?;
+            if let Err(error) = fs::rename(&temporary, &file_path) {
+                if !file_path
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.len() == u64::from(chunk.byte_length))
+                {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(error).context("could not finish decrypted media chunk cache");
+                }
+                let _ = fs::remove_file(&temporary);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&file_path, fs::Permissions::from_mode(0o600))?;
+            }
+            Ok(plaintext)
+        }
+        .await;
+
+        if let Ok(mut active) = active_media_chunk_downloads().lock()
+            && let Some(download) = active.remove(&file_path)
+        {
+            let _ = download.send(true);
+        }
+        result
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn fetch_attachment_range(
+        &self,
+        path: impl AsRef<Path>,
+        _cache_path: impl AsRef<Path>,
+        scope_id: Option<String>,
+        attachment: &MediaAttachment,
+        offset: u64,
+        byte_length: u64,
+        relays: Vec<String>,
+    ) -> anyhow::Result<AttachmentRangeData> {
+        validate_media_reference(attachment)?;
+        if byte_length == 0 || byte_length > MAX_MEDIA_RANGE_BYTES {
+            bail!("media range length is invalid")
+        }
+        if offset >= attachment.byte_length {
+            bail!("media range starts beyond the attachment")
+        }
+        let state = load_state(path.as_ref())?;
+        let scope_id = resolve_media_scope(&state, scope_id)?;
+        let _relays = relay_list(relays)?;
+        let requested_end = offset
+            .saturating_add(byte_length)
+            .min(attachment.byte_length);
+        let selected = select_media_chunks(attachment, offset, requested_end);
+
+        // Browsers usually ask for the first two media chunks sequentially
+        // before playback starts. Warm the next chunk alongside the current
+        // request so the second range can join the same in-flight download or
+        // read it directly from cache.
+        if let Some((index, _, _)) = selected.last()
+            && let Some(chunk) = attachment.chunks.get(index + 1).cloned()
+        {
+            let client = self.clone();
+            let scope_id = scope_id.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = client.fetch_attachment_chunk(&scope_id, &chunk).await;
+            });
+        }
+
+        let mut downloaded =
+            futures_util::stream::iter(selected.into_iter().map(|(index, start, chunk)| {
+                let scope_id = scope_id.clone();
+                async move {
+                    let plaintext = self.fetch_attachment_chunk(&scope_id, &chunk).await?;
+                    Ok::<_, anyhow::Error>((index, start, plaintext))
+                }
+            }))
+            .buffer_unordered(MEDIA_CHUNK_DOWNLOAD_CONCURRENCY);
+        let mut chunks = Vec::new();
+        while let Some(chunk) = downloaded.next().await {
+            chunks.push(chunk?);
+        }
+        chunks.sort_by_key(|(index, _, _)| *index);
+
+        let mut output = Vec::with_capacity((requested_end - offset) as usize);
+        for (_, start, plaintext) in chunks {
+            let end = start + plaintext.len() as u64;
+            let slice_start = offset.saturating_sub(start) as usize;
+            let slice_end = (requested_end.min(end) - start) as usize;
+            output.extend_from_slice(&plaintext[slice_start..slice_end]);
+        }
+        if output.len() as u64 != requested_end - offset {
+            bail!("media range does not match its manifest")
+        }
+        Ok(AttachmentRangeData {
+            mime_type: attachment.mime_type.clone(),
+            data_base64: STANDARD.encode(&output),
+            offset,
+            byte_length: output.len() as u64,
+            total_byte_length: attachment.byte_length,
+        })
+    }
+
+    /// Browser media chunks live in a memory LRU instead of the disk cache the
+    /// native build uses. Concurrent range requests for the same chunk join a
+    /// single in-flight download through the shared future registry.
+    #[cfg(target_arch = "wasm32")]
+    async fn fetch_attachment_chunk(
+        &self,
+        scope_id: &str,
+        chunk: &MediaChunk,
+    ) -> anyhow::Result<Rc<Vec<u8>>> {
+        if let Some(cached) = WEB_MEDIA_CHUNKS.with(|cache| {
+            cache
+                .borrow_mut()
+                .get(&chunk.blob_id, u64::from(chunk.byte_length))
+        }) {
+            return Ok(cached);
+        }
+
+        let pending = WEB_MEDIA_CHUNK_DOWNLOADS
+            .with(|downloads| downloads.borrow().get(&chunk.blob_id).cloned());
+        let download = match pending {
+            Some(download) => download,
+            None => {
+                let client = self.clone();
+                let scope_id = scope_id.to_owned();
+                let chunk = chunk.clone();
+                let download: WebChunkDownload = async move {
+                    let Some(storage) = chunk.storage.as_ref() else {
+                        return Err(
+                            "this media predates constellation storage and is no longer available"
+                                .to_owned(),
+                        );
+                    };
+                    let blob = client
+                        .reconstruct_blob(storage, &chunk.key_base64)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if blob.group_id.as_deref() != Some(scope_id.as_str()) {
+                        return Err("media chunk belongs to a different conversation".to_owned());
+                    }
+                    let plaintext = blob
+                        .open(&chunk.key_base64)
+                        .map_err(|error| error.to_string())?;
+                    if plaintext.len() != chunk.byte_length as usize {
+                        return Err("media chunk does not match its manifest".to_owned());
+                    }
+                    Ok(Rc::new(plaintext))
+                }
+                .boxed_local()
+                .shared();
+                WEB_MEDIA_CHUNK_DOWNLOADS.with(|downloads| {
+                    downloads
+                        .borrow_mut()
+                        .insert(chunk.blob_id.clone(), download.clone());
+                });
+                download
+            }
+        };
+
+        let plaintext = download.await.map_err(anyhow::Error::msg)?;
+        WEB_MEDIA_CHUNK_DOWNLOADS.with(|downloads| {
+            downloads.borrow_mut().remove(&chunk.blob_id);
+        });
+        WEB_MEDIA_CHUNKS.with(|cache| {
+            cache
+                .borrow_mut()
+                .insert(chunk.blob_id.clone(), plaintext.clone());
+        });
+        Ok(plaintext)
+    }
+
+    pub async fn fetch_link_preview(
+        &self,
+        url: String,
+        relays: Vec<String>,
+    ) -> anyhow::Result<Option<LinkPreview>> {
+        let relays = relay_list(relays)?;
+        let body = serde_json::to_vec(&LinkPreviewRequest { url })?;
+        let mut last_error = None;
+        let start_index = usize::from(blake3::hash(&body).as_bytes()[0]) % relays.len();
+
+        for offset in 0..relays.len() {
+            let index = (start_index + offset) % relays.len();
+            match self
+                .relay_request(&relays, index, "POST", "/v1/link-preview", &body)
+                .await
+            {
+                Ok(response) if response.status == 200 => {
+                    return serde_json::from_slice(&response.body)
+                        .context("relay returned an invalid link preview")
+                        .map(Some);
+                }
+                Ok(response)
+                    if response.status == 204
+                        || response.status == 404 && response.body.is_empty() =>
+                {
+                    return Ok(None);
+                }
+                Ok(response) => {
+                    last_error = Some(anyhow::anyhow!(
+                        "relay rejected the link preview with {}",
+                        response.status
+                    ));
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no relay was reachable")))
     }
 
     pub async fn upload_media_chunk(
@@ -2705,6 +3508,7 @@ impl NoiseClient {
             state.group_frequencies.remove(&group.group_id);
             state.forget_group_activity(&group.group_id);
             state.group_conversation_cache.remove(&group.group_id);
+            state.group_event_caches.remove(&group.group_id);
             state.tombstone_group(&group.group_id);
             save_state(path, &state)?;
             return Ok(GroupEncryptionStatus {
@@ -2884,12 +3688,9 @@ impl NoiseClient {
             .mls_control_logs
             .insert(group.group_id.clone(), control_log.clone());
         save_state(path, &state)?;
-        if local_epoch.is_some() && state.mls_recovery_dirty && state.account.is_some() {
-            self.publish_account_state(&mut state, &relays)
-                .await
-                .context("could not save automatic encrypted-group recovery")?;
-            save_state(path, &state)?;
-        }
+        // Do not couple an active group to the remote account-vault backup.
+        // The new MLS recovery material is already saved locally and the
+        // client's background account-sync lane retries the encrypted backup.
         let (head_epoch, _) = control_log.head();
         if local_epoch == Some(head_epoch)
             && control_log
@@ -3656,6 +4457,285 @@ impl NoiseClient {
         Ok(sent)
     }
 
+    pub async fn create_topic(
+        &self,
+        path: impl AsRef<Path>,
+        name: impl Into<String>,
+        icon: impl Into<String>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<GroupActivityResult> {
+        let path = path.as_ref();
+        let name = name.into().trim().to_owned();
+        let icon = icon.into();
+        validate_topic_name(&name)?;
+        validate_topic_icon(&icon)?;
+        let relays = relay_list(relays)?;
+        let mut state = load_state(path)?;
+        let group = state.active_group()?.clone();
+        let identity = state.identity()?;
+        ensure_topic_manager(&state, &group, &identity.public_key_base64())?;
+        let sequence = state.take_sequence();
+        let seed = format!(
+            "noise-topic-v1:{}:{}:{}",
+            group.group_id,
+            identity.public_key_base64(),
+            sequence
+        );
+        let topic_id = blake3::hash(format!("{seed}:id").as_bytes())
+            .to_hex()
+            .to_string();
+        let stream_locator = blake3::hash(format!("{seed}:stream").as_bytes())
+            .to_hex()
+            .to_string();
+        let event = create_group_event(
+            &state,
+            &identity,
+            &group,
+            GroupEventPayload::TopicCreated {
+                topic_id,
+                name,
+                icon,
+                stream_locator,
+            },
+            sequence,
+        )?;
+        self.publish_event(&relays, &event).await?;
+        save_state(path, &state)?;
+        self.apply_group_activity(
+            path,
+            GroupActivityUpdate {
+                group_id: group.group_id,
+                events: vec![event],
+                full_snapshot: false,
+                older_cursor: None,
+                has_older_messages: false,
+                topic_update: None,
+            },
+        )
+    }
+
+    pub async fn update_topic(
+        &self,
+        path: impl AsRef<Path>,
+        topic_id: &str,
+        name: impl Into<String>,
+        icon: impl Into<String>,
+        locked: bool,
+        relays: Vec<String>,
+    ) -> anyhow::Result<GroupActivityResult> {
+        let path = path.as_ref();
+        let name = name.into().trim().to_owned();
+        let icon = icon.into();
+        validate_topic_name(&name)?;
+        validate_topic_icon(&icon)?;
+        let relays = relay_list(relays)?;
+        let mut state = load_state(path)?;
+        let group = state.active_group()?.clone();
+        let identity = state.identity()?;
+        ensure_topic_manager(&state, &group, &identity.public_key_base64())?;
+        ensure_active_topic(&state, &group, topic_id)?;
+        let sequence = state.take_sequence();
+        let event = create_group_event(
+            &state,
+            &identity,
+            &group,
+            GroupEventPayload::TopicUpdated {
+                topic_id: topic_id.to_owned(),
+                name,
+                icon: Some(icon),
+                locked,
+            },
+            sequence,
+        )?;
+        self.publish_event(&relays, &event).await?;
+        save_state(path, &state)?;
+        self.apply_group_activity(
+            path,
+            GroupActivityUpdate {
+                group_id: group.group_id,
+                events: vec![event],
+                full_snapshot: false,
+                older_cursor: None,
+                has_older_messages: false,
+                topic_update: None,
+            },
+        )
+    }
+
+    pub async fn archive_topic(
+        &self,
+        path: impl AsRef<Path>,
+        topic_id: &str,
+        relays: Vec<String>,
+    ) -> anyhow::Result<GroupActivityResult> {
+        let path = path.as_ref();
+        let relays = relay_list(relays)?;
+        let mut state = load_state(path)?;
+        let group = state.active_group()?.clone();
+        let identity = state.identity()?;
+        ensure_topic_manager(&state, &group, &identity.public_key_base64())?;
+        ensure_active_topic(&state, &group, topic_id)?;
+        let sequence = state.take_sequence();
+        let event = create_group_event(
+            &state,
+            &identity,
+            &group,
+            GroupEventPayload::TopicArchived {
+                topic_id: topic_id.to_owned(),
+            },
+            sequence,
+        )?;
+        self.publish_event(&relays, &event).await?;
+        save_state(path, &state)?;
+        self.apply_group_activity(
+            path,
+            GroupActivityUpdate {
+                group_id: group.group_id,
+                events: vec![event],
+                full_snapshot: false,
+                older_cursor: None,
+                has_older_messages: false,
+                topic_update: None,
+            },
+        )
+    }
+
+    pub async fn reorder_topics(
+        &self,
+        path: impl AsRef<Path>,
+        topic_ids: Vec<String>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<GroupActivityResult> {
+        let path = path.as_ref();
+        let relays = relay_list(relays)?;
+        let mut state = load_state(path)?;
+        let group = state.active_group()?.clone();
+        let identity = state.identity()?;
+        let view = cached_group_view(&state, &group)?;
+        if view.owner_public_key.as_deref() != Some(identity.public_key_base64().as_str()) {
+            bail!("only the group founder can rearrange topics")
+        }
+        let active_topic_ids = view
+            .topics
+            .values()
+            .filter(|topic| !topic.archived)
+            .map(|topic| topic.topic_id.clone())
+            .collect::<HashSet<_>>();
+        let requested_topic_ids = topic_ids.iter().cloned().collect::<HashSet<_>>();
+        if topic_ids.len() != requested_topic_ids.len()
+            || requested_topic_ids != active_topic_ids
+        {
+            bail!("topic order is out of date")
+        }
+        let sequence = state.take_sequence();
+        let event = create_group_event(
+            &state,
+            &identity,
+            &group,
+            GroupEventPayload::TopicsReordered { topic_ids },
+            sequence,
+        )?;
+        self.publish_event(&relays, &event).await?;
+        save_state(path, &state)?;
+        self.apply_group_activity(
+            path,
+            GroupActivityUpdate {
+                group_id: group.group_id,
+                events: vec![event],
+                full_snapshot: false,
+                older_cursor: None,
+                has_older_messages: false,
+                topic_update: None,
+            },
+        )
+    }
+
+    pub async fn say_topic(
+        &self,
+        path: impl AsRef<Path>,
+        topic_id: &str,
+        text: impl Into<String>,
+        attachment: Option<MediaAttachment>,
+        reply_to_message_id: Option<String>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<SentMessageResult> {
+        let path = path.as_ref();
+        let text = text.into();
+        if text.trim().is_empty() && attachment.is_none() {
+            bail!("message cannot be empty")
+        }
+        if let Some(attachment) = attachment.as_ref() {
+            validate_media_reference(attachment)?;
+        }
+        validate_reply_reference(reply_to_message_id.as_deref())?;
+        let relays = relay_list(relays)?;
+        let mut state = load_state(path)?;
+        let group = state.active_group()?.clone();
+        let identity = state.identity()?;
+        let topic = ensure_active_topic(&state, &group, topic_id)?;
+        let existing_stream = state
+            .group_event_caches
+            .get(&group.group_id)
+            .and_then(|cache| cache.topic_streams.get(topic_id))
+            .cloned();
+        let actor_public_key = identity.public_key_base64();
+        if topic.locked {
+            let view = cached_group_view(&state, &group)?;
+            let is_manager = view.owner_public_key.as_deref() == Some(actor_public_key.as_str())
+                || view.moderators.contains(&actor_public_key);
+            if !is_manager {
+                bail!("this topic is locked")
+            }
+        }
+        let stream_locator = topic.stream_locator.clone();
+        let sequence = state.take_sequence();
+        let event = create_group_event_in_stream(
+            &state,
+            &identity,
+            &group,
+            &stream_locator,
+            GroupEventPayload::TopicMessage {
+                topic_id: topic_id.to_owned(),
+                text,
+                attachment,
+                reply_to_message_id,
+            },
+            sequence,
+        )?;
+        let sent = SentMessageResult {
+            event_id: event.event_id.clone(),
+            message_id: event.event_id.clone(),
+            created_at_millis: event.created_at_millis,
+        };
+        self.publish_event(&relays, &event).await?;
+        save_state(path, &state)?;
+        let cursor = GroupEventCursor::from_event(&event);
+        let _ = self.apply_group_activity(
+            path,
+            GroupActivityUpdate {
+                group_id: group.group_id,
+                events: vec![event],
+                full_snapshot: false,
+                older_cursor: None,
+                has_older_messages: false,
+                topic_update: Some(TopicActivityUpdate {
+                    topic_id: topic_id.to_owned(),
+                    latest_cursor: Some(cursor),
+                    older_cursor: existing_stream
+                        .as_ref()
+                        .and_then(|stream| stream.older_cursor.clone()),
+                    has_older_messages: existing_stream
+                        .as_ref()
+                        .is_some_and(|stream| stream.has_older_messages),
+                    message_limit: existing_stream
+                        .as_ref()
+                        .map_or(INITIAL_GROUP_MESSAGE_WINDOW, |stream| stream.message_limit),
+                }),
+            },
+        )?;
+        Ok(sent)
+    }
+
     pub async fn set_moderator(
         &self,
         path: impl AsRef<Path>,
@@ -3708,19 +4788,68 @@ impl NoiseClient {
         let group = state.active_group()?.clone();
         let identity = state.identity()?;
         let actor_public_key = identity.public_key_base64();
-        let view = rebuild_group_state(
-            &state,
-            &group,
-            &self.fetch_events(&group, relays.clone()).await?,
-        )?;
-        let is_owner = view.owner_public_key.as_deref() == Some(actor_public_key.as_str());
-        let target = view
-            .messages
-            .iter()
-            .find(|message| message.event_id == message_event_id)
-            .context("that message no longer exists")?;
-        let is_moderator = view.moderators.contains(&actor_public_key);
-        let is_active = view.members.contains_key(&actor_public_key);
+        let cached_conversation = state
+            .group_conversation_cache
+            .get(&group.group_id)
+            .cloned()
+            .or_else(|| {
+                state
+                    .group_event_caches
+                    .get(&group.group_id)
+                    .and_then(|cache| cache.portable_conversation.clone())
+            });
+        let (target, is_owner, is_moderator, is_active) =
+            if let Some(conversation) = cached_conversation {
+                let target = conversation
+                    .messages
+                    .iter()
+                    .find(|message| message.event_id == message_event_id)
+                    .cloned()
+                    .context("that message no longer exists")?;
+                let actor = conversation
+                    .members
+                    .iter()
+                    .find(|member| member.public_key == actor_public_key);
+                (
+                    target,
+                    conversation.group.owner_public_key == actor_public_key,
+                    actor.is_some_and(|member| member.is_moderator),
+                    actor.is_some(),
+                )
+            } else {
+                let cache = state
+                    .group_event_caches
+                    .get(&group.group_id)
+                    .context("open this group and try deleting the message again")?;
+                let view = rebuild_group_state(&state, &group, &cache.events)?;
+                let target = view
+                    .messages
+                    .iter()
+                    .find(|message| message.event_id == message_event_id)
+                    .map(|message| MessageSummary {
+                        event_id: message.event_id.clone(),
+                        message_id: message.message_id.clone(),
+                        author_public_key: message.author_public_key.clone(),
+                        username: message.username.clone(),
+                        bio: message.bio.clone(),
+                        avatar: message.avatar.clone(),
+                        album: message.album.clone(),
+                        accepts_direct_messages: message.accepts_direct_messages,
+                        text: message.text.clone(),
+                        attachment: message.attachment.clone(),
+                        reply_to_message_id: message.reply_to_message_id.clone(),
+                        topic_id: message.topic_id.clone(),
+                        created_at_millis: message.created_at_millis,
+                        reactions: Vec::new(),
+                    })
+                    .context("that message no longer exists")?;
+                (
+                    target,
+                    view.owner_public_key.as_deref() == Some(actor_public_key.as_str()),
+                    view.moderators.contains(&actor_public_key),
+                    view.members.contains_key(&actor_public_key),
+                )
+            };
         if !is_active
             || (!is_owner && !is_moderator && target.author_public_key != actor_public_key)
         {
@@ -3742,8 +4871,31 @@ impl NoiseClient {
             sequence,
         )?;
         self.publish_event(&relays, &event).await?;
-        let _ = self.erase_storage_references(storage, false).await;
+
+        if let Some(cache) = state.group_event_caches.get_mut(&group.group_id) {
+            cache.events.push(event);
+            cache.latest_cursor =
+                max_group_event_cursor(cache.latest_cursor.clone(), &cache.events, None);
+            if let Some(conversation) = cache.portable_conversation.as_mut() {
+                remove_message_from_conversation(conversation, message_event_id);
+            }
+        }
+        if let Some(conversation) = state.group_conversation_cache.get_mut(&group.group_id) {
+            remove_message_from_conversation(conversation, message_event_id);
+        }
         save_state(path, &state)?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if !storage.is_empty() {
+            let client = self.clone();
+            tokio::spawn(async move {
+                let _ = client.erase_storage_references(storage, false).await;
+            });
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = self.erase_storage_references(storage, false).await;
+        }
         Ok(())
     }
 
@@ -4042,6 +5194,7 @@ impl NoiseClient {
         state.group_frequencies.remove(&group.group_id);
         state.forget_group_activity(&group.group_id);
         state.group_conversation_cache.remove(&group.group_id);
+        state.group_event_caches.remove(&group.group_id);
         state.tombstone_group(&group.group_id);
         save_state(path, &state)?;
         state.summary()
@@ -4087,6 +5240,7 @@ impl NoiseClient {
         state.group_frequencies.remove(group_id);
         state.forget_group_activity(group_id);
         state.group_conversation_cache.remove(group_id);
+        state.group_event_caches.remove(group_id);
         state.mls_join_requests.remove(group_id);
         state.mls_local_geneses.remove(group_id);
         state.mls_control_logs.remove(group_id);
@@ -4231,6 +5385,312 @@ impl NoiseClient {
         self.apply_group_activity(path, update)
     }
 
+    pub async fn sync_topic_activity(
+        &self,
+        path: impl AsRef<Path>,
+        group_id: &str,
+        topic_id: &str,
+        relays: Vec<String>,
+    ) -> anyhow::Result<GroupActivityResult> {
+        let update = self
+            .fetch_topic_activity(path.as_ref(), group_id, topic_id, relays)
+            .await?;
+        self.apply_group_activity(path, update)
+    }
+
+    pub async fn fetch_topic_activity(
+        &self,
+        path: impl AsRef<Path>,
+        group_id: &str,
+        topic_id: &str,
+        relays: Vec<String>,
+    ) -> anyhow::Result<GroupActivityUpdate> {
+        let path = path.as_ref();
+        let state = load_state(path)?;
+        let group = state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .cloned()
+            .context("unknown group")?;
+        let topic = ensure_active_topic(&state, &group, topic_id)?;
+        let stream = state
+            .group_event_caches
+            .get(group_id)
+            .and_then(|cache| cache.topic_streams.get(topic_id))
+            .cloned();
+        let relays = relay_list(relays)?;
+        let request = stream
+            .as_ref()
+            .and_then(|stream| stream.latest_cursor.as_ref())
+            .map_or(GroupEventPageRequest::Latest, GroupEventPageRequest::After);
+        let page = self
+            .fetch_group_event_page(
+                group_id,
+                Some(&topic.stream_locator),
+                request,
+                &relays,
+            )
+            .await?
+            .context("the configured relays do not support topic streams")?;
+        let is_latest = matches!(request, GroupEventPageRequest::Latest);
+        let latest_cursor = match request {
+            GroupEventPageRequest::Latest | GroupEventPageRequest::After(_) => page
+                .events
+                .last()
+                .map(GroupEventCursor::from_event)
+                .or_else(|| stream.as_ref().and_then(|stream| stream.latest_cursor.clone())),
+            GroupEventPageRequest::Before(_) => unreachable!(),
+        };
+        Ok(GroupActivityUpdate {
+            group_id: group_id.to_owned(),
+            events: page.events,
+            full_snapshot: false,
+            older_cursor: None,
+            has_older_messages: false,
+            topic_update: Some(TopicActivityUpdate {
+                topic_id: topic_id.to_owned(),
+                latest_cursor,
+                older_cursor: if is_latest {
+                    page.continuation_cursor
+                } else {
+                    stream.as_ref().and_then(|stream| stream.older_cursor.clone())
+                },
+                has_older_messages: if is_latest {
+                    page.has_more
+                } else {
+                    stream
+                        .as_ref()
+                        .is_some_and(|stream| stream.has_older_messages)
+                },
+                message_limit: stream
+                    .as_ref()
+                    .map_or(INITIAL_GROUP_MESSAGE_WINDOW, |stream| stream.message_limit),
+            }),
+        })
+    }
+
+    pub async fn load_older_topic_history(
+        &self,
+        path: impl AsRef<Path>,
+        group_id: &str,
+        topic_id: &str,
+        relays: Vec<String>,
+    ) -> anyhow::Result<Conversation> {
+        let path = path.as_ref();
+        let state = load_state(path)?;
+        let group = state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .cloned()
+            .context("unknown group")?;
+        let topic = ensure_active_topic(&state, &group, topic_id)?;
+        let stream = state
+            .group_event_caches
+            .get(group_id)
+            .and_then(|cache| cache.topic_streams.get(topic_id))
+            .cloned()
+            .context("topic history is not available yet")?;
+        if !stream.has_older_messages {
+            return state
+                .group_conversation_cache
+                .get(group_id)
+                .cloned()
+                .context("open this topic and try again");
+        }
+        let mut cursor = stream
+            .older_cursor
+            .clone()
+            .context("topic history cursor is unavailable")?;
+        let relays = relay_list(relays)?;
+        let mut events = Vec::new();
+        let mut has_older_messages;
+        loop {
+            let page = self
+                .fetch_group_event_page(
+                    group_id,
+                    Some(&topic.stream_locator),
+                    GroupEventPageRequest::Before(&cursor),
+                    &relays,
+                )
+                .await?
+                .context("the configured relays do not support topic streams")?;
+            events.extend(page.events);
+            has_older_messages = page.has_more;
+            let Some(next_cursor) = page.continuation_cursor else {
+                break;
+            };
+            if next_cursor.key() >= cursor.key() {
+                bail!("relay returned a non-advancing topic history page")
+            }
+            cursor = next_cursor;
+            if events.len() >= INITIAL_GROUP_MESSAGE_WINDOW || !page.has_more {
+                break;
+            }
+        }
+        let result = self.apply_group_activity(
+            path,
+            GroupActivityUpdate {
+                group_id: group_id.to_owned(),
+                events,
+                full_snapshot: false,
+                older_cursor: None,
+                has_older_messages: false,
+                topic_update: Some(TopicActivityUpdate {
+                    topic_id: topic_id.to_owned(),
+                    latest_cursor: stream.latest_cursor,
+                    older_cursor: Some(cursor),
+                    has_older_messages,
+                    message_limit: stream
+                        .message_limit
+                        .saturating_add(INITIAL_GROUP_MESSAGE_WINDOW),
+                }),
+            },
+        )?;
+        result
+            .conversation
+            .context("this identity is not an active group member")
+    }
+
+    pub async fn load_older_group_history(
+        &self,
+        path: impl AsRef<Path>,
+        group_id: &str,
+        relays: Vec<String>,
+    ) -> anyhow::Result<Conversation> {
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        let group = state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .cloned()
+            .context("unknown group")?;
+        let identity_public_key = state.identity()?.public_key_base64();
+        let mut existing = state
+            .group_event_caches
+            .get(group_id)
+            .cloned()
+            .context("group history is not available yet")?;
+        if !existing.has_older_messages {
+            if let Some(mut conversation) = existing.portable_conversation.clone() {
+                filter_conversation_for_blocks(&mut conversation, &state.active_hidden_keys());
+                return Ok(conversation);
+            }
+            let view = rebuild_group_state(&state, &group, &existing.events)?;
+            let mut conversation =
+                cached_conversation_from_view(&state, &group, view, &identity_public_key);
+            conversation.has_older_messages = false;
+            filter_conversation_for_blocks(&mut conversation, &state.active_hidden_keys());
+            return Ok(conversation);
+        }
+
+        let relays = relay_list(relays)?;
+        if existing.needs_recent_hydration {
+            if let Some(page) = self
+                .fetch_group_event_page(group_id, None, GroupEventPageRequest::Latest, &relays)
+                .await?
+            {
+                let mut hydrated_events = existing.events.clone();
+                hydrated_events.extend(page.events);
+                existing = compact_group_event_cache(
+                    &state,
+                    &group,
+                    hydrated_events,
+                    existing.message_limit,
+                    existing.latest_cursor.clone(),
+                    page.continuation_cursor
+                        .or_else(|| existing.older_cursor.clone()),
+                    page.has_more || existing.has_older_messages,
+                    existing.topic_streams.clone(),
+                )?;
+            } else {
+                existing = compact_group_event_cache(
+                    &state,
+                    &group,
+                    self.fetch_events(&group, relays.clone()).await?,
+                    existing.message_limit,
+                    existing.latest_cursor.clone(),
+                    None,
+                    false,
+                    existing.topic_streams.clone(),
+                )?;
+            }
+        }
+        let mut events = existing.events.clone();
+        let mut older_cursor = existing.older_cursor.clone();
+        let mut has_older_hint = false;
+        let mut used_page = false;
+        let target_message_count = rebuild_group_state(&state, &group, &events)?
+            .messages
+            .len()
+            .saturating_add(INITIAL_GROUP_MESSAGE_WINDOW);
+        if let Some(mut cursor) = existing.older_cursor.clone() {
+            loop {
+                let Some(page) = self
+                    .fetch_group_event_page(
+                        group_id,
+                        None,
+                        GroupEventPageRequest::Before(&cursor),
+                        &relays,
+                    )
+                    .await?
+                else {
+                    break;
+                };
+                used_page = true;
+                events.extend(page.events);
+                older_cursor = page.continuation_cursor.clone();
+                has_older_hint = page.has_more;
+                if rebuild_group_state(&state, &group, &events)?.messages.len()
+                    >= target_message_count
+                    || !page.has_more
+                {
+                    break;
+                }
+                let Some(next_cursor) = page.continuation_cursor else {
+                    break;
+                };
+                if next_cursor.key() >= cursor.key() {
+                    bail!("relay returned a non-advancing group history page")
+                }
+                cursor = next_cursor;
+            }
+        }
+        if !used_page {
+            events = self.fetch_events(&group, relays).await?;
+            older_cursor = None;
+        }
+
+        let cache = compact_group_event_cache(
+            &state,
+            &group,
+            events,
+            existing
+                .message_limit
+                .saturating_add(INITIAL_GROUP_MESSAGE_WINDOW),
+            existing.latest_cursor.clone(),
+            older_cursor,
+            has_older_hint,
+            existing.topic_streams.clone(),
+        )?;
+        let view = rebuild_group_state(&state, &group, &cache.events)?;
+        if !view.members.contains_key(&identity_public_key) {
+            bail!("this identity is not an active group member")
+        }
+        let mut conversation =
+            cached_conversation_from_view(&state, &group, view, &identity_public_key);
+        conversation.has_older_messages = cache.has_older_messages;
+        filter_conversation_for_blocks(&mut conversation, &state.active_hidden_keys());
+        state.group_event_caches.insert(group_id.to_owned(), cache);
+        state
+            .group_conversation_cache
+            .insert(group_id.to_owned(), conversation.clone());
+        save_state(path, &state)?;
+        Ok(conversation)
+    }
+
     pub async fn fetch_group_activity(
         &self,
         path: impl AsRef<Path>,
@@ -4245,10 +5705,77 @@ impl NoiseClient {
             .find(|group| group.group_id == group_id)
             .cloned()
             .context("unknown group")?;
-        let events = self.fetch_events(&group, relay_list(relays)?).await?;
+        let relays = relay_list(relays)?;
+        if let Some(cache) = state
+            .group_event_caches
+            .get(group_id)
+            .filter(|cache| cache.needs_recent_hydration)
+            && let Some(page) = self
+                .fetch_group_event_page(group_id, None, GroupEventPageRequest::Latest, &relays)
+                .await?
+        {
+            return Ok(GroupActivityUpdate {
+                group_id: group_id.to_owned(),
+                events: page.events,
+                full_snapshot: false,
+                older_cursor: page
+                    .continuation_cursor
+                    .or_else(|| cache.older_cursor.clone()),
+                has_older_messages: page.has_more || cache.has_older_messages,
+                topic_update: None,
+            });
+        }
+        if let Some(cache) = state.group_event_caches.get(group_id)
+            && let Some(mut cursor) = cache.latest_cursor.clone()
+        {
+            let mut events = Vec::new();
+            loop {
+                let Some(page) = self
+                    .fetch_group_event_page(
+                        group_id,
+                        None,
+                        GroupEventPageRequest::After(&cursor),
+                        &relays,
+                    )
+                    .await?
+                else {
+                    break;
+                };
+                events.extend(page.events);
+                let Some(next_cursor) = page.continuation_cursor else {
+                    return Ok(GroupActivityUpdate {
+                        group_id: group_id.to_owned(),
+                        events,
+                        full_snapshot: false,
+                        older_cursor: cache.older_cursor.clone(),
+                        has_older_messages: cache.has_older_messages,
+                        topic_update: None,
+                    });
+                };
+                if next_cursor.key() <= cursor.key() {
+                    bail!("relay returned a non-advancing group history page")
+                }
+                cursor = next_cursor;
+                if !page.has_more {
+                    return Ok(GroupActivityUpdate {
+                        group_id: group_id.to_owned(),
+                        events,
+                        full_snapshot: false,
+                        older_cursor: cache.older_cursor.clone(),
+                        has_older_messages: cache.has_older_messages,
+                        topic_update: None,
+                    });
+                }
+            }
+        }
+        let events = self.fetch_events(&group, relays).await?;
         Ok(GroupActivityUpdate {
             group_id: group_id.to_owned(),
             events,
+            full_snapshot: true,
+            older_cursor: None,
+            has_older_messages: false,
+            topic_update: None,
         })
     }
 
@@ -4267,10 +5794,72 @@ impl NoiseClient {
             .context("unknown group")?;
         let identity_public_key = state.identity()?.public_key_base64();
         let group_id = group.group_id.clone();
-        let view = rebuild_group_state(&state, &group, &update.events)?;
+        let existing_cache = state.group_event_caches.get(&group_id).cloned();
+        let message_limit = existing_cache
+            .as_ref()
+            .map_or(INITIAL_GROUP_MESSAGE_WINDOW, |cache| cache.message_limit);
+        let mut topic_streams = existing_cache
+            .as_ref()
+            .map(|cache| cache.topic_streams.clone())
+            .unwrap_or_default();
+        if let Some(topic_update) = update.topic_update {
+            let stream = topic_streams
+                .entry(topic_update.topic_id)
+                .or_insert_with(|| TopicStreamCache {
+                    latest_cursor: None,
+                    older_cursor: None,
+                    message_limit: INITIAL_GROUP_MESSAGE_WINDOW,
+                    has_older_messages: false,
+                });
+            stream.latest_cursor = [
+                stream.latest_cursor.clone(),
+                topic_update.latest_cursor,
+            ]
+            .into_iter()
+            .flatten()
+            .max_by(|left, right| left.key().cmp(&right.key()));
+            stream.older_cursor = topic_update
+                .older_cursor
+                .or_else(|| stream.older_cursor.clone());
+            stream.has_older_messages = topic_update.has_older_messages;
+            stream.message_limit = topic_update.message_limit.max(1);
+        }
+        let mut events = if update.full_snapshot {
+            Vec::new()
+        } else {
+            existing_cache
+                .as_ref()
+                .map(|cache| cache.events.clone())
+                .unwrap_or_default()
+        };
+        events.extend(update.events);
+        let cache = compact_group_event_cache(
+            &state,
+            &group,
+            events,
+            message_limit,
+            existing_cache
+                .as_ref()
+                .and_then(|cache| cache.latest_cursor.clone()),
+            update.older_cursor.or_else(|| {
+                existing_cache
+                    .as_ref()
+                    .and_then(|cache| cache.older_cursor.clone())
+            }),
+            update.has_older_messages
+                || existing_cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.has_older_messages),
+            topic_streams,
+        )?;
+        let view = rebuild_group_state(&state, &group, &cache.events)?;
         let is_member = view.members.contains_key(&identity_public_key);
-        let mut state_changed = is_member
-            && state.record_group_activity(&group_id, &view.messages, &identity_public_key);
+        let mut state_changed = existing_cache.as_ref() != Some(&cache)
+            || is_member
+                && state.record_group_activity(&group_id, &view.messages, &identity_public_key);
+        state
+            .group_event_caches
+            .insert(group_id.clone(), cache.clone());
         let resolved_owner = view.owner_public_key.clone().unwrap_or_else(|| {
             state
                 .groups
@@ -4302,6 +5891,7 @@ impl NoiseClient {
         let conversation = is_member.then(|| {
             let mut conversation =
                 cached_conversation_from_view(&state, &group, view, &identity_public_key);
+            conversation.has_older_messages = cache.has_older_messages;
             let blocked = state.active_hidden_keys();
             filter_conversation_for_blocks(&mut conversation, &blocked);
             conversation
@@ -4325,21 +5915,65 @@ impl NoiseClient {
         path: impl AsRef<Path>,
         group_id: &str,
     ) -> anyhow::Result<LocalSummary> {
+        self.mark_topic_read(path, group_id, None)
+    }
+
+    pub fn mark_topic_read(
+        &self,
+        path: impl AsRef<Path>,
+        group_id: &str,
+        topic_id: Option<&str>,
+    ) -> anyhow::Result<LocalSummary> {
         let path = path.as_ref();
         let mut state = load_state(path)?;
         if !state.groups.iter().any(|group| group.group_id == group_id) {
             bail!("unknown group")
         }
-        let was_initialized = state.group_activity_initialized.insert(group_id.to_owned());
-        let latest = state.group_latest_incoming.get(group_id).cloned();
-        let marker_changed = latest
-            .as_ref()
-            .is_some_and(|marker| state.group_read_through.get(group_id) != Some(marker));
-        if let Some(marker) = latest {
-            state.group_read_through.insert(group_id.to_owned(), marker);
+        if let Some(topic_id) = topic_id {
+            let topic_is_known = state
+                .group_conversation_cache
+                .get(group_id)
+                .or_else(|| {
+                    state
+                        .group_event_caches
+                        .get(group_id)
+                        .and_then(|cache| cache.portable_conversation.as_ref())
+                })
+                .is_some_and(|conversation| {
+                    conversation
+                        .topics
+                        .iter()
+                        .any(|topic| topic.topic_id == topic_id && !topic.archived)
+                });
+            if !topic_is_known {
+                bail!("unknown topic")
+            }
         }
-        let had_unread = state.group_unread_messages.remove(group_id).is_some();
-        if was_initialized || marker_changed || had_unread {
+        let topic_key = topic_activity_key(group_id, topic_id);
+        let topic_was_initialized = state.topic_activity_initialized.insert(topic_key.clone());
+        let topic_latest = state.topic_latest_incoming.get(&topic_key).cloned();
+        let topic_marker_changed = topic_latest
+            .as_ref()
+            .is_some_and(|marker| state.topic_read_through.get(&topic_key) != Some(marker));
+        if let Some(marker) = topic_latest {
+            state.topic_read_through.insert(topic_key.clone(), marker);
+        }
+        let topic_had_unread = state.topic_unread_messages.remove(&topic_key).is_some();
+
+        let mut legacy_changed = false;
+        if topic_id.is_none() {
+            let was_initialized = state.group_activity_initialized.insert(group_id.to_owned());
+            let latest = state.group_latest_incoming.get(group_id).cloned();
+            let marker_changed = latest
+                .as_ref()
+                .is_some_and(|marker| state.group_read_through.get(group_id) != Some(marker));
+            if let Some(marker) = latest {
+                state.group_read_through.insert(group_id.to_owned(), marker);
+            }
+            let had_unread = state.group_unread_messages.remove(group_id).is_some();
+            legacy_changed = was_initialized || marker_changed || had_unread;
+        }
+        if topic_was_initialized || topic_marker_changed || topic_had_unread || legacy_changed {
             save_state(path, &state)?;
         }
         state.summary()
@@ -4353,6 +5987,14 @@ impl NoiseClient {
         let path = path.as_ref();
         let mut state = load_state(path)?;
         let group_id = state.active_group()?.group_id.clone();
+        if state.group_event_caches.contains_key(&group_id) {
+            drop(state);
+            return self
+                .sync_group_activity(path, &group_id, relays)
+                .await?
+                .conversation
+                .context("this identity is not an active group member");
+        }
         let group_index = state
             .groups
             .iter()
@@ -4385,9 +6027,22 @@ impl NoiseClient {
             self.publish_event(&relays, &joined).await?;
             events.push(joined);
         }
-        let view = rebuild_group_state(&state, &group, &events)?;
-        let mut state_changed =
-            state.record_group_activity(&group.group_id, &view.messages, &identity_public_key);
+        let cache = compact_group_event_cache(
+            &state,
+            &group,
+            events,
+            INITIAL_GROUP_MESSAGE_WINDOW,
+            None,
+            None,
+            false,
+            HashMap::new(),
+        )?;
+        let view = rebuild_group_state(&state, &group, &cache.events)?;
+        state
+            .group_event_caches
+            .insert(group.group_id.clone(), cache.clone());
+        state.record_group_activity(&group.group_id, &view.messages, &identity_public_key);
+        let mut state_changed = true;
         let resolved_owner = view.owner_public_key.clone().unwrap_or_default();
         let resolved_profile = view.profile.clone();
         let moderators = view.moderators.clone();
@@ -4482,6 +6137,7 @@ impl NoiseClient {
                         text: message.text.clone(),
                         attachment: message.attachment.clone(),
                         reply_to_message_id: message.reply_to_message_id.clone(),
+                        topic_id: message.topic_id.clone(),
                         created_at_millis: message.created_at_millis,
                         reactions: reactions_by_message
                             .get(&message.event_id)
@@ -4491,6 +6147,7 @@ impl NoiseClient {
                 })
             })
             .collect::<Vec<_>>();
+        let topics = topic_summaries(&state, &group.group_id, &view.topics);
         let mut members = view
             .members
             .into_values()
@@ -4525,8 +6182,10 @@ impl NoiseClient {
                 remote_deletion_supported: !group.authority_nonce_base64.is_empty(),
                 is_active: true,
                 unread_count: state.group_unread_count(&group.group_id),
-                read_state_initialized: state.group_activity_initialized.contains(&group.group_id),
+                read_state_initialized: state.topic_read_state_initialized(&group.group_id, None),
             },
+            topics,
+            general_unread_count: state.topic_unread_count(&group.group_id, None),
             members,
             banned_members,
             messages: view
@@ -4548,6 +6207,7 @@ impl NoiseClient {
                         text: message.text,
                         attachment: message.attachment,
                         reply_to_message_id: message.reply_to_message_id,
+                        topic_id: message.topic_id,
                         created_at_millis: message.created_at_millis,
                         reactions,
                     }
@@ -4556,6 +6216,7 @@ impl NoiseClient {
             reports,
             reported_message_event_ids,
             rejected_events: view.rejected_events,
+            has_older_messages: cache.has_older_messages,
         };
         let blocked = state.active_hidden_keys();
         filter_conversation_for_blocks(&mut conversation, &blocked);
@@ -5098,8 +6759,134 @@ impl NoiseClient {
         state
             .mls_group_states
             .retain(|group_id, _| present_group_ids.contains(group_id));
-        let recovery_changed =
-            recovery_changed_before_merge || recovery_before != state.mls_group_states;
+        let control_logs_before = state.mls_control_logs.clone();
+        for (group_id, remote_log) in contents.mls_control_logs {
+            if !present_group_ids.contains(&group_id) {
+                continue;
+            }
+            remote_log
+                .verify()
+                .context("encrypted account vault contains an invalid group encryption log")?;
+            if remote_log.genesis.group_id != group_id {
+                bail!("encrypted account vault contains a mismatched group encryption log")
+            }
+            let remote_epoch = remote_log
+                .epochs
+                .last()
+                .map_or(0, |record| record.bundle.epoch);
+            let local_epoch = state
+                .mls_control_logs
+                .get(&group_id)
+                .and_then(|log| log.epochs.last())
+                .map_or(0, |record| record.bundle.epoch);
+            if !state.mls_control_logs.contains_key(&group_id) || remote_epoch > local_epoch {
+                state.mls_control_logs.insert(group_id, remote_log);
+            }
+        }
+        state
+            .mls_control_logs
+            .retain(|group_id, _| present_group_ids.contains(group_id));
+
+        let event_caches_before = state.group_event_caches.clone();
+        for (group_id, remote_cache) in contents.group_event_caches {
+            let Some(group) = state
+                .groups
+                .iter()
+                .find(|group| group.group_id == group_id)
+                .cloned()
+            else {
+                continue;
+            };
+            let local = state.group_event_caches.get(&group_id).cloned();
+            let mut remote_portable_conversation = remote_cache.portable_conversation;
+            if remote_portable_conversation
+                .as_ref()
+                .is_some_and(|conversation| {
+                    conversation.group.group_id != group_id
+                        || conversation.messages.len() > INITIAL_GROUP_MESSAGE_WINDOW
+                })
+            {
+                bail!("encrypted account vault contains invalid cached conversation")
+            }
+            if let Some(conversation) = remote_portable_conversation.as_mut() {
+                strip_conversation_media_previews(conversation);
+            }
+            let preserve_remote_portable = remote_cache.needs_recent_hydration
+                && remote_portable_conversation.is_some()
+                && local
+                    .as_ref()
+                    .is_none_or(|cache| cache.needs_recent_hydration);
+            let mut events = local
+                .as_ref()
+                .map(|cache| cache.events.clone())
+                .unwrap_or_default();
+            events.extend(remote_cache.events);
+            let message_limit = local
+                .as_ref()
+                .map_or(remote_cache.message_limit, |cache| {
+                    cache.message_limit.max(remote_cache.message_limit)
+                })
+                .max(INITIAL_GROUP_MESSAGE_WINDOW);
+            let latest_cursor = [
+                local.as_ref().and_then(|cache| cache.latest_cursor.clone()),
+                remote_cache.latest_cursor,
+            ]
+            .into_iter()
+            .flatten()
+            .max_by(|left, right| left.key().cmp(&right.key()));
+            let older_cursor = [
+                local.as_ref().and_then(|cache| cache.older_cursor.clone()),
+                remote_cache.older_cursor,
+            ]
+            .into_iter()
+            .flatten()
+            .max_by(|left, right| left.key().cmp(&right.key()));
+            let has_older_messages = remote_cache.has_older_messages
+                || local.as_ref().is_some_and(|cache| cache.has_older_messages);
+            let mut topic_streams = remote_cache.topic_streams;
+            if let Some(local) = local.as_ref() {
+                for (topic_id, local_stream) in &local.topic_streams {
+                    let stream = topic_streams
+                        .entry(topic_id.clone())
+                        .or_insert_with(|| local_stream.clone());
+                    stream.message_limit = stream.message_limit.max(local_stream.message_limit);
+                    stream.has_older_messages |= local_stream.has_older_messages;
+                    stream.latest_cursor =
+                        [stream.latest_cursor.clone(), local_stream.latest_cursor.clone()]
+                            .into_iter()
+                            .flatten()
+                            .max_by(|left, right| left.key().cmp(&right.key()));
+                    stream.older_cursor =
+                        [stream.older_cursor.clone(), local_stream.older_cursor.clone()]
+                            .into_iter()
+                            .flatten()
+                            .max_by(|left, right| left.key().cmp(&right.key()));
+                }
+            }
+            let mut cache = compact_group_event_cache(
+                state,
+                &group,
+                events,
+                message_limit,
+                latest_cursor,
+                older_cursor,
+                has_older_messages,
+                topic_streams,
+            )
+            .context("encrypted account vault contains invalid group history")?;
+            if preserve_remote_portable {
+                cache.needs_recent_hydration = true;
+                cache.portable_conversation = remote_portable_conversation;
+            }
+            state.group_event_caches.insert(group_id, cache);
+        }
+        state
+            .group_event_caches
+            .retain(|group_id, _| present_group_ids.contains(group_id));
+        let recovery_changed = recovery_changed_before_merge
+            || recovery_before != state.mls_group_states
+            || control_logs_before != state.mls_control_logs;
+        let event_caches_changed = event_caches_before != state.group_event_caches;
         if state.active_group_id.is_none()
             && contents
                 .active_group_id
@@ -5113,6 +6900,7 @@ impl NoiseClient {
             || frequencies_before != state.group_frequencies;
         let direct_reads_changed = state.merge_direct_read_through(&contents.direct_read_through);
         let group_reads_changed = state.merge_group_read_through(&contents.group_read_through);
+        let topic_reads_changed = state.merge_topic_read_through(&contents.topic_read_through);
         let blocks_changed = merge_block_states(&mut state.block_states, &contents.block_states);
         let blocked_by_changed =
             merge_block_states(&mut state.blocked_by_states, &contents.blocked_by_states);
@@ -5127,7 +6915,12 @@ impl NoiseClient {
         state
             .group_activity_initialized
             .extend(contents.group_activity_initialized);
-        let initialized_changed = state.group_activity_initialized.len() != initialized_before;
+        let topic_initialized_before = state.topic_activity_initialized.len();
+        state
+            .topic_activity_initialized
+            .extend(contents.topic_activity_initialized);
+        let initialized_changed = state.group_activity_initialized.len() != initialized_before
+            || state.topic_activity_initialized.len() != topic_initialized_before;
         let account = state
             .account
             .as_mut()
@@ -5138,11 +6931,13 @@ impl NoiseClient {
             || profile_changed
             || memberships_changed
             || group_reads_changed
+            || topic_reads_changed
             || blocks_changed
             || blocked_by_changed
             || group_activity_changed
             || initialized_changed
             || recovery_changed
+            || event_caches_changed
             || revision_changed)
     }
 
@@ -5152,18 +6947,48 @@ impl NoiseClient {
         vault: &AccountVault,
     ) -> anyhow::Result<()> {
         let body = serde_json::to_vec(vault)?;
-        let mut accepted = 0usize;
+        let mut requests = FuturesUnordered::new();
         for index in 0..relays.len() {
-            if let Ok(response) = self
-                .relay_request(relays, index, "POST", "/v1/accounts", &body)
-                .await
-                && (200..300).contains(&response.status)
-            {
-                accepted += 1;
+            let body = &body;
+            requests.push(async move {
+                (
+                    index,
+                    self.relay_request(relays, index, "POST", "/v1/accounts", body)
+                        .await,
+                )
+            });
+        }
+
+        let mut accepted = 0usize;
+        let mut failures = Vec::with_capacity(relays.len());
+        while let Some((index, result)) = requests.next().await {
+            match result {
+                Ok(response) if (200..300).contains(&response.status) => {
+                    accepted += 1;
+                }
+                Ok(response) => {
+                    let detail = String::from_utf8_lossy(&response.body);
+                    failures.push(format!(
+                        "{} returned {}{}",
+                        relays[index].base_url,
+                        response.status,
+                        if detail.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", detail.trim())
+                        },
+                    ));
+                }
+                Err(error) => {
+                    failures.push(format!("{}: {error:#}", relays[index].base_url));
+                }
             }
         }
         if accepted == 0 {
-            bail!("no relay accepted the encrypted account vault")
+            bail!(
+                "no relay accepted the encrypted account vault ({})",
+                failures.join("; ")
+            )
         }
         Ok(())
     }
@@ -5173,18 +6998,19 @@ impl NoiseClient {
         relays: &[RelayDescriptor],
         locator: &str,
     ) -> anyhow::Result<AccountVault> {
-        let mut newest: Option<AccountVault> = None;
+        let endpoint = format!("/v1/accounts/{locator}");
+        let mut requests = FuturesUnordered::new();
         for index in 0..relays.len() {
-            let Ok(response) = self
-                .relay_request(
-                    relays,
-                    index,
-                    "GET",
-                    &format!("/v1/accounts/{locator}"),
-                    &[],
-                )
-                .await
-            else {
+            let endpoint = &endpoint;
+            requests.push(async move {
+                self.relay_request(relays, index, "GET", endpoint, &[])
+                    .await
+            });
+        }
+
+        let mut newest: Option<AccountVault> = None;
+        while let Some(result) = requests.next().await {
+            let Ok(response) = result else {
                 continue;
             };
             if !(200..300).contains(&response.status) {
@@ -5238,18 +7064,39 @@ impl NoiseClient {
         for index in 0..relays.len() {
             let body = body.as_slice();
             publications.push(async move {
-                self.relay_request(relays, index, "POST", "/v1/events", body)
-                    .await
+                (
+                    index,
+                    self.relay_request(relays, index, "POST", "/v1/events", body)
+                        .await,
+                )
             });
         }
-        while let Some(result) = publications.next().await {
-            if result.is_ok_and(|response| (200..300).contains(&response.status)) {
-                // Events are idempotent and relays replicate accepted events to
-                // their peers. A lagging replica must not hold the sender UI.
-                return Ok(());
+        let mut failures = Vec::with_capacity(relays.len());
+        while let Some((index, result)) = publications.next().await {
+            match result {
+                Ok(response) if (200..300).contains(&response.status) => {
+                    // Events are idempotent and relays replicate accepted events to
+                    // their peers. A lagging replica must not hold the sender UI.
+                    return Ok(());
+                }
+                Ok(response) => {
+                    let detail = String::from_utf8_lossy(&response.body);
+                    let detail = detail.trim();
+                    failures.push(if detail.is_empty() {
+                        format!("{} returned {}", relays[index].base_url, response.status)
+                    } else {
+                        format!(
+                            "{} returned {}: {detail}",
+                            relays[index].base_url, response.status
+                        )
+                    });
+                }
+                Err(error) => {
+                    failures.push(format!("{}: {error:#}", relays[index].base_url));
+                }
             }
         }
-        bail!("no relay accepted the event")
+        bail!("no relay accepted the event ({})", failures.join("; "))
     }
 
     fn storage_relays(
@@ -5296,18 +7143,17 @@ impl NoiseClient {
                 if !seen.insert(placement.shard_id.clone()) {
                     continue;
                 }
-                let deletion = noise_core::shard_deletion(&key_base64, &placement.shard_id)?;
+                let deletion = noise_core::shard_deletion_bytes(&key_base64, &placement.shard_id)?;
                 let client = self.clone();
                 deletions.push(async move {
                     let relay = RelayDescriptor::parse(&placement.relay)?;
-                    let body = serde_json::to_vec(&deletion)?;
                     let response = client
                         .relay_request(
                             std::slice::from_ref(&relay),
                             0,
                             "DELETE",
-                            &format!("/v3/shards/{}", placement.shard_id),
-                            &body,
+                            &format!("/v4/shards/{}", placement.shard_id),
+                            &deletion,
                         )
                         .await?;
                     anyhow::ensure!(
@@ -5345,9 +7191,9 @@ impl NoiseClient {
         for (relay, shard) in storage_relays.into_iter().zip(shards) {
             let client = self.clone();
             uploads.push(async move {
-                let body = serde_json::to_vec(&shard)?;
+                let body = shard.binary_upload()?;
                 let response = client
-                    .relay_request(std::slice::from_ref(&relay), 0, "POST", "/v3/shards", &body)
+                    .relay_request(std::slice::from_ref(&relay), 0, "POST", "/v4/shards", &body)
                     .await?;
                 anyhow::ensure!(
                     (200..300).contains(&response.status),
@@ -5406,6 +7252,10 @@ impl NoiseClient {
         key_base64: &str,
     ) -> anyhow::Result<EncryptedBlob> {
         manifest.verify(&manifest.object_id)?;
+        anyhow::ensure!(
+            manifest.version == noise_core::STREAMING_STORAGE_VERSION,
+            "this attachment uses the retired alpha media format"
+        );
         let required = usize::from(manifest.data_shards);
         let mut downloads = FuturesUnordered::new();
         for placement in manifest.placements.clone() {
@@ -5417,7 +7267,7 @@ impl NoiseClient {
                         std::slice::from_ref(&relay),
                         0,
                         "GET",
-                        &format!("/v3/shards/{}", placement.shard_id),
+                        &format!("/v4/shards/{}", placement.shard_id),
                         &[],
                     )
                     .await?;
@@ -5425,31 +7275,26 @@ impl NoiseClient {
                     (200..300).contains(&response.status),
                     "storage relay does not have shard"
                 );
-                let shard = serde_json::from_slice::<StorageShard>(&response.body)?;
-                shard.verify()?;
                 anyhow::ensure!(
-                    shard.shard_id == placement.shard_id,
-                    "storage relay returned the wrong shard"
-                );
-                anyhow::ensure!(
-                    shard.payload_hash == placement.payload_hash,
+                    response.body.len() == manifest.shard_byte_length as usize
+                        && blake3::hash(&response.body).to_hex().as_str() == placement.payload_hash,
                     "storage relay returned a corrupt shard"
                 );
-                Ok::<StorageShard, anyhow::Error>(shard)
+                Ok::<(String, Vec<u8>), anyhow::Error>((placement.shard_id, response.body))
             });
         }
         let mut shards = Vec::with_capacity(required);
         let mut healthy_shard_ids = HashSet::new();
         while let Some(result) = downloads.next().await {
-            if let Ok(shard) = result {
-                healthy_shard_ids.insert(shard.shard_id.clone());
-                shards.push(shard);
+            if let Ok((shard_id, payload)) = result {
+                healthy_shard_ids.insert(shard_id.clone());
+                shards.push((shard_id, payload));
                 if shards.len() >= required {
                     break;
                 }
             }
         }
-        let blob = reconstruct_blob_from_storage(manifest, &shards)
+        let blob = reconstruct_blob_from_storage_payloads(manifest, &shards)
             .context("encrypted media does not have enough healthy storage shards")?;
         #[cfg(not(target_arch = "wasm32"))]
         if healthy_shard_ids.len() < manifest.placements.len() {
@@ -5499,26 +7344,24 @@ impl NoiseClient {
                     std::slice::from_ref(&relay),
                     0,
                     "GET",
-                    &format!("/v3/shards/{}", placement.shard_id),
+                    &format!("/v4/shards/{}", placement.shard_id),
                     &[],
                 )
                 .await
                 .ok()
                 .filter(|response| (200..300).contains(&response.status))
-                .and_then(|response| serde_json::from_slice::<StorageShard>(&response.body).ok())
-                .is_some_and(|existing| {
-                    existing.verify().is_ok()
-                        && existing.shard_id == placement.shard_id
-                        && existing.payload_hash == placement.payload_hash
+                .is_some_and(|response| {
+                    response.body.len() == repair_manifest.shard_byte_length as usize
+                        && blake3::hash(&response.body).to_hex().as_str() == placement.payload_hash
                 });
             if already_healthy {
                 continue;
             }
-            let Ok(body) = serde_json::to_vec(&shard) else {
+            let Ok(body) = shard.binary_upload() else {
                 continue;
             };
             let _ = self
-                .relay_request(std::slice::from_ref(&relay), 0, "POST", "/v3/shards", &body)
+                .relay_request(std::slice::from_ref(&relay), 0, "POST", "/v4/shards", &body)
                 .await;
         }
     }
@@ -5550,6 +7393,122 @@ impl NoiseClient {
         relays: Vec<RelayDescriptor>,
     ) -> anyhow::Result<Vec<SignedEvent>> {
         self.fetch_events_for_id(&group.group_id, relays).await
+    }
+
+    async fn fetch_group_event_page(
+        &self,
+        group_id: &str,
+        stream_locator: Option<&str>,
+        request: GroupEventPageRequest<'_>,
+        relays: &[RelayDescriptor],
+    ) -> anyhow::Result<Option<GroupEventPage>> {
+        let endpoint = match (stream_locator, request) {
+            (None, GroupEventPageRequest::Latest) => {
+                format!("/v2/groups/{group_id}/events/latest")
+            }
+            (None, GroupEventPageRequest::Before(cursor)) => format!(
+                "/v2/groups/{group_id}/events/before/{}/{}",
+                cursor.created_at_millis, cursor.event_id
+            ),
+            (None, GroupEventPageRequest::After(cursor)) => format!(
+                "/v2/groups/{group_id}/events/after/{}/{}",
+                cursor.created_at_millis, cursor.event_id
+            ),
+            (Some(stream_locator), GroupEventPageRequest::Latest) => {
+                format!("/v3/groups/{group_id}/streams/{stream_locator}/events/latest")
+            }
+            (Some(stream_locator), GroupEventPageRequest::Before(cursor)) => format!(
+                "/v3/groups/{group_id}/streams/{stream_locator}/events/before/{}/{}",
+                cursor.created_at_millis, cursor.event_id
+            ),
+            (Some(stream_locator), GroupEventPageRequest::After(cursor)) => format!(
+                "/v3/groups/{group_id}/streams/{stream_locator}/events/after/{}/{}",
+                cursor.created_at_millis, cursor.event_id
+            ),
+        };
+        let mut requests = FuturesUnordered::new();
+        for index in 0..relays.len() {
+            let endpoint = endpoint.clone();
+            requests.push(async move {
+                self.relay_request(relays, index, "GET", &endpoint, &[])
+                    .await
+            });
+        }
+
+        let mut merged = Vec::new();
+        let mut has_more = false;
+        let mut continuation_cursors = Vec::new();
+        let mut supported = 0usize;
+        let mut responded = 0usize;
+        while !requests.is_empty() {
+            let response = if supported == 0 {
+                requests.next().await
+            } else {
+                use futures_util::future::{Either, select};
+                match select(Box::pin(requests.next()), Box::pin(replica_settle_delay())).await {
+                    Either::Left((response, _)) => response,
+                    Either::Right(_) => break,
+                }
+            };
+            let Some(response) = response else {
+                break;
+            };
+            let Ok(response) = response else {
+                continue;
+            };
+            responded += 1;
+            if response.status == 404 {
+                continue;
+            }
+            if !(200..300).contains(&response.status) {
+                continue;
+            }
+            let Ok(page) = serde_json::from_slice::<GroupEventPage>(&response.body) else {
+                continue;
+            };
+            if page.events.len() > GROUP_EVENT_PAGE_SIZE
+                || page
+                    .events
+                    .iter()
+                    .any(|event| event.stream_locator.as_deref() != stream_locator)
+            {
+                continue;
+            }
+            supported += 1;
+            has_more |= page.has_more;
+            let continuation = match request {
+                GroupEventPageRequest::Latest | GroupEventPageRequest::Before(_) => {
+                    page.events.first()
+                }
+                GroupEventPageRequest::After(_) => page.events.last(),
+            }
+            .map(GroupEventCursor::from_event);
+            if let Some(continuation) = continuation {
+                continuation_cursors.push(continuation);
+            }
+            merged.extend(page.events);
+        }
+        if supported == 0 {
+            if responded > 0 {
+                return Ok(None);
+            }
+            bail!("no relay was reachable")
+        }
+        let continuation_cursor = match request {
+            GroupEventPageRequest::Latest | GroupEventPageRequest::Before(_) => {
+                continuation_cursors
+                    .into_iter()
+                    .max_by(|left, right| left.key().cmp(&right.key()))
+            }
+            GroupEventPageRequest::After(_) => continuation_cursors
+                .into_iter()
+                .min_by(|left, right| left.key().cmp(&right.key())),
+        };
+        Ok(Some(GroupEventPage {
+            events: merge_group_events(group_id, merged),
+            has_more,
+            continuation_cursor,
+        }))
     }
 
     async fn fetch_events_for_id(
@@ -5613,19 +7572,28 @@ impl NoiseClient {
         let storage = relays
             .get(storage_index)
             .context("relay index is invalid")?;
-        let mask = self
-            .mask_relays
-            .iter()
-            .find(|candidate| candidate.base_url != storage.base_url)
-            .or_else(|| {
-                (1..relays.len())
-                    .map(|offset| &relays[(storage_index + offset) % relays.len()])
-                    .find(|candidate| candidate.base_url != storage.base_url)
-            });
-        if let (Some(config), Some(mask)) = (storage.ohttp_config.as_deref(), mask) {
-            return self
-                .oblivious_request(storage, mask, config, method, path, body)
-                .await;
+        if let Some(config) = storage.ohttp_config.as_deref() {
+            let relay_masks =
+                (1..relays.len()).map(|offset| &relays[(storage_index + offset) % relays.len()]);
+            let mut seen_masks = HashSet::new();
+            let mut requests = FuturesUnordered::new();
+            for mask in self.mask_relays.iter().chain(relay_masks) {
+                if mask.base_url == storage.base_url || !seen_masks.insert(mask.base_url.clone()) {
+                    continue;
+                }
+                requests.push(self.oblivious_request(storage, mask, config, method, path, body));
+            }
+
+            let mut last_error = None;
+            while let Some(result) = requests.next().await {
+                match result {
+                    Ok(response) => return Ok(response),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            if let Some(error) = last_error {
+                return Err(error);
+            }
         }
         self.direct_request(storage, method, path, body).await
     }
@@ -5723,8 +7691,13 @@ impl NoiseClient {
             .http
             .request(method, format!("{}{path}", relay.base_url));
         if !body.is_empty() {
+            let content_type = if path.starts_with("/v4/shards") {
+                "application/octet-stream"
+            } else {
+                "application/json"
+            };
             request = request
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::CONTENT_TYPE, content_type)
                 .body(body.to_vec());
         }
         let response = request
@@ -5992,6 +7965,69 @@ fn filter_conversation_for_blocks(conversation: &mut Conversation, blocked: &Has
     });
 }
 
+fn remove_message_from_conversation(conversation: &mut Conversation, message_event_id: &str) {
+    conversation
+        .messages
+        .retain(|message| message.event_id != message_event_id);
+    conversation
+        .reports
+        .retain(|report| report.message.event_id != message_event_id);
+    conversation
+        .reported_message_event_ids
+        .retain(|event_id| event_id != message_event_id);
+}
+
+fn strip_conversation_media_previews(conversation: &mut Conversation) {
+    for attachment in conversation
+        .messages
+        .iter_mut()
+        .filter_map(|message| message.attachment.as_mut())
+        .chain(
+            conversation
+                .reports
+                .iter_mut()
+                .filter_map(|report| report.message.attachment.as_mut()),
+        )
+    {
+        attachment.preview_data_base64 = None;
+        attachment.preview_mime_type = None;
+    }
+}
+
+fn topic_summaries(
+    state: &ClientState,
+    group_id: &str,
+    topics: &HashMap<String, AcceptedTopic>,
+) -> Vec<TopicSummary> {
+    let mut summaries = topics
+        .values()
+        .map(|topic| TopicSummary {
+            topic_id: topic.topic_id.clone(),
+            name: topic.name.clone(),
+            icon: topic.icon.clone(),
+            stream_locator: topic.stream_locator.clone(),
+            locked: topic.locked,
+            archived: topic.archived,
+            created_by_public_key: topic.created_by_public_key.clone(),
+            created_at_millis: topic.created_at_millis,
+            unread_count: state.topic_unread_count(group_id, Some(&topic.topic_id)),
+            has_older_messages: state
+                .group_event_caches
+                .get(group_id)
+                .and_then(|cache| cache.topic_streams.get(&topic.topic_id))
+                .is_some_and(|stream| stream.has_older_messages),
+        })
+        .collect::<Vec<_>>();
+    summaries.sort_by(|left, right| {
+        let left_order = topics.get(&left.topic_id).map_or(usize::MAX, |topic| topic.sort_index);
+        let right_order = topics.get(&right.topic_id).map_or(usize::MAX, |topic| topic.sort_index);
+        left_order
+            .cmp(&right_order)
+            .then_with(|| left.topic_id.cmp(&right.topic_id))
+    });
+    summaries
+}
+
 fn cached_conversation_from_view(
     state: &ClientState,
     group: &GroupMembership,
@@ -6074,6 +8110,7 @@ fn cached_conversation_from_view(
                     text: message.text.clone(),
                     attachment: message.attachment.clone(),
                     reply_to_message_id: message.reply_to_message_id.clone(),
+                    topic_id: message.topic_id.clone(),
                     created_at_millis: message.created_at_millis,
                     reactions: reactions_by_message
                         .get(&message.event_id)
@@ -6084,6 +8121,7 @@ fn cached_conversation_from_view(
         })
         .collect::<Vec<_>>();
 
+    let topics = topic_summaries(state, &group.group_id, &view.topics);
     let mut members = view
         .members
         .into_values()
@@ -6119,8 +8157,10 @@ fn cached_conversation_from_view(
             remote_deletion_supported: !group.authority_nonce_base64.is_empty(),
             is_active: state.active_group_id.as_deref() == Some(group.group_id.as_str()),
             unread_count: state.group_unread_count(&group.group_id),
-            read_state_initialized: state.group_activity_initialized.contains(&group.group_id),
+            read_state_initialized: state.topic_read_state_initialized(&group.group_id, None),
         },
+        topics,
+        general_unread_count: state.topic_unread_count(&group.group_id, None),
         members,
         banned_members,
         messages: view
@@ -6142,6 +8182,7 @@ fn cached_conversation_from_view(
                     text: message.text,
                     attachment: message.attachment,
                     reply_to_message_id: message.reply_to_message_id,
+                    topic_id: message.topic_id,
                     created_at_millis: message.created_at_millis,
                     reactions,
                 }
@@ -6150,6 +8191,7 @@ fn cached_conversation_from_view(
         reports,
         reported_message_event_ids,
         rejected_events: view.rejected_events,
+        has_older_messages: false,
     }
 }
 
@@ -6159,6 +8201,12 @@ fn rebuild_group_state(
     events: &[SignedEvent],
 ) -> anyhow::Result<GroupState> {
     let Some(log) = state.mls_control_logs.get(&group.group_id) else {
+        if events
+            .iter()
+            .any(|event| event.encryption_version == 2 || event.epoch.is_some())
+        {
+            bail!("this group must restore its encryption history before messages can sync")
+        }
         return Ok(GroupState::rebuild(group, events));
     };
     log.verify().context("cached MLS control log is invalid")?;
@@ -6208,20 +8256,170 @@ fn rebuild_group_state(
     ))
 }
 
+fn merge_group_events(
+    group_id: &str,
+    events: impl IntoIterator<Item = SignedEvent>,
+) -> Vec<SignedEvent> {
+    let mut merged = HashMap::<String, SignedEvent>::new();
+    for event in events {
+        if event.group_id == group_id && event.verify().is_ok() {
+            merged.entry(event.event_id.clone()).or_insert(event);
+        }
+    }
+    let mut events = merged.into_values().collect::<Vec<_>>();
+    events.sort_by(|left, right| {
+        left.created_at_millis
+            .cmp(&right.created_at_millis)
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
+    events
+}
+
+fn max_group_event_cursor(
+    existing: Option<GroupEventCursor>,
+    events: &[SignedEvent],
+    stream_locator: Option<&str>,
+) -> Option<GroupEventCursor> {
+    events
+        .iter()
+        .filter(|event| event.stream_locator.as_deref() == stream_locator)
+        .map(GroupEventCursor::from_event)
+        .chain(existing)
+        .max_by(|left, right| left.key().cmp(&right.key()))
+}
+
+fn compact_group_event_cache(
+    state: &ClientState,
+    group: &GroupMembership,
+    events: Vec<SignedEvent>,
+    message_limit: usize,
+    latest_cursor: Option<GroupEventCursor>,
+    older_cursor: Option<GroupEventCursor>,
+    has_older_hint: bool,
+    mut topic_streams: HashMap<String, TopicStreamCache>,
+) -> anyhow::Result<GroupEventCache> {
+    let mut events = merge_group_events(&group.group_id, events);
+    let latest_cursor = max_group_event_cursor(latest_cursor, &events, None);
+    let view = rebuild_group_state(state, group, &events)?;
+    let general_message_ids = view
+        .messages
+        .iter()
+        .filter(|message| message.topic_id.is_none())
+        .map(|message| message.event_id.clone())
+        .collect::<HashSet<_>>();
+    let mut retained_message_ids = view
+        .messages
+        .iter()
+        .filter(|message| message.topic_id.is_none())
+        .rev()
+        .take(message_limit.max(1))
+        .map(|message| message.event_id.clone())
+        .collect::<HashSet<_>>();
+    let has_older_messages =
+        has_older_hint || general_message_ids.len() > retained_message_ids.len();
+    let retained_message_cursor = has_older_messages
+        .then(|| {
+            events
+                .iter()
+                .filter(|event| retained_message_ids.contains(&event.event_id))
+                .map(GroupEventCursor::from_event)
+                .min_by(|left, right| left.key().cmp(&right.key()))
+        })
+        .flatten();
+    let older_cursor = [older_cursor, retained_message_cursor]
+        .into_iter()
+        .flatten()
+        .max_by(|left, right| left.key().cmp(&right.key()));
+
+    for topic in view.topics.values() {
+        let stream = topic_streams
+            .entry(topic.topic_id.clone())
+            .or_insert_with(|| TopicStreamCache {
+                latest_cursor: None,
+                older_cursor: None,
+                message_limit: INITIAL_GROUP_MESSAGE_WINDOW,
+                has_older_messages: false,
+            });
+        stream.latest_cursor = max_group_event_cursor(
+            stream.latest_cursor.clone(),
+            &events,
+            Some(&topic.stream_locator),
+        );
+        let topic_message_ids = view
+            .messages
+            .iter()
+            .filter(|message| message.topic_id.as_deref() == Some(topic.topic_id.as_str()))
+            .map(|message| message.event_id.clone())
+            .collect::<HashSet<_>>();
+        let retained_topic_ids = view
+            .messages
+            .iter()
+            .filter(|message| message.topic_id.as_deref() == Some(topic.topic_id.as_str()))
+            .rev()
+            .take(stream.message_limit.max(1))
+            .map(|message| message.event_id.clone())
+            .collect::<HashSet<_>>();
+        stream.has_older_messages |= topic_message_ids.len() > retained_topic_ids.len();
+        if stream.has_older_messages {
+            let retained_cursor = events
+                .iter()
+                .filter(|event| retained_topic_ids.contains(&event.event_id))
+                .map(GroupEventCursor::from_event)
+                .min_by(|left, right| left.key().cmp(&right.key()));
+            stream.older_cursor = [stream.older_cursor.clone(), retained_cursor]
+                .into_iter()
+                .flatten()
+                .max_by(|left, right| left.key().cmp(&right.key()));
+        }
+        retained_message_ids.extend(retained_topic_ids);
+    }
+    let accepted_message_ids = view
+        .messages
+        .iter()
+        .map(|message| message.event_id.clone())
+        .collect::<HashSet<_>>();
+    events.retain(|event| {
+        !accepted_message_ids.contains(&event.event_id)
+            || retained_message_ids.contains(&event.event_id)
+    });
+    Ok(GroupEventCache {
+        events,
+        latest_cursor,
+        older_cursor,
+        message_limit: message_limit.max(1),
+        has_older_messages,
+        needs_recent_hydration: false,
+        topic_streams,
+        portable_conversation: None,
+    })
+}
+
 fn active_group_epoch(
     state: &ClientState,
     group_id: &str,
 ) -> anyhow::Result<Option<noise_core::MlsEpochSummary>> {
-    if !state.mls_control_logs.contains_key(group_id) {
-        return Ok(None);
+    if let Some(epoch) = state
+        .mls_group_state(group_id)
+        .and_then(|mls| mls.epoch(group_id).ok())
+    {
+        // Recoverable MLS state can arrive from the encrypted account vault
+        // before this installation has cached the group's signed control log.
+        // Do not silently downgrade an already encrypted group to a legacy
+        // event during that window.
+        return Ok(Some(epoch));
     }
-    Ok(Some(
-        state
-            .mls_group_state(group_id)
-            .context("this group has no recoverable MLS identity")?
-            .epoch(group_id)
-            .context("this device is not in the current encrypted group")?,
-    ))
+
+    if state.mls_control_logs.contains_key(group_id) {
+        return Ok(Some(
+            state
+                .mls_group_state(group_id)
+                .context("this group has no recoverable MLS identity")?
+                .epoch(group_id)
+                .context("this device is not in the current encrypted group")?,
+        ));
+    }
+
+    Ok(None)
 }
 
 fn create_group_event(
@@ -6248,6 +8446,69 @@ fn create_group_event(
             author_sequence,
         )?)
     }
+}
+
+fn create_group_event_in_stream(
+    state: &ClientState,
+    identity: &Identity,
+    group: &GroupMembership,
+    stream_locator: &str,
+    payload: GroupEventPayload,
+    author_sequence: u64,
+) -> anyhow::Result<SignedEvent> {
+    let epoch = active_group_epoch(state, &group.group_id)?
+        .context("topics require an encrypted group")?;
+    Ok(SignedEvent::create_for_epoch_in_stream(
+        identity,
+        group.group_id.clone(),
+        &epoch.archive_key_base64,
+        epoch.epoch,
+        stream_locator.to_owned(),
+        payload,
+        author_sequence,
+    )?)
+}
+
+fn cached_group_view(
+    state: &ClientState,
+    group: &GroupMembership,
+) -> anyhow::Result<GroupState> {
+    let cache = state
+        .group_event_caches
+        .get(&group.group_id)
+        .context("open this group and try again")?;
+    rebuild_group_state(state, group, &cache.events)
+}
+
+fn ensure_topic_manager(
+    state: &ClientState,
+    group: &GroupMembership,
+    actor_public_key: &str,
+) -> anyhow::Result<()> {
+    let view = cached_group_view(state, group)?;
+    if !view.members.contains_key(actor_public_key)
+        || (view.owner_public_key.as_deref() != Some(actor_public_key)
+            && !view.moderators.contains(actor_public_key))
+    {
+        bail!("only group owners and moderators can manage topics")
+    }
+    Ok(())
+}
+
+fn ensure_active_topic(
+    state: &ClientState,
+    group: &GroupMembership,
+    topic_id: &str,
+) -> anyhow::Result<AcceptedTopic> {
+    let mut view = cached_group_view(state, group)?;
+    let topic = view
+        .topics
+        .remove(topic_id)
+        .context("unknown topic")?;
+    if topic.archived {
+        bail!("this topic is archived")
+    }
+    Ok(topic)
 }
 
 fn validate_mls_member_accounts(
@@ -6684,6 +8945,28 @@ fn validate_display_name(username: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_topic_name(name: &str) -> anyhow::Result<()> {
+    let length = name.trim().chars().count();
+    if !(1..=80).contains(&length) {
+        bail!("topic names must contain between 1 and 80 characters")
+    }
+    if name.chars().any(char::is_control) {
+        bail!("topic names cannot contain control characters")
+    }
+    Ok(())
+}
+
+fn validate_topic_icon(icon: &str) -> anyhow::Result<()> {
+    if !valid_reaction_emoji(icon) {
+        bail!("topic icons must be a single emoji")
+    }
+    Ok(())
+}
+
+fn default_topic_icon() -> String {
+    "💬".to_owned()
+}
+
 fn validate_password(password: &str) -> anyhow::Result<()> {
     let length = password.chars().count();
     if !(16..=256).contains(&length) {
@@ -6763,6 +9046,23 @@ fn media_extension(mime_type: &str) -> &'static str {
     }
 }
 
+fn select_media_chunks(
+    attachment: &MediaAttachment,
+    offset: u64,
+    requested_end: u64,
+) -> Vec<(usize, u64, MediaChunk)> {
+    let mut chunk_offset = 0_u64;
+    let mut selected = Vec::new();
+    for (index, chunk) in attachment.chunks.iter().cloned().enumerate() {
+        let chunk_end = chunk_offset + u64::from(chunk.byte_length);
+        if chunk_end > offset && chunk_offset < requested_end {
+            selected.push((index, chunk_offset, chunk));
+        }
+        chunk_offset = chunk_end;
+    }
+    selected
+}
+
 fn validate_media_reference(media: &MediaAttachment) -> anyhow::Result<()> {
     if media.file_name.trim().is_empty() || media.file_name.chars().count() > 255 {
         bail!("media has an invalid file name")
@@ -6798,6 +9098,41 @@ fn validate_media_reference(media: &MediaAttachment) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn resolve_media_scope(
+    state: &ClientState,
+    requested_scope_id: Option<String>,
+) -> anyhow::Result<String> {
+    let identity = state.identity()?;
+    let Some(scope_id) = requested_scope_id else {
+        return Ok(state.active_group()?.group_id.clone());
+    };
+    let allowed = state.groups.iter().any(|group| group.group_id == scope_id)
+        || state.direct_contacts.iter().any(|contact| {
+            identity
+                .direct_scope_id(&contact.public_key)
+                .ok()
+                .as_deref()
+                == Some(scope_id.as_str())
+        })
+        || profile_media_scope_id(&identity.public_key_base64())
+            .ok()
+            .as_deref()
+            == Some(scope_id.as_str())
+        || state
+            .direct_contacts
+            .iter()
+            .chain(state.known_people.iter())
+            .filter(|person| !state.is_hidden(&person.public_key))
+            .any(|person| {
+                profile_media_scope_id(&person.public_key).ok().as_deref()
+                    == Some(scope_id.as_str())
+            });
+    if !allowed {
+        bail!("media does not belong to a known conversation")
+    }
+    Ok(scope_id)
+}
+
 fn validate_reply_reference(reply_to_message_id: Option<&str>) -> anyhow::Result<()> {
     if reply_to_message_id.is_some_and(|message_id| {
         message_id.len() != 64 || !message_id.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -6831,10 +9166,14 @@ fn purge_scope_cache(cache_path: &Path, scope_id: &str) -> anyhow::Result<()> {
     if scope_id.len() != 64 || !scope_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("conversation has an invalid local cache identifier")
     }
-    let directory = cache_path.join("media").join(scope_id);
-    if directory.exists() {
-        fs::remove_dir_all(&directory)
-            .with_context(|| format!("could not erase {}", directory.display()))?;
+    for directory in [
+        cache_path.join("media").join(scope_id),
+        cache_path.join("media-chunks").join(scope_id),
+    ] {
+        if directory.exists() {
+            fs::remove_dir_all(&directory)
+                .with_context(|| format!("could not erase {}", directory.display()))?;
+        }
     }
     Ok(())
 }
@@ -6996,6 +9335,7 @@ mod tests {
             mls_join_requests: HashMap::new(),
             mls_local_geneses: HashMap::new(),
             mls_control_logs: HashMap::new(),
+            group_event_caches: HashMap::new(),
             groups: Vec::new(),
             group_memberships: HashMap::new(),
             active_group_id: None,
@@ -7013,6 +9353,10 @@ mod tests {
             group_latest_activity: HashMap::new(),
             group_read_through: HashMap::new(),
             group_unread_messages: HashMap::new(),
+            topic_read_through: HashMap::new(),
+            topic_unread_messages: HashMap::new(),
+            topic_latest_incoming: HashMap::new(),
+            topic_activity_initialized: HashSet::new(),
             group_activity_initialized: HashSet::new(),
             group_conversation_cache: HashMap::new(),
             group_frequencies: HashMap::new(),
@@ -7193,6 +9537,10 @@ mod tests {
                 GroupActivityUpdate {
                     group_id: group_id.clone(),
                     events,
+                    full_snapshot: true,
+                    older_cursor: None,
+                    has_older_messages: false,
+                    topic_update: None,
                 },
             )
             .unwrap();
@@ -7359,4 +9707,84 @@ mod tests {
         );
         assert!(restored.mls_join_requests.is_empty());
     }
+
+    fn test_attachment(chunk_lengths: &[u32]) -> MediaAttachment {
+        MediaAttachment {
+            file_name: "clip.mp4".to_owned(),
+            mime_type: "video/mp4".to_owned(),
+            byte_length: chunk_lengths.iter().map(|length| u64::from(*length)).sum(),
+            chunks: chunk_lengths
+                .iter()
+                .enumerate()
+                .map(|(index, byte_length)| MediaChunk {
+                    blob_id: format!("blob-{index}"),
+                    key_base64: String::new(),
+                    byte_length: *byte_length,
+                    storage: None,
+                })
+                .collect(),
+            preview_data_base64: None,
+            preview_mime_type: None,
+            pixel_width: None,
+            pixel_height: None,
+        }
+    }
+
+    #[test]
+    fn select_media_chunks_covers_exactly_the_requested_range() {
+        let attachment = test_attachment(&[100, 100, 100, 100]);
+
+        let selected = select_media_chunks(&attachment, 0, 100);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(index, start, _)| (*index, *start))
+                .collect::<Vec<_>>(),
+            vec![(0, 0)]
+        );
+
+        let selected = select_media_chunks(&attachment, 150, 350);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(index, start, _)| (*index, *start))
+                .collect::<Vec<_>>(),
+            vec![(1, 100), (2, 200), (3, 300)]
+        );
+
+        let selected = select_media_chunks(&attachment, 400, 400);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn media_chunk_lru_serves_hits_and_evicts_oldest() {
+        let mut cache = MediaChunkLru::new(3);
+        cache.insert("a".to_owned(), Rc::new(vec![1]));
+        cache.insert("b".to_owned(), Rc::new(vec![2]));
+        cache.insert("c".to_owned(), Rc::new(vec![3]));
+
+        // Touch "a" so "b" becomes the oldest entry.
+        assert_eq!(cache.get("a", 1).as_deref().map(Vec::as_slice), Some(&[1][..]));
+
+        cache.insert("d".to_owned(), Rc::new(vec![4]));
+        assert!(cache.get("b", 1).is_none(), "oldest chunk must be evicted");
+        assert_eq!(cache.get("a", 1).as_deref().map(Vec::as_slice), Some(&[1][..]));
+        assert_eq!(cache.get("c", 1).as_deref().map(Vec::as_slice), Some(&[3][..]));
+        assert_eq!(cache.get("d", 1).as_deref().map(Vec::as_slice), Some(&[4][..]));
+
+        // Length mismatches are cache misses (stale or corrupt entries).
+        assert!(cache.get("a", 2).is_none());
+    }
+
+    #[test]
+    fn media_chunk_lru_replacement_does_not_double_count_bytes() {
+        let mut cache = MediaChunkLru::new(4);
+        cache.insert("a".to_owned(), Rc::new(vec![1, 1]));
+        cache.insert("a".to_owned(), Rc::new(vec![2, 2]));
+        assert_eq!(cache.total_bytes, 2);
+        cache.insert("b".to_owned(), Rc::new(vec![3, 3]));
+        assert_eq!(cache.total_bytes, 4);
+        assert_eq!(cache.get("a", 2).as_deref().map(Vec::as_slice), Some(&[2, 2][..]));
+    }
+
 }

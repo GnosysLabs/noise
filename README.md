@@ -185,7 +185,7 @@ one.
 The repository is a Rust workspace with one React interface shared by Tauri on
 macOS and Windows:
 
-- `apps/client`: desktop interface and Tauri shell
+- `apps/client`: official macOS and Windows desktop interface and Tauri shell
 - `apps/marketing`: public site for `makenoise.chat`
 - `noise-core`: identity, groups, encryption, signed events, and media coding
 - `noise-client`: reusable profile, group, DM, and moderation operations

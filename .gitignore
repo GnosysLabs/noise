@@ -7,9 +7,8 @@
 .env.*
 !.env.example
 node_modules/
+.pnpm-store/
 dist/
-/apps/macos/.derived
-/apps/macos/DerivedData
 /apps/client/src-tauri/gen
 /apps/client/public/wasm/
 xcuserdata/

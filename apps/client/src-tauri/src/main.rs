@@ -1,23 +1,45 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::Path,
     path::PathBuf,
+    process::Command,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tauri::Manager;
 #[cfg(not(target_os = "macos"))]
 use tauri_plugin_notification::NotificationExt;
 
 static NOTIFICATION_WATCHERS_STARTED: AtomicBool = AtomicBool::new(false);
+static NEXT_MEDIA_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Default)]
+struct MediaStreamRegistry(Arc<Mutex<HashMap<String, Value>>>);
+
+#[derive(Serialize)]
+struct OptimizedMediaUpload {
+    file_path: String,
+    file_name: String,
+    mime_type: String,
+    byte_length: u64,
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 #[derive(Clone)]
 struct PendingNotification {
@@ -79,6 +101,438 @@ async fn noise_request_data(app: &tauri::AppHandle, request: Value) -> Result<Va
 #[tauri::command]
 async fn noise_invoke(app: tauri::AppHandle, request: Value) -> Value {
     execute_noise_request(&app, request).await
+}
+
+#[tauri::command]
+fn register_media_stream(
+    registry: tauri::State<'_, MediaStreamRegistry>,
+    request: Value,
+) -> Result<String, String> {
+    let attachment = request
+        .get("attachment")
+        .ok_or_else(|| "media stream is missing its attachment".to_owned())?;
+    let byte_length = attachment
+        .get("byte_length")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "media stream has an invalid length".to_owned())?;
+    if byte_length == 0 || byte_length > 500 * 1024 * 1024 {
+        return Err("media stream has an invalid length".to_owned());
+    }
+    let file_extension = attachment
+        .get("file_name")
+        .and_then(Value::as_str)
+        .and_then(|file_name| Path::new(file_name).extension())
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 8
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+        .unwrap_or_else(|| {
+            match attachment
+                .get("mime_type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+            {
+                "video/quicktime" => "mov",
+                "video/x-m4v" => "m4v",
+                _ => "mp4",
+            }
+            .to_owned()
+        });
+    let id = format!(
+        "{:016x}{:016x}",
+        unix_millis(),
+        NEXT_MEDIA_STREAM_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut streams = registry
+        .0
+        .lock()
+        .map_err(|_| "media stream registry is unavailable".to_owned())?;
+    if streams.len() >= 256
+        && let Some(oldest) = streams.keys().next().cloned()
+    {
+        streams.remove(&oldest);
+    }
+    streams.insert(id.clone(), request);
+    Ok(format!(
+        "noise-media://localhost/{id}/media.{file_extension}"
+    ))
+}
+
+#[tauri::command]
+async fn optimize_video_upload(
+    app: tauri::AppHandle,
+    source_path: String,
+) -> Result<OptimizedMediaUpload, String> {
+    prepare_media_upload(app, source_path).await
+}
+
+#[tauri::command]
+fn inspect_media_upload(
+    app: tauri::AppHandle,
+    source_path: String,
+) -> Result<OptimizedMediaUpload, String> {
+    let source = fs::canonicalize(source_path).map_err(|error| error.to_string())?;
+    let metadata = source.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 500 * 1024 * 1024 {
+        return Err("media has an invalid size".to_owned());
+    }
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mime_type = match extension.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mov" => "video/quicktime",
+        "mp4" | "m4v" => "video/mp4",
+        "avi" => "video/x-msvideo",
+        "mpeg" | "mpg" => "video/mpeg",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "wav" => "audio/wav",
+        "aac" => "audio/aac",
+        "ogg" => "audio/ogg",
+        _ => return Err("media has an unsupported format".to_owned()),
+    };
+    app.asset_protocol_scope()
+        .allow_file(&source)
+        .map_err(|error| error.to_string())?;
+    let file_name = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("noise-media")
+        .to_owned();
+    Ok(OptimizedMediaUpload {
+        file_path: source.to_string_lossy().into_owned(),
+        file_name,
+        mime_type: mime_type.to_owned(),
+        byte_length: metadata.len(),
+    })
+}
+
+#[tauri::command]
+async fn prepare_media_upload(
+    app: tauri::AppHandle,
+    source_path: String,
+) -> Result<OptimizedMediaUpload, String> {
+    let output_directory = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?
+        .join("outgoing");
+    tauri::async_runtime::spawn_blocking(move || {
+        prepare_media_upload_blocking(&source_path, &output_directory)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn prepare_media_upload_blocking(
+    source_path: &str,
+    output_directory: &Path,
+) -> Result<OptimizedMediaUpload, String> {
+    let source = fs::canonicalize(source_path).map_err(|error| error.to_string())?;
+    let metadata = source.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 500 * 1024 * 1024 {
+        return Err("media has an invalid size".to_owned());
+    }
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let (mime_type, is_video) = match extension.as_str() {
+        "jpg" | "jpeg" => ("image/jpeg", false),
+        "png" => ("image/png", false),
+        "gif" => ("image/gif", false),
+        "webp" => ("image/webp", false),
+        "mov" => ("video/quicktime", true),
+        "mp4" | "m4v" => ("video/mp4", true),
+        "avi" => ("video/x-msvideo", true),
+        "mpeg" | "mpg" => ("video/mpeg", true),
+        "mp3" => ("audio/mpeg", false),
+        "m4a" => ("audio/mp4", false),
+        "wav" => ("audio/wav", false),
+        "aac" => ("audio/aac", false),
+        "ogg" => ("audio/ogg", false),
+        _ => return Err("media has an unsupported format".to_owned()),
+    };
+    fs::create_dir_all(output_directory).map_err(|error| error.to_string())?;
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("noise-media");
+    let id = format!(
+        "{:016x}-{:016x}",
+        unix_millis(),
+        NEXT_MEDIA_STREAM_ID.fetch_add(1, Ordering::Relaxed)
+    );
+
+    #[cfg(target_os = "macos")]
+    if is_video {
+        let output = output_directory.join(format!("noise-video-{id}.m4v"));
+        let source_arg = source.to_string_lossy().into_owned();
+        let output_arg = output.to_string_lossy().into_owned();
+        // Preserve the source tracks and only relocate the movie metadata for
+        // fast-start playback. Size is not a proxy for codec compatibility:
+        // Apple's 1080p preset can inflate an efficient 45 MB source to nearly
+        // 300 MB by forcing a high-bitrate H.264 encode.
+        let preset = "PresetPassthrough";
+        let status = Command::new("/usr/bin/avconvert")
+            .args([
+                "--source",
+                &source_arg,
+                "--preset",
+                preset,
+                "--output",
+                &output_arg,
+                "--replace",
+            ])
+            .status()
+            .map_err(|error| error.to_string())?;
+        if status.success() {
+            let output_metadata = output.metadata().map_err(|error| error.to_string())?;
+            // The 1080p compatibility transcode can be slightly larger than
+            // an already-efficient HEVC source while still being the correct
+            // streamable output. Reject invalid or oversized files, not valid
+            // MP4s merely because their byte count grew.
+            let usable_output =
+                output_metadata.len() > 0 && output_metadata.len() <= 500 * 1024 * 1024;
+            if usable_output {
+                return Ok(OptimizedMediaUpload {
+                    file_path: output.to_string_lossy().into_owned(),
+                    file_name: format!("{stem}.m4v"),
+                    mime_type: "video/mp4".to_owned(),
+                    byte_length: output_metadata.len(),
+                });
+            }
+        }
+        let _ = fs::remove_file(&output);
+        return Err(
+            "this video could not be converted to Noise's streamable MP4 format".to_owned(),
+        );
+    }
+
+    let output = output_directory.join(format!("noise-media-{id}.{extension}"));
+    fs::copy(&source, &output).map_err(|error| error.to_string())?;
+    Ok(OptimizedMediaUpload {
+        file_path: output.to_string_lossy().into_owned(),
+        file_name: format!("{stem}.{extension}"),
+        mime_type: mime_type.to_owned(),
+        byte_length: metadata.len(),
+    })
+}
+
+#[tauri::command]
+async fn read_prepared_media(
+    app: tauri::AppHandle,
+    source_path: String,
+) -> Result<tauri::ipc::Response, String> {
+    let outgoing_directory = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?
+        .join("outgoing");
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = fs::canonicalize(source_path).map_err(|error| error.to_string())?;
+        let outgoing = fs::canonicalize(outgoing_directory).map_err(|error| error.to_string())?;
+        if !source.starts_with(outgoing) {
+            return Err("noise can only read its prepared outgoing media".to_owned());
+        }
+        let metadata = source.metadata().map_err(|error| error.to_string())?;
+        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 500 * 1024 * 1024 {
+            return Err("prepared media has an invalid size".to_owned());
+        }
+        fs::read(source)
+            .map(tauri::ipc::Response::new)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn media_stream_response(
+    registry: MediaStreamRegistry,
+    app: tauri::AppHandle,
+    request: tauri::http::Request<Vec<u8>>,
+    responder: tauri::UriSchemeResponder,
+) {
+    let id = request
+        .uri()
+        .path()
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let registered = registry
+        .0
+        .lock()
+        .ok()
+        .and_then(|streams| streams.get(&id).cloned());
+    let Some(mut core_request) = registered else {
+        return responder.respond(
+            tauri::http::Response::builder()
+                .status(tauri::http::StatusCode::NOT_FOUND)
+                .body(b"media stream is unavailable".to_vec())
+                .expect("media protocol response is valid"),
+        );
+    };
+    let total = core_request
+        .pointer("/attachment/byte_length")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let mime_type = core_request
+        .pointer("/attachment/mime_type")
+        .and_then(Value::as_str)
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    if request.method() == tauri::http::Method::HEAD {
+        return responder.respond(
+            tauri::http::Response::builder()
+                .status(tauri::http::StatusCode::OK)
+                .header(tauri::http::header::CONTENT_TYPE, mime_type)
+                .header(tauri::http::header::CONTENT_LENGTH, total)
+                .header(tauri::http::header::ACCEPT_RANGES, "bytes")
+                .header(tauri::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .body(Vec::new())
+                .expect("media protocol response is valid"),
+        );
+    }
+    if total == 0 {
+        return responder.respond(
+            tauri::http::Response::builder()
+                .status(tauri::http::StatusCode::BAD_REQUEST)
+                .body(b"media stream has an invalid length".to_vec())
+                .expect("media protocol response is valid"),
+        );
+    }
+    let (start, end) = requested_media_range(
+        request
+            .headers()
+            .get(tauri::http::header::RANGE)
+            .and_then(|value| value.to_str().ok()),
+        total,
+    );
+    let Some(object) = core_request.as_object_mut() else {
+        return responder.respond(
+            tauri::http::Response::builder()
+                .status(tauri::http::StatusCode::BAD_REQUEST)
+                .body(b"media stream request is invalid".to_vec())
+                .expect("media protocol response is valid"),
+        );
+    };
+    object.insert(
+        "action".to_owned(),
+        Value::String("fetch_attachment_range".to_owned()),
+    );
+    object.insert("offset".to_owned(), Value::from(start));
+    object.insert("byte_length".to_owned(), Value::from(end - start + 1));
+
+    tauri::async_runtime::spawn(async move {
+        let response = match noise_request_data(&app, core_request).await {
+            Ok(data) => data,
+            Err(error) => {
+                responder.respond(
+                    tauri::http::Response::builder()
+                        .status(tauri::http::StatusCode::BAD_GATEWAY)
+                        .header(tauri::http::header::CONTENT_TYPE, "text/plain")
+                        .body(error.into_bytes())
+                        .expect("media protocol response is valid"),
+                );
+                return;
+            }
+        };
+        let decoded = response
+            .get("data_base64")
+            .and_then(Value::as_str)
+            .and_then(|value| STANDARD.decode(value).ok());
+        let Some(mut body) = decoded else {
+            responder.respond(
+                tauri::http::Response::builder()
+                    .status(tauri::http::StatusCode::BAD_GATEWAY)
+                    .body(b"relay returned an invalid media range".to_vec())
+                    .expect("media protocol response is valid"),
+            );
+            return;
+        };
+        let maximum_length = (end - start + 1) as usize;
+        if body.len() > maximum_length {
+            body.truncate(maximum_length);
+        }
+        if body.is_empty() {
+            responder.respond(
+                tauri::http::Response::builder()
+                    .status(tauri::http::StatusCode::BAD_GATEWAY)
+                    .body(b"relay returned an empty media range".to_vec())
+                    .expect("media protocol response is valid"),
+            );
+            return;
+        }
+        let actual_end = start
+            .saturating_add(body.len() as u64)
+            .saturating_sub(1)
+            .min(total.saturating_sub(1));
+        responder.respond(
+            tauri::http::Response::builder()
+                .status(tauri::http::StatusCode::PARTIAL_CONTENT)
+                .header(tauri::http::header::CONTENT_TYPE, mime_type)
+                .header(tauri::http::header::CONTENT_LENGTH, body.len())
+                .header(tauri::http::header::ACCEPT_RANGES, "bytes")
+                .header(
+                    tauri::http::header::CONTENT_RANGE,
+                    format!("bytes {start}-{actual_end}/{total}"),
+                )
+                .header(tauri::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header(
+                    tauri::http::header::CACHE_CONTROL,
+                    "private, max-age=31536000",
+                )
+                .body(body)
+                .expect("media protocol response is valid"),
+        );
+    });
+}
+
+fn requested_media_range(range: Option<&str>, total: u64) -> (u64, u64) {
+    // WebKit normally needs about a megabyte before it emits the first video
+    // frame. V2 stores that window as four independently encrypted 256 KiB
+    // blocks, which the core fetches concurrently. Returning only one block
+    // made WebKit issue four serial protocol requests and added several relay
+    // round trips to every cold start.
+    const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
+    let requested = range
+        .and_then(|value| value.strip_prefix("bytes="))
+        .and_then(|value| value.split(',').next())
+        .and_then(|value| {
+            let (start, end) = value.split_once('-')?;
+            if start.is_empty() {
+                let suffix_length = end.parse::<u64>().ok()?.min(total);
+                return Some((total.saturating_sub(suffix_length), total.saturating_sub(1)));
+            }
+            let start = start.parse::<u64>().ok()?;
+            let end = if end.is_empty() {
+                total.saturating_sub(1)
+            } else {
+                end.parse::<u64>().ok()?
+            };
+            Some((start, end))
+        });
+    let (start, requested_end) = requested.unwrap_or((0, total.saturating_sub(1)));
+    let start = start.min(total.saturating_sub(1));
+    let end = requested_end
+        .min(start.saturating_add(MAX_RESPONSE_BYTES - 1))
+        .min(total.saturating_sub(1))
+        .max(start);
+    (start, end)
 }
 
 #[tauri::command]
@@ -558,12 +1012,33 @@ async fn ensure_native_notification_permission(
 }
 
 fn main() {
+    let media_streams = MediaStreamRegistry::default();
+    let protocol_streams = media_streams.clone();
     tauri::Builder::default()
+        .manage(media_streams)
+        .register_asynchronous_uri_scheme_protocol(
+            "noise-media",
+            move |context, request, responder| {
+                media_stream_response(
+                    protocol_streams.clone(),
+                    context.app_handle().clone(),
+                    request,
+                    responder,
+                );
+            },
+        )
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             noise_invoke,
+            register_media_stream,
+            optimize_video_upload,
+            inspect_media_upload,
+            prepare_media_upload,
+            read_prepared_media,
             download_media,
             ensure_native_notification_permission
         ])

@@ -1,10 +1,15 @@
 use std::{
     ffi::{CStr, CString, c_char},
+    future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
+use futures_util::future::{AbortHandle, Abortable};
 use noise_client::{MediaAttachment, NoiseClient, ProfileAlbum, ProfileAlbumItem, ProfileImage};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -37,11 +42,15 @@ enum Request {
     SyncAccount {
         state_path: String,
         relays: Vec<String>,
+        #[serde(default)]
+        interruptible: bool,
     },
     SyncReadState {
         state_path: String,
         cache_path: String,
         relays: Vec<String>,
+        #[serde(default)]
+        interruptible: bool,
     },
     WatchAccount {
         state_path: String,
@@ -121,6 +130,19 @@ enum Request {
         attachment: MediaAttachment,
         relays: Vec<String>,
     },
+    FetchAttachmentRange {
+        state_path: String,
+        cache_path: String,
+        scope_id: Option<String>,
+        attachment: MediaAttachment,
+        offset: u64,
+        byte_length: u64,
+        relays: Vec<String>,
+    },
+    FetchLinkPreview {
+        url: String,
+        relays: Vec<String>,
+    },
     UploadMediaChunk {
         state_path: String,
         data_base64: String,
@@ -158,9 +180,55 @@ enum Request {
         group_id: String,
         relays: Vec<String>,
     },
+    SyncTopicActivity {
+        state_path: String,
+        group_id: String,
+        topic_id: String,
+        relays: Vec<String>,
+    },
+    LoadOlderGroupHistory {
+        state_path: String,
+        group_id: String,
+        relays: Vec<String>,
+    },
+    LoadOlderTopicHistory {
+        state_path: String,
+        group_id: String,
+        topic_id: String,
+        relays: Vec<String>,
+    },
     MarkGroupRead {
         state_path: String,
         group_id: String,
+    },
+    MarkTopicRead {
+        state_path: String,
+        group_id: String,
+        topic_id: String,
+    },
+    CreateTopic {
+        state_path: String,
+        name: String,
+        icon: String,
+        relays: Vec<String>,
+    },
+    UpdateTopic {
+        state_path: String,
+        topic_id: String,
+        name: String,
+        icon: String,
+        locked: bool,
+        relays: Vec<String>,
+    },
+    ArchiveTopic {
+        state_path: String,
+        topic_id: String,
+        relays: Vec<String>,
+    },
+    ReorderTopics {
+        state_path: String,
+        topic_ids: Vec<String>,
+        relays: Vec<String>,
     },
     Say {
         state_path: String,
@@ -168,6 +236,8 @@ enum Request {
         attachment: Option<MediaAttachment>,
         #[serde(default)]
         reply_to_message_id: Option<String>,
+        #[serde(default)]
+        topic_id: Option<String>,
         relays: Vec<String>,
     },
     StartDirect {
@@ -204,6 +274,8 @@ enum Request {
         state_path: String,
         cache_path: String,
         relays: Vec<String>,
+        #[serde(default)]
+        interruptible: bool,
     },
     DirectConversation {
         state_path: String,
@@ -321,9 +393,86 @@ enum Request {
         delete_direct_threads: bool,
         relays: Vec<String>,
     },
+    CancelGroupLoading,
+    CancelBackgroundLoading,
+    CancelMediaLoading,
 }
 
-fn runtime() -> Result<&'static Runtime, String> {
+struct SessionRuntime(&'static Runtime);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadingClass {
+    Group,
+    Background,
+    Media,
+}
+
+#[derive(Clone, Copy)]
+struct LoadingTicket {
+    class: LoadingClass,
+    generation: u64,
+}
+
+impl SessionRuntime {
+    fn block_on<F, T>(&self, future: F) -> anyhow::Result<T>
+    where
+        F: Future<Output = anyhow::Result<T>>,
+    {
+        self.block_on_registered(future, None)
+    }
+
+    fn block_on_loading<F, T>(&self, future: F, ticket: LoadingTicket) -> anyhow::Result<T>
+    where
+        F: Future<Output = anyhow::Result<T>>,
+    {
+        self.block_on_registered(future, Some(ticket))
+    }
+
+    fn block_on_registered<F, T>(
+        &self,
+        future: F,
+        loading: Option<LoadingTicket>,
+    ) -> anyhow::Result<T>
+    where
+        F: Future<Output = anyhow::Result<T>>,
+    {
+        if session_ending().load(Ordering::Acquire) {
+            anyhow::bail!("session ended")
+        }
+        let (abort_handle, abort_registration) = AbortHandle::new_pair();
+        let operation_id = next_session_operation_id().fetch_add(1, Ordering::Relaxed);
+        {
+            let mut operations = active_session_operations()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session operation lock is unavailable"))?;
+            operations.push((
+                operation_id,
+                abort_handle.clone(),
+                loading.map(|ticket| ticket.class),
+            ));
+        }
+        if session_ending().load(Ordering::Acquire)
+            || loading.is_some_and(|ticket| {
+                loading_generation(ticket.class).load(Ordering::Acquire) != ticket.generation
+            })
+        {
+            abort_handle.abort();
+        }
+        let result = self.0.block_on(Abortable::new(future, abort_registration));
+        if let Ok(mut operations) = active_session_operations().lock() {
+            operations.retain(|(candidate, _, _)| *candidate != operation_id);
+        }
+        result.map_err(|_| {
+            if session_ending().load(Ordering::Acquire) {
+                anyhow::anyhow!("session ended")
+            } else {
+                anyhow::anyhow!("loading superseded")
+            }
+        })?
+    }
+}
+
+fn runtime() -> Result<SessionRuntime, String> {
     static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
     RUNTIME
         .get_or_init(|| {
@@ -334,11 +483,104 @@ fn runtime() -> Result<&'static Runtime, String> {
         })
         .as_ref()
         .map_err(Clone::clone)
+        .map(SessionRuntime)
 }
 
 fn state_lock() -> &'static Mutex<()> {
     static STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     STATE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn session_ending() -> &'static AtomicBool {
+    static SESSION_ENDING: AtomicBool = AtomicBool::new(false);
+    &SESSION_ENDING
+}
+
+fn next_session_operation_id() -> &'static AtomicU64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    &NEXT_ID
+}
+
+fn active_session_operations() -> &'static Mutex<Vec<(u64, AbortHandle, Option<LoadingClass>)>> {
+    static OPERATIONS: OnceLock<Mutex<Vec<(u64, AbortHandle, Option<LoadingClass>)>>> =
+        OnceLock::new();
+    OPERATIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn cancel_session_operations() {
+    if let Ok(mut operations) = active_session_operations().lock() {
+        for (_, operation, _) in operations.drain(..) {
+            operation.abort();
+        }
+    }
+}
+
+fn loading_generation(class: LoadingClass) -> &'static AtomicU64 {
+    static GROUP: AtomicU64 = AtomicU64::new(1);
+    static BACKGROUND: AtomicU64 = AtomicU64::new(1);
+    static MEDIA: AtomicU64 = AtomicU64::new(1);
+    match class {
+        LoadingClass::Group => &GROUP,
+        LoadingClass::Background => &BACKGROUND,
+        LoadingClass::Media => &MEDIA,
+    }
+}
+
+fn cancel_loading_operations(class: LoadingClass) {
+    loading_generation(class).fetch_add(1, Ordering::AcqRel);
+    if let Ok(operations) = active_session_operations().lock() {
+        for (_, operation, candidate) in operations.iter() {
+            if *candidate == Some(class) {
+                operation.abort();
+            }
+        }
+    }
+}
+
+struct SessionEndGuard;
+
+impl Drop for SessionEndGuard {
+    fn drop(&mut self) {
+        session_ending().store(false, Ordering::Release);
+    }
+}
+
+fn begin_session_end() -> SessionEndGuard {
+    session_ending().store(true, Ordering::Release);
+    cancel_session_operations();
+    SessionEndGuard
+}
+
+fn request_loading_ticket(request: &Request) -> Option<LoadingTicket> {
+    let class = match request {
+        Request::SyncGroupEncryption { .. }
+        | Request::Conversation { .. }
+        | Request::LoadOlderGroupHistory { .. }
+        | Request::LoadOlderTopicHistory { .. } => LoadingClass::Group,
+        Request::SyncAccount {
+            interruptible: true,
+            ..
+        }
+        | Request::SyncReadState {
+            interruptible: true,
+            ..
+        }
+        | Request::DirectInbox {
+            interruptible: true,
+            ..
+        }
+        | Request::SyncGroupActivity { .. }
+        | Request::SyncTopicActivity { .. }
+        | Request::DirectConversation { .. } => LoadingClass::Background,
+        Request::FetchAttachment { .. } | Request::FetchAttachmentRange { .. } => {
+            LoadingClass::Media
+        }
+        _ => return None,
+    };
+    Some(LoadingTicket {
+        class,
+        generation: loading_generation(class).load(Ordering::Acquire),
+    })
 }
 
 fn invoke(request_json: &str) -> Result<Value, String> {
@@ -357,6 +599,27 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         .unwrap_or_default();
     let request =
         serde_json::from_value::<Request>(request_value).map_err(|error| error.to_string())?;
+    match &request {
+        Request::CancelGroupLoading => {
+            cancel_loading_operations(LoadingClass::Group);
+            return Ok(Value::Null);
+        }
+        Request::CancelBackgroundLoading => {
+            cancel_loading_operations(LoadingClass::Background);
+            return Ok(Value::Null);
+        }
+        Request::CancelMediaLoading => {
+            cancel_loading_operations(LoadingClass::Media);
+            return Ok(Value::Null);
+        }
+        _ => {}
+    }
+    let loading_ticket = request_loading_ticket(&request);
+    let is_logout = matches!(&request, Request::Logout { .. });
+    let _session_end_guard = is_logout.then(begin_session_end);
+    if !is_logout && session_ending().load(Ordering::Acquire) {
+        return Err("session ended".to_owned());
+    }
     // The watch holds a network request for up to 20 seconds and never writes
     // local state. Everything else is serialized so a refresh cannot save an
     // older state snapshot over a message or profile update in progress.
@@ -366,6 +629,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             | Request::WatchGroup { .. }
             | Request::WatchGroupId { .. }
             | Request::SyncGroupActivity { .. }
+            | Request::SyncTopicActivity { .. }
             | Request::CachedConversation { .. }
             | Request::HeartbeatPresence { .. }
             | Request::ReplyNotificationSnapshot { .. }
@@ -373,6 +637,8 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             | Request::WatchAccount { .. }
             | Request::FetchAvatar { .. }
             | Request::FetchAttachment { .. }
+            | Request::FetchAttachmentRange { .. }
+            | Request::FetchLinkPreview { .. }
             | Request::UploadMediaChunk { .. }
             | Request::UploadDirectMediaChunk { .. }
     ) {
@@ -384,6 +650,14 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|_| "local state lock is unavailable".to_owned())?,
         )
     };
+    if !is_logout && session_ending().load(Ordering::Acquire) {
+        return Err("session ended".to_owned());
+    }
+    if loading_ticket.is_some_and(|ticket| {
+        loading_generation(ticket.class).load(Ordering::Acquire) != ticket.generation
+    }) {
+        return Err("loading superseded".to_owned());
+    }
     let client = NoiseClient::with_mask_relays(mask_relays).map_err(|error| error.to_string())?;
 
     match request {
@@ -435,22 +709,45 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
-        Request::SyncAccount { state_path, relays } => serde_json::to_value(
-            runtime()?
-                .block_on(client.sync_account(state_path, relays))
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string()),
+        Request::SyncAccount {
+            state_path,
+            relays,
+            interruptible,
+        } => {
+            let runtime = runtime()?;
+            let future = client.sync_account(state_path, relays);
+            let result = if interruptible {
+                runtime.block_on_loading(
+                    future,
+                    loading_ticket
+                        .ok_or_else(|| "background loading ticket is missing".to_owned())?,
+                )
+            } else {
+                runtime.block_on(future)
+            }
+            .map_err(|error| error.to_string())?;
+            serde_json::to_value(result).map_err(|error| error.to_string())
+        }
         Request::SyncReadState {
             state_path,
             cache_path,
             relays,
-        } => serde_json::to_value(
-            runtime()?
-                .block_on(client.sync_read_state(state_path, cache_path, relays))
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string()),
+            interruptible,
+        } => {
+            let runtime = runtime()?;
+            let future = client.sync_read_state(state_path, cache_path, relays);
+            let result = if interruptible {
+                runtime.block_on_loading(
+                    future,
+                    loading_ticket
+                        .ok_or_else(|| "background loading ticket is missing".to_owned())?,
+                )
+            } else {
+                runtime.block_on(future)
+            }
+            .map_err(|error| error.to_string())?;
+            serde_json::to_value(result).map_err(|error| error.to_string())
+        }
         Request::WatchAccount {
             state_path,
             since,
@@ -594,13 +891,41 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             relays,
         } => serde_json::to_value(
             runtime()?
-                .block_on(client.fetch_attachment(
-                    state_path,
-                    cache_path,
-                    scope_id,
-                    &attachment,
-                    relays,
-                ))
+                .block_on_loading(
+                    client.fetch_attachment(state_path, cache_path, scope_id, &attachment, relays),
+                    loading_ticket.expect("attachment requests have a loading ticket"),
+                )
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::FetchAttachmentRange {
+            state_path,
+            cache_path,
+            scope_id,
+            attachment,
+            offset,
+            byte_length,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on_loading(
+                    client.fetch_attachment_range(
+                        state_path,
+                        cache_path,
+                        scope_id,
+                        &attachment,
+                        offset,
+                        byte_length,
+                        relays,
+                    ),
+                    loading_ticket.expect("attachment range requests have a loading ticket"),
+                )
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::FetchLinkPreview { url, relays } => serde_json::to_value(
+            runtime()?
+                .block_on(client.fetch_link_preview(url, relays))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
@@ -668,7 +993,10 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             relays,
         } => serde_json::to_value(
             runtime()?
-                .block_on(client.sync_active_group_encryption(state_path, cache_path, relays))
+                .block_on_loading(
+                    client.sync_active_group_encryption(state_path, cache_path, relays),
+                    loading_ticket.ok_or_else(|| "group loading ticket is missing".to_owned())?,
+                )
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
@@ -678,8 +1006,44 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             relays,
         } => {
             let update = runtime()?
-                .block_on(client.fetch_group_activity(&state_path, &group_id, relays))
+                .block_on_loading(
+                    client.fetch_group_activity(&state_path, &group_id, relays),
+                    loading_ticket
+                        .ok_or_else(|| "background loading ticket is missing".to_owned())?,
+                )
                 .map_err(|error| error.to_string())?;
+            if session_ending().load(Ordering::Acquire) {
+                return Err("session ended".to_owned());
+            }
+            let _state_guard = state_lock()
+                .lock()
+                .map_err(|_| "local state lock is unavailable".to_owned())?;
+            if session_ending().load(Ordering::Acquire) {
+                return Err("session ended".to_owned());
+            }
+            serde_json::to_value(
+                client
+                    .apply_group_activity(state_path, update)
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())
+        }
+        Request::SyncTopicActivity {
+            state_path,
+            group_id,
+            topic_id,
+            relays,
+        } => {
+            let update = runtime()?
+                .block_on_loading(
+                    client.fetch_topic_activity(&state_path, &group_id, &topic_id, relays),
+                    loading_ticket
+                        .ok_or_else(|| "background loading ticket is missing".to_owned())?,
+                )
+                .map_err(|error| error.to_string())?;
+            if session_ending().load(Ordering::Acquire) {
+                return Err("session ended".to_owned());
+            }
             let _state_guard = state_lock()
                 .lock()
                 .map_err(|_| "local state lock is unavailable".to_owned())?;
@@ -690,6 +1054,33 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             )
             .map_err(|error| error.to_string())
         }
+        Request::LoadOlderGroupHistory {
+            state_path,
+            group_id,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on_loading(
+                    client.load_older_group_history(state_path, &group_id, relays),
+                    loading_ticket.ok_or_else(|| "group loading ticket is missing".to_owned())?,
+                )
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::LoadOlderTopicHistory {
+            state_path,
+            group_id,
+            topic_id,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on_loading(
+                    client.load_older_topic_history(state_path, &group_id, &topic_id, relays),
+                    loading_ticket.ok_or_else(|| "group loading ticket is missing".to_owned())?,
+                )
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         Request::MarkGroupRead {
             state_path,
             group_id,
@@ -699,14 +1090,81 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
+        Request::MarkTopicRead {
+            state_path,
+            group_id,
+            topic_id,
+        } => serde_json::to_value(
+            client
+                .mark_topic_read(state_path, &group_id, Some(&topic_id))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::CreateTopic {
+            state_path,
+            name,
+            icon,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.create_topic(state_path, name, icon, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::UpdateTopic {
+            state_path,
+            topic_id,
+            name,
+            icon,
+            locked,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.update_topic(state_path, &topic_id, name, icon, locked, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::ArchiveTopic {
+            state_path,
+            topic_id,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.archive_topic(state_path, &topic_id, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::ReorderTopics {
+            state_path,
+            topic_ids,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.reorder_topics(state_path, topic_ids, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         Request::Say {
             state_path,
             text,
             attachment,
             reply_to_message_id,
+            topic_id,
             relays,
         } => {
-            let sent = match attachment {
+            let sent = if let Some(topic_id) = topic_id {
+                runtime()?
+                    .block_on(client.say_topic(
+                        state_path,
+                        &topic_id,
+                        text,
+                        attachment,
+                        reply_to_message_id,
+                        relays,
+                    ))
+                    .map_err(|error| error.to_string())?
+            } else {
+                match attachment {
                 Some(attachment) => runtime()?
                     .block_on(client.say_with_attachment_reply(
                         state_path,
@@ -719,6 +1177,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 None => runtime()?
                     .block_on(client.say_reply(state_path, text, reply_to_message_id, relays))
                     .map_err(|error| error.to_string())?,
+                }
             };
             serde_json::to_value(sent).map_err(|error| error.to_string())
         }
@@ -795,19 +1254,33 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             state_path,
             cache_path,
             relays,
-        } => serde_json::to_value(
-            runtime()?
-                .block_on(client.direct_inbox(state_path, cache_path, relays))
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string()),
+            interruptible,
+        } => {
+            let runtime = runtime()?;
+            let future = client.direct_inbox(state_path, cache_path, relays);
+            let result = if interruptible {
+                runtime.block_on_loading(
+                    future,
+                    loading_ticket
+                        .ok_or_else(|| "background loading ticket is missing".to_owned())?,
+                )
+            } else {
+                runtime.block_on(future)
+            }
+            .map_err(|error| error.to_string())?;
+            serde_json::to_value(result).map_err(|error| error.to_string())
+        }
         Request::DirectConversation {
             state_path,
             cache_path,
             relays,
         } => serde_json::to_value(
             runtime()?
-                .block_on(client.direct_conversation(state_path, cache_path, relays))
+                .block_on_loading(
+                    client.direct_conversation(state_path, cache_path, relays),
+                    loading_ticket
+                        .ok_or_else(|| "background loading ticket is missing".to_owned())?,
+                )
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
@@ -954,7 +1427,10 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         }
         Request::Conversation { state_path, relays } => serde_json::to_value(
             runtime()?
-                .block_on(client.conversation(state_path, relays))
+                .block_on_loading(
+                    client.conversation(state_path, relays),
+                    loading_ticket.ok_or_else(|| "group loading ticket is missing".to_owned())?,
+                )
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
@@ -1047,6 +1523,11 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?;
             Ok(Value::Null)
         }
+        Request::CancelGroupLoading
+        | Request::CancelBackgroundLoading
+        | Request::CancelMediaLoading => {
+            unreachable!("loading cancellation is handled before dispatch")
+        }
     }
 }
 
@@ -1110,12 +1591,97 @@ pub unsafe extern "C" fn noise_free_string(value: *mut c_char) {
 
 #[cfg(test)]
 mod tests {
-    use super::response_json;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        LoadingClass, LoadingTicket, active_session_operations, begin_session_end,
+        cancel_loading_operations, loading_generation, response_json, runtime, session_ending,
+    };
+
+    fn session_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn invalid_requests_are_structured_errors() {
         let response: serde_json::Value =
             serde_json::from_str(&response_json("{}")).expect("response is JSON");
         assert_eq!(response["ok"], false);
+    }
+
+    #[test]
+    fn ending_a_session_cancels_active_async_work() {
+        let _test_guard = session_test_lock().lock().expect("test lock");
+        session_ending().store(false, std::sync::atomic::Ordering::Release);
+        let worker = std::thread::spawn(|| {
+            runtime().expect("runtime").block_on(async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok::<(), anyhow::Error>(())
+            })
+        });
+        let wait_started = Instant::now();
+        while active_session_operations()
+            .lock()
+            .expect("operation lock")
+            .is_empty()
+        {
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(2),
+                "async work did not register"
+            );
+            std::thread::yield_now();
+        }
+
+        let cancel_started = Instant::now();
+        let ending = begin_session_end();
+        let result = worker.join().expect("worker did not panic");
+        assert!(result.is_err());
+        assert!(cancel_started.elapsed() < Duration::from_secs(1));
+        drop(ending);
+    }
+
+    #[test]
+    fn superseding_group_loading_aborts_the_registered_operation() {
+        let _test_guard = session_test_lock().lock().expect("test lock");
+        let ticket = LoadingTicket {
+            class: LoadingClass::Group,
+            generation: loading_generation(LoadingClass::Group)
+                .load(std::sync::atomic::Ordering::Acquire),
+        };
+        let worker = std::thread::spawn(move || {
+            runtime().expect("runtime").block_on_loading(
+                async {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    Ok::<(), anyhow::Error>(())
+                },
+                ticket,
+            )
+        });
+        let wait_started = Instant::now();
+        while !active_session_operations()
+            .lock()
+            .expect("operation lock")
+            .iter()
+            .any(|(_, _, class)| *class == Some(LoadingClass::Group))
+        {
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(2),
+                "group loading did not register"
+            );
+            std::thread::yield_now();
+        }
+
+        let cancel_started = Instant::now();
+        cancel_loading_operations(LoadingClass::Group);
+        let result = worker.join().expect("worker did not panic");
+        assert_eq!(
+            result
+                .expect_err("group loading was not aborted")
+                .to_string(),
+            "loading superseded"
+        );
+        assert!(cancel_started.elapsed() < Duration::from_secs(1));
     }
 }

@@ -7,6 +7,8 @@ edition.workspace = true
 crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
+anyhow.workspace = true
+futures-util.workspace = true
 noise-client = { path = "../noise-client" }
 serde.workspace = true
 serde_json.workspace = true

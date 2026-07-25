@@ -5,10 +5,11 @@ small runtime boundary in `src/api.ts`.
 
 ## Desktop today
 
-The Tauri shell exposes the existing `noise-ffi` JSON request API as one command.
-The UI therefore uses the same Rust identity, signing, encryption, reducer, and
-relay transport as the CLI and native macOS prototype. macOS and Windows share
-the interface; only the thin platform shell differs.
+The Tauri app in `apps/client` is the official desktop client for both macOS and
+Windows. Its shell exposes the existing `noise-ffi` JSON request API as one
+command, so the UI uses the same Rust identity, signing, encryption, reducer,
+and relay transport as the CLI. macOS and Windows share the interface; only the
+thin platform shell differs.
 
 Private identity state is owned by Rust and stored outside the webview. The
 webview receives only the view models needed to render the current screen.

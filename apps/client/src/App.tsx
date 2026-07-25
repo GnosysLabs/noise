@@ -9,6 +9,7 @@ import {
   Copy,
   Crown,
   Download,
+  GripVertical,
   Images,
   Info,
   LoaderCircle,
@@ -35,15 +36,19 @@ import {
   VolumeX,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { CSSProperties, RefObject } from "react";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
-import { isTauri, noise, prepareGroupBackground, prepareImage, relays } from "./api";
+import { isTauri, noise, prepareGroupBackground, prepareImage, registerMediaStream, relays } from "./api";
+import { registerWebMediaStream, webMediaStreamReady } from "./mediaStream";
 import { generateGroupAvatar, generateUserAvatar } from "./groupAvatar";
+import { firstLink, linkify, openExternalLink } from "./linkify";
 import { ReactionPicker } from "./ReactionPicker";
+import { useLinkPreview } from "./useLinkPreview";
 import type {
   AttachmentData,
+  AttachmentRangeData,
   AvatarData,
   BannedMemberSummary,
   Conversation,
@@ -56,6 +61,7 @@ import type {
   GroupWatch,
   IdentitySummary,
   LocalSummary,
+  LinkPreview,
   MakeResult,
   MediaAttachment,
   MediaChunk,
@@ -67,6 +73,7 @@ import type {
   ReactionSummary,
   ReportSummary,
   SentMessageResult,
+  TopicSummary,
 } from "./types";
 
 type Dialog =
@@ -76,6 +83,8 @@ type Dialog =
   | { type: "noise_id"; noiseId: string }
   | { type: "profile"; profile: IdentitySummary }
   | { type: "group"; group: GroupSummary }
+  | { type: "create_topic"; group: GroupSummary }
+  | { type: "topic"; group: GroupSummary; topic: TopicSummary }
   | { type: "rules"; group: GroupSummary }
   | { type: "media" }
   | { type: "reports" }
@@ -167,6 +176,57 @@ function withCurrentDirectProfile(
   };
 }
 
+function withoutMessage(conversation: Conversation, messageEventId: string): Conversation {
+  return {
+    ...conversation,
+    messages: conversation.messages.filter((message) => message.event_id !== messageEventId),
+    reports: conversation.reports.filter(
+      (report) => report.message.event_id !== messageEventId,
+    ),
+    reported_message_event_ids: conversation.reported_message_event_ids.filter(
+      (eventId) => eventId !== messageEventId,
+    ),
+  };
+}
+
+function restoreMessage(
+  conversation: Conversation,
+  snapshot: Conversation,
+  messageEventId: string,
+): Conversation {
+  const message = snapshot.messages.find((item) => item.event_id === messageEventId);
+  const reports = snapshot.reports.filter(
+    (report) => report.message.event_id === messageEventId,
+  );
+  return {
+    ...conversation,
+    messages: message && !conversation.messages.some((item) => item.event_id === messageEventId)
+      ? [...conversation.messages, message].sort((left, right) =>
+          left.created_at_millis - right.created_at_millis
+          || left.event_id.localeCompare(right.event_id)
+        )
+      : conversation.messages,
+    reports: reports.length
+      ? [
+          ...conversation.reports,
+          ...reports.filter((report) =>
+            !conversation.reports.some(
+              (existing) => existing.report_event_id === report.report_event_id,
+            )
+          ),
+        ].sort((left, right) =>
+          left.created_at_millis - right.created_at_millis
+          || left.report_event_id.localeCompare(right.report_event_id)
+        )
+      : conversation.reports,
+    reported_message_event_ids:
+      snapshot.reported_message_event_ids.includes(messageEventId)
+      && !conversation.reported_message_event_ids.includes(messageEventId)
+        ? [...conversation.reported_message_event_ids, messageEventId]
+        : conversation.reported_message_event_ids,
+  };
+}
+
 function withCurrentGroupProfile(
   group: GroupSummary,
   current: GroupSummary,
@@ -237,7 +297,8 @@ function accentStyle(value?: string | null): CSSProperties {
   } as CSSProperties;
 }
 
-function NoiseMark({ size, className }: { size: number; className?: string }) {
+function NoiseMark({ size, className, monochrome = false }: { size: number; className?: string; monochrome?: boolean }) {
+  const gradientId = useId().replaceAll(":", "");
   return (
     <svg
       aria-hidden="true"
@@ -248,20 +309,50 @@ function NoiseMark({ size, className }: { size: number; className?: string }) {
       fill="none"
       xmlns="http://www.w3.org/2000/svg"
     >
-      <defs>
-        <linearGradient id="noise-mark-gradient" x1="214" y1="512" x2="810" y2="512" gradientUnits="userSpaceOnUse">
-          <stop stopColor="var(--accent-light)" />
-          <stop offset="1" stopColor="var(--accent-dark)" />
-        </linearGradient>
-      </defs>
+      {!monochrome && (
+        <defs>
+          <linearGradient id={gradientId} x1="214" y1="512" x2="810" y2="512" gradientUnits="userSpaceOnUse">
+            <stop stopColor="var(--accent-light)" />
+            <stop offset="1" stopColor="var(--accent-dark)" />
+          </linearGradient>
+        </defs>
+      )}
       <path
         d="M206 512h72l55-144 94 296 91-390 91 476 86-382 53 144h70"
-        stroke="url(#noise-mark-gradient)"
+        stroke={monochrome ? "currentColor" : `url(#${gradientId})`}
         strokeWidth="64"
         strokeLinecap="round"
         strokeLinejoin="round"
       />
     </svg>
+  );
+}
+
+function MediaLoadStatus({
+  failed = false,
+  compact = false,
+  prominent = false,
+}: {
+  failed?: boolean;
+  compact?: boolean;
+  prominent?: boolean;
+}) {
+  return (
+    <span
+      className={`media-load-status ${failed ? "failed" : ""} ${compact ? "compact" : ""} ${prominent ? "prominent" : ""}`}
+      role="status"
+      aria-label={failed ? "media unavailable" : "loading media"}
+    >
+      <span className="media-load-status-circle">
+        {failed
+          ? <X size={compact ? 13 : 18} />
+          : <NoiseMark
+              size={compact ? 15 : prominent ? 38 : 30}
+              className="noise-loading-indicator"
+              monochrome
+            />}
+      </span>
+    </span>
   );
 }
 
@@ -313,6 +404,7 @@ const profileImageRequests = new Map<string, Promise<string>>();
 let profileImageCacheGeneration = 0;
 const mediaCache = new Map<string, string>();
 const mediaLoadPromises = new Map<string, Promise<string>>();
+const mediaBootstrapPromises = new Map<string, Promise<void>>();
 const mediaPreparationPromises = new Map<string, Promise<void>>();
 const decodedImageCache = new Set<string>();
 const MEDIA_DIMENSIONS_STORAGE_KEY = "noise.media-dimensions.v1";
@@ -325,6 +417,83 @@ let mediaCacheGeneration = 0;
 
 const INITIAL_MESSAGE_COUNT = 24;
 const MESSAGE_PAGE_SIZE = 40;
+type MediaLoadPriority = "visible" | "nearby" | "background";
+const MEDIA_PRIORITY_RANK: Record<MediaLoadPriority, number> = {
+  visible: 0,
+  nearby: 1,
+  background: 2,
+};
+
+class MediaLoadScheduler {
+  private active = 0;
+  private sequence = 0;
+  private readonly queued = new Map<string, {
+    key: string;
+    priority: MediaLoadPriority;
+    sequence: number;
+    run: () => Promise<string>;
+    resolve: (value: string) => void;
+    reject: (cause: unknown) => void;
+  }>();
+
+  constructor(private readonly limit: number) {}
+
+  enqueue(
+    key: string,
+    priority: MediaLoadPriority,
+    run: () => Promise<string>,
+  ) {
+    const promise = new Promise<string>((resolve, reject) => {
+      this.queued.set(key, {
+        key,
+        priority,
+        sequence: this.sequence++,
+        run,
+        resolve,
+        reject,
+      });
+    });
+    this.pump();
+    return promise;
+  }
+
+  promote(key: string, priority: MediaLoadPriority) {
+    const job = this.queued.get(key);
+    if (!job || MEDIA_PRIORITY_RANK[priority] >= MEDIA_PRIORITY_RANK[job.priority]) return;
+    job.priority = priority;
+    this.pump();
+  }
+
+  cancelQueued() {
+    const jobs = [...this.queued.values()];
+    this.queued.clear();
+    for (const job of jobs) job.reject(new Error("loading superseded"));
+  }
+
+  private pump() {
+    while (this.active < this.limit && this.queued.size) {
+      const job = [...this.queued.values()].sort((left, right) =>
+        MEDIA_PRIORITY_RANK[left.priority] - MEDIA_PRIORITY_RANK[right.priority]
+        || left.sequence - right.sequence
+      )[0];
+      this.queued.delete(job.key);
+      this.active += 1;
+      void job.run()
+        .then(job.resolve, job.reject)
+        .finally(() => {
+          this.active -= 1;
+          this.pump();
+        });
+    }
+  }
+}
+
+const mediaLoadScheduler = new MediaLoadScheduler(3);
+
+// Video bootstraps (the first megabyte a browser needs before the first
+// frame) get their own lane so a Play click is never queued behind feed
+// images.
+const mediaBootstrapScheduler = new MediaLoadScheduler(2);
 
 function mediaCacheKey(attachment: MediaAttachment) {
   return attachment.chunks.map((chunk) => chunk.blob_id).join(":");
@@ -333,6 +502,7 @@ function mediaCacheKey(attachment: MediaAttachment) {
 function mediaFailureIsPermanent(cause: unknown) {
   const detail = message(cause).toLowerCase();
   return detail.includes("predates constellation storage")
+    || detail.includes("retired alpha media format")
     || detail.includes("invalid blob")
     || detail.includes("invalid size")
     || detail.includes("does not match")
@@ -357,6 +527,7 @@ function clearMediaMemoryCache() {
     // The in-memory cache is still cleared when storage is unavailable.
   }
   mediaLoadPromises.clear();
+  mediaBootstrapPromises.clear();
   mediaPreparationPromises.clear();
   mediaCache.clear();
 }
@@ -395,10 +566,71 @@ type PendingMedia = {
   name: string;
   mimeType: string;
   byteLength: number;
-  file: File;
+  file: Promise<File>;
   previewUrl: string;
   mediaPreview: Promise<MediaPreview | null> | null;
 };
+
+type ComposerUploadState = {
+  attachment: PendingMedia | null;
+  progress: number | null;
+  controller: AbortController | null;
+};
+
+const emptyComposerUpload: ComposerUploadState = {
+  attachment: null,
+  progress: null,
+  controller: null,
+};
+const composerUploads = new Map<string, ComposerUploadState>();
+const composerUploadListeners = new Map<string, Set<() => void>>();
+
+function composerUpload(key: string) {
+  return composerUploads.get(key) ?? emptyComposerUpload;
+}
+
+function updateComposerUpload(
+  key: string,
+  update: (current: ComposerUploadState) => ComposerUploadState,
+) {
+  const current = composerUpload(key);
+  const next = update(current);
+  if (!next.attachment && next.progress === null && !next.controller) {
+    composerUploads.delete(key);
+  } else {
+    composerUploads.set(key, next);
+  }
+  for (const listener of composerUploadListeners.get(key) ?? []) listener();
+}
+
+function useComposerUpload(key: string) {
+  const subscribe = useCallback((listener: () => void) => {
+    const listeners = composerUploadListeners.get(key) ?? new Set();
+    listeners.add(listener);
+    composerUploadListeners.set(key, listeners);
+    return () => {
+      listeners.delete(listener);
+      if (!listeners.size) composerUploadListeners.delete(key);
+    };
+  }, [key]);
+  const getSnapshot = useCallback(() => composerUpload(key), [key]);
+  const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const setAttachment = useCallback((attachment: PendingMedia | null) => {
+    updateComposerUpload(key, (current) => {
+      if (current.attachment && current.attachment !== attachment) {
+        URL.revokeObjectURL(current.attachment.previewUrl);
+      }
+      return { ...current, attachment };
+    });
+  }, [key]);
+  const setProgress = useCallback((progress: number | null) => {
+    updateComposerUpload(key, (current) => ({ ...current, progress }));
+  }, [key]);
+  const setController = useCallback((controller: AbortController | null) => {
+    updateComposerUpload(key, (current) => ({ ...current, controller }));
+  }, [key]);
+  return { ...state, setAttachment, setProgress, setController };
+}
 
 type MediaPreview = {
   dataBase64: string;
@@ -407,12 +639,185 @@ type MediaPreview = {
   pixelHeight: number;
 };
 
-function prepareImagePreview(file: File): Promise<MediaPreview | null> {
-  const source = URL.createObjectURL(file);
+function preparePendingMedia(file: File): PendingMedia {
+  const previewUrl = URL.createObjectURL(file);
+  return {
+    name: file.name,
+    mimeType: file.type,
+    byteLength: file.size,
+    file: optimizeOutgoingMedia(file),
+    previewUrl,
+    mediaPreview: file.type.startsWith("video/")
+      ? prepareVideoPreviewSource(previewUrl)
+      : file.type.startsWith("image/")
+        ? prepareImagePreviewSource(previewUrl)
+        : null,
+  };
+}
+
+async function optimizeOutgoingMedia(file: File) {
+  if (
+    file.type.startsWith("image/")
+    && file.type !== "image/gif"
+  ) {
+    return optimizeOutgoingImage(file);
+  }
+  if (file.type.startsWith("video/") && file.size > 24 * 1024 * 1024) {
+    return optimizeOutgoingVideo(file);
+  }
+  return file;
+}
+
+async function optimizeOutgoingImage(file: File) {
+  let bitmap: ImageBitmap | null = null;
+  try {
+    bitmap = await createImageBitmap(file);
+    const maximumDimension = Math.max(bitmap.width, bitmap.height);
+    if (maximumDimension <= 2_560 && file.size <= 4 * 1024 * 1024) {
+      return file;
+    }
+    const scale = Math.min(1, 2_560 / maximumDimension);
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const context = canvas.getContext("2d");
+    if (!context) return file;
+    context.fillStyle = "#17161a";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    const profiles = [
+      { edge: 2_560, quality: 0.84 },
+      { edge: 2_048, quality: 0.8 },
+      { edge: 1_600, quality: 0.76 },
+    ];
+    for (const profile of profiles) {
+      const profileScale = Math.min(
+        1,
+        profile.edge / Math.max(canvas.width, canvas.height),
+      );
+      const output = document.createElement("canvas");
+      output.width = Math.max(1, Math.round(canvas.width * profileScale));
+      output.height = Math.max(1, Math.round(canvas.height * profileScale));
+      output.getContext("2d")?.drawImage(
+        canvas,
+        0,
+        0,
+        output.width,
+        output.height,
+      );
+      const blob = await new Promise<Blob | null>((resolve) =>
+        output.toBlob(resolve, "image/jpeg", profile.quality)
+      );
+      if (!blob) continue;
+      if (blob.size > 6 * 1024 * 1024 && profile !== profiles.at(-1)) {
+        continue;
+      }
+      if (blob.size >= file.size) return file;
+      const name = file.name.replace(/\.[^.]+$/, "") || "noise-photo";
+      return new File([blob], `${name}.jpg`, {
+        type: "image/jpeg",
+        lastModified: file.lastModified,
+      });
+    }
+  } catch {
+    return file;
+  } finally {
+    bitmap?.close();
+  }
+  return file;
+}
+
+async function optimizeOutgoingVideo(file: File) {
+  if (!isTauri) return file;
+  const nativePath = (file as File & { path?: string }).path;
+  if (!nativePath) return file;
+  try {
+    const { convertFileSrc, invoke } = await import("@tauri-apps/api/core");
+    const optimized = await invoke<{
+      file_path: string;
+      file_name: string;
+      mime_type: string;
+      byte_length: number;
+    }>("optimize_video_upload", { sourcePath: nativePath });
+    if (!optimized.byte_length || optimized.byte_length >= file.size) return file;
+    const response = await fetch(convertFileSrc(optimized.file_path));
+    if (!response.ok) return file;
+    const blob = await response.blob();
+    if (blob.size !== optimized.byte_length) return file;
+    return new File([blob], optimized.file_name, {
+      type: optimized.mime_type,
+      lastModified: file.lastModified,
+    });
+  } catch {
+    return file;
+  }
+}
+
+async function chooseNativePendingMedia() {
+  if (!isTauri) return null;
+  const [{ open }, { convertFileSrc, invoke }] = await Promise.all([
+    import("@tauri-apps/plugin-dialog"),
+    import("@tauri-apps/api/core"),
+  ]);
+  const selected = await open({
+    multiple: false,
+    directory: false,
+    filters: [{
+      name: "media",
+      extensions: [
+        "jpg", "jpeg", "png", "gif", "webp",
+        "mov", "mp4", "m4v", "avi", "mpeg", "mpg",
+        "mp3", "m4a", "wav", "aac", "ogg",
+      ],
+    }],
+  });
+  if (!selected) return null;
+  const inspected = await invoke<{
+    file_path: string;
+    file_name: string;
+    mime_type: string;
+    byte_length: number;
+  }>("inspect_media_upload", { sourcePath: selected });
+  const previewUrl = convertFileSrc(inspected.file_path);
+  const file = (async () => {
+    const prepared = await invoke<{
+      file_path: string;
+      file_name: string;
+      mime_type: string;
+      byte_length: number;
+    }>("prepare_media_upload", { sourcePath: inspected.file_path });
+    const bytes = await invoke<Uint8Array>("read_prepared_media", {
+      sourcePath: prepared.file_path,
+    });
+    const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    if (data.byteLength !== prepared.byte_length) {
+      throw new Error("prepared media could not be read");
+    }
+    const buffer = new ArrayBuffer(data.byteLength);
+    new Uint8Array(buffer).set(data);
+    return new File([buffer], prepared.file_name, {
+      type: prepared.mime_type,
+      lastModified: Date.now(),
+    });
+  })();
+  return {
+    name: inspected.file_name,
+    mimeType: inspected.mime_type,
+    byteLength: inspected.byte_length,
+    file,
+    previewUrl,
+    mediaPreview: inspected.mime_type.startsWith("video/")
+      ? prepareVideoPreviewSource(previewUrl)
+      : inspected.mime_type.startsWith("image/")
+        ? prepareImagePreviewSource(previewUrl)
+        : null,
+  } satisfies PendingMedia;
+}
+
+function prepareImagePreviewSource(source: string): Promise<MediaPreview | null> {
   const image = new Image();
   return new Promise((resolve) => {
     const finish = (value: MediaPreview | null) => {
-      URL.revokeObjectURL(source);
       resolve(value);
     };
     image.onload = async () => {
@@ -455,8 +860,7 @@ function prepareImagePreview(file: File): Promise<MediaPreview | null> {
   });
 }
 
-function prepareVideoPreview(file: File): Promise<MediaPreview | null> {
-  const source = URL.createObjectURL(file);
+function prepareVideoPreviewSource(source: string): Promise<MediaPreview | null> {
   const video = document.createElement("video");
   video.muted = true;
   video.playsInline = true;
@@ -473,7 +877,6 @@ function prepareVideoPreview(file: File): Promise<MediaPreview | null> {
       window.clearTimeout(timeout);
       video.removeAttribute("src");
       video.load();
-      URL.revokeObjectURL(source);
       resolve(value);
     };
     const capture = async () => {
@@ -539,13 +942,14 @@ function prepareVideoPreview(file: File): Promise<MediaPreview | null> {
   });
 }
 
-function optimisticMessage(
+async function optimisticMessage(
   identity: IdentitySummary,
   text: string,
   attachment: PendingMedia | null,
   replyToMessageId: string | null,
-): MessageSummary {
+): Promise<MessageSummary> {
   const localId = `local:${crypto.randomUUID()}`;
+  const localFile = attachment ? await attachment.file : null;
   return {
     event_id: localId,
     message_id: localId,
@@ -560,8 +964,8 @@ function optimisticMessage(
     reply_to_message_id: replyToMessageId,
     created_at_millis: Date.now(),
     optimistic: true,
-    local_attachment: attachment ? {
-      preview_url: URL.createObjectURL(attachment.file),
+    local_attachment: attachment && localFile ? {
+      preview_url: URL.createObjectURL(localFile),
       mime_type: attachment.mimeType,
     } : undefined,
   };
@@ -691,6 +1095,8 @@ export default function App() {
   const [directConversation, setDirectConversation] = useState<DirectConversation | null>(null);
   const [sidebarMode, setSidebarMode] = useState<SidebarMode>("groups");
   const [pendingGroupId, setPendingGroupId] = useState<string | null>(null);
+  const [activeTopicId, setActiveTopicId] = useState<string | null>(null);
+  const [pendingTopicId, setPendingTopicId] = useState<string | null>(null);
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -709,11 +1115,15 @@ export default function App() {
   const groupWatchRevisions = useRef(new Map<string, number>());
   const directConversationCache = useRef(new Map<string, DirectConversation>());
   const groupReadInFlight = useRef(new Set<string>());
+  const accountCacheSyncTimer = useRef<number | null>(null);
   const groupSelectionInFlight = useRef(false);
+  const topicSelectionGeneration = useRef(0);
+  const activeTopicIdRef = useRef<string | null>(null);
   const desiredGroupIdRef = useRef<string | null>(null);
   const sidebarModeRef = useRef(sidebarMode);
   const desiredDirectPublicKeyRef = useRef<string | null>(null);
   sidebarModeRef.current = sidebarMode;
+  activeTopicIdRef.current = activeTopicId;
   const summaryActiveDirectPublicKey = summary?.directs.find((direct) => direct.is_active)?.public_key ?? null;
   const summaryActiveGroupId = summary?.groups.find((group) => group.is_active)?.group_id ?? null;
   if (
@@ -744,6 +1154,42 @@ export default function App() {
   const lastPresenceActivityAt = useRef(Date.now());
   const selfPresenceActive = useRef(true);
   const [selfPresenceStatus, setSelfPresenceStatus] = useState<PresenceStatus>("online");
+
+  const scheduleAccountCacheSync = useCallback(() => {
+    if (accountCacheSyncTimer.current !== null) {
+      window.clearTimeout(accountCacheSyncTimer.current);
+    }
+    accountCacheSyncTimer.current = window.setTimeout(() => {
+      accountCacheSyncTimer.current = null;
+      void noise<LocalSummary>({
+        action: "sync_account",
+        relays,
+        interruptible: true,
+      })
+        .then((synced) => {
+          if (synced) setSummary(synced);
+        })
+        .catch(() => {
+          // Cached text remains local and the next normal account sync retries.
+        });
+    }, 4_000);
+  }, []);
+
+  useEffect(() => () => {
+    if (accountCacheSyncTimer.current !== null) {
+      window.clearTimeout(accountCacheSyncTimer.current);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (identityPublicKey && conversation) scheduleAccountCacheSync();
+  }, [
+    conversation?.group.group_id,
+    conversation?.has_older_messages,
+    conversation?.messages.length,
+    identityPublicKey,
+    scheduleAccountCacheSync,
+  ]);
 
   useEffect(() => {
     const suppressNativeContextMenu = (event: MouseEvent) => {
@@ -1019,7 +1465,7 @@ export default function App() {
       public_key: publicKey,
     });
     if (marked) setSummary(marked);
-    void noise({ action: "sync_account", relays }).catch(() => {
+    void noise({ action: "sync_account", relays, interruptible: true }).catch(() => {
       // The local read marker is immediate; cross-device sync retries normally.
     });
   }, []);
@@ -1031,7 +1477,13 @@ export default function App() {
       const marked = await markGroupRead(groupId);
       if (!marked) return;
       setSummary(marked);
-      void noise({ action: "sync_account", relays }).catch(() => {
+      setConversation((current) => {
+        if (current?.group.group_id !== groupId) return current;
+        const updated = { ...current, general_unread_count: 0 };
+        groupConversationCache.current.set(groupId, updated);
+        return updated;
+      });
+      void noise({ action: "sync_account", relays, interruptible: true }).catch(() => {
         // The local group read marker is immediate; cross-device sync retries normally.
       });
     } finally {
@@ -1039,9 +1491,43 @@ export default function App() {
     }
   }, []);
 
-  const syncDirectInbox = useCallback(async (markActiveRead: boolean) => {
+  const markActiveTopicRead = useCallback(async (groupId: string, topicId: string) => {
+    const readKey = `${groupId}:${topicId}`;
+    if (groupReadInFlight.current.has(readKey)) return;
+    groupReadInFlight.current.add(readKey);
+    try {
+      const marked = await markTopicRead(groupId, topicId);
+      if (!marked) return;
+      setSummary(marked);
+      setConversation((current) => {
+        if (current?.group.group_id !== groupId) return current;
+        const updated = {
+          ...current,
+          topics: current.topics.map((topic) =>
+            topic.topic_id === topicId ? { ...topic, unread_count: 0 } : topic
+          ),
+        };
+        groupConversationCache.current.set(groupId, updated);
+        return updated;
+      });
+      void noise({ action: "sync_account", relays, interruptible: true }).catch(() => {
+        // The local topic read marker is immediate; cross-device sync retries normally.
+      });
+    } finally {
+      groupReadInFlight.current.delete(readKey);
+    }
+  }, []);
+
+  const syncDirectInbox = useCallback(async (
+    markActiveRead: boolean,
+    interruptible = false,
+  ) => {
     const generation = refreshGeneration.current;
-    const inbox = await noise<DirectInbox>({ action: "direct_inbox", relays });
+    const inbox = await noise<DirectInbox>({
+      action: "direct_inbox",
+      relays,
+      interruptible,
+    });
     if (!inbox) return;
     // The Rust client has already fetched and decrypted these messages. Keep them
     // even if another UI selection changed while that work was in flight, so an
@@ -1062,14 +1548,19 @@ export default function App() {
     const generation = ++refreshGeneration.current;
     const local = await noise<LocalSummary>({ action: "status" });
     if (generation !== refreshGeneration.current) return;
-    setSummary(local);
-    if (!local) return;
+    if (!local) {
+      setSummary(null);
+      setLoading(false);
+      return;
+    }
 
     if (sidebarMode === "groups") {
       const activeGroup = local.groups.find((group) => group.is_active);
       if (!activeGroup) {
+        setSummary(local);
         setConversation(null);
         setGroupEncryption(null);
+        setLoading(false);
         return;
       }
       const needsReadBaseline = !activeGroup.read_state_initialized;
@@ -1082,7 +1573,38 @@ export default function App() {
         if (generation !== refreshGeneration.current) return;
         if (cached) groupConversationCache.current.set(activeGroup.group_id, cached);
       }
-      if (cached) setConversation(cached);
+
+      // A fresh login must spend its first relay request on the selected
+      // group's newest page. That page already carries the embedded image and
+      // video posters, so it can unlock the complete recent feed without
+      // waiting for encryption reconciliation or background group watches.
+      let latestActivity: GroupActivityResult | null = null;
+      let latestActivityError: unknown = null;
+      try {
+        await cancelBackgroundLoading();
+        latestActivity = await syncGroupActivity(activeGroup.group_id);
+      } catch (cause) {
+        if (!isSupersededLoading(cause)) latestActivityError = cause;
+      }
+      if (generation !== refreshGeneration.current) return;
+      if (latestActivity) {
+        setSummary(latestActivity.summary);
+        if (latestActivity.conversation) {
+          groupConversationCache.current.set(
+            activeGroup.group_id,
+            latestActivity.conversation,
+          );
+          dirtyGroupIds.current.delete(activeGroup.group_id);
+          setConversation(latestActivity.conversation);
+        } else if (cached) {
+          setConversation(cached);
+        }
+      } else {
+        setSummary(local);
+        if (cached) setConversation(cached);
+      }
+      setLoading(false);
+
       const encryption = await syncGroupEncryption();
       if (generation !== refreshGeneration.current) return;
       setGroupEncryption(encryption);
@@ -1094,24 +1616,39 @@ export default function App() {
         setSummary(reconciled);
         return;
       }
-      if (
-        encryption?.phase === "waiting_for_admission"
-        || encryption?.phase === "waiting_for_device"
-      ) {
-        setConversation(null);
+      if (encryption && encryption.phase !== "active") {
         return;
       }
-      const nextConversation = await noise<Conversation>({ action: "conversation", relays });
+
+      // If the priority fetch needed encryption repair, retry it now that the
+      // group is active. Normal fresh logins never take this second path.
+      if (!latestActivity) {
+        try {
+          latestActivity = await syncGroupActivity(activeGroup.group_id);
+        } catch (cause) {
+          if (!isSupersededLoading(cause)) latestActivityError = cause;
+        }
+      }
       const reconciled = await noise<LocalSummary>({ action: "status" });
       if (generation !== refreshGeneration.current) return;
-      if (nextConversation) {
-        groupConversationCache.current.set(nextConversation.group.group_id, nextConversation);
-        dirtyGroupIds.current.delete(nextConversation.group.group_id);
-        setConversation(nextConversation);
+      if (latestActivity?.conversation) {
+        groupConversationCache.current.set(
+          activeGroup.group_id,
+          latestActivity.conversation,
+        );
+        dirtyGroupIds.current.delete(activeGroup.group_id);
+        setConversation(latestActivity.conversation);
+        setSummary(latestActivity.summary);
+      } else {
+        setSummary(reconciled);
+        if (!cached && latestActivityError) throw latestActivityError;
       }
-      setSummary(reconciled);
       if (needsReadBaseline) {
-        void noise<LocalSummary>({ action: "sync_account", relays })
+        void noise<LocalSummary>({
+          action: "sync_account",
+          relays,
+          interruptible: true,
+        })
           .then((synced) => {
             if (synced) setSummary(synced);
           })
@@ -1122,8 +1659,45 @@ export default function App() {
       return;
     }
 
+    setSummary(local);
+    setLoading(false);
     await syncDirectInbox(true);
   }, [sidebarMode, syncDirectInbox]);
+
+  const loadOlderGroupHistory = useCallback(async (groupId: string) => {
+    try {
+      const expanded = await noise<Conversation>({
+        action: "load_older_group_history",
+        group_id: groupId,
+        relays,
+      });
+      if (!expanded) return;
+      groupConversationCache.current.set(groupId, expanded);
+      setConversation((current) =>
+        current?.group.group_id === groupId ? expanded : current
+      );
+    } catch (cause) {
+      setError(message(cause));
+    }
+  }, []);
+
+  const loadOlderTopicHistory = useCallback(async (groupId: string, topicId: string) => {
+    try {
+      const expanded = await noise<Conversation>({
+        action: "load_older_topic_history",
+        group_id: groupId,
+        topic_id: topicId,
+        relays,
+      });
+      if (!expanded) return;
+      groupConversationCache.current.set(groupId, expanded);
+      setConversation((current) =>
+        current?.group.group_id === groupId ? expanded : current
+      );
+    } catch (cause) {
+      setError(message(cause));
+    }
+  }, []);
 
   useEffect(() => {
     if (!summary) {
@@ -1172,7 +1746,9 @@ export default function App() {
 
   useEffect(() => {
     void refresh()
-      .catch((cause) => setError(message(cause)))
+      .catch((cause) => {
+        if (!isSupersededLoading(cause)) setError(message(cause));
+      })
       .finally(() => setLoading(false));
   }, [refresh]);
 
@@ -1191,8 +1767,13 @@ export default function App() {
   const activeGroupId = activeGroup?.group_id ?? null;
   const activeDirectPublicKey = summary?.directs.find((direct) => direct.is_active)?.public_key ?? null;
   const markCurrentGroupRead = useCallback(() => {
-    if (activeGroupId) void markActiveGroupRead(activeGroupId);
-  }, [activeGroupId, markActiveGroupRead]);
+    if (!activeGroupId) return;
+    if (activeTopicId) {
+      void markActiveTopicRead(activeGroupId, activeTopicId);
+    } else {
+      void markActiveGroupRead(activeGroupId);
+    }
+  }, [activeGroupId, activeTopicId, markActiveGroupRead, markActiveTopicRead]);
   const activeGroupBackground = sidebarMode === "groups" ? activeGroup?.background ?? null : null;
   const activeAccentStyle = accentStyle(sidebarMode === "groups" ? activeGroup?.accent_color : null);
   const appBackgroundSource = useProfileImageSource(activeGroupBackground);
@@ -1206,6 +1787,12 @@ export default function App() {
     const groups = summary.groups
       .filter((group) => sidebarMode !== "groups" || group.group_id !== activeGroupId);
     let stopped = false;
+    let initialSyncQueue = Promise.resolve();
+    const syncInitialGroup = (groupId: string) => {
+      const task = initialSyncQueue.then(() => syncGroupActivity(groupId));
+      initialSyncQueue = task.then(() => undefined, () => undefined);
+      return task;
+    };
     const watch = async (group: GroupSummary) => {
       let revision: number | null = groupWatchRevisions.current.get(group.group_id) ?? null;
       while (!stopped) {
@@ -1226,16 +1813,54 @@ export default function App() {
           );
           if (initial || change.changed) {
             if (!initial && change.changed) dirtyGroupIds.current.add(group.group_id);
-            const activity = await syncGroupActivity(group.group_id);
+            const activity = initial
+              ? await syncInitialGroup(group.group_id)
+              : await syncGroupActivity(group.group_id);
             if (!stopped && activity) {
               if (activity.conversation) {
                 groupConversationCache.current.set(group.group_id, activity.conversation);
                 dirtyGroupIds.current.delete(group.group_id);
               }
               setSummary(activity.summary);
+              if (!initial && change.changed) {
+                const topicSource = activity.conversation
+                  ?? groupConversationCache.current.get(group.group_id);
+                const preferredTopicId = desiredGroupIdRef.current === group.group_id
+                  ? activeTopicIdRef.current
+                  : null;
+                const topicIds = (topicSource?.topics ?? [])
+                  .filter((topic) => !topic.archived)
+                  .map((topic) => topic.topic_id)
+                  .sort((left, right) =>
+                    Number(right === preferredTopicId) - Number(left === preferredTopicId)
+                  );
+                for (const topicId of topicIds) {
+                  try {
+                    const topicActivity = await syncTopicActivity(group.group_id, topicId);
+                    if (stopped || !topicActivity) break;
+                    setSummary(topicActivity.summary);
+                    if (topicActivity.conversation) {
+                      groupConversationCache.current.set(
+                        group.group_id,
+                        topicActivity.conversation,
+                      );
+                      if (desiredGroupIdRef.current === group.group_id) {
+                        setConversation(topicActivity.conversation);
+                      }
+                    }
+                  } catch {
+                    // Topic streams retry on the next group revision or when opened.
+                  }
+                }
+              }
+              if (initial) scheduleAccountCacheSync();
             }
             if (initial && !group.read_state_initialized) {
-              void noise<LocalSummary>({ action: "sync_account", relays })
+              void noise<LocalSummary>({
+                action: "sync_account",
+                relays,
+                interruptible: true,
+              })
                 .then((synced) => {
                   if (!stopped && synced) setSummary(synced);
                 })
@@ -1253,7 +1878,14 @@ export default function App() {
     return () => {
       stopped = true;
     };
-  }, [activeGroupId, groupWatchKey, identityPublicKey, sidebarMode, updatePresenceScope]);
+  }, [
+    activeGroupId,
+    groupWatchKey,
+    identityPublicKey,
+    scheduleAccountCacheSync,
+    sidebarMode,
+    updatePresenceScope,
+  ]);
 
   useEffect(() => {
     if (sidebarMode !== "groups" || !activeGroupId) return;
@@ -1304,9 +1936,15 @@ export default function App() {
           revision = change.revision;
           updatePresenceScope("directs", presenceStatusesFromWatch(change));
           if (initial) {
-            await syncDirectInbox(sidebarModeRef.current === "directs");
+            await syncDirectInbox(
+              sidebarModeRef.current === "directs",
+              true,
+            );
           } else if (change.changed) {
-            await syncDirectInbox(sidebarModeRef.current === "directs");
+            await syncDirectInbox(
+              sidebarModeRef.current === "directs",
+              true,
+            );
           }
         } catch {
           await new Promise((resolve) => window.setTimeout(resolve, 1500));
@@ -1341,6 +1979,40 @@ export default function App() {
     return () => { stopped = true; };
   }, [identityPublicKey, summary?.identity.noise_id]);
 
+  const resetLocalSession = useCallback(() => {
+    refreshGeneration.current += 1;
+    if (accountCacheSyncTimer.current !== null) {
+      window.clearTimeout(accountCacheSyncTimer.current);
+      accountCacheSyncTimer.current = null;
+    }
+    groupSelectionInFlight.current = false;
+    desiredGroupIdRef.current = null;
+    desiredDirectPublicKeyRef.current = null;
+    groupConversationCache.current.clear();
+    directConversationCache.current.clear();
+    dirtyGroupIds.current.clear();
+    groupWatchRevisions.current.clear();
+    groupReadInFlight.current.clear();
+    presenceScopes.current.clear();
+    mediaLoadScheduler.cancelQueued();
+    clearMediaMemoryCache();
+    clearProfileImageMemoryCache();
+    setOptimisticGroupMessages(new Map());
+    setOptimisticDirectMessages(new Map());
+    setPresenceStatuses(new Map());
+    setPendingGroupId(null);
+    setPendingTopicId(null);
+    setActiveTopicId(null);
+    setGroupEncryption(null);
+    setConversation(null);
+    setDirectConversation(null);
+    setGroupMenu(null);
+    setDirectMenu(null);
+    setSidebarMode("groups");
+    setDialog(null);
+    setSummary(null);
+  }, []);
+
   async function perform(operation: () => Promise<void>, syncAccount = true) {
     if (busy) return false;
     setBusy(true);
@@ -1355,6 +2027,129 @@ export default function App() {
     } finally {
       setBusy(false);
     }
+  }
+
+  function applySavedGroup(local: LocalSummary, groupId: string) {
+    setSummary(local);
+    const updatedGroup = local.groups.find((group) => group.group_id === groupId);
+    if (updatedGroup) {
+      setConversation((current) => {
+        if (current?.group.group_id !== groupId) return current;
+        const updatedConversation = { ...current, group: updatedGroup };
+        groupConversationCache.current.set(groupId, updatedConversation);
+        return updatedConversation;
+      });
+    }
+    setDialog(null);
+    void noise({
+      action: "sync_account",
+      relays,
+      interruptible: true,
+    }).catch(() => {
+      // The relay-confirmed settings are already durable locally. Account
+      // backup retries normally and must not hold the settings dialog open.
+    });
+  }
+
+  function applyTopicActivityResult(result: GroupActivityResult, groupId: string) {
+    setSummary(result.summary);
+    if (result.conversation) {
+      groupConversationCache.current.set(groupId, result.conversation);
+      setConversation((current) =>
+        current?.group.group_id === groupId ? result.conversation : current
+      );
+    }
+  }
+
+  async function reorderTopics(groupId: string, topicIds: string[]) {
+    let previousTopics: TopicSummary[] | null = null;
+    setConversation((current) => {
+      if (current?.group.group_id !== groupId) return current;
+      previousTopics = current.topics;
+      const byId = new Map(current.topics.map((topic) => [topic.topic_id, topic]));
+      const reordered = topicIds
+        .map((topicId) => byId.get(topicId))
+        .filter((topic): topic is TopicSummary => Boolean(topic));
+      const next = {
+        ...current,
+        topics: [...reordered, ...current.topics.filter((topic) => topic.archived)],
+      };
+      groupConversationCache.current.set(groupId, next);
+      return next;
+    });
+    try {
+      const result = await noise<GroupActivityResult>({
+        action: "reorder_topics",
+        topic_ids: topicIds,
+        relays,
+      });
+      if (!result) throw new Error("the relay did not confirm the topic order");
+      applyTopicActivityResult(result, groupId);
+    } catch (cause) {
+      if (previousTopics) {
+        setConversation((current) => {
+          if (current?.group.group_id !== groupId) return current;
+          const restored = { ...current, topics: previousTopics! };
+          groupConversationCache.current.set(groupId, restored);
+          return restored;
+        });
+      }
+      setError(message(cause));
+    }
+  }
+
+  function applySavedIdentity(local: LocalSummary) {
+    const identity = local.identity;
+    const updateMessage = (item: MessageSummary): MessageSummary =>
+      item.author_public_key === identity.public_key
+        ? {
+            ...item,
+            username: identity.username,
+            bio: identity.bio,
+            avatar: identity.avatar,
+            album: identity.album,
+            accepts_direct_messages: identity.accepts_direct_messages,
+          }
+        : item;
+    const updateGroupConversation = (current: Conversation): Conversation => ({
+      ...current,
+      members: current.members.map((member) =>
+        member.public_key === identity.public_key
+          ? {
+              ...member,
+              username: identity.username,
+              bio: identity.bio,
+              avatar: identity.avatar,
+              album: identity.album,
+              accepts_direct_messages: identity.accepts_direct_messages,
+            }
+          : member
+      ),
+      messages: current.messages.map(updateMessage),
+    });
+    const updateDirectConversation = (current: DirectConversation): DirectConversation => ({
+      ...current,
+      messages: current.messages.map(updateMessage),
+    });
+
+    setSummary(local);
+    for (const [groupId, cached] of groupConversationCache.current) {
+      groupConversationCache.current.set(groupId, updateGroupConversation(cached));
+    }
+    for (const [publicKey, cached] of directConversationCache.current) {
+      directConversationCache.current.set(publicKey, updateDirectConversation(cached));
+    }
+    setConversation((current) => current ? updateGroupConversation(current) : current);
+    setDirectConversation((current) => current ? updateDirectConversation(current) : current);
+    setDialog(null);
+    void noise({
+      action: "sync_account",
+      relays,
+      interruptible: true,
+    }).catch(() => {
+      // The public profile update is already saved and published. Encrypted
+      // account backup retries independently.
+    });
   }
 
   async function updateBlock(person: PersonSummary, blocked: boolean) {
@@ -1384,7 +2179,12 @@ export default function App() {
   }
 
   async function selectGroup(group: GroupSummary) {
-    if (group.group_id === activeGroupId && !pendingGroupId) return;
+    topicSelectionGeneration.current += 1;
+    setActiveTopicId(null);
+    setPendingTopicId(null);
+    if (group.group_id === activeGroupId && !pendingGroupId) {
+      if (conversation?.group.group_id === group.group_id) return;
+    }
     const previousGroupId = activeGroupId;
     const needsReadBaseline = !group.read_state_initialized;
     const generation = ++refreshGeneration.current;
@@ -1394,6 +2194,12 @@ export default function App() {
     setGroupEncryption(null);
 
     try {
+      await cancelBackgroundLoading();
+      if (previousGroupId !== group.group_id) {
+        await cancelMediaDownloads();
+        await cancelGroupLoading();
+      }
+
       let cached = groupConversationCache.current.get(group.group_id);
       if (!cached) {
         cached = await noise<Conversation>({
@@ -1403,7 +2209,6 @@ export default function App() {
         if (generation !== refreshGeneration.current) return;
         if (cached) {
           groupConversationCache.current.set(group.group_id, cached);
-          dirtyGroupIds.current.add(group.group_id);
         }
       }
       if (cached) {
@@ -1420,64 +2225,20 @@ export default function App() {
 
       const local = await noise<LocalSummary>({ action: "select_group", group_id: group.group_id });
       if (generation !== refreshGeneration.current) return;
-      if (cached) {
-        setSummary(local);
-        if (!dirtyGroupIds.current.has(group.group_id)) {
-          if (needsReadBaseline) {
-            void noise<LocalSummary>({ action: "sync_account", relays })
-              .then((synced) => {
-                if (synced) setSummary(synced);
-              })
-              .catch(() => {
-                // The cached conversation is already usable; account sync retries normally.
-              });
-          }
-          return;
-        }
-      }
-      const encryption = await syncGroupEncryption();
-      if (generation !== refreshGeneration.current) return;
-      if (encryption?.phase === "removed") {
-        const reconciled = await noise<LocalSummary>({ action: "status" });
-        if (generation !== refreshGeneration.current) return;
-        desiredGroupIdRef.current = reconciled?.groups.find((candidate) => candidate.is_active)?.group_id
-          ?? previousGroupId;
-        setConversation(null);
-        setGroupEncryption(null);
-        setSummary(reconciled);
-        return;
-      }
-      if (
-        encryption?.phase === "waiting_for_admission"
-        || encryption?.phase === "waiting_for_device"
-      ) {
-        desiredGroupIdRef.current = group.group_id;
-        setSummary(local);
-        setGroupEncryption(encryption);
-        setConversation(null);
-        return;
-      }
-      const fresh = await noise<Conversation>({ action: "conversation", relays });
-      const reconciled = await noise<LocalSummary>({ action: "status" });
-      if (generation !== refreshGeneration.current) return;
-      if (!fresh || fresh.group.group_id !== group.group_id) {
-        throw new Error("the selected group did not return its conversation");
-      }
-      groupConversationCache.current.set(fresh.group.group_id, fresh);
-      dirtyGroupIds.current.delete(fresh.group.group_id);
       desiredGroupIdRef.current = group.group_id;
-      setConversation(fresh);
-      setGroupEncryption(encryption);
-      setSummary(reconciled);
-      if (needsReadBaseline) {
-        void noise<LocalSummary>({ action: "sync_account", relays })
-          .then((synced) => {
-            if (synced) setSummary(synced);
-          })
-          .catch(() => {
-            // The local baseline is durable; encrypted cross-device sync retries normally.
-          });
-      }
+      setSummary(local);
+
+      // Navigation is complete once the durable local selection and cache are
+      // visible. Relay and encryption reconciliation must never extend a click.
+      groupSelectionInFlight.current = false;
+      setPendingGroupId(null);
+      void hydrateSelectedGroup(
+        group,
+        generation,
+        needsReadBaseline,
+        Boolean(cached),
+        previousGroupId,
+      );
     } catch (cause) {
       if (generation === refreshGeneration.current) {
         desiredGroupIdRef.current = previousGroupId;
@@ -1495,11 +2256,110 @@ export default function App() {
     }
   }
 
+  async function selectTopic(topic: TopicSummary | null) {
+    if (!activeGroupId || !conversation || conversation.group.group_id !== activeGroupId) return;
+    const topicId = topic?.topic_id ?? null;
+    const generation = ++topicSelectionGeneration.current;
+    setActiveTopicId(topicId);
+    setPendingTopicId(topicId);
+    setError(null);
+    if (!topicId) {
+      setPendingTopicId(null);
+      void markActiveGroupRead(activeGroupId);
+      return;
+    }
+    try {
+      await cancelBackgroundLoading();
+      const activity = await syncTopicActivity(activeGroupId, topicId);
+      if (generation !== topicSelectionGeneration.current
+        || desiredGroupIdRef.current !== activeGroupId) return;
+      if (activity) {
+        setSummary(activity.summary);
+        if (activity.conversation) {
+          groupConversationCache.current.set(activeGroupId, activity.conversation);
+          setConversation(activity.conversation);
+        }
+      }
+      void markActiveTopicRead(activeGroupId, topicId);
+    } catch (cause) {
+      if (generation === topicSelectionGeneration.current && !isSupersededLoading(cause)) {
+        setError(message(cause));
+      }
+    } finally {
+      if (generation === topicSelectionGeneration.current) setPendingTopicId(null);
+    }
+  }
+
+  async function hydrateSelectedGroup(
+    group: GroupSummary,
+    generation: number,
+    needsReadBaseline: boolean,
+    hasCachedConversation: boolean,
+    previousGroupId: string | null,
+  ) {
+    try {
+      const encryption = await syncGroupEncryption();
+      if (generation !== refreshGeneration.current) return;
+      setGroupEncryption(encryption);
+      if (encryption?.phase === "removed") {
+        const reconciled = await noise<LocalSummary>({ action: "status" });
+        if (generation !== refreshGeneration.current) return;
+        desiredGroupIdRef.current = reconciled?.groups.find((candidate) => candidate.is_active)?.group_id
+          ?? previousGroupId;
+        setConversation(null);
+        setGroupEncryption(null);
+        setSummary(reconciled);
+        return;
+      }
+      if (encryption && encryption.phase !== "active") {
+        // Cached history remains readable while secure sending is restored.
+        // A group without cache shows the explicit recovery state.
+        return;
+      }
+
+      const activity = await syncGroupActivity(group.group_id);
+      if (generation !== refreshGeneration.current) return;
+      if (activity) {
+        setSummary(activity.summary);
+        if (activity.conversation) {
+          groupConversationCache.current.set(group.group_id, activity.conversation);
+          dirtyGroupIds.current.delete(group.group_id);
+          setConversation(activity.conversation);
+        }
+      } else if (!hasCachedConversation) {
+        throw new Error("the selected group has no locally available conversation");
+      }
+
+      if (needsReadBaseline) {
+        void noise<LocalSummary>({
+          action: "sync_account",
+          relays,
+          interruptible: true,
+        })
+          .then((synced) => {
+            if (generation === refreshGeneration.current && synced) setSummary(synced);
+          })
+          .catch((cause) => {
+            if (!isSupersededLoading(cause)) {
+              // The local baseline is durable; a later account sync retries it.
+            }
+          });
+      }
+    } catch (cause) {
+      if (generation === refreshGeneration.current && !isSupersededLoading(cause)) {
+        setError(message(cause));
+      }
+    }
+  }
+
   async function selectDirect(direct: DirectSummary) {
     if (desiredDirectPublicKeyRef.current === direct.public_key && direct.is_active) return;
     const generation = ++refreshGeneration.current;
     desiredDirectPublicKeyRef.current = direct.public_key;
     setError(null);
+    await cancelMediaDownloads();
+    await cancelGroupLoading();
+    await cancelBackgroundLoading();
     const cached = directConversationCache.current.get(direct.public_key);
     if (cached) setDirectConversation(cached);
     setSummary((current) => current ? {
@@ -1527,7 +2387,11 @@ export default function App() {
         setDirectConversation(fresh);
       }
       setSummary(reconciled);
-      void noise({ action: "sync_account", relays }).catch(() => {
+      void noise({
+        action: "sync_account",
+        relays,
+        interruptible: true,
+      }).catch(() => {
         // The thread is already read locally; cross-device sync retries normally.
       });
     } catch (cause) {
@@ -1576,13 +2440,18 @@ export default function App() {
         setError(message(cause));
       }
     })();
-    void noise({ action: "sync_account", relays }).catch(() => {
+    void noise({
+      action: "sync_account",
+      relays,
+      interruptible: true,
+    }).catch(() => {
       // The DM is already available locally; encrypted account sync retries normally.
     });
   }
 
   async function switchSidebarMode(nextMode: SidebarMode) {
     if (nextMode === sidebarMode) return;
+    await cancelMediaDownloads();
     if (nextMode === "groups") {
       setSidebarMode("groups");
       return;
@@ -1644,7 +2513,11 @@ export default function App() {
         onSignIn={(noiseId, password) =>
           perform(async () => {
             const local = await noise<LocalSummary>({ action: "sign_in", noise_id: noiseId, password, relays });
-            setSummary(local);
+            desiredGroupIdRef.current =
+              local?.groups.find((group) => group.is_active)?.group_id ?? null;
+            desiredDirectPublicKeyRef.current =
+              local?.directs.find((direct) => direct.is_active)?.public_key ?? null;
+            await refresh();
           })
         }
       />
@@ -1655,15 +2528,26 @@ export default function App() {
   }
 
   const selectedConversationState = conversation?.group.group_id === activeGroupId ? conversation : null;
+  const selectedTopic = activeTopicId
+    ? selectedConversationState?.topics.find(
+        (topic) => topic.topic_id === activeTopicId && !topic.archived,
+      ) ?? null
+    : null;
+  const effectiveTopicId = selectedTopic?.topic_id ?? null;
   const selectedGroupPending = activeGroupId ? optimisticGroupMessages.get(activeGroupId) ?? [] : [];
   const selectedConversation = selectedConversationState ? {
     ...selectedConversationState,
     messages: [
-      ...selectedConversationState.messages,
+      ...selectedConversationState.messages.filter(
+        (item) => (item.topic_id ?? null) === effectiveTopicId,
+      ),
       ...selectedGroupPending.filter((pending) =>
-        !selectedConversationState.messages.some((item) => item.event_id === pending.event_id)
+        (pending.topic_id ?? null) === effectiveTopicId
+        && !selectedConversationState.messages.some((item) => item.event_id === pending.event_id)
       ),
     ],
+    has_older_messages: selectedTopic?.has_older_messages
+      ?? selectedConversationState.has_older_messages,
   } : null;
   const selectedDirectConversationState = directConversation?.contact.public_key === activeDirectPublicKey
     ? directConversation
@@ -1703,8 +2587,11 @@ export default function App() {
       {appBackgroundSource && <div className="group-app-background" style={{ backgroundImage: `url(${JSON.stringify(appBackgroundSource)})` }} aria-hidden="true" />}
         <Sidebar
         summary={visibleSummary}
+        conversation={selectedConversationState}
         mode={sidebarMode}
         pendingGroupId={pendingGroupId}
+        pendingTopicId={pendingTopicId}
+        activeTopicId={effectiveTopicId}
         directPresenceStatuses={presenceStatuses}
         selfPresenceStatus={selfPresenceStatus}
         onMode={(mode) => void switchSidebarMode(mode)}
@@ -1716,6 +2603,10 @@ export default function App() {
         }}
         onDirectContextMenu={(direct, x, y) => setDirectMenu({ direct, x, y })}
         onSelect={(group) => void selectGroup(group)}
+        onSelectTopic={(topic) => void selectTopic(topic)}
+        onCreateTopic={(group) => setDialog({ type: "create_topic", group })}
+        onManageTopic={(group, topic) => setDialog({ type: "topic", group, topic })}
+        onReorderTopics={(group, topicIds) => reorderTopics(group.group_id, topicIds)}
         onSelectDirect={(direct) => void selectDirect(direct)}
       />
 
@@ -1723,15 +2614,23 @@ export default function App() {
         <section className={`mode-pane ${sidebarMode === "groups" ? "active" : "inactive"}`} aria-hidden={sidebarMode !== "groups"}>
           {selectedConversation ? (
             <ConversationPanel
-              key={selectedConversation.group.group_id}
+              key={`${selectedConversation.group.group_id}:${effectiveTopicId ?? "general"}`}
               conversation={selectedConversation}
+              topic={selectedTopic}
               busy={busy || pendingGroupId === selectedConversation.group.group_id}
               hasBackground={Boolean(appBackgroundSource)}
               canEditGroup={selectedConversation.group.owner_public_key === summary.identity.public_key}
-              unreadCount={activeGroup?.unread_count ?? 0}
+              unreadCount={selectedTopic?.unread_count ?? selectedConversation.general_unread_count}
               selfPublicKey={summary.identity.public_key}
               presenceStatuses={selectedPresenceStatuses}
               onGroupSettings={() => setDialog({ type: "group", group: selectedConversation.group })}
+              onTopicSettings={selectedTopic
+                ? () => setDialog({
+                    type: "topic",
+                    group: selectedConversation.group,
+                    topic: selectedTopic,
+                  })
+                : undefined}
               onReports={() => setDialog({ type: "reports" })}
               onMedia={() => setDialog({ type: "media" })}
               onRules={() => setDialog({ type: "rules", group: selectedConversation.group })}
@@ -1788,10 +2687,21 @@ export default function App() {
               onBan={(member) => setDialog({ type: "ban_member", member })}
               onReport={(message) => setDialog({ type: "report_message", message })}
               onReachedBottom={markCurrentGroupRead}
+              onLoadOlder={() =>
+                selectedTopic
+                  ? loadOlderTopicHistory(
+                      selectedConversation.group.group_id,
+                      selectedTopic.topic_id,
+                    )
+                  : loadOlderGroupHistory(selectedConversation.group.group_id)
+              }
               onSend={async (text, pending, onProgress, replyToMessageId, signal) => {
                 const groupId = selectedConversation.group.group_id;
-                const optimistic = optimisticMessage(summary.identity, text, pending, replyToMessageId);
-                if (!pending) addOptimisticGroupMessage(groupId, optimistic);
+                let optimistic = pending
+                  ? null
+                  : await optimisticMessage(summary.identity, text, null, replyToMessageId);
+                if (optimistic) optimistic = { ...optimistic, topic_id: effectiveTopicId };
+                if (optimistic) addOptimisticGroupMessage(groupId, optimistic);
                 let attachment: MediaAttachment | null = null;
                 let result: SentMessageResult | null = null;
                 const sent = await perform(async () => {
@@ -1802,32 +2712,40 @@ export default function App() {
                     text,
                     attachment,
                     reply_to_message_id: replyToMessageId,
+                    topic_id: effectiveTopicId,
                     relays,
                   });
                   if (!result) throw new Error("the relay did not confirm the message");
                 }, false);
                 if (!sent || !result) {
-                  if (pending) releaseOptimisticPreview(optimistic);
-                  else removeOptimisticGroupMessage(groupId, optimistic.event_id);
+                  if (optimistic) removeOptimisticGroupMessage(groupId, optimistic.event_id);
                   return false;
                 }
                 const confirmed = result as SentMessageResult;
-                if (pending) addOptimisticGroupMessage(groupId, optimistic);
-                if (attachment && optimistic.local_attachment) {
-                  mediaCache.set(mediaCacheKey(attachment), optimistic.local_attachment.preview_url);
+                const confirmedAttachment = attachment as MediaAttachment | null;
+                if (pending) {
+                  optimistic = await optimisticMessage(summary.identity, text, pending, replyToMessageId);
+                  optimistic = { ...optimistic, topic_id: effectiveTopicId };
+                  addOptimisticGroupMessage(groupId, optimistic);
+                }
+                if (!optimistic) return false;
+                if (confirmedAttachment && optimistic.local_attachment && !confirmedAttachment.mime_type.startsWith("video/")) {
+                  mediaCache.set(mediaCacheKey(confirmedAttachment), optimistic.local_attachment.preview_url);
                   sentMediaPreviewCache.set(confirmed.event_id, optimistic.local_attachment);
                 }
-                confirmOptimisticGroupMessage(groupId, optimistic.event_id, confirmed, attachment);
+                confirmOptimisticGroupMessage(groupId, optimistic.event_id, confirmed, confirmedAttachment);
                 void refresh().catch((cause) => setError(message(cause)));
-                void noise({ action: "sync_account", relays }).catch(() => undefined);
+                void noise({
+                  action: "sync_account",
+                  relays,
+                  interruptible: true,
+                }).catch(() => undefined);
                 return true;
               }}
             />
           ) : activeGroupId && groupEncryption?.group_id === activeGroupId
-            && (
-              groupEncryption.phase === "waiting_for_admission"
-              || groupEncryption.phase === "waiting_for_device"
-            ) ? (
+            && groupEncryption.phase !== "active"
+            && groupEncryption.phase !== "removed" ? (
               <EncryptionPending phase={groupEncryption.phase} />
             ) : activeGroupId ? <Loading /> : (
             <EmptyGroup
@@ -1856,8 +2774,10 @@ export default function App() {
               }, false)}
               onSend={async (text, pending, onProgress, replyToMessageId, signal) => {
                 const publicKey = selectedDirectConversation.contact.public_key;
-                const optimistic = optimisticMessage(summary.identity, text, pending, replyToMessageId);
-                if (!pending) addOptimisticDirectMessage(publicKey, optimistic);
+                let optimistic = pending
+                  ? null
+                  : await optimisticMessage(summary.identity, text, null, replyToMessageId);
+                if (optimistic) addOptimisticDirectMessage(publicKey, optimistic);
                 let attachment: MediaAttachment | null = null;
                 let result: SentMessageResult | null = null;
                 const sent = await perform(async () => {
@@ -1873,19 +2793,27 @@ export default function App() {
                   if (!result) throw new Error("the relay did not confirm the message");
                 }, false);
                 if (!sent || !result) {
-                  if (pending) releaseOptimisticPreview(optimistic);
-                  else removeOptimisticDirectMessage(publicKey, optimistic.event_id);
+                  if (optimistic) removeOptimisticDirectMessage(publicKey, optimistic.event_id);
                   return false;
                 }
                 const confirmed = result as SentMessageResult;
-                if (pending) addOptimisticDirectMessage(publicKey, optimistic);
-                if (attachment && optimistic.local_attachment) {
-                  mediaCache.set(mediaCacheKey(attachment), optimistic.local_attachment.preview_url);
+                const confirmedAttachment = attachment as MediaAttachment | null;
+                if (pending) {
+                  optimistic = await optimisticMessage(summary.identity, text, pending, replyToMessageId);
+                  addOptimisticDirectMessage(publicKey, optimistic);
+                }
+                if (!optimistic) return false;
+                if (confirmedAttachment && optimistic.local_attachment && !confirmedAttachment.mime_type.startsWith("video/")) {
+                  mediaCache.set(mediaCacheKey(confirmedAttachment), optimistic.local_attachment.preview_url);
                   sentMediaPreviewCache.set(confirmed.event_id, optimistic.local_attachment);
                 }
-                confirmOptimisticDirectMessage(publicKey, optimistic.event_id, confirmed, attachment);
+                confirmOptimisticDirectMessage(publicKey, optimistic.event_id, confirmed, confirmedAttachment);
                 void refresh().catch((cause) => setError(message(cause)));
-                void noise({ action: "sync_account", relays }).catch(() => undefined);
+                void noise({
+                  action: "sync_account",
+                  relays,
+                  interruptible: true,
+                }).catch(() => undefined);
                 return true;
               }}
             />
@@ -1964,11 +2892,67 @@ export default function App() {
                 accepts_direct_messages: acceptsDirectMessages,
                 relays,
               });
-              setSummary(local);
-              await refresh();
-              setDialog(null);
-            })
+              if (!local) throw new Error("the relay did not return the updated profile");
+              applySavedIdentity(local);
+            }, false)
           }
+        />
+      )}
+      {dialog?.type === "create_topic" && (
+        <CreateTopicDialog
+          busy={busy}
+          onClose={() => setDialog(null)}
+          onCreate={(name, icon) => perform(async () => {
+            const existingIds = new Set(
+              conversation?.group.group_id === dialog.group.group_id
+                ? conversation.topics.map((topic) => topic.topic_id)
+                : [],
+            );
+            const result = await noise<GroupActivityResult>({
+              action: "create_topic",
+              name,
+              icon,
+              relays,
+            });
+            if (!result) throw new Error("the relay did not return the new topic");
+            applyTopicActivityResult(result, dialog.group.group_id);
+            const created = result.conversation?.topics.find(
+              (topic) => !existingIds.has(topic.topic_id),
+            );
+            if (created) setActiveTopicId(created.topic_id);
+            setDialog(null);
+          }, false)}
+        />
+      )}
+      {dialog?.type === "topic" && (
+        <TopicSettingsDialog
+          topic={dialog.topic}
+          busy={busy}
+          onClose={() => setDialog(null)}
+          onSave={(name, icon, locked) => perform(async () => {
+            const result = await noise<GroupActivityResult>({
+              action: "update_topic",
+              topic_id: dialog.topic.topic_id,
+              name,
+              icon,
+              locked,
+              relays,
+            });
+            if (!result) throw new Error("the relay did not return the updated topic");
+            applyTopicActivityResult(result, dialog.group.group_id);
+            setDialog(null);
+          }, false)}
+          onArchive={() => perform(async () => {
+            const result = await noise<GroupActivityResult>({
+              action: "archive_topic",
+              topic_id: dialog.topic.topic_id,
+              relays,
+            });
+            if (!result) throw new Error("the relay did not confirm the archive");
+            applyTopicActivityResult(result, dialog.group.group_id);
+            if (activeTopicId === dialog.topic.topic_id) setActiveTopicId(null);
+            setDialog(null);
+          }, false)}
         />
       )}
       {dialog?.type === "group" && (
@@ -2011,10 +2995,9 @@ export default function App() {
                 members_can_send_media: membersCanSendMedia,
                 relays,
               });
-              setSummary(local);
-              await refresh();
-              setDialog(null);
-            })
+              if (!local) throw new Error("the relay did not return the updated group");
+              applySavedGroup(local, dialog.group.group_id);
+            }, false)
           }
         />
       )}
@@ -2036,10 +3019,9 @@ export default function App() {
                 remove_avatar: false,
                 relays,
               });
-              setSummary(local);
-              await refresh();
-              setDialog(null);
-            })
+              if (!local) throw new Error("the relay did not return the updated group");
+              applySavedGroup(local, dialog.group.group_id);
+            }, false)
           }
         />
       )}
@@ -2068,15 +3050,45 @@ export default function App() {
           scopeId={dialog.scopeId}
           busy={busy}
           onClose={() => setDialog(null)}
-          onDelete={() => perform(async () => {
-            await noise({
-              action: "delete_message",
-              message_event_id: dialog.message.event_id,
-              relays,
-            });
-            await refresh();
+          onDelete={async () => {
+            const groupId = dialog.scopeId;
+            const messageEventId = dialog.message.event_id;
+            const previous = groupConversationCache.current.get(groupId)
+              ?? (conversation?.group.group_id === groupId ? conversation : null);
+            if (previous) {
+              const optimistic = withoutMessage(previous, messageEventId);
+              groupConversationCache.current.set(groupId, optimistic);
+              setConversation((current) =>
+                current?.group.group_id === groupId
+                  ? withoutMessage(current, messageEventId)
+                  : current
+              );
+            }
             setDialog(null);
-          })}
+
+            try {
+              await noise({
+                action: "delete_message",
+                message_event_id: messageEventId,
+                relays,
+              });
+              return true;
+            } catch (cause) {
+              setError(message(cause));
+              if (!previous) return false;
+              const cached = groupConversationCache.current.get(groupId) ?? previous;
+              groupConversationCache.current.set(
+                groupId,
+                restoreMessage(cached, previous, messageEventId),
+              );
+              setConversation((current) =>
+                current?.group.group_id === groupId
+                  ? restoreMessage(current, previous, messageEventId)
+                  : current
+              );
+              return false;
+            }
+          }}
         />
       )}
       {dialog?.type === "reports" && conversation && (
@@ -2187,15 +3199,7 @@ export default function App() {
               delete_direct_threads: deleteDirectThreads,
               relays,
             });
-            refreshGeneration.current += 1;
-            clearMediaMemoryCache();
-            clearProfileImageMemoryCache();
-            groupConversationCache.current.clear();
-            directConversationCache.current.clear();
-            setConversation(null);
-            setDirectConversation(null);
-            setDialog(null);
-            setSummary(null);
+            resetLocalSession();
           }, false)}
         />
       )}
@@ -2205,15 +3209,7 @@ export default function App() {
           onClose={() => setDialog({ type: "profile", profile: summary.identity })}
           onLogout={() => perform(async () => {
             await noise({ action: "logout" });
-            refreshGeneration.current += 1;
-            clearMediaMemoryCache();
-            clearProfileImageMemoryCache();
-            groupConversationCache.current.clear();
-            directConversationCache.current.clear();
-            setConversation(null);
-            setDirectConversation(null);
-            setDialog(null);
-            setSummary(null);
+            resetLocalSession();
           }, false)}
         />
       )}
@@ -2282,8 +3278,11 @@ export default function App() {
 
 function Sidebar({
   summary,
+  conversation,
   mode,
   pendingGroupId,
+  pendingTopicId,
+  activeTopicId,
   directPresenceStatuses,
   selfPresenceStatus,
   onMode,
@@ -2293,11 +3292,18 @@ function Sidebar({
   onContextMenu,
   onDirectContextMenu,
   onSelect,
+  onSelectTopic,
+  onCreateTopic,
+  onManageTopic,
+  onReorderTopics,
   onSelectDirect,
 }: {
   summary: LocalSummary;
+  conversation: Conversation | null;
   mode: SidebarMode;
   pendingGroupId: string | null;
+  pendingTopicId: string | null;
+  activeTopicId: string | null;
   directPresenceStatuses: Map<string, PresenceStatus>;
   selfPresenceStatus: PresenceStatus;
   onMode: (mode: SidebarMode) => void;
@@ -2307,9 +3313,27 @@ function Sidebar({
   onContextMenu: (group: GroupSummary, x: number, y: number) => void;
   onDirectContextMenu: (direct: DirectSummary, x: number, y: number) => void;
   onSelect: (group: GroupSummary) => void;
+  onSelectTopic: (topic: TopicSummary | null) => void;
+  onCreateTopic: (group: GroupSummary) => void;
+  onManageTopic: (group: GroupSummary, topic: TopicSummary) => void;
+  onReorderTopics: (group: GroupSummary, topicIds: string[]) => Promise<void>;
   onSelectDirect: (direct: DirectSummary) => void;
 }) {
   const hasUnreadDirects = summary.directs.some((direct) => direct.has_unread);
+  const canManageTopics = conversation?.group.owner_public_key === summary.identity.public_key
+    || conversation?.members.some(
+      (member) => member.public_key === summary.identity.public_key && member.is_moderator,
+    ) === true;
+  const canReorderTopics = conversation?.group.owner_public_key === summary.identity.public_key;
+  const [draggedTopicId, setDraggedTopicId] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<{ topicId: string; after: boolean } | null>(null);
+  const topicDrag = useRef<{ pointerId: number; topicId: string; startY: number; moved: boolean } | null>(null);
+  const dropTargetRef = useRef<{ topicId: string; after: boolean } | null>(null);
+  const suppressTopicClick = useRef(false);
+  const updateDropTarget = (target: { topicId: string; after: boolean } | null) => {
+    dropTargetRef.current = target;
+    setDropTarget(target);
+  };
   return (
     <aside className="sidebar">
       <div className="sidebar-drag" data-tauri-drag-region>
@@ -2324,28 +3348,154 @@ function Sidebar({
         <button className="square-button" onClick={onJoin} title="join group" aria-label="join group"><Radio size={16} /></button>
       </div>}
       <div className="group-list">
-        {mode === "groups" ? summary.groups.map((group) => (
-          <button
-            className={`group-row ${group.is_active ? "active" : ""} ${pendingGroupId === group.group_id ? "pending" : ""}`}
-            key={group.group_id}
-            onClick={() => onSelect(group)}
-            onContextMenu={(event) => {
-              event.preventDefault();
-              onContextMenu(group, event.clientX, event.clientY);
-            }}
-          >
-            <Avatar name={group.name} image={group.avatar} size={27} square />
-            <span>{group.name}</span>
-            {group.unread_count > 0 && (
-              <span
-                className="group-unread-count"
-                aria-label={`${group.unread_count} unread ${group.unread_count === 1 ? "message" : "messages"}`}
+        {mode === "groups" ? summary.groups.map((group) => {
+          const groupConversation = group.is_active
+            && conversation?.group.group_id === group.group_id
+            ? conversation
+            : null;
+          const topics = groupConversation?.topics.filter((topic) => !topic.archived) ?? [];
+          return (
+            <div className="group-entry" key={group.group_id}>
+              <button
+                className={`group-row ${group.is_active ? "active" : ""} ${pendingGroupId === group.group_id ? "pending" : ""}`}
+                onClick={() => onSelect(group)}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  onContextMenu(group, event.clientX, event.clientY);
+                }}
               >
-                {group.unread_count > 99 ? "99+" : group.unread_count}
-              </span>
-            )}
-          </button>
-        )) : summary.directs.map((direct) => (
+                <Avatar name={group.name} image={group.avatar} size={27} square />
+                <span>{group.name}</span>
+                {group.unread_count > 0 && (
+                  <span
+                    className="group-unread-count"
+                    aria-label={`${group.unread_count} unread ${group.unread_count === 1 ? "message" : "messages"}`}
+                  >
+                    {group.unread_count > 99 ? "99+" : group.unread_count}
+                  </span>
+                )}
+              </button>
+              {groupConversation && (
+                <div className="group-topics">
+                  <button
+                    className={`topic-row ${activeTopicId === null ? "active" : ""}`}
+                    onClick={() => onSelectTopic(null)}
+                  >
+                    <span className="topic-icon" aria-hidden="true">💬</span>
+                    <span>General</span>
+                    {groupConversation.general_unread_count > 0 && (
+                      <i>{groupConversation.general_unread_count > 99 ? "99+" : groupConversation.general_unread_count}</i>
+                    )}
+                  </button>
+                  {topics.map((topic) => (
+                    <div
+                      className={`topic-entry ${canReorderTopics ? "reorderable" : ""} ${draggedTopicId === topic.topic_id ? "dragging" : ""} ${dropTarget?.topicId === topic.topic_id ? `drop-target drop-${dropTarget.after ? "after" : "before"}` : ""}`}
+                      key={topic.topic_id}
+                      data-topic-id={topic.topic_id}
+                      data-group-id={group.group_id}
+                      onClick={(event) => {
+                        if ((event.target as Element).closest(".topic-manage")) return;
+                        if (suppressTopicClick.current) {
+                          event.preventDefault();
+                          return;
+                        }
+                        onSelectTopic(topic);
+                      }}
+                      onPointerDown={(event) => {
+                        if (
+                          !canReorderTopics
+                          || event.button !== 0
+                          || (event.target as Element).closest(".topic-manage")
+                        ) return;
+                        topicDrag.current = {
+                          pointerId: event.pointerId,
+                          topicId: topic.topic_id,
+                          startY: event.clientY,
+                          moved: false,
+                        };
+                        event.currentTarget.setPointerCapture(event.pointerId);
+                      }}
+                      onPointerMove={(event) => {
+                        const drag = topicDrag.current;
+                        if (!drag || drag.pointerId !== event.pointerId) return;
+                        if (!drag.moved && Math.abs(event.clientY - drag.startY) < 4) return;
+                        if (!drag.moved) {
+                          drag.moved = true;
+                          setDraggedTopicId(drag.topicId);
+                        }
+                        const target = document
+                          .elementFromPoint(event.clientX, event.clientY)
+                          ?.closest<HTMLElement>(".topic-entry[data-topic-id]");
+                        if (
+                          !target
+                          || target.dataset.groupId !== group.group_id
+                          || !target.dataset.topicId
+                          || target.dataset.topicId === drag.topicId
+                        ) {
+                          updateDropTarget(null);
+                          return;
+                        }
+                        const bounds = target.getBoundingClientRect();
+                        updateDropTarget({
+                          topicId: target.dataset.topicId,
+                          after: event.clientY >= bounds.top + bounds.height / 2,
+                        });
+                      }}
+                      onPointerUp={(event) => {
+                        const drag = topicDrag.current;
+                        if (!drag || drag.pointerId !== event.pointerId) return;
+                        topicDrag.current = null;
+                        setDraggedTopicId(null);
+                        const target = dropTargetRef.current;
+                        updateDropTarget(null);
+                        if (!drag.moved || !target) return;
+                        suppressTopicClick.current = true;
+                        window.setTimeout(() => { suppressTopicClick.current = false; }, 0);
+                        const topicIds = topics
+                          .map((item) => item.topic_id)
+                          .filter((topicId) => topicId !== drag.topicId);
+                        const targetIndex = topicIds.indexOf(target.topicId);
+                        topicIds.splice(targetIndex + (target.after ? 1 : 0), 0, drag.topicId);
+                        void onReorderTopics(group, topicIds);
+                      }}
+                      onPointerCancel={() => {
+                        topicDrag.current = null;
+                        setDraggedTopicId(null);
+                        updateDropTarget(null);
+                      }}
+                    >
+                      <button
+                        className={`topic-row ${activeTopicId === topic.topic_id ? "active" : ""} ${pendingTopicId === topic.topic_id ? "pending" : ""}`}
+                      >
+                        <span className="topic-icon" aria-hidden="true">{topic.icon || "💬"}</span>
+                        <span>{topic.name}</span>
+                        {topic.locked && <Shield size={11} />}
+                        {canReorderTopics && <GripVertical className="topic-grip" size={12} aria-hidden="true" />}
+                        {topic.unread_count > 0 && (
+                          <i>{topic.unread_count > 99 ? "99+" : topic.unread_count}</i>
+                        )}
+                      </button>
+                      {canManageTopics && (
+                        <button
+                          className="topic-manage"
+                          aria-label={`manage ${topic.name}`}
+                          onClick={() => onManageTopic(group, topic)}
+                        >
+                          <MoreHorizontal size={13} />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  {canManageTopics && (
+                    <button className="topic-create" onClick={() => onCreateTopic(group)}>
+                      <Plus size={12} /> new topic
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        }) : summary.directs.map((direct) => (
           <button
             className={`group-row direct-row ${direct.is_active ? "active" : ""}`}
             key={direct.public_key}
@@ -2477,12 +3627,15 @@ type SavedMessageScroll =
 function useChunkedMessageList<T extends { event_id: string }>(
   conversationKey: string,
   messages: T[],
+  hasRemoteHistory = false,
+  onLoadRemoteHistory?: () => Promise<void>,
 ) {
   const ref = useRef<HTMLDivElement>(null);
   const positionedConversation = useRef<string | null>(null);
   const previousMessageCount = useRef(messages.length);
   const savedScroll = useRef<SavedMessageScroll>({ stuckAtBottom: true });
   const loadingOlder = useRef(false);
+  const loadingRemoteHistory = useRef(false);
   const [atBottom, setAtBottom] = useState(true);
   const [visibleCount, setVisibleCount] = useState(() =>
     Math.min(
@@ -2494,6 +3647,7 @@ function useChunkedMessageList<T extends { event_id: string }>(
   const renderedCount = Math.min(messages.length, visibleCount + incomingCount);
   const visibleMessages = messages.slice(Math.max(0, messages.length - renderedCount));
   const hasOlder = renderedCount < messages.length;
+  const canLoadOlder = hasOlder || hasRemoteHistory;
 
   const saveScrollPosition = useCallback(() => {
     const element = ref.current;
@@ -2551,14 +3705,23 @@ function useChunkedMessageList<T extends { event_id: string }>(
     previousMessageCount.current = messages.length;
     loadingOlder.current = false;
     if (
-      hasOlder
+      canLoadOlder
       && element.scrollHeight <= element.clientHeight + 1
       && !loadingOlder.current
+      && !loadingRemoteHistory.current
     ) {
       loadingOlder.current = true;
-      setVisibleCount((current) =>
-        Math.min(messages.length, current + MESSAGE_PAGE_SIZE)
-      );
+      if (hasOlder) {
+        setVisibleCount((current) =>
+          Math.min(messages.length, current + MESSAGE_PAGE_SIZE)
+        );
+      } else if (onLoadRemoteHistory) {
+        loadingRemoteHistory.current = true;
+        saveScrollPosition();
+        void onLoadRemoteHistory().finally(() => {
+          loadingRemoteHistory.current = false;
+        });
+      }
     }
   });
 
@@ -2566,14 +3729,33 @@ function useChunkedMessageList<T extends { event_id: string }>(
     const element = ref.current;
     if (!element) return;
     saveScrollPosition();
-    if (!hasOlder || loadingOlder.current || element.scrollTop > element.clientHeight) return;
+    if (
+      !canLoadOlder
+      || loadingOlder.current
+      || loadingRemoteHistory.current
+      || element.scrollTop > element.clientHeight
+    ) return;
     loadingOlder.current = true;
-    setVisibleCount((current) => {
-      const next = Math.min(messages.length, current + MESSAGE_PAGE_SIZE);
-      renderedMessageCounts.set(conversationKey, next);
-      return next;
-    });
-  }, [conversationKey, hasOlder, messages.length, saveScrollPosition]);
+    if (hasOlder) {
+      setVisibleCount((current) => {
+        const next = Math.min(messages.length, current + MESSAGE_PAGE_SIZE);
+        renderedMessageCounts.set(conversationKey, next);
+        return next;
+      });
+    } else if (onLoadRemoteHistory) {
+      loadingRemoteHistory.current = true;
+      void onLoadRemoteHistory().finally(() => {
+        loadingRemoteHistory.current = false;
+      });
+    }
+  }, [
+    canLoadOlder,
+    conversationKey,
+    hasOlder,
+    messages.length,
+    onLoadRemoteHistory,
+    saveScrollPosition,
+  ]);
 
   return { ref, onScroll, visibleMessages, renderedCount, atBottom };
 }
@@ -2594,6 +3776,7 @@ function useAutosizeComposer(
 
 function ConversationPanel({
   conversation,
+  topic,
   busy,
   hasBackground,
   canEditGroup,
@@ -2601,6 +3784,7 @@ function ConversationPanel({
   selfPublicKey,
   presenceStatuses,
   onGroupSettings,
+  onTopicSettings,
   onReports,
   onMedia,
   onRules,
@@ -2614,9 +3798,11 @@ function ConversationPanel({
   onBan,
   onReport,
   onReachedBottom,
+  onLoadOlder,
   onSend,
 }: {
   conversation: Conversation;
+  topic: TopicSummary | null;
   busy: boolean;
   hasBackground: boolean;
   canEditGroup: boolean;
@@ -2624,6 +3810,7 @@ function ConversationPanel({
   selfPublicKey: string;
   presenceStatuses: Map<string, PresenceStatus>;
   onGroupSettings: () => void;
+  onTopicSettings?: () => void;
   onReports: () => void;
   onMedia: () => void;
   onRules: () => void;
@@ -2637,36 +3824,43 @@ function ConversationPanel({
   onBan: (member: MemberSummary) => void;
   onReport: (message: MessageSummary) => void;
   onReachedBottom: () => void;
+  onLoadOlder: () => Promise<void>;
   onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null, signal: AbortSignal) => Promise<boolean>;
 }) {
   const [draft, setDraft] = useState("");
-  const [attachment, setAttachment] = useState<PendingMedia | null>(null);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
-  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const composerUploadKey = `group:${conversation.group.group_id}:${topic?.topic_id ?? "general"}`;
+  const {
+    attachment,
+    progress: uploadProgress,
+    controller: uploadController,
+    setAttachment,
+    setProgress: setUploadProgress,
+    setController: setUploadController,
+  } = useComposerUpload(composerUploadKey);
   const [memberMenu, setMemberMenu] = useState<{ member: MemberSummary; x: number; y: number } | null>(null);
   const [messageMenu, setMessageMenu] = useState<{ message: MessageSummary; x: number; y: number } | null>(null);
   const [reactionPicker, setReactionPicker] = useState<{ message: MessageSummary; x: number; y: number } | null>(null);
   const [replyingTo, setReplyingTo] = useState<MessageSummary | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
-  const uploadController = useRef<AbortController | null>(null);
   useAutosizeComposer(composerInput, draft);
   const messageList = useChunkedMessageList(
-    conversation.group.group_id,
+    `${conversation.group.group_id}:${topic?.topic_id ?? "general"}`,
     conversation.messages,
+    conversation.has_older_messages,
+    onLoadOlder,
   );
   useEffect(() => {
     if (messageList.atBottom && unreadCount > 0) onReachedBottom();
   }, [conversation.messages.length, messageList.atBottom, onReachedBottom, unreadCount]);
-  useWarmConversationMedia(
-    conversation.messages,
-    conversation.group.group_id,
-    messageList.renderedCount,
-  );
   const selfMember = conversation.members.find((member) => member.public_key === selfPublicKey);
   const canModerate = canEditGroup || selfMember?.is_moderator === true;
-  const canSendMessages = canModerate || conversation.group.members_can_send_messages;
-  const canSendMedia = canModerate || conversation.group.members_can_send_media;
+  const topicAllowsPosting = !topic?.locked || canModerate;
+  const canSendMessages = topicAllowsPosting
+    && (canModerate || conversation.group.members_can_send_messages);
+  const canSendMedia = topicAllowsPosting
+    && (canModerate || conversation.group.members_can_send_media);
   const sortedMembers = [...conversation.members].sort((left, right) => {
     const roleRank = (member: MemberSummary) =>
       member.public_key === conversation.group.owner_public_key ? 0 : member.is_moderator ? 1 : 2;
@@ -2706,10 +3900,6 @@ function ConversationPanel({
       {member.public_key !== selfPublicKey && <button className="member-actions" aria-label={`actions for ${member.username}`} onClick={(event) => { const rect = event.currentTarget.getBoundingClientRect(); setMemberMenu({ member, x: rect.right, y: rect.bottom + 4 }); }}><MoreHorizontal size={15} /></button>}
     </div>
   );
-  const attachmentPreview = attachment?.previewUrl;
-  useEffect(() => () => {
-    if (attachmentPreview) URL.revokeObjectURL(attachmentPreview);
-  }, [attachmentPreview]);
   async function chooseMedia(file?: File) {
     if (!file) return;
     setAttachmentError(null);
@@ -2721,19 +3911,21 @@ function ConversationPanel({
       setAttachmentError("media can be up to 500 MB");
       return;
     }
-    setAttachment({
-      name: file.name,
-      mimeType: file.type,
-      byteLength: file.size,
-      file,
-      previewUrl: URL.createObjectURL(file),
-      mediaPreview: file.type.startsWith("video/")
-        ? prepareVideoPreview(file)
-        : file.type.startsWith("image/")
-          ? prepareImagePreview(file)
-          : null,
-    });
+    setAttachment(preparePendingMedia(file));
     if (fileInput.current) fileInput.current.value = "";
+  }
+  async function chooseMediaFromDevice() {
+    if (!isTauri) {
+      fileInput.current?.click();
+      return;
+    }
+    setAttachmentError(null);
+    try {
+      const pending = await chooseNativePendingMedia();
+      if (pending) setAttachment(pending);
+    } catch (cause) {
+      setAttachmentError(message(cause));
+    }
   }
   async function submit() {
     const text = draft.trim();
@@ -2745,13 +3937,16 @@ function ConversationPanel({
     setReplyingTo(null);
     if (pendingAttachment) setUploadProgress(0);
     const controller = new AbortController();
-    uploadController.current = controller;
+    setUploadController(controller);
     const sent = await onSend(text, pendingAttachment, setUploadProgress, submittedReply?.message_id ?? null, controller.signal);
-    if (uploadController.current === controller) uploadController.current = null;
-    setUploadProgress(null);
-    if (sent) {
+    const ownsUploadState = composerUpload(composerUploadKey).controller === controller;
+    if (ownsUploadState) {
+      setUploadController(null);
+      setUploadProgress(null);
+    }
+    if (sent && ownsUploadState) {
       setAttachment(null);
-    } else {
+    } else if (!sent && ownsUploadState) {
       setDraft((current) => current || submittedDraft);
       setReplyingTo((current) => current ?? submittedReply);
     }
@@ -2761,34 +3956,38 @@ function ConversationPanel({
       <header className="chat-header" data-tauri-drag-region>
         <div className="group-identity static" data-tauri-drag-region>
           <Avatar name={conversation.group.name} image={conversation.group.avatar} size={36} square />
-          <span><strong>{conversation.group.name}</strong><small>{conversation.group.description || "group"}</small></span>
+          <span>
+            <strong>{conversation.group.name}{topic ? ` / ${topic.name}` : ""}</strong>
+            <small>{topic?.locked ? "locked topic" : conversation.group.description || "group"}</small>
+          </span>
         </div>
         <div className="chat-header-actions">
           {canModerate && <button className={`icon-button media-button reports-button ${conversation.reports.length ? "has-reports" : ""}`} onClick={onReports} aria-label="moderation reports" title="moderation reports"><TriangleAlert size={17} />{conversation.reports.length > 0 && <i />}</button>}
           {canEditGroup && <button className="icon-button media-button" onClick={onGroupSettings} aria-label="group settings" title="group settings"><Settings2 size={17} /></button>}
+          {canModerate && topic && onTopicSettings && <button className="icon-button media-button" onClick={onTopicSettings} aria-label="topic settings" title="topic settings"><MessageCircle size={17} /></button>}
           <button className="icon-button media-button" onClick={onMedia} aria-label="group media" title="group media"><Images size={17} /></button>
           <button className="rules-button" onClick={onRules}>Rules</button>
           {busy && <LoaderCircle className="spinner" size={14} />}
         </div>
       </header>
       <div className="messages" ref={messageList.ref} onScroll={messageList.onScroll}>
-        {conversation.messages.length === 0 && <div className="quiet">the group is quiet</div>}
+        {conversation.messages.length === 0 && <div className="quiet">{topic ? "this topic is quiet" : "the group is quiet"}</div>}
         {messageList.visibleMessages.map((item) => (
           <MessageRow key={item.event_id} message={item} own={item.author_public_key === selfPublicKey} presence={presenceStatuses.get(item.author_public_key) ?? "offline"} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onToggleReaction={(emoji) => void onReaction(item, emoji)} onPerson={onPerson} mediaScopeId={conversation.group.group_id} />
         ))}
       </div>
       {selfMember && (canSendMessages || canSendMedia) ? <div className="composer">
         {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.group.group_id} onClose={() => setReplyingTo(null)} />}
-        {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => { const video = event.currentTarget; if (Number.isFinite(video.duration) && video.duration > 0) video.currentTime = Math.min(0.25, video.duration / 2); }} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}{uploadProgress !== null && <div className="attachment-progress"><i style={{ width: `${uploadProgress}%` }} /><span>{uploadProgress}%</span></div>}<button onClick={() => { uploadController.current?.abort(); setAttachment(null); setUploadProgress(null); }} aria-label={uploadProgress !== null ? "cancel upload" : "remove attachment"}><X size={14} /></button></div>}
+        {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => { const video = event.currentTarget; if (Number.isFinite(video.duration) && video.duration > 0) video.currentTime = Math.min(0.25, video.duration / 2); }} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}{uploadProgress !== null && <div className="attachment-progress"><i style={{ width: `${uploadProgress}%` }} /><span>{uploadProgress === 0 && attachment.mimeType.startsWith("video/") ? "preparing video" : `${uploadProgress}%`}</span></div>}<button onClick={() => { uploadController?.abort(); setUploadController(null); setAttachment(null); setUploadProgress(null); }} aria-label={uploadProgress !== null ? "cancel upload" : "remove attachment"}><X size={14} /></button></div>}
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
-        <button className="attach-button" disabled={busy || !canSendMedia} onClick={() => fileInput.current?.click()} aria-label="attach media" title={canSendMedia ? "attach media" : "members cannot send media"}><Paperclip size={17} /></button>
+        <button className="attach-button" disabled={busy || !canSendMedia} onClick={() => void chooseMediaFromDevice()} aria-label="attach media" title={canSendMedia ? "attach media" : "members cannot send media"}><Paperclip size={17} /></button>
         <input ref={fileInput} hidden type="file" accept="image/*,video/*,audio/*" onChange={(event) => void chooseMedia(event.target.files?.[0])} />
         <textarea
           ref={composerInput}
           rows={1}
           value={draft}
           disabled={!canSendMessages}
-          placeholder={canSendMessages ? "send noise" : "members cannot send messages"}
+          placeholder={canSendMessages ? `send to ${topic?.name ?? "General"}` : topic?.locked ? "this topic is locked" : "members cannot send messages"}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === "Enter" && !event.shiftKey) {
@@ -2798,7 +3997,7 @@ function ConversationPanel({
           }}
         />
         <button className="send-button" disabled={(!draft.trim() && !attachment) || busy || (!!draft.trim() && !canSendMessages) || (!!attachment && !canSendMedia)} onClick={() => void submit()}><ArrowUp size={17} /></button>
-      </div> : selfMember ? <div className="membership-revoked"><ShieldOff size={16} /> only moderators can post right now</div> : <div className="membership-revoked"><UserRoundX size={16} /> you no longer have access to this group</div>}
+      </div> : selfMember ? <div className="membership-revoked"><ShieldOff size={16} /> {topic?.locked ? "this topic is locked" : "only moderators can post right now"}</div> : <div className="membership-revoked"><UserRoundX size={16} /> you no longer have access to this group</div>}
       <aside className="member-sidebar">
         <div className="member-sidebar-list">
           <section className="member-sidebar-section">
@@ -2884,26 +4083,25 @@ function ConversationPanel({
 
 function DirectConversationPanel({ conversation, contact, busy, self, selfPresence, contactPresence, onPerson, onAlbum, onBlock, onDelete, onDownload, onSend }: { conversation: DirectConversation; contact: DirectSummary; busy: boolean; self: IdentitySummary; selfPresence: PresenceStatus; contactPresence: PresenceStatus; onPerson: (person: PersonSummary) => void; onAlbum: (person: PersonSummary) => void; onBlock: (person: PersonSummary) => void; onDelete: () => void; onDownload: (message: MessageSummary) => Promise<boolean>; onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null, signal: AbortSignal) => Promise<boolean> }) {
   const [draft, setDraft] = useState("");
-  const [attachment, setAttachment] = useState<PendingMedia | null>(null);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
-  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const composerUploadKey = `direct:${contact.public_key}`;
+  const {
+    attachment,
+    progress: uploadProgress,
+    controller: uploadController,
+    setAttachment,
+    setProgress: setUploadProgress,
+    setController: setUploadController,
+  } = useComposerUpload(composerUploadKey);
   const [messageMenu, setMessageMenu] = useState<{ message: MessageSummary; x: number; y: number } | null>(null);
   const [replyingTo, setReplyingTo] = useState<MessageSummary | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
-  const uploadController = useRef<AbortController | null>(null);
   useAutosizeComposer(composerInput, draft);
   const messageList = useChunkedMessageList(
     contact.public_key,
     conversation.messages,
   );
-  useWarmConversationMedia(
-    conversation.messages,
-    conversation.media_scope_id,
-    messageList.renderedCount,
-  );
-  const attachmentPreview = attachment?.previewUrl;
-  useEffect(() => () => { if (attachmentPreview) URL.revokeObjectURL(attachmentPreview); }, [attachmentPreview]);
   async function chooseMedia(file?: File) {
     if (!file) return;
     setAttachmentError(null);
@@ -2915,19 +4113,21 @@ function DirectConversationPanel({ conversation, contact, busy, self, selfPresen
       setAttachmentError("media can be up to 500 MB");
       return;
     }
-    setAttachment({
-      name: file.name,
-      mimeType: file.type,
-      byteLength: file.size,
-      file,
-      previewUrl: URL.createObjectURL(file),
-      mediaPreview: file.type.startsWith("video/")
-        ? prepareVideoPreview(file)
-        : file.type.startsWith("image/")
-          ? prepareImagePreview(file)
-          : null,
-    });
+    setAttachment(preparePendingMedia(file));
     if (fileInput.current) fileInput.current.value = "";
+  }
+  async function chooseMediaFromDevice() {
+    if (!isTauri) {
+      fileInput.current?.click();
+      return;
+    }
+    setAttachmentError(null);
+    try {
+      const pending = await chooseNativePendingMedia();
+      if (pending) setAttachment(pending);
+    } catch (cause) {
+      setAttachmentError(message(cause));
+    }
   }
   async function submit() {
     const text = draft.trim();
@@ -2939,13 +4139,16 @@ function DirectConversationPanel({ conversation, contact, busy, self, selfPresen
     setReplyingTo(null);
     if (pendingAttachment) setUploadProgress(0);
     const controller = new AbortController();
-    uploadController.current = controller;
+    setUploadController(controller);
     const sent = await onSend(text, pendingAttachment, setUploadProgress, submittedReply?.message_id ?? null, controller.signal);
-    if (uploadController.current === controller) uploadController.current = null;
-    setUploadProgress(null);
-    if (sent) {
+    const ownsUploadState = composerUpload(composerUploadKey).controller === controller;
+    if (ownsUploadState) {
+      setUploadController(null);
+      setUploadProgress(null);
+    }
+    if (sent && ownsUploadState) {
       setAttachment(null);
-    } else {
+    } else if (!sent && ownsUploadState) {
       setDraft((current) => current || submittedDraft);
       setReplyingTo((current) => current ?? submittedReply);
     }
@@ -2973,9 +4176,9 @@ function DirectConversationPanel({ conversation, contact, busy, self, selfPresen
       </div>
       {contact.accepts_direct_messages ? <div className="composer">
         {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.media_scope_id} onClose={() => setReplyingTo(null)} />}
-        {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => primeVideoFrame(event.currentTarget)} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}{uploadProgress !== null && <div className="attachment-progress"><i style={{ width: `${uploadProgress}%` }} /><span>{uploadProgress}%</span></div>}<button onClick={() => { uploadController.current?.abort(); setAttachment(null); setUploadProgress(null); }} aria-label={uploadProgress !== null ? "cancel upload" : "remove attachment"}><X size={14} /></button></div>}
+        {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => primeVideoFrame(event.currentTarget)} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}{uploadProgress !== null && <div className="attachment-progress"><i style={{ width: `${uploadProgress}%` }} /><span>{uploadProgress === 0 && attachment.mimeType.startsWith("video/") ? "preparing video" : `${uploadProgress}%`}</span></div>}<button onClick={() => { uploadController?.abort(); setUploadController(null); setAttachment(null); setUploadProgress(null); }} aria-label={uploadProgress !== null ? "cancel upload" : "remove attachment"}><X size={14} /></button></div>}
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
-        <button className="attach-button" disabled={busy} onClick={() => fileInput.current?.click()} aria-label="attach media"><Paperclip size={17} /></button>
+        <button className="attach-button" disabled={busy} onClick={() => void chooseMediaFromDevice()} aria-label="attach media"><Paperclip size={17} /></button>
         <input ref={fileInput} hidden type="file" accept="image/*,video/*,audio/*" onChange={(event) => void chooseMedia(event.target.files?.[0])} />
         <textarea ref={composerInput} rows={1} value={draft} placeholder={`message ${contact.username}`} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); } }} />
         <button className="send-button" disabled={(!draft.trim() && !attachment) || busy} onClick={() => void submit()}><ArrowUp size={17} /></button>
@@ -3098,6 +4301,7 @@ function MessageRow({
   const jumboEmojiCount = !localAttachment && !message.attachment
     ? emojiOnlyCount(message.text)
     : null;
+  const previewUrl = firstLink(message.text);
   return (
     <article
       className={`message-row ${own ? "own" : ""} ${message.optimistic ? "optimistic" : ""}`}
@@ -3110,9 +4314,40 @@ function MessageRow({
       } : undefined}
     >
       <button onClick={() => onPerson(person)}><PresenceAvatar name={message.username} image={message.avatar} size={34} status={presence ?? "offline"} /></button>
-      <div className="message-body"><div className="message-meta"><button onClick={() => onPerson(person)}>{message.username}</button></div>{message.reply_to_message_id && <div className="message-reply-reference">{replyTo ? <>{replyTo.attachment && <ReplyMediaThumbnail message={replyTo as MessageSummary & { attachment: MediaAttachment }} scopeId={mediaScopeId} />}<span className="message-reply-copy"><strong>{replyTo.username}</strong><span>{replyPreview(replyTo)}</span></span></> : <span>original message unavailable</span>}</div>}{message.text && <p className={jumboEmojiCount ? `emoji-only emoji-only-${jumboEmojiCount}` : undefined}>{message.text}</p>}{localAttachment ? <LocalMessageMedia attachment={localAttachment} manifest={message.attachment} /> : message.attachment && <MessageMedia attachment={message.attachment} scopeId={mediaScopeId} />}<time className="message-time">{formatTime(message.created_at_millis)}</time>{message.reactions && message.reactions.length > 0 && <MessageReactions reactions={message.reactions} onToggle={onToggleReaction} />}</div>
+      <div className="message-body"><div className="message-meta"><button onClick={() => onPerson(person)}>{message.username}</button></div>{message.reply_to_message_id && <div className="message-reply-reference">{replyTo ? <>{replyTo.attachment && <ReplyMediaThumbnail message={replyTo as MessageSummary & { attachment: MediaAttachment }} scopeId={mediaScopeId} />}<span className="message-reply-copy"><strong>{replyTo.username}</strong><span>{replyPreview(replyTo)}</span></span></> : <span>original message unavailable</span>}</div>}{message.text && <p className={jumboEmojiCount ? `emoji-only emoji-only-${jumboEmojiCount}` : undefined}>{linkify(message.text)}</p>}{previewUrl && <LinkPreviewCard url={previewUrl} />}{localAttachment ? <LocalMessageMedia attachment={localAttachment} manifest={message.attachment} scopeId={mediaScopeId} /> : message.attachment && <MessageMedia attachment={message.attachment} scopeId={mediaScopeId} />}<time className="message-time">{formatTime(message.created_at_millis)}</time>{message.reactions && message.reactions.length > 0 && <MessageReactions reactions={message.reactions} onToggle={onToggleReaction} />}</div>
     </article>
   );
+}
+
+function LinkPreviewCard({ url }: { url: string }) {
+  const preview = useLinkPreview(url);
+  if (!preview) return null;
+  return (
+    <a
+      className={`link-preview ${preview.image_data_url ? "with-image" : ""}`}
+      href={preview.url}
+      onClick={(event) => openExternalLink(event, preview.url)}
+      rel="noopener noreferrer"
+      target="_blank"
+    >
+      {preview.image_data_url && (
+        <img alt="" loading="lazy" src={preview.image_data_url} />
+      )}
+      <span className="link-preview-copy">
+        <small>{preview.site_name || previewHost(preview)}</small>
+        <strong>{preview.title}</strong>
+        {preview.description && <span>{preview.description}</span>}
+      </span>
+    </a>
+  );
+}
+
+function previewHost(preview: LinkPreview) {
+  try {
+    return new URL(preview.url).hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
 }
 
 function MessageReactions({
@@ -3154,32 +4389,49 @@ function ReplyMediaThumbnail({ message, scopeId }: { message: MessageSummary & {
   const { attachment } = message;
   const localAttachment = message.local_attachment ?? sentMediaPreviewCache.get(message.event_id);
   const embeddedPreview = mediaPoster(attachment);
-  const { source } = useMediaSource(
-    attachment,
-    scopeId,
-    !localAttachment && !embeddedPreview,
-  );
   const image = attachment.mime_type.startsWith("image/");
   const video = attachment.mime_type.startsWith("video/");
+  const { source, failed } = useMediaSource(
+    attachment,
+    scopeId,
+    !video && !localAttachment && !embeddedPreview ? "background" : null,
+  );
   const posterCacheKey = mediaCacheKey(attachment);
   const poster = embeddedPreview ?? videoPosterCache.get(posterCacheKey);
   if (image) {
     const imageSource = localAttachment?.preview_url ?? poster ?? source;
-    return <span className="reply-media-thumbnail">{imageSource ? <img src={imageSource} alt="" /> : <LoaderCircle className="spinner" size={13} />}</span>;
+    const loading = !localAttachment && !embeddedPreview && !source;
+    return <span className="reply-media-thumbnail">{imageSource && <img src={imageSource} alt="" />}{loading && <MediaLoadStatus failed={failed} compact />}</span>;
   }
   if (video) {
-    const videoSource = localAttachment?.preview_url ?? source;
-    return <span className="reply-media-thumbnail video">{poster ? <img src={poster} alt="" /> : videoSource ? <video src={videoSource} muted playsInline preload="metadata" onLoadedMetadata={(event) => primeVideoFrame(event.currentTarget)} /> : <LoaderCircle className="spinner" size={13} />}<i><Play size={9} fill="currentColor" /></i></span>;
+    return <span className="reply-media-thumbnail video">{poster ? <img src={poster} alt="" /> : <span className="reply-video-placeholder"><NoiseMark size={16} monochrome /></span>}<i><Play size={9} fill="currentColor" /></i></span>;
   }
   return <span className="reply-media-thumbnail audio"><AudioWaveform size={18} /></span>;
 }
 
 function MessageMedia({ attachment, scopeId, autoplayVideo = false }: { attachment: MediaAttachment; scopeId?: string; autoplayVideo?: boolean }) {
-  const visibility = useNearViewport<HTMLDivElement>();
-  const { source, failed } = useMediaSource(attachment, scopeId, visibility.near);
-  const poster = mediaPoster(attachment);
+  const visibility = useMediaPriority<HTMLDivElement>();
   const image = attachment.mime_type.startsWith("image/");
   const video = attachment.mime_type.startsWith("video/");
+  const [videoRequested, setVideoRequested] = useState(autoplayVideo);
+  useEffect(() => {
+    if (autoplayVideo) setVideoRequested(true);
+  }, [autoplayVideo]);
+  useEffect(() => {
+    if (
+      !video
+      || videoRequested
+      || !visibility.priority
+      || visibility.priority === "background"
+    ) return;
+    void prewarmMediaBootstrap(attachment, scopeId, visibility.priority);
+  }, [attachment, scopeId, video, videoRequested, visibility.priority]);
+  const { source, failed } = useMediaSource(
+    attachment,
+    scopeId,
+    video ? (videoRequested ? "visible" : null) : visibility.priority,
+  );
+  const poster = mediaPoster(attachment);
   const posterCacheKey = mediaCacheKey(attachment);
   return (
     <div className="message-media" ref={visibility.ref}>
@@ -3199,20 +4451,59 @@ function MessageMedia({ attachment, scopeId, autoplayVideo = false }: { attachme
           posterCacheKey={posterCacheKey}
           pixelWidth={attachment.pixel_width}
           pixelHeight={attachment.pixel_height}
-          autoPlay={autoplayVideo}
+          autoPlay={videoRequested}
+          playbackRequested={videoRequested}
+          onRequestPlayback={() => setVideoRequested(true)}
+          failed={failed}
         />
       ) : source ? (
         <audio src={source} controls preload="metadata" />
       ) : (
-        <div className="media-loading" aria-label={failed ? "media unavailable" : "loading media"}>
-          {failed ? <X size={16} /> : <LoaderCircle className="spinner" size={15} />}
-        </div>
+        <div className="media-loading"><MediaLoadStatus failed={failed} /></div>
       )}
     </div>
   );
 }
 
-function LocalMessageMedia({ attachment, manifest }: { attachment: NonNullable<MessageSummary["local_attachment"]>; manifest: MediaAttachment | null }) {
+function prewarmMediaBootstrap(
+  attachment: MediaAttachment,
+  scopeId: string | undefined,
+  priority: MediaLoadPriority,
+) {
+  if (attachment.chunks[0]?.storage?.v !== 2) return Promise.resolve();
+  const key = `bootstrap:${mediaCacheKey(attachment)}`;
+  const pending = mediaBootstrapPromises.get(key);
+  if (pending) {
+    mediaBootstrapScheduler.promote(key, priority);
+    return pending;
+  }
+  const request = mediaBootstrapScheduler
+    .enqueue(key, priority, async () => {
+      const startupByteLength = Math.min(1024 * 1024, attachment.byte_length);
+      await noise<AttachmentRangeData>({
+        action: "fetch_attachment_range",
+        attachment,
+        scope_id: scopeId,
+        offset: 0,
+        byte_length: startupByteLength,
+        relays,
+      });
+      return "";
+    })
+    .then(() => undefined)
+    .finally(() => {
+      if (mediaBootstrapPromises.get(key) === request) {
+        mediaBootstrapPromises.delete(key);
+      }
+    });
+  mediaBootstrapPromises.set(key, request);
+  return request;
+}
+
+function LocalMessageMedia({ attachment, manifest, scopeId }: { attachment: NonNullable<MessageSummary["local_attachment"]>; manifest: MediaAttachment | null; scopeId?: string }) {
+  if (manifest?.mime_type.startsWith("video/")) {
+    return <MessageMedia attachment={manifest} scopeId={scopeId} />;
+  }
   const poster = manifest ? mediaPoster(manifest) : undefined;
   const posterCacheKey = manifest ? mediaCacheKey(manifest) : undefined;
   return <div className="message-media">{attachment.mime_type.startsWith("image/") ? <ChatImage source={attachment.preview_url} preview={poster ?? attachment.preview_url} cacheKey={posterCacheKey ?? attachment.preview_url} pixelWidth={manifest?.pixel_width} pixelHeight={manifest?.pixel_height} /> : attachment.mime_type.startsWith("video/") ? <ChatVideo source={attachment.preview_url} poster={poster} posterCacheKey={posterCacheKey} pixelWidth={manifest?.pixel_width} pixelHeight={manifest?.pixel_height} /> : <audio src={attachment.preview_url} controls preload="metadata" />}</div>;
@@ -3224,15 +4515,56 @@ function mediaPoster(attachment: MediaAttachment) {
     : undefined;
 }
 
-function requestMediaSource(attachment: MediaAttachment, scopeId?: string) {
+function requestMediaSource(
+  attachment: MediaAttachment,
+  scopeId: string | undefined,
+  priority: MediaLoadPriority,
+) {
   const cacheKey = mediaCacheKey(attachment);
   const cached = mediaCache.get(cacheKey);
   if (cached) return Promise.resolve(cached);
   const pending = mediaLoadPromises.get(cacheKey);
-  if (pending) return pending;
+  if (pending) {
+    mediaLoadScheduler.promote(cacheKey, priority);
+    return pending;
+  }
   const generation = mediaCacheGeneration;
+
+  // Registering a video stream is a local operation, not a media download:
+  // the desktop app hands the video element a noise-media:// URL, the browser
+  // build hands it a same-origin URL served by the media service worker.
+  // Putting registration behind the three-slot image queue made a Play click
+  // wait for unrelated feed images before the video element even had a URL.
+  if (attachment.mime_type.startsWith("video/")) {
+    const streamPromise = isTauri
+      ? registerMediaStream({
+          action: "fetch_attachment_range",
+          attachment,
+          scope_id: scopeId,
+        })
+      : webMediaStreamReady()
+        ? Promise.resolve(registerWebMediaStream(attachment, scopeId))
+        : null;
+    if (streamPromise) {
+      let streamRequest: Promise<string>;
+      streamRequest = streamPromise
+        .then((stream) => {
+          if (!stream) throw new Error("video stream is unavailable");
+          if (generation === mediaCacheGeneration) mediaCache.set(cacheKey, stream);
+          return stream;
+        })
+        .finally(() => {
+          if (mediaLoadPromises.get(cacheKey) === streamRequest) {
+            mediaLoadPromises.delete(cacheKey);
+          }
+        });
+      mediaLoadPromises.set(cacheKey, streamRequest);
+      return streamRequest;
+    }
+  }
+
   let request: Promise<string>;
-  request = (async () => {
+  request = mediaLoadScheduler.enqueue(cacheKey, priority, async () => {
     for (let attempt = 0; attempt < 12; attempt += 1) {
       try {
         const data = await noise<AttachmentData>({
@@ -3248,13 +4580,17 @@ function requestMediaSource(attachment: MediaAttachment, scopeId?: string) {
         if (generation === mediaCacheGeneration) mediaCache.set(cacheKey, next);
         return next;
       } catch (cause) {
-        if (mediaFailureIsPermanent(cause) || attempt === 11) throw cause;
+        if (
+          isSupersededLoading(cause)
+          || mediaFailureIsPermanent(cause)
+          || attempt === 11
+        ) throw cause;
         const delay = Math.min(400 * 1.6 ** attempt, 3000);
         await new Promise<void>((resolve) => window.setTimeout(resolve, delay));
       }
     }
     throw new Error("media is unavailable");
-  })().finally(() => {
+  }).finally(() => {
     if (mediaLoadPromises.get(cacheKey) === request) mediaLoadPromises.delete(cacheKey);
   });
   mediaLoadPromises.set(cacheKey, request);
@@ -3299,6 +4635,7 @@ function prepareMediaSource(attachment: MediaAttachment, source: string) {
     );
   } else if (
     attachment.mime_type.startsWith("video/")
+    && !mediaPoster(attachment)
     && !videoPosterCache.has(cacheKey)
   ) {
     request = prepareVideoMediaSource(source, cacheKey);
@@ -3380,11 +4717,11 @@ function prepareVideoMediaSource(source: string, cacheKey: string) {
     const video = document.createElement("video");
     video.muted = true;
     video.playsInline = true;
-    video.preload = "auto";
+    video.preload = "metadata";
     let previewIndex = 0;
     let settled = false;
     let previewTimes: number[] = [];
-    const timeout = window.setTimeout(finish, 12_000);
+    const timeout = window.setTimeout(finish, 8_000);
     function finish() {
       if (settled) return;
       settled = true;
@@ -3429,43 +4766,10 @@ function prepareVideoMediaSource(source: string, cacheKey: string) {
   });
 }
 
-function useWarmConversationMedia(
-  messages: Array<{ attachment: MediaAttachment | null }>,
-  scopeId: string,
-  renderedCount: number,
-) {
-  const candidates = messages
-    .slice(Math.max(0, messages.length - renderedCount - MESSAGE_PAGE_SIZE))
-    .reverse()
-    .flatMap((message) => message.attachment ? [message.attachment] : []);
-  const signature = candidates.map(mediaCacheKey).join("|");
-  useEffect(() => {
-    if (!candidates.length) return;
-    let stopped = false;
-    let cursor = 0;
-    const warmNext = async () => {
-      while (!stopped) {
-        const attachment = candidates[cursor];
-        cursor += 1;
-        if (!attachment) return;
-        try {
-          const source = await requestMediaSource(attachment, scopeId);
-          await prepareMediaSource(attachment, source);
-        } catch {
-          // The normal renderer can retry media that is still propagating between relays.
-        }
-      }
-    };
-    const workerCount = Math.min(4, candidates.length);
-    for (let index = 0; index < workerCount; index += 1) void warmNext();
-    return () => { stopped = true; };
-  }, [scopeId, signature]);
-}
-
 function useMediaSource(
   attachment: MediaAttachment,
   scopeId?: string,
-  enabled = true,
+  priority: MediaLoadPriority | null = "visible",
 ) {
   const cacheKey = mediaCacheKey(attachment);
   const [loaded, setLoaded] = useState<{ cacheKey: string; source: string } | null>(() => {
@@ -3483,19 +4787,20 @@ function useMediaSource(
       setFailedKey(null);
       return;
     }
-    if (!enabled) return;
+    if (!priority) return;
     let active = true;
     let retryTimer: number | undefined;
     let retryRound = 0;
     setFailedKey(null);
     const load = () => {
       setFailedKey(null);
-      void requestMediaSource(attachment, scopeId)
+      void requestMediaSource(attachment, scopeId, priority)
         .then((next) => {
           if (active) setLoaded({ cacheKey, source: next });
         })
         .catch((cause) => {
           if (!active) return;
+          if (isSupersededLoading(cause)) return;
           setFailedKey(cacheKey);
           if (mediaFailureIsPermanent(cause)) return;
           const delay = Math.min(5_000 * 1.7 ** retryRound, 30_000);
@@ -3508,26 +4813,52 @@ function useMediaSource(
       active = false;
       if (retryTimer !== undefined) window.clearTimeout(retryTimer);
     };
-  }, [attachment, cacheKey, enabled, scopeId]);
+  }, [attachment, cacheKey, priority, scopeId]);
   return { source, failed: failedKey === cacheKey };
 }
 
-function useNearViewport<T extends HTMLElement>() {
+function useMediaPriority<T extends HTMLElement>() {
   const ref = useRef<T>(null);
-  const [near, setNear] = useState(false);
+  const [priority, setPriority] = useState<MediaLoadPriority | null>(null);
   useEffect(() => {
     const element = ref.current;
-    if (!element || near) return;
-    const observer = new IntersectionObserver((entries) => {
-      if (entries.some((entry) => entry.isIntersecting)) {
-        setNear(true);
-        observer.disconnect();
+    if (!element) return;
+    let visible = false;
+    let nearby = false;
+    let activated = false;
+    const update = () => {
+      if (visible) {
+        activated = true;
+        setPriority("visible");
+      } else if (nearby) {
+        activated = true;
+        setPriority("nearby");
+      } else if (activated) {
+        setPriority("background");
       }
+    };
+    const visibleObserver = new IntersectionObserver(([entry]) => {
+      visible = entry.isIntersecting;
+      update();
+    });
+    const nearbyObserver = new IntersectionObserver(([entry]) => {
+      nearby = entry.isIntersecting;
+      update();
     }, { rootMargin: "900px 0px" });
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [near]);
-  return { ref, near };
+    const fallback = window.setTimeout(() => {
+      activated = true;
+      update();
+      if (!visible && !nearby) setPriority("background");
+    }, 1_200);
+    visibleObserver.observe(element);
+    nearbyObserver.observe(element);
+    return () => {
+      window.clearTimeout(fallback);
+      visibleObserver.disconnect();
+      nearbyObserver.disconnect();
+    };
+  }, []);
+  return { ref, priority };
 }
 
 function mediaFrameStyle(
@@ -3655,11 +4986,7 @@ function ChatImage({
         />
       )}
       {!ready && preview && <img className="media-preview-cover" src={preview} alt="" aria-hidden="true" />}
-      {!ready && !preview && (
-        <span className={`media-skeleton ${failed ? "failed" : ""}`}>
-          {failed && <X size={16} />}
-        </span>
-      )}
+      {!ready && <MediaLoadStatus failed={failed} compact={Boolean(preview)} />}
     </span>
   );
 }
@@ -3671,6 +4998,9 @@ function ChatVideo({
   pixelWidth,
   pixelHeight,
   autoPlay = false,
+  playbackRequested = false,
+  onRequestPlayback,
+  failed = false,
 }: {
   source?: string;
   poster?: string;
@@ -3678,13 +5008,19 @@ function ChatVideo({
   pixelWidth?: number | null;
   pixelHeight?: number | null;
   autoPlay?: boolean;
+  playbackRequested?: boolean;
+  onRequestPlayback?: () => void;
+  failed?: boolean;
 }) {
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(false);
   const [hasStarted, setHasStarted] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [videoReady, setVideoReady] = useState(false);
   const [playbackFrameReady, setPlaybackFrameReady] = useState(false);
+  const [buffering, setBuffering] = useState(false);
+  const [playbackFailed, setPlaybackFailed] = useState(false);
   const [decodedPoster, setDecodedPoster] = useState(
     () => (posterCacheKey ? videoPosterCache.get(posterCacheKey) : undefined) ?? poster,
   );
@@ -3692,20 +5028,29 @@ function ChatVideo({
     posterCacheKey ? mediaDimensionCache.get(posterCacheKey) ?? null : null
   );
   const video = useRef<HTMLVideoElement>(null);
+  const streamEnabled = !onRequestPlayback || playbackRequested;
+  const activeSource = streamEnabled ? source : undefined;
   useEffect(() => {
+    setPlaying(false);
+    setMuted(false);
+    setVideoReady(false);
     setPlaybackFrameReady(false);
     setHasStarted(false);
-  }, [source]);
+    setCurrentTime(0);
+    setDuration(0);
+    setBuffering(false);
+    setPlaybackFailed(false);
+  }, [activeSource]);
   useEffect(() => {
     const element = video.current;
-    if (!autoPlay || !source || !element) return;
+    if (!autoPlay || !activeSource || !element) return;
     element.currentTime = 0;
     void element.play().catch(() => undefined);
     return () => {
       element.pause();
       element.currentTime = 0;
     };
-  }, [autoPlay, source]);
+  }, [activeSource, autoPlay]);
   useEffect(() => {
     setMeasuredDimensions(
       pixelWidth && pixelHeight
@@ -3716,24 +5061,19 @@ function ChatVideo({
     );
   }, [pixelHeight, pixelWidth, posterCacheKey]);
   useEffect(() => {
-    if (!poster) return;
+    const cached = posterCacheKey ? videoPosterCache.get(posterCacheKey) : undefined;
+    if (!poster) {
+      setDecodedPoster(cached);
+      return;
+    }
     let active = true;
     void imageIsNearBlack(poster).then((nearBlack) => {
       if (!active) return;
       if (nearBlack) {
-        setDecodedPoster(
-          posterCacheKey ? videoPosterCache.get(posterCacheKey) : undefined,
-        );
-        const element = video.current;
-        if (element && element.readyState >= HTMLMediaElement.HAVE_METADATA) {
-          element.dataset.thumbnailPrimed = "false";
-          primeVideoFrame(element);
-        }
+        setDecodedPoster(cached);
         return;
       }
-      setDecodedPoster(
-        (posterCacheKey ? videoPosterCache.get(posterCacheKey) : undefined) ?? poster,
-      );
+      setDecodedPoster(cached ?? poster);
     });
     return () => { active = false; };
   }, [poster, posterCacheKey]);
@@ -3745,16 +5085,7 @@ function ChatVideo({
       return;
     }
     try {
-      if (videoFrameIsNearBlack(element)) {
-        const previewTimes = videoPreviewTimes(element.duration);
-        const currentIndex = Number(element.dataset.posterAttempt ?? "0");
-        if (currentIndex < previewTimes.length - 1) {
-          const nextIndex = currentIndex + 1;
-          element.dataset.posterAttempt = String(nextIndex);
-          element.currentTime = previewTimes[nextIndex];
-          return;
-        }
-      }
+      if (videoFrameIsNearBlack(element)) return;
       const scale = Math.min(1, 960 / Math.max(element.videoWidth, element.videoHeight));
       const canvas = document.createElement("canvas");
       canvas.width = Math.max(1, Math.round(element.videoWidth * scale));
@@ -3771,13 +5102,20 @@ function ChatVideo({
   };
   const frameWidth = pixelWidth ?? measuredDimensions?.width;
   const frameHeight = pixelHeight ?? measuredDimensions?.height;
-  const hasDimensions = Boolean(frameWidth && frameHeight);
   const frameStyle = mediaFrameStyle(frameWidth, frameHeight, 288, 176);
   const togglePlayback = () => {
+    if (onRequestPlayback && !playbackRequested) {
+      onRequestPlayback();
+      return;
+    }
     const element = video.current;
-    if (!element || !source) return;
-    if (element.paused) void element.play();
-    else element.pause();
+    if (!element || !activeSource) return;
+    if (element.paused) {
+      setPlaybackFailed(false);
+      void element.play().catch(() => setPlaybackFailed(true));
+    } else {
+      element.pause();
+    }
   };
   const toggleMuted = () => {
     const element = video.current;
@@ -3800,18 +5138,42 @@ function ChatVideo({
       window.requestAnimationFrame(() => setPlaybackFrameReady(true));
     });
   };
-  return <div className={`chat-video ${hasDimensions ? "sized" : ""} ${hasStarted ? "started" : ""}`} style={frameStyle}>
+  const retryPlayback = () => {
+    const element = video.current;
+    if (!element || !activeSource) return;
+    setPlaybackFailed(false);
+    setBuffering(true);
+    element.load();
+    void element.play().catch(() => setPlaybackFailed(true));
+  };
+  const loading = streamEnabled
+    && (!activeSource || (!decodedPoster && !videoReady));
+  const waitingForFirstPlaybackFrame = playbackRequested
+    && !playbackFrameReady
+    && !playbackFailed;
+  const showStartButton = !hasStarted
+    && !playbackFailed
+    && (onRequestPlayback
+      ? !playbackRequested || Boolean(activeSource)
+      : Boolean(activeSource));
+  return <div className={`chat-video ${hasStarted ? "started" : ""} ${loading ? "media-pending" : ""}`} style={frameStyle}>
     <video
       ref={video}
-      src={source}
+      src={activeSource}
       poster={decodedPoster}
       width={frameWidth ?? undefined}
       height={frameHeight ?? undefined}
-      muted={muted}
       autoPlay={autoPlay}
+      muted={muted}
       playsInline
-      preload="auto"
+      preload={autoPlay ? "auto" : "metadata"}
+      onLoadStart={() => {
+        setVideoReady(false);
+        if (hasStarted || autoPlay) setBuffering(true);
+      }}
       onCanPlay={(event) => {
+        setVideoReady(true);
+        setBuffering(false);
         if (autoPlay && event.currentTarget.paused) {
           void event.currentTarget.play().catch(() => undefined);
         }
@@ -3831,22 +5193,43 @@ function ChatVideo({
         setDuration(Number.isFinite(element.duration) ? element.duration : 0);
         setCurrentTime(element.currentTime);
         setMuted(element.muted);
-        if (!posterCacheKey || !videoPosterCache.has(posterCacheKey)) {
-          primeVideoFrame(element);
-        }
+        setVideoReady(true);
       }}
-      onLoadedData={(event) => capturePoster(event.currentTarget)}
-      onSeeked={(event) => capturePoster(event.currentTarget)}
+      onLoadedData={(event) => {
+        setVideoReady(true);
+        capturePoster(event.currentTarget);
+      }}
       onPlay={() => {
         setPlaying(true);
         setHasStarted(true);
+        setPlaybackFailed(false);
       }}
-      onPlaying={(event) => revealOnRenderedFrame(event.currentTarget)}
+      onPlaying={(event) => {
+        setVideoReady(true);
+        setBuffering(false);
+        revealOnRenderedFrame(event.currentTarget);
+      }}
       onPause={() => setPlaying(false)}
       onEnded={() => setPlaying(false)}
       onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-      onDurationChange={(event) => setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0)}
+      onDurationChange={(event) => {
+        setDuration(
+          Number.isFinite(event.currentTarget.duration)
+            ? event.currentTarget.duration
+            : 0,
+        );
+      }}
       onVolumeChange={(event) => setMuted(event.currentTarget.muted)}
+      onWaiting={() => setBuffering(true)}
+      onStalled={() => setBuffering(true)}
+      onSuspend={() => {
+        if (!hasStarted) setBuffering(false);
+      }}
+      onError={() => {
+        setPlaying(false);
+        setBuffering(false);
+        setPlaybackFailed(true);
+      }}
       onClick={togglePlayback}
       onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") {
@@ -3858,12 +5241,49 @@ function ChatVideo({
       aria-label="video"
       title="play or pause video"
     />
-    {decodedPoster && !playbackFrameReady && <img className="chat-video-poster-cover" src={decodedPoster} alt="" aria-hidden="true" />}
-    {!decodedPoster && !playbackFrameReady && <span className="media-skeleton video" aria-hidden="true" />}
-    {!hasStarted && source && <button type="button" className="chat-video-start" onClick={togglePlayback} aria-label="play video" title="play video"><Play size={25} fill="currentColor" /></button>}
+    {decodedPoster && !playbackFrameReady && (
+      <img
+        className="chat-video-poster-cover"
+        src={decodedPoster}
+        alt=""
+        aria-hidden="true"
+      />
+    )}
+    {!decodedPoster && !playbackFrameReady && (
+      <span className="chat-video-placeholder" aria-hidden="true">
+        <NoiseMark size={34} monochrome />
+      </span>
+    )}
+    {(loading || buffering || waitingForFirstPlaybackFrame) && (
+      <MediaLoadStatus
+        failed={failed}
+        compact={!waitingForFirstPlaybackFrame && Boolean(decodedPoster)}
+        prominent={waitingForFirstPlaybackFrame}
+      />
+    )}
+    {showStartButton && (
+      <button
+        type="button"
+        className="chat-video-start"
+        onClick={togglePlayback}
+        aria-label="play video"
+        title="play video"
+      >
+        <Play size={25} fill="currentColor" />
+      </button>
+    )}
     <div className="noise-video-controls" aria-label="video controls">
-      <button type="button" className="noise-video-control-button" disabled={!source} onClick={togglePlayback} aria-label={playing ? "pause video" : "play video"} title={playing ? "pause" : "play"}>
-        {playing ? <Pause size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" />}
+      <button
+        type="button"
+        className="noise-video-control-button"
+        disabled={!activeSource}
+        onClick={togglePlayback}
+        aria-label={playing ? "pause video" : "play video"}
+        title={playing ? "pause" : "play"}
+      >
+        {playing
+          ? <Pause size={16} fill="currentColor" />
+          : <Play size={16} fill="currentColor" />}
       </button>
       <span className="noise-video-time">{formatVideoTime(currentTime)}</span>
       <input
@@ -3876,13 +5296,26 @@ function ChatVideo({
         onChange={(event) => seek(Number(event.currentTarget.value))}
         aria-label="seek video"
         aria-valuetext={`${formatVideoTime(currentTime)} of ${formatVideoTime(duration)}`}
-        disabled={!source || !duration}
+        disabled={!activeSource || !duration}
       />
       <span className="noise-video-time">{formatVideoTime(duration)}</span>
-      <button type="button" className="noise-video-control-button" disabled={!source} onClick={toggleMuted} aria-label={muted ? "unmute video" : "mute video"} title={muted ? "unmute" : "mute"}>
+      <button
+        type="button"
+        className="noise-video-control-button"
+        disabled={!activeSource}
+        onClick={toggleMuted}
+        aria-label={muted ? "unmute video" : "mute video"}
+        title={muted ? "unmute" : "mute"}
+      >
         {muted ? <VolumeX size={17} /> : <Volume2 size={17} />}
       </button>
     </div>
+    {playbackFailed && activeSource && (
+      <button type="button" className="chat-video-retry" onClick={retryPlayback}>
+        <LoaderCircle size={18} />
+        <span>retry video</span>
+      </button>
+    )}
   </div>;
 }
 
@@ -4165,11 +5598,11 @@ function ProfileAlbumDialog({
             name: queued.file.name,
             mimeType: queued.file.type,
             byteLength: queued.file.size,
-            file: queued.file,
+            file: Promise.resolve(queued.file),
             previewUrl: queued.previewUrl,
             mediaPreview: queued.file.type.startsWith("video/")
-              ? prepareVideoPreview(queued.file)
-              : prepareImagePreview(queued.file),
+              ? prepareVideoPreviewSource(queued.previewUrl)
+              : prepareImagePreviewSource(queued.previewUrl),
           };
           attachment = await uploadPendingMedia(
             pending,
@@ -4302,21 +5735,25 @@ function ProfileAlbumDialog({
 
 function GalleryTile({ message, scopeId, onOpen }: { message: MediaMessage; scopeId: string; onOpen: () => void }) {
   const { attachment } = message;
-  const visibility = useNearViewport<HTMLButtonElement>();
-  const { source, failed } = useMediaSource(attachment, scopeId, visibility.near);
+  const visibility = useMediaPriority<HTMLButtonElement>();
   const image = attachment.mime_type.startsWith("image/");
   const video = attachment.mime_type.startsWith("video/");
+  const { source, failed } = useMediaSource(
+    attachment,
+    scopeId,
+    video ? null : visibility.priority,
+  );
   const thumbnail = useGalleryThumbnail(attachment, source);
+  const loading = video
+    ? false
+    : !source || (image && !thumbnail);
   return (
     <button ref={visibility.ref} className={`gallery-tile ${image ? "image" : video ? "video" : "audio"}`} onClick={onOpen} aria-label={`open media shared by ${message.username}`}>
-      {image || video
-        ? thumbnail
-          ? <img src={thumbnail} alt="" />
-          : <span className="gallery-loading">{failed ? <X size={16} /> : <LoaderCircle className="spinner" size={16} />}</span>
-        : source
-          ? <span className="gallery-audio"><AudioWaveform size={30} /><small>audio</small></span>
-          : <span className="gallery-loading">{failed ? <X size={16} /> : <LoaderCircle className="spinner" size={16} />}</span>}
-      {video && thumbnail && <i className="gallery-play"><Play size={15} fill="currentColor" /></i>}
+      {(image || video) && thumbnail && <img src={thumbnail} alt="" />}
+      {video && !thumbnail && <span className="gallery-video-placeholder"><NoiseMark size={28} monochrome /></span>}
+      {!image && !video && source && <span className="gallery-audio"><AudioWaveform size={30} /><small>audio</small></span>}
+      {loading && <span className="gallery-loading"><MediaLoadStatus failed={failed} /></span>}
+      {video && !loading && <i className="gallery-play"><Play size={15} fill="currentColor" /></i>}
     </button>
   );
 }
@@ -4861,6 +6298,148 @@ function noiseSignature(publicKey: string) {
   }
 }
 
+function CreateTopicDialog({
+  busy,
+  onClose,
+  onCreate,
+}: {
+  busy: boolean;
+  onClose: () => void;
+  onCreate: (name: string, icon: string) => Promise<boolean>;
+}) {
+  const [name, setName] = useState("");
+  const [icon, setIcon] = useState("💬");
+  return (
+    <Modal onClose={onClose} compact>
+      <div className="topic-dialog">
+        <div className="dialog-heading">
+          <span className="topic-dialog-icon">{icon}</span>
+          <span><strong>new topic</strong><small>shared with everyone in this group</small></span>
+        </div>
+        <TopicIconPicker value={icon} onChange={setIcon} />
+        <label>
+          <span>name</span>
+          <input
+            autoFocus
+            maxLength={80}
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="Announcements"
+          />
+        </label>
+        <div className="dialog-actions">
+          <button className="secondary" disabled={busy} onClick={onClose}>cancel</button>
+          <button disabled={busy || !name.trim()} onClick={() => void onCreate(name.trim(), icon)}>
+            {busy ? <LoaderCircle className="spinner" size={14} /> : <Plus size={14} />} create topic
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function TopicSettingsDialog({
+  topic,
+  busy,
+  onClose,
+  onSave,
+  onArchive,
+}: {
+  topic: TopicSummary;
+  busy: boolean;
+  onClose: () => void;
+  onSave: (name: string, icon: string, locked: boolean) => Promise<boolean>;
+  onArchive: () => Promise<boolean>;
+}) {
+  const [name, setName] = useState(topic.name);
+  const [icon, setIcon] = useState(topic.icon || "💬");
+  const [locked, setLocked] = useState(topic.locked);
+  const [archiveArmed, setArchiveArmed] = useState(false);
+  return (
+    <Modal onClose={onClose} compact>
+      <div className="topic-dialog">
+        <div className="dialog-heading">
+          <span className="topic-dialog-icon">{icon}</span>
+          <span><strong>topic settings</strong><small>names are encrypted; membership stays shared</small></span>
+        </div>
+        <TopicIconPicker value={icon} onChange={setIcon} />
+        <label>
+          <span>name</span>
+          <input
+            autoFocus
+            maxLength={80}
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+          />
+        </label>
+        <label className="topic-lock-toggle">
+          <input
+            type="checkbox"
+            checked={locked}
+            onChange={(event) => setLocked(event.target.checked)}
+          />
+          <span><strong>lock topic</strong><small>only moderators can post</small></span>
+        </label>
+        <button
+          className="topic-archive danger"
+          disabled={busy}
+          onClick={() => {
+            if (!archiveArmed) {
+              setArchiveArmed(true);
+              return;
+            }
+            void onArchive();
+          }}
+        >
+          <Trash2 size={14} /> {archiveArmed ? "click again to archive" : "archive topic"}
+        </button>
+        <div className="dialog-actions">
+          <button className="secondary" disabled={busy} onClick={onClose}>cancel</button>
+          <button
+            disabled={busy || !name.trim()}
+            onClick={() => void onSave(name.trim(), icon, locked)}
+          >
+            {busy ? <LoaderCircle className="spinner" size={14} /> : <Check size={14} />} save
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function TopicIconPicker({ value, onChange }: { value: string; onChange: (icon: string) => void }) {
+  const button = useRef<HTMLButtonElement | null>(null);
+  const [pickerPosition, setPickerPosition] = useState<{ x: number; y: number } | null>(null);
+  return (
+    <fieldset className="topic-icon-picker">
+      <legend>icon</legend>
+      <button
+        ref={button}
+        type="button"
+        className="topic-icon-select"
+        onClick={() => {
+          const bounds = button.current?.getBoundingClientRect();
+          if (bounds) setPickerPosition({ x: bounds.left, y: bounds.bottom + 8 });
+        }}
+      >
+        <span>{value}</span>
+        choose emoji
+      </button>
+      {pickerPosition && (
+        <ReactionPicker
+          x={pickerPosition.x}
+          y={pickerPosition.y}
+          onClose={() => setPickerPosition(null)}
+          onPick={(icon) => {
+            onChange(icon);
+            setPickerPosition(null);
+          }}
+        />
+      )}
+    </fieldset>
+  );
+}
+
 function Modal({ children, onClose, compact = false, wide = false, closeDisabled = false, className = "" }: { children: React.ReactNode; onClose: () => void; compact?: boolean; wide?: boolean; closeDisabled?: boolean; className?: string }) {
   return <div className="modal-backdrop" onMouseDown={closeDisabled ? undefined : onClose}><section className={`modal ${compact ? "compact" : ""} ${wide ? "wide" : ""} ${className}`.trim()} onMouseDown={(event) => event.stopPropagation()}><button className="modal-close" disabled={closeDisabled} onClick={onClose} aria-label={closeDisabled ? "saving settings" : "close"}>{closeDisabled ? <LoaderCircle className="spinner" size={14} /> : <X size={15} />}</button>{children}</section></div>;
 }
@@ -4995,6 +6574,38 @@ async function syncGroupEncryption(): Promise<GroupEncryptionStatus | null> {
   }
 }
 
+async function cancelGroupLoading() {
+  if (!isTauri) return;
+  try {
+    await noise({ action: "cancel_group_loading" });
+  } catch (cause) {
+    if (!message(cause).includes("unknown variant `cancel_group_loading`")) throw cause;
+  }
+}
+
+async function cancelBackgroundLoading() {
+  if (!isTauri) return;
+  try {
+    await noise({ action: "cancel_background_loading" });
+  } catch (cause) {
+    if (!message(cause).includes("unknown variant `cancel_background_loading`")) throw cause;
+  }
+}
+
+async function cancelMediaDownloads() {
+  mediaLoadScheduler.cancelQueued();
+  if (!isTauri) return;
+  try {
+    await noise({ action: "cancel_media_loading" });
+  } catch (cause) {
+    if (!message(cause).includes("unknown variant `cancel_media_loading`")) throw cause;
+  }
+}
+
+function isSupersededLoading(cause: unknown) {
+  return message(cause).includes("loading superseded");
+}
+
 async function syncGroupActivity(groupId: string): Promise<GroupActivityResult | null> {
   try {
     const result = await noise<GroupActivityResult | LocalSummary>({
@@ -5012,6 +6623,18 @@ async function syncGroupActivity(groupId: string): Promise<GroupActivityResult |
   }
 }
 
+async function syncTopicActivity(
+  groupId: string,
+  topicId: string,
+): Promise<GroupActivityResult | null> {
+  return noise<GroupActivityResult>({
+    action: "sync_topic_activity",
+    group_id: groupId,
+    topic_id: topicId,
+    relays,
+  });
+}
+
 async function markGroupRead(groupId: string): Promise<LocalSummary | null> {
   try {
     return await noise<LocalSummary>({
@@ -5022,6 +6645,14 @@ async function markGroupRead(groupId: string): Promise<LocalSummary | null> {
     if (message(cause).includes("unknown variant `mark_group_read`")) return null;
     throw cause;
   }
+}
+
+async function markTopicRead(groupId: string, topicId: string): Promise<LocalSummary | null> {
+  return noise<LocalSummary>({
+    action: "mark_topic_read",
+    group_id: groupId,
+    topic_id: topicId,
+  });
 }
 
 function EncryptionPending({ phase }: { phase: GroupEncryptionStatus["phase"] }) {
@@ -5118,28 +6749,36 @@ function imageIsNearBlack(source: string) {
 
 async function uploadPendingMedia(pending: PendingMedia | null, action: "upload_media_chunk" | "upload_direct_media_chunk" | "upload_profile_media_chunk", onProgress: (progress: number) => void, signal: AbortSignal): Promise<MediaAttachment | null> {
   if (!pending) return null;
+  const file = await pending.file;
   const mediaPreview = pending.mediaPreview;
   const chunks: MediaChunk[] = [];
-  const chunkSize = 1024 * 1024;
-  for (let offset = 0; offset < pending.file.size; offset += chunkSize) {
+  const mimeType = file.type || pending.mimeType;
+  const streaming = mimeType.startsWith("video/") || mimeType.startsWith("audio/");
+  const bootstrapBytes = 2 * 1024 * 1024;
+  let offset = 0;
+  while (offset < file.size) {
     if (signal.aborted) throw new Error("media upload cancelled");
+    const chunkSize = streaming && offset < bootstrapBytes
+      ? 256 * 1024
+      : 1024 * 1024;
     const chunk = await noise<MediaChunk>({
       action,
-      data_base64: await fileBase64(pending.file.slice(offset, offset + chunkSize)),
+      data_base64: await fileBase64(file.slice(offset, offset + chunkSize)),
       relays,
     });
     if (signal.aborted) throw new Error("media upload cancelled");
     if (!chunk) throw new Error("relay did not return a media chunk reference");
     chunks.push(chunk);
-    onProgress(Math.min(95, Math.round(((offset + chunk.byte_length) / pending.file.size) * 95)));
+    onProgress(Math.min(95, Math.round(((offset + chunk.byte_length) / file.size) * 95)));
+    offset += chunk.byte_length;
   }
   if (signal.aborted) throw new Error("media upload cancelled");
   const preview = mediaPreview ? await mediaPreview : null;
   if (signal.aborted) throw new Error("media upload cancelled");
   return {
-    file_name: pending.name,
-    mime_type: pending.mimeType,
-    byte_length: pending.byteLength,
+    file_name: file.name || pending.name,
+    mime_type: mimeType,
+    byte_length: file.size,
     chunks,
     preview_data_base64: preview?.dataBase64 ?? null,
     preview_mime_type: preview?.mimeType ?? null,

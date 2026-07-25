@@ -3,6 +3,7 @@ use std::{
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::Path,
+    sync::{Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,6 +21,7 @@ const MAX_DIRECTORY_ENTRIES: usize = 512;
 const MAX_DISCOVERY_SOURCES: usize = 10;
 const MAX_CANDIDATES_TO_VERIFY: usize = 24;
 const MAX_MASK_RELAYS: usize = 12;
+const MAX_CACHED_MASK_CLIENTS: usize = 32;
 const MAX_DESCRIPTOR_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_DIRECTORY_RESPONSE_BYTES: usize = 1024 * 1024;
 const MIN_STORAGE_AVAILABLE_BYTES: u64 = 2_000_000;
@@ -190,7 +192,34 @@ fn consider_descriptor(
 
 pub(super) async fn client_for_mask(base_url: &str) -> anyhow::Result<Client> {
     let relay = RelayDescriptor::parse(base_url)?;
-    client_for_relay(&relay.base_url, relay.is_local()).await
+    if let Some(client) = mask_clients()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("relay client cache is unavailable"))?
+        .get(&relay.base_url)
+        .cloned()
+    {
+        return Ok(client);
+    }
+
+    let client = client_for_relay(&relay.base_url, relay.is_local()).await?;
+    let mut clients = mask_clients()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("relay client cache is unavailable"))?;
+    if let Some(existing) = clients.get(&relay.base_url) {
+        return Ok(existing.clone());
+    }
+    if clients.len() >= MAX_CACHED_MASK_CLIENTS
+        && let Some(expired) = clients.keys().next().cloned()
+    {
+        clients.remove(&expired);
+    }
+    clients.insert(relay.base_url, client.clone());
+    Ok(client)
+}
+
+fn mask_clients() -> &'static Mutex<HashMap<String, Client>> {
+    static CLIENTS: OnceLock<Mutex<HashMap<String, Client>>> = OnceLock::new();
+    CLIENTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 async fn fetch_directory(
