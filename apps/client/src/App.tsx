@@ -2069,6 +2069,79 @@ export default function App() {
     .map((group) => group.group_id)
     .sort()
     .join("|") ?? "";
+
+  useEffect(() => {
+    if (
+      sidebarMode !== "groups"
+      || !activeGroupId
+      || !groupEncryption
+      || groupEncryption.group_id !== activeGroupId
+      || groupEncryption.phase === "active"
+      || groupEncryption.phase === "removed"
+    ) return;
+
+    let stopped = false;
+    const recover = async () => {
+      let retryDelay = 650;
+      while (!stopped && desiredGroupIdRef.current === activeGroupId) {
+        try {
+          if (summary?.identity.noise_id) {
+            const reconciled = await noise<LocalSummary>({
+              action: "sync_read_state",
+              relays,
+            });
+            if (stopped || desiredGroupIdRef.current !== activeGroupId) return;
+            if (reconciled) setSummary(reconciled);
+          }
+
+          const encryption = await syncGroupEncryption();
+          if (stopped || desiredGroupIdRef.current !== activeGroupId) return;
+          setGroupEncryption(encryption);
+          if (encryption?.phase === "removed") {
+            const reconciled = await noise<LocalSummary>({ action: "status" });
+            if (!stopped) {
+              setConversation(null);
+              setSummary(reconciled);
+            }
+            return;
+          }
+          if (encryption?.phase === "active") {
+            const activity = await syncGroupActivity(activeGroupId);
+            if (stopped || desiredGroupIdRef.current !== activeGroupId) return;
+            if (activity) {
+              setSummary(activity.summary);
+              if (activity.conversation) {
+                groupConversationCache.current.set(activeGroupId, activity.conversation);
+                setConversation(activity.conversation);
+              }
+            }
+            void noise({
+              action: "sync_account",
+              relays,
+              interruptible: true,
+            }).catch(() => undefined);
+            return;
+          }
+        } catch {
+          // Recovery remains on screen and retries until the encrypted account
+          // snapshot or group admission becomes available.
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, retryDelay));
+        retryDelay = Math.min(Math.round(retryDelay * 1.55), 4_000);
+      }
+    };
+    void recover();
+    return () => {
+      stopped = true;
+    };
+  }, [
+    activeGroupId,
+    groupEncryption?.group_id,
+    groupEncryption?.phase,
+    sidebarMode,
+    summary?.identity.noise_id,
+  ]);
+
   const handleDeletedGroup = useCallback(async (groupId: string) => {
     groupWatchRevisions.current.delete(groupId);
     dirtyGroupIds.current.delete(groupId);
