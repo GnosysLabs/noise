@@ -73,6 +73,7 @@ const MAX_MEDIA_RANGE_BYTES: u64 = 4 * 1024 * 1024;
 const WEB_MEDIA_CHUNK_CACHE_BYTES: usize = 96 * 1024 * 1024;
 const INITIAL_GROUP_MESSAGE_WINDOW: usize = 30;
 const GROUP_EVENT_PAGE_SIZE: usize = 128;
+const TOPIC_RECOVERY_CONCURRENCY: usize = 4;
 
 #[derive(Clone)]
 pub struct NoiseClient {
@@ -5470,11 +5471,23 @@ impl NoiseClient {
             .get(group_id)
             .and_then(|cache| cache.topic_streams.get(topic_id))
             .cloned();
+        let has_cached_stream_events = state
+            .group_event_caches
+            .get(group_id)
+            .is_some_and(|cache| {
+                cache.events.iter().any(|event| {
+                    event.stream_locator.as_deref() == Some(topic.stream_locator.as_str())
+                })
+            });
         let relays = relay_list(relays)?;
-        let request = stream
-            .as_ref()
-            .and_then(|stream| stream.latest_cursor.as_ref())
-            .map_or(GroupEventPageRequest::Latest, GroupEventPageRequest::After);
+        let request = if has_cached_stream_events {
+            stream
+                .as_ref()
+                .and_then(|stream| stream.latest_cursor.as_ref())
+                .map_or(GroupEventPageRequest::Latest, GroupEventPageRequest::After)
+        } else {
+            GroupEventPageRequest::Latest
+        };
         let page = self
             .fetch_group_event_page(
                 group_id,
@@ -5781,7 +5794,11 @@ impl NoiseClient {
             .get(group_id)
             .is_some_and(|cache| cache.needs_control_hydration)
         {
-            let events = self.fetch_events(&group, relays).await?;
+            let mut events = self.fetch_events(&group, relays.clone()).await?;
+            let topic_events =
+                self.fetch_latest_topic_events(&state, &group, &events, &relays)
+                    .await;
+            events.extend(topic_events);
             return Ok(GroupActivityUpdate {
                 group_id: group_id.to_owned(),
                 events,
@@ -5790,6 +5807,35 @@ impl NoiseClient {
                 has_older_messages: false,
                 topic_update: None,
             });
+        }
+        if let Some(cache) = state.group_event_caches.get(group_id)
+            && let Ok(view) = rebuild_group_state(&state, &group, &cache.events)
+        {
+            let missing_topic_events = view.topics.values().any(|topic| {
+                !topic.archived
+                    && cache
+                        .topic_streams
+                        .get(&topic.topic_id)
+                        .is_some_and(|stream| stream.latest_cursor.is_some())
+                    && !cache.events.iter().any(|event| {
+                        event.stream_locator.as_deref() == Some(topic.stream_locator.as_str())
+                    })
+            });
+            if missing_topic_events {
+                let events = self
+                    .fetch_latest_topic_events(&state, &group, &cache.events, &relays)
+                    .await;
+                if !events.is_empty() {
+                    return Ok(GroupActivityUpdate {
+                        group_id: group_id.to_owned(),
+                        events,
+                        full_snapshot: false,
+                        older_cursor: cache.older_cursor.clone(),
+                        has_older_messages: cache.has_older_messages,
+                        topic_update: None,
+                    });
+                }
+            }
         }
         if let Some(cache) = state.group_event_caches.get(group_id)
             && let Some(mut cursor) = cache.latest_cursor.clone()
@@ -5847,7 +5893,11 @@ impl NoiseClient {
                 topic_update: None,
             });
         }
-        let events = self.fetch_events(&group, relays).await?;
+        let mut events = self.fetch_events(&group, relays.clone()).await?;
+        let topic_events =
+            self.fetch_latest_topic_events(&state, &group, &events, &relays)
+                .await;
+        events.extend(topic_events);
         Ok(GroupActivityUpdate {
             group_id: group_id.to_owned(),
             events,
@@ -5856,6 +5906,43 @@ impl NoiseClient {
             has_older_messages: false,
             topic_update: None,
         })
+    }
+
+    async fn fetch_latest_topic_events(
+        &self,
+        state: &ClientState,
+        group: &GroupMembership,
+        control_events: &[SignedEvent],
+        relays: &[RelayDescriptor],
+    ) -> Vec<SignedEvent> {
+        let Ok(view) = rebuild_group_state(state, group, control_events) else {
+            return Vec::new();
+        };
+        let requests = futures_util::stream::iter(
+            view.topics
+                .values()
+                .filter(|topic| !topic.archived)
+                .map(|topic| topic.stream_locator.clone())
+                .collect::<Vec<_>>(),
+        )
+        .map(|stream_locator| async move {
+            self.fetch_group_event_page(
+                &group.group_id,
+                Some(&stream_locator),
+                GroupEventPageRequest::Latest,
+                relays,
+            )
+            .await
+        })
+        .buffer_unordered(TOPIC_RECOVERY_CONCURRENCY);
+        futures_util::pin_mut!(requests);
+        let mut events = Vec::new();
+        while let Some(result) = requests.next().await {
+            if let Ok(Some(page)) = result {
+                events.extend(page.events);
+            }
+        }
+        events
     }
 
     pub fn apply_group_activity(
@@ -5908,7 +5995,17 @@ impl NoiseClient {
             stream.message_limit = topic_update.message_limit.max(1);
         }
         let mut events = if full_snapshot {
-            Vec::new()
+            existing_cache
+                .as_ref()
+                .map(|cache| {
+                    cache
+                        .events
+                        .iter()
+                        .filter(|event| event.stream_locator.is_some())
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
         } else {
             existing_cache
                 .as_ref()
