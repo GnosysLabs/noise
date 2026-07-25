@@ -7624,19 +7624,52 @@ impl NoiseClient {
         id: &str,
         relays: Vec<RelayDescriptor>,
     ) -> anyhow::Result<Vec<SignedEvent>> {
+        if let Some(mut page) = self
+            .fetch_group_event_page(id, None, GroupEventPageRequest::Latest, &relays)
+            .await?
+        {
+            let mut events = page.events;
+            while page.has_more {
+                let cursor = page
+                    .continuation_cursor
+                    .context("relay history page has no continuation cursor")?;
+                page = self
+                    .fetch_group_event_page(
+                        id,
+                        None,
+                        GroupEventPageRequest::Before(&cursor),
+                        &relays,
+                    )
+                    .await?
+                    .context("the configured relays stopped paginating group history")?;
+                if let Some(next_cursor) = page.continuation_cursor.as_ref()
+                    && next_cursor.key() >= cursor.key()
+                {
+                    bail!("relay returned a non-advancing group history page")
+                }
+                events.extend(page.events);
+            }
+            return Ok(merge_group_events(id, events));
+        }
+
+        // Compatibility for older relays that predate bounded event pages.
         let endpoint = format!("/v1/groups/{id}/events");
         let mut requests = FuturesUnordered::new();
         for index in 0..relays.len() {
             let endpoint = endpoint.clone();
             let relays = &relays;
             requests.push(async move {
-                self.relay_request(&relays, index, "GET", &endpoint, &[])
-                    .await
+                (
+                    index,
+                    self.relay_request(&relays, index, "GET", &endpoint, &[])
+                        .await,
+                )
             });
         }
 
         let mut merged = HashMap::<String, SignedEvent>::new();
         let mut reachable = 0usize;
+        let mut failures = Vec::new();
         while !requests.is_empty() {
             let response = if reachable == 0 {
                 requests.next().await
@@ -7647,13 +7680,28 @@ impl NoiseClient {
                     Either::Right(_) => break,
                 }
             };
-            let Some(Ok(response)) = response else {
+            let Some((index, result)) = response else {
                 continue;
             };
+            let response = match result {
+                Ok(response) => response,
+                Err(error) => {
+                    failures.push(format!("{}: {error:#}", relays[index].base_url));
+                    continue;
+                }
+            };
             if !(200..300).contains(&response.status) {
+                failures.push(format!(
+                    "{} returned {}",
+                    relays[index].base_url, response.status
+                ));
                 continue;
             }
             let Ok(events) = serde_json::from_slice::<Vec<SignedEvent>>(&response.body) else {
+                failures.push(format!(
+                    "{} returned invalid group history",
+                    relays[index].base_url
+                ));
                 continue;
             };
             reachable += 1;
@@ -7664,7 +7712,7 @@ impl NoiseClient {
             }
         }
         if reachable == 0 {
-            bail!("no relay was reachable")
+            bail!("no relay was reachable ({})", failures.join("; "))
         }
         Ok(merged.into_values().collect())
     }
