@@ -20,6 +20,7 @@ const SAFETY_REPORT_CONTEXT: &str = "xyz.gnosyslabs.noise.safety-report.v1";
 const SAFETY_HPKE_INFO: &[u8] = b"xyz.gnosyslabs.noise.safety-envelope.v1";
 const SAFETY_KEY_ID_CONTEXT: &str = "xyz.gnosyslabs.noise.safety-key-id.v1";
 const MAX_REPORT_DETAILS_CHARS: usize = 1_000;
+const MAX_REPORTED_TEXT_CHARS: usize = 4_000;
 const MAX_ENCRYPTED_OBJECTS: usize = 256;
 const MAX_RELAY_URL_BYTES: usize = 2_048;
 
@@ -34,7 +35,7 @@ pub enum SafetyReportCategoryV1 {
     HarassmentOrHatefulBehavior,
     SpamScamOrImpersonation,
     ThreatsOrImmediateDanger,
-    SexualExploitationOrIntimateImagery,
+    SexualExploitationOrNonConsensualSexualContent,
     ChildSafety,
     Other,
 }
@@ -69,11 +70,13 @@ pub struct SafetyEncryptedShardV1 {
     pub shard_id: String,
 }
 
-/// A metadata-only report intended for Noise Safety rather than group staff.
+/// A content-minimized report intended for Noise Safety rather than group staff.
 ///
 /// `reported_event` remains encrypted. Including the complete signed event
 /// lets the safety service verify its author, group, event id, and timestamp
-/// without receiving the decrypted message or any media bytes.
+/// without receiving the decrypted message or any media bytes. Threat reports
+/// may explicitly include one bounded text excerpt so staff can assess the
+/// danger without receiving surrounding history.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SafetyReportV1 {
     pub version: u32,
@@ -87,6 +90,8 @@ pub struct SafetyReportV1 {
     pub media_fingerprint: Option<SafetyMediaFingerprintV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub encrypted_objects: Vec<SafetyEncryptedObjectV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_text_excerpt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
     pub created_at_millis: u64,
@@ -104,6 +109,8 @@ struct UnsignedSafetyReportV1<'a> {
     group_context_proof: Option<&'a SignedEvent>,
     media_fingerprint: Option<&'a SafetyMediaFingerprintV1>,
     encrypted_objects: &'a [SafetyEncryptedObjectV1],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reported_text_excerpt: Option<&'a str>,
     details: Option<&'a str>,
     created_at_millis: u64,
 }
@@ -117,8 +124,10 @@ impl SafetyReportV1 {
         group_context_proof: Option<SignedEvent>,
         media_fingerprint: Option<SafetyMediaFingerprintV1>,
         encrypted_objects: Vec<SafetyEncryptedObjectV1>,
+        reported_text_excerpt: Option<String>,
         details: Option<String>,
     ) -> Result<Self, NoiseError> {
+        let reported_text_excerpt = reported_text_excerpt.filter(|value| !value.trim().is_empty());
         let details = details
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
@@ -132,6 +141,7 @@ impl SafetyReportV1 {
             group_context_proof,
             media_fingerprint,
             encrypted_objects,
+            reported_text_excerpt,
             details,
             created_at_millis: now_millis(),
             signature_base64: String::new(),
@@ -149,6 +159,11 @@ impl SafetyReportV1 {
                 .details
                 .as_deref()
                 .is_some_and(|details| details.chars().count() > MAX_REPORT_DETAILS_CHARS)
+            || self.reported_text_excerpt.as_deref().is_some_and(|text| {
+                text.trim().is_empty()
+                    || text.chars().count() > MAX_REPORTED_TEXT_CHARS
+                    || self.category != SafetyReportCategoryV1::ThreatsOrImmediateDanger
+            })
             || self.encrypted_objects.len() > MAX_ENCRYPTED_OBJECTS
         {
             return Err(NoiseError::InvalidEncoding("safety report"));
@@ -245,6 +260,7 @@ impl SafetyReportV1 {
             group_context_proof: self.group_context_proof.as_ref(),
             media_fingerprint: self.media_fingerprint.as_ref(),
             encrypted_objects: &self.encrypted_objects,
+            reported_text_excerpt: self.reported_text_excerpt.as_deref(),
             details: self.details.as_deref(),
             created_at_millis: self.created_at_millis,
         })?)
@@ -355,7 +371,7 @@ mod tests {
     use crate::{DirectMessagePolicy, GroupMembership, Profile};
 
     #[test]
-    fn signed_metadata_only_safety_report_seals_and_opens() {
+    fn signed_content_minimized_safety_report_seals_and_opens() {
         let author = Identity::generate();
         let reporter = Identity::generate();
         let group = GroupMembership::create_owned("reported group", author.public_key_base64());
@@ -377,7 +393,7 @@ mod tests {
             SignedEvent::chat(&author, &group, "encrypted report target", 1).unwrap();
         let report = SafetyReportV1::create(
             &reporter,
-            SafetyReportCategoryV1::ChildSafety,
+            SafetyReportCategoryV1::ThreatsOrImmediateDanger,
             reported_event,
             Some(membership_proof),
             Some(SafetyMediaFingerprintV1 {
@@ -392,6 +408,7 @@ mod tests {
                     shard_id: "b".repeat(64),
                 }],
             }],
+            Some("A direct threat from the reported message.".into()),
             Some("Group staff may be involved.".into()),
         )
         .unwrap();
@@ -405,6 +422,10 @@ mod tests {
         let opened = restored_key.open(&decoded).unwrap();
 
         assert_eq!(opened, report);
+        assert_eq!(
+            opened.reported_text_excerpt.as_deref(),
+            Some("A direct threat from the reported message.")
+        );
         assert_eq!(decoded.recipient_key_id, restored_key.key_id());
         assert!(
             SafetyEncryptionKeyPair::generate()
