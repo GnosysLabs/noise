@@ -1936,7 +1936,7 @@ export default function App() {
       public_key: publicKey,
     });
     if (marked) setSummary(marked);
-    void noise({ action: "sync_account", relays, interruptible: true }).catch(() => {
+    void noise({ action: "publish_read_state", relays }).catch(() => {
       // The local read marker is immediate; cross-device sync retries normally.
     });
   }, []);
@@ -1978,7 +1978,7 @@ export default function App() {
       if (!marked) return;
       setSummary(marked);
       clearVisibleUnread();
-      void noise({ action: "sync_account", relays, interruptible: true }).catch(() => {
+      void noise({ action: "publish_read_state", relays }).catch(() => {
         // The local group read marker is immediate; cross-device sync retries normally.
       });
     } finally {
@@ -2030,7 +2030,7 @@ export default function App() {
       if (!marked) return;
       setSummary(marked);
       clearVisibleUnread();
-      void noise({ action: "sync_account", relays, interruptible: true }).catch(() => {
+      void noise({ action: "publish_read_state", relays }).catch(() => {
         // The local topic read marker is immediate; cross-device sync retries normally.
       });
     } finally {
@@ -2844,7 +2844,11 @@ export default function App() {
           if (stopped || !change) return;
           revision = change.revision;
           if (initial || change.changed) {
-            const reconciled = await noise<LocalSummary>({ action: "sync_read_state", relays });
+            const reconciled = await noise<LocalSummary>({
+              action: "refresh_account_state",
+              relays,
+              interruptible: true,
+            });
             if (!stopped && reconciled) setSummary(reconciled);
           }
         } catch (cause) {
@@ -2853,6 +2857,37 @@ export default function App() {
             window.location.reload();
             return;
           }
+          await new Promise((resolve) => window.setTimeout(resolve, 1500));
+        }
+      }
+    };
+    void watch();
+    return () => { stopped = true; };
+  }, [identityPublicKey, summary?.identity.noise_id]);
+
+  useEffect(() => {
+    if (!identityPublicKey || !summary?.identity.noise_id) return;
+    let stopped = false;
+    const watch = async () => {
+      let revision: number | null = null;
+      while (!stopped) {
+        try {
+          const initial = revision === null;
+          const change: GroupWatch | null = await noise<GroupWatch>({
+            action: "watch_read_state",
+            since: revision,
+            relays,
+          });
+          if (stopped || !change) return;
+          revision = change.revision;
+          if (initial || change.changed) {
+            const reconciled = await noise<LocalSummary>({
+              action: "sync_read_state",
+              relays,
+            });
+            if (!stopped && reconciled) setSummary(reconciled);
+          }
+        } catch {
           await new Promise((resolve) => window.setTimeout(resolve, 1500));
         }
       }
@@ -3380,9 +3415,8 @@ export default function App() {
       }
       setSummary(reconciled);
       void noise({
-        action: "sync_account",
+        action: "publish_read_state",
         relays,
-        interruptible: true,
       }).catch(() => {
         // The thread is already read locally; cross-device sync retries normally.
       });
@@ -8398,11 +8432,22 @@ function GlobalSearchModal({
   const [results, setResults] = useState<SearchResults>(emptySearchResults);
   const [loading, setLoading] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  const [showOlderSearchStatus, setShowOlderSearchStatus] = useState(false);
+  const [olderSearchError, setOlderSearchError] = useState<string | null>(null);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const searchSequence = useRef(0);
+  const olderSearchSequence = useRef(0);
+  const loadingOlderRef = useRef(false);
+  const queryRef = useRef("");
   const selectedRef = useRef<HTMLButtonElement | null>(null);
+  const historySentinelRef = useRef<HTMLDivElement | null>(null);
   const groupMessages = results.messages.filter((result) => !result.direct_public_key);
   const directMessages = results.messages.filter((result) => result.direct_public_key);
+  const canSearchOlderHistory = Boolean(
+    query.trim()
+    && results.has_more_history
+    && results.older_scopes[0],
+  );
   const choices: GlobalSearchChoice[] = [
     ...groupMessages.map((result): GlobalSearchChoice => ({ kind: "message", result })),
     ...directMessages.map((result): GlobalSearchChoice => ({ kind: "message", result })),
@@ -8410,7 +8455,7 @@ function GlobalSearchModal({
     ...results.people.map((result): GlobalSearchChoice => ({ kind: "person", result })),
   ];
 
-  const runSearch = useCallback(async (value: string) => {
+  const runSearch = useCallback(async (value: string, resetSelection = true) => {
     const trimmed = value.trim();
     const sequence = ++searchSequence.current;
     if (!trimmed) {
@@ -8427,7 +8472,7 @@ function GlobalSearchModal({
       });
       if (sequence === searchSequence.current) {
         setResults(found ?? emptySearchResults);
-        setSelectedIndex(0);
+        if (resetSelection) setSelectedIndex(0);
       }
     } finally {
       if (sequence === searchSequence.current) setLoading(false);
@@ -8435,11 +8480,108 @@ function GlobalSearchModal({
   }, []);
 
   useEffect(() => {
+    queryRef.current = query;
+    setOlderSearchError(null);
+    setShowOlderSearchStatus(false);
     const timer = window.setTimeout(() => {
       void runSearch(query);
     }, 120);
     return () => window.clearTimeout(timer);
   }, [query, runSearch]);
+
+  useEffect(() => () => {
+    olderSearchSequence.current += 1;
+  }, []);
+
+  const loadOlderPage = useCallback(async () => {
+    const requestedQuery = queryRef.current.trim();
+    const scope = results.older_scopes[0];
+    if (
+      !requestedQuery
+      || !scope
+      || loadingOlderRef.current
+      || olderSearchError
+    ) return;
+
+    const sequence = ++olderSearchSequence.current;
+    loadingOlderRef.current = true;
+    setLoadingOlder(true);
+    setOlderSearchError(null);
+    const statusTimer = window.setTimeout(() => {
+      if (
+        sequence === olderSearchSequence.current
+        && requestedQuery === queryRef.current.trim()
+      ) {
+        setShowOlderSearchStatus(true);
+      }
+    }, 400);
+
+    try {
+      await onLoadOlder(scope);
+      if (
+        sequence !== olderSearchSequence.current
+        || requestedQuery !== queryRef.current.trim()
+      ) {
+        return;
+      }
+      await runSearch(requestedQuery, false);
+    } catch {
+      if (
+        sequence === olderSearchSequence.current
+        && requestedQuery === queryRef.current.trim()
+      ) {
+        setOlderSearchError("Couldn’t search all history.");
+      }
+    } finally {
+      window.clearTimeout(statusTimer);
+      if (sequence === olderSearchSequence.current) {
+        loadingOlderRef.current = false;
+        setLoadingOlder(false);
+        setShowOlderSearchStatus(false);
+      }
+    }
+  }, [
+    loadingOlder,
+    olderSearchError,
+    onLoadOlder,
+    results.older_scopes,
+    runSearch,
+  ]);
+
+  useEffect(() => {
+    const sentinel = historySentinelRef.current;
+    const scope = results.older_scopes[0];
+    if (
+      !sentinel
+      || !query.trim()
+      || !results.has_more_history
+      || !scope
+      || loadingOlder
+      || olderSearchError
+    ) {
+      return;
+    }
+
+    const root = sentinel.closest(".global-search-results");
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        void loadOlderPage();
+      }
+    }, {
+      root,
+      rootMargin: "0px 0px 120px",
+      threshold: 0.01,
+    });
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [
+    loadOlderPage,
+    loadingOlder,
+    olderSearchError,
+    query,
+    results.has_more_history,
+    results.older_scopes,
+  ]);
 
   useEffect(() => {
     selectedRef.current?.scrollIntoView({ block: "nearest" });
@@ -8498,11 +8640,14 @@ function GlobalSearchModal({
             <span>Decrypted messages are searched privately on this device.</span>
           </div>
         )}
-        {query.trim() && !loading && choices.length === 0 && (
+        {query.trim()
+          && !loading
+          && !canSearchOlderHistory
+          && choices.length === 0 && (
           <div className="global-search-empty">
             <Search size={28} />
-            <strong>no matches yet</strong>
-            <span>Try another word, or search older history below.</span>
+            <strong>no matches</strong>
+            <span>Try another word.</span>
           </div>
         )}
         {[
@@ -8589,22 +8734,29 @@ function GlobalSearchModal({
             })}
           </section>
         )}
-        {query.trim() && results.has_more_history && (
-          <button
-            className="search-older-history"
-            disabled={loadingOlder}
-            onClick={() => {
-              const scope = results.older_scopes[0];
-              if (!scope) return;
-              setLoadingOlder(true);
-              void onLoadOlder(scope)
-                .then(() => runSearch(query))
-                .finally(() => setLoadingOlder(false));
-            }}
+        {canSearchOlderHistory && (
+          <div
+            ref={historySentinelRef}
+            className="search-history-sentinel"
+            aria-live="polite"
           >
-            {loadingOlder ? <LoaderCircle className="spinner" size={14} /> : <Search size={14} />}
-            {loadingOlder ? "searching an older page…" : "search older history"}
-          </button>
+            {olderSearchError ? (
+              <>
+                <span>{olderSearchError}</span>
+                <button
+                  className="search-history-retry"
+                  onClick={() => setOlderSearchError(null)}
+                >
+                  retry
+                </button>
+              </>
+            ) : showOlderSearchStatus ? (
+              <>
+                <LoaderCircle className="spinner" size={14} />
+                <span>looking further back…</span>
+              </>
+            ) : null}
+          </div>
         )}
       </div>
       <div className="global-search-footer">

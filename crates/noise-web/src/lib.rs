@@ -139,9 +139,31 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .await
                 .map_err(|error| error.to_string())?,
         ),
+        "refresh_account_state" => data(
+            client
+                .refresh_account_state(STATE_PATH, CACHE_PATH, relays(&request)?)
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "publish_read_state" => data(
+            client
+                .publish_read_state(STATE_PATH, relays(&request)?)
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
         "watch_account" => data(
             client
                 .watch_account(
+                    STATE_PATH,
+                    optional::<u64>(&request, "since")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "watch_read_state" => data(
+            client
+                .watch_read_state(
                     STATE_PATH,
                     optional::<u64>(&request, "since")?,
                     relays(&request)?,

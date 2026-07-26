@@ -121,6 +121,11 @@ pub struct AccountStateUpdate {
     vault: AccountVault,
 }
 
+pub struct ReadStateUpdate {
+    account: Option<AccountStateUpdate>,
+    read_state: Option<AccountStateUpdate>,
+}
+
 struct TopicActivityUpdate {
     topic_id: String,
     latest_cursor: Option<GroupEventCursor>,
@@ -778,6 +783,19 @@ struct AccountSession {
     locator: String,
     vault_key_base64: String,
     revision: u64,
+    #[serde(default)]
+    read_state_revision: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AccountReadStateContents {
+    version: u32,
+    #[serde(default)]
+    direct_read_through: HashMap<String, DirectMessageMarker>,
+    #[serde(default)]
+    group_read_through: HashMap<String, MessageMarker>,
+    #[serde(default)]
+    topic_read_through: HashMap<String, MessageMarker>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1683,6 +1701,31 @@ impl ClientState {
         })
     }
 
+    fn account_read_state_credentials(&self) -> anyhow::Result<AccountCredentials> {
+        let account = self
+            .account
+            .as_ref()
+            .context("this identity has no noise ID")?;
+        let locator =
+            blake3::hash(format!("noise-account-read-state-v1:{}", account.locator).as_bytes())
+                .to_hex()
+                .to_string();
+        Ok(AccountCredentials {
+            noise_id: account.noise_id.clone(),
+            locator,
+            vault_key_base64: account.vault_key_base64.clone(),
+        })
+    }
+
+    fn read_state_contents(&self) -> AccountReadStateContents {
+        AccountReadStateContents {
+            version: 1,
+            direct_read_through: self.direct_read_through.clone(),
+            group_read_through: self.group_read_through.clone(),
+            topic_read_through: self.topic_read_through.clone(),
+        }
+    }
+
     fn portable_group_state_snapshots(&self) -> HashMap<String, GroupEventCache> {
         self.groups
             .iter()
@@ -2562,9 +2605,12 @@ impl NoiseClient {
                 locator: credentials.locator,
                 vault_key_base64: credentials.vault_key_base64,
                 revision: 0,
+                read_state_revision: 0,
             }),
         };
         self.publish_account_state(&mut state, &relays).await?;
+        self.publish_read_state_for_state(&mut state, &relays)
+            .await?;
         save_state(path, &state)?;
         state.summary()
     }
@@ -2594,8 +2640,9 @@ impl NoiseClient {
             }
             bail!("an identity is already active on this device")
         }
+        let relays = relay_list(relays)?;
         let vault = self
-            .fetch_account_vault(&relay_list(relays)?, &credentials.locator)
+            .fetch_account_vault(&relays, &credentials.locator)
             .await
             .context("noise ID or password is incorrect")?;
         let plaintext = vault
@@ -2608,11 +2655,25 @@ impl NoiseClient {
             locator: credentials.locator,
             vault_key_base64: credentials.vault_key_base64,
             revision: vault.revision,
+            read_state_revision: 0,
         };
-        let state = ClientState::from_vault(contents, account)
+        let mut state = ClientState::from_vault(contents, account)
             .map_err(|_| anyhow::anyhow!("noise ID or password is incorrect"))?;
         if state.identity()?.public_key_base64() != vault.identity_public_key {
             bail!("noise ID or password is incorrect")
+        }
+        let read_credentials = state.account_read_state_credentials()?;
+        let has_read_state = if let Ok(read_vault) = self
+            .fetch_account_vault(&relays, &read_credentials.locator)
+            .await
+        {
+            Self::merge_remote_read_state(&mut state, &read_credentials, &read_vault)?;
+            true
+        } else {
+            false
+        };
+        if !has_read_state {
+            let _ = self.publish_read_state_for_state(&mut state, &relays).await;
         }
         save_state(path, &state)?;
         state.summary()
@@ -2730,8 +2791,56 @@ impl NoiseClient {
         &self,
         path: impl AsRef<Path>,
         relays: Vec<String>,
-    ) -> anyhow::Result<Option<AccountStateUpdate>> {
+    ) -> anyhow::Result<Option<ReadStateUpdate>> {
         let state = load_state(path.as_ref())?;
+        if state.account.is_none() {
+            return Ok(None);
+        }
+        let relays = relay_list(relays)?;
+        let read_credentials = state.account_read_state_credentials()?;
+        let read_state = self
+            .fetch_account_vault(&relays, &read_credentials.locator)
+            .await
+            .ok()
+            .map(|vault| AccountStateUpdate {
+                credentials: read_credentials,
+                vault,
+            });
+        let account = if read_state.is_none() {
+            let credentials = state.account_credentials()?;
+            let vault = self
+                .fetch_account_vault(&relays, &credentials.locator)
+                .await?;
+            Some(AccountStateUpdate { credentials, vault })
+        } else {
+            None
+        };
+        Ok(Some(ReadStateUpdate {
+            account,
+            read_state,
+        }))
+    }
+
+    pub async fn refresh_account_state(
+        &self,
+        path: impl AsRef<Path>,
+        cache_path: impl AsRef<Path>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<LocalSummary> {
+        let path = path.as_ref();
+        let Some(update) = self.prepare_account_state_refresh(path, relays).await? else {
+            return load_state(path)?.summary();
+        };
+        self.apply_read_state_update(path, cache_path, update)
+    }
+
+    pub async fn prepare_account_state_refresh(
+        &self,
+        path: impl AsRef<Path>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<Option<ReadStateUpdate>> {
+        let path = path.as_ref();
+        let state = load_state(path)?;
         if state.account.is_none() {
             return Ok(None);
         }
@@ -2739,14 +2848,17 @@ impl NoiseClient {
         let vault = self
             .fetch_account_vault(&relay_list(relays)?, &credentials.locator)
             .await?;
-        Ok(Some(AccountStateUpdate { credentials, vault }))
+        Ok(Some(ReadStateUpdate {
+            account: Some(AccountStateUpdate { credentials, vault }),
+            read_state: None,
+        }))
     }
 
     pub fn apply_read_state_update(
         &self,
         path: impl AsRef<Path>,
         cache_path: impl AsRef<Path>,
-        update: AccountStateUpdate,
+        update: ReadStateUpdate,
     ) -> anyhow::Result<LocalSummary> {
         let path = path.as_ref();
         let mut state = load_state(path)?;
@@ -2755,8 +2867,18 @@ impl NoiseClient {
             .iter()
             .map(|group| group.group_id.clone())
             .collect::<HashSet<_>>();
-        let changed =
-            Self::merge_remote_account_state(&mut state, &update.credentials, &update.vault)?;
+        let mut changed = false;
+        if let Some(account) = update.account {
+            changed |=
+                Self::merge_remote_account_state(&mut state, &account.credentials, &account.vault)?;
+        }
+        if let Some(read_state) = update.read_state {
+            changed |= Self::merge_remote_read_state(
+                &mut state,
+                &read_state.credentials,
+                &read_state.vault,
+            )?;
+        }
         let groups_after = state
             .groups
             .iter()
@@ -2786,6 +2908,22 @@ impl NoiseClient {
         // Recovery snapshots are durable locally and the client schedules an
         // account sync independently. A remote vault write must never block
         // reading account state or opening a group.
+        state.summary()
+    }
+
+    pub async fn publish_read_state(
+        &self,
+        path: impl AsRef<Path>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<LocalSummary> {
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        if state.account.is_none() {
+            return state.summary();
+        }
+        self.publish_read_state_for_state(&mut state, &relay_list(relays)?)
+            .await?;
+        save_state(path, &state)?;
         state.summary()
     }
 
@@ -3071,6 +3209,40 @@ impl NoiseClient {
             }
         }
         bail!("no relay could hold the private account watch")
+    }
+
+    pub async fn watch_read_state(
+        &self,
+        path: impl AsRef<Path>,
+        since: Option<u64>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<GroupWatch> {
+        let state = load_state(path.as_ref())?;
+        let credentials = state.account_read_state_credentials()?;
+        let revision = since
+            .map(|revision| revision.to_string())
+            .unwrap_or_else(|| "initial".to_owned());
+        let endpoint = format!("/v1/accounts/{}/watch/{revision}", credentials.locator);
+        let relay_values = relays.clone();
+        let relays = relay_list(relays)?;
+
+        for index in 0..relays.len() {
+            let Ok(response) = self
+                .relay_request(&relays, index, "GET", &endpoint, &[])
+                .await
+            else {
+                continue;
+            };
+            if response.status == 404 {
+                return self.watch_account(path, since, relay_values).await;
+            }
+            if (200..300).contains(&response.status)
+                && let Ok(change) = serde_json::from_slice::<GroupWatch>(&response.body)
+            {
+                return Ok(change);
+            }
+        }
+        bail!("no relay could hold the private read-state watch")
     }
 
     async fn watch_id(
@@ -8880,6 +9052,84 @@ impl NoiseClient {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("account sync did not complete")))
     }
 
+    async fn publish_read_state_for_state(
+        &self,
+        state: &mut ClientState,
+        relays: &[RelayDescriptor],
+    ) -> anyhow::Result<()> {
+        let credentials = state.account_read_state_credentials()?;
+        let identity = state.identity()?;
+        if let Ok(remote) = self.fetch_account_vault(relays, &credentials.locator).await {
+            Self::merge_remote_read_state(state, &credentials, &remote)?;
+        }
+
+        let mut last_error = None;
+        for _ in 0..4 {
+            let revision = state
+                .account
+                .as_ref()
+                .context("this identity has no noise ID")?
+                .read_state_revision
+                .checked_add(1)
+                .context("account read-state revision is exhausted")?;
+            let plaintext = serde_json::to_vec(&state.read_state_contents())?;
+            let vault = AccountVault::seal(&identity, &credentials, revision, &plaintext)?;
+            let publish_error = self.publish_account_vault(relays, &vault).await.err();
+
+            let remote = match self.fetch_account_vault(relays, &credentials.locator).await {
+                Ok(remote) => remote,
+                Err(error) => {
+                    last_error = Some(publish_error.unwrap_or(error));
+                    continue;
+                }
+            };
+            if remote.identity_public_key != identity.public_key_base64() {
+                bail!("account identity does not match the encrypted read state")
+            }
+            if remote.revision == revision && remote.signature_base64 == vault.signature_base64 {
+                state
+                    .account
+                    .as_mut()
+                    .context("this identity has no noise ID")?
+                    .read_state_revision = revision;
+                return Ok(());
+            }
+
+            Self::merge_remote_read_state(state, &credentials, &remote)?;
+            last_error = Some(publish_error.unwrap_or_else(|| {
+                anyhow::anyhow!("another device updated the encrypted read state")
+            }));
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("read-state sync did not complete")))
+    }
+
+    fn merge_remote_read_state(
+        state: &mut ClientState,
+        credentials: &AccountCredentials,
+        remote: &AccountVault,
+    ) -> anyhow::Result<bool> {
+        if remote.identity_public_key != state.identity()?.public_key_base64() {
+            bail!("account identity does not match the encrypted read state")
+        }
+        let plaintext = remote.open(credentials)?;
+        let contents: AccountReadStateContents =
+            serde_json::from_slice(&plaintext).context("encrypted read state is invalid")?;
+        if contents.version != 1 {
+            bail!("this read state was created by an unsupported noise version")
+        }
+        let direct_changed = state.merge_direct_read_through(&contents.direct_read_through);
+        let group_changed = state.merge_group_read_through(&contents.group_read_through);
+        let topic_changed = state.merge_topic_read_through(&contents.topic_read_through);
+        let account = state
+            .account
+            .as_mut()
+            .context("this identity has no noise ID")?;
+        let revision_changed = remote.revision > account.read_state_revision;
+        account.read_state_revision = account.read_state_revision.max(remote.revision);
+        Ok(direct_changed || group_changed || topic_changed || revision_changed)
+    }
+
     fn merge_remote_account_state(
         state: &mut ClientState,
         credentials: &AccountCredentials,
@@ -12486,6 +12736,7 @@ mod tests {
                 locator: credentials.locator.clone(),
                 vault_key_base64: credentials.vault_key_base64.clone(),
                 revision,
+                read_state_revision: 0,
             }),
         }
     }
@@ -12546,6 +12797,54 @@ mod tests {
         assert!(merge_read_markers(&mut current, &newer));
         assert_eq!(current.get("alice"), Some(&marker(300, "event-d")));
         assert!(!merge_read_markers(&mut current, &newer));
+    }
+
+    #[test]
+    fn encrypted_account_read_state_merges_monotonically() {
+        let identity = Identity::generate();
+        let credentials = AccountCredentials {
+            noise_id: "123456789012".to_owned(),
+            locator: "ab".repeat(32),
+            vault_key_base64: STANDARD_NO_PAD.encode([7_u8; 32]),
+        };
+        let mut state = account_state(&identity, &credentials, test_profile(None), 1, 4);
+        state
+            .direct_read_through
+            .insert("alice".to_owned(), marker(200, "event-b"));
+        let read_credentials = state.account_read_state_credentials().unwrap();
+        assert_ne!(read_credentials.locator, credentials.locator);
+        let contents = AccountReadStateContents {
+            version: 1,
+            direct_read_through: HashMap::from([
+                ("alice".to_owned(), marker(100, "event-a")),
+                ("bob".to_owned(), marker(300, "event-c")),
+            ]),
+            group_read_through: HashMap::new(),
+            topic_read_through: HashMap::new(),
+        };
+        let vault = AccountVault::seal(
+            &identity,
+            &read_credentials,
+            7,
+            &serde_json::to_vec(&contents).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            NoiseClient::merge_remote_read_state(&mut state, &read_credentials, &vault).unwrap()
+        );
+        assert_eq!(
+            state.direct_read_through.get("alice"),
+            Some(&marker(200, "event-b"))
+        );
+        assert_eq!(
+            state.direct_read_through.get("bob"),
+            Some(&marker(300, "event-c"))
+        );
+        assert_eq!(
+            state.account.as_ref().unwrap().read_state_revision,
+            vault.revision
+        );
     }
 
     #[test]
