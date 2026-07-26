@@ -1,23 +1,23 @@
 {
   "schema": 1,
   "channel": "stable",
-  "version": "0.1.1",
+  "version": "0.1.5",
   "protocol_min": 4,
   "protocol_max": 4,
-  "published_at_unix_seconds": 1784827199,
-  "expires_at_unix_seconds": 1792603199,
+  "published_at_unix_seconds": 1785037838,
+  "expires_at_unix_seconds": 1792813838,
   "assets": [
     {
       "target": "linux-x86_64",
-      "url": "https://github.com/GnosysLabs/noise/releases/download/relay-v0.1.1/noise-relay_0.1.1_amd64.deb",
-      "sha256": "dbb828e8ecab73b640fc4339bd23617c93c2156bcd40a0d19f147b808e2ef006",
-      "byte_length": 14921898
+      "url": "https://github.com/GnosysLabs/noise/releases/download/relay-v0.1.5/noise-relay_0.1.5_amd64.deb",
+      "sha256": "b14176aaa509c5445be8a5588a000a5620dd9c523acdacca89f575ead317762d",
+      "byte_length": 16535434
     },
     {
       "target": "linux-aarch64",
-      "url": "https://github.com/GnosysLabs/noise/releases/download/relay-v0.1.1/noise-relay_0.1.1_arm64.deb",
-      "sha256": "93eed0d9ce4ceb79b2676574f1354aa0b0be841ffecb74c6744bdbefcaaad86f",
-      "byte_length": 14204084
+      "url": "https://github.com/GnosysLabs/noise/releases/download/relay-v0.1.5/noise-relay_0.1.5_arm64.deb",
+      "sha256": "2f028c73812fd754cbd7b89dc269794a11e648f1a8eceb7731a2e6842b557b31",
+      "byte_length": 15760338
     }
   ]
 }
