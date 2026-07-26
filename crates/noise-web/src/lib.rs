@@ -1,5 +1,6 @@
 use noise_client::{
-    ForwardedFrom, MediaAttachment, NoiseClient, ProfileAlbum, ProfileAlbumItem, ProfileImage,
+    DirectMessagePolicy, ForwardedFrom, MediaAttachment, NoiseClient, ProfileAlbum,
+    ProfileAlbumItem, ProfileImage,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -57,6 +58,30 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 )
             }
         }
+        "search_local" => data(
+            client
+                .search_local(
+                    STATE_PATH,
+                    &required::<String>(&request, "query")?,
+                    optional::<usize>(&request, "limit")?.unwrap_or(60),
+                )
+                .map_err(|error| error.to_string())?,
+        ),
+        "publish_contact_signal" => data(
+            client
+                .publish_contact_signal(STATE_PATH, relays(&request)?)
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "resolve_contact_signal" => data(
+            client
+                .resolve_contact_signal(
+                    &required::<String>(&request, "signature")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
         "initialize" => data(
             client
                 .initialize(
@@ -135,7 +160,8 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .select_group(STATE_PATH, &required::<String>(&request, "group_id")?)
                 .map_err(|error| error.to_string())?,
         ),
-        "update_profile" => data(
+        "update_profile" => data({
+            let accepts_direct_messages = required::<bool>(&request, "accepts_direct_messages")?;
             client
                 .update_profile(
                     STATE_PATH,
@@ -144,12 +170,18 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                     optional::<String>(&request, "avatar_data_base64")?,
                     optional::<String>(&request, "avatar_mime_type")?,
                     required::<bool>(&request, "remove_avatar")?,
-                    required::<bool>(&request, "accepts_direct_messages")?,
+                    optional::<DirectMessagePolicy>(&request, "direct_message_policy")?.unwrap_or(
+                        if accepts_direct_messages {
+                            DirectMessagePolicy::Everyone
+                        } else {
+                            DirectMessagePolicy::Nobody
+                        },
+                    ),
                     relays(&request)?,
                 )
                 .await
-                .map_err(|error| error.to_string())?,
-        ),
+                .map_err(|error| error.to_string())?
+        }),
         "fetch_profile_album" => data(
             client
                 .fetch_profile_album(
@@ -492,7 +524,8 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 )
                 .map_err(|error| error.to_string())?,
         ),
-        "start_direct" => data(
+        "start_direct" => data({
+            let accepts_direct_messages = required::<bool>(&request, "accepts_direct_messages")?;
             client
                 .start_direct(
                     STATE_PATH,
@@ -501,10 +534,16 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                     required::<String>(&request, "bio")?,
                     optional::<ProfileImage>(&request, "avatar")?,
                     optional::<ProfileAlbum>(&request, "album")?,
-                    required::<bool>(&request, "accepts_direct_messages")?,
+                    optional::<DirectMessagePolicy>(&request, "direct_message_policy")?.unwrap_or(
+                        if accepts_direct_messages {
+                            DirectMessagePolicy::Everyone
+                        } else {
+                            DirectMessagePolicy::Nobody
+                        },
+                    ),
                 )
-                .map_err(|error| error.to_string())?,
-        ),
+                .map_err(|error| error.to_string())?
+        }),
         "set_block" => data(
             client
                 .set_block(
@@ -531,6 +570,11 @@ async fn dispatch(request: Value) -> Result<Value, String> {
             client
                 .sync_directs(STATE_PATH, CACHE_PATH, relays(&request)?)
                 .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "cached_direct_inbox" => data(
+            client
+                .cached_direct_inbox(STATE_PATH)
                 .map_err(|error| error.to_string())?,
         ),
         "direct_inbox" => data(
@@ -709,6 +753,12 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                     &required::<String>(&request, "topic_id")?,
                     relays(&request)?,
                 )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "load_older_direct_history" => data(
+            client
+                .load_older_direct_history(STATE_PATH, CACHE_PATH, relays(&request)?)
                 .await
                 .map_err(|error| error.to_string())?,
         ),

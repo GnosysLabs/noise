@@ -62,7 +62,8 @@ use noise_core::{
     profile_media_scope_id, reconstruct_blob_from_storage_payloads, valid_reaction_emoji,
 };
 pub use noise_core::{
-    ForwardedFrom, MediaAttachment, MediaChunk, ProfileAlbum, ProfileAlbumItem, ProfileImage,
+    DirectMessagePolicy, ForwardedFrom, MediaAttachment, MediaChunk, ProfileAlbum,
+    ProfileAlbumItem, ProfileImage,
 };
 pub use noise_transport::LinkPreview;
 use noise_transport::{
@@ -91,6 +92,7 @@ const MAX_MEDIA_RANGE_BYTES: u64 = 4 * 1024 * 1024;
 const WEB_MEDIA_CHUNK_CACHE_BYTES: usize = 96 * 1024 * 1024;
 const INITIAL_GROUP_MESSAGE_WINDOW: usize = 30;
 const GROUP_EVENT_PAGE_SIZE: usize = 128;
+const DIRECT_EVENT_CACHE_LIMIT: usize = 1024;
 const TOPIC_RECOVERY_CONCURRENCY: usize = 4;
 /// How long a member waits for the member ranked ahead of it to publish a
 /// pending admission before taking the turn itself.
@@ -297,6 +299,7 @@ pub struct IdentitySummary {
     pub avatar: Option<ProfileImage>,
     pub album: Option<ProfileAlbum>,
     pub accepts_direct_messages: bool,
+    pub direct_message_policy: DirectMessagePolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -348,6 +351,7 @@ pub struct DirectSummary {
     pub avatar: Option<ProfileImage>,
     pub album: Option<ProfileAlbum>,
     pub accepts_direct_messages: bool,
+    pub direct_message_policy: DirectMessagePolicy,
     pub is_active: bool,
     pub has_unread: bool,
 }
@@ -380,6 +384,7 @@ pub struct MemberSummary {
     pub avatar: Option<ProfileImage>,
     pub album: Option<ProfileAlbum>,
     pub accepts_direct_messages: bool,
+    pub direct_message_policy: DirectMessagePolicy,
     pub is_moderator: bool,
 }
 
@@ -393,6 +398,7 @@ pub struct MessageSummary {
     pub avatar: Option<ProfileImage>,
     pub album: Option<ProfileAlbum>,
     pub accepts_direct_messages: bool,
+    pub direct_message_policy: DirectMessagePolicy,
     pub text: String,
     pub attachment: Option<MediaAttachment>,
     pub reply_to_message_id: Option<String>,
@@ -481,6 +487,7 @@ pub struct DirectMessageSummary {
     pub avatar: Option<ProfileImage>,
     pub album: Option<ProfileAlbum>,
     pub accepts_direct_messages: bool,
+    pub direct_message_policy: DirectMessagePolicy,
     pub text: String,
     pub attachment: Option<MediaAttachment>,
     pub reply_to_message_id: Option<String>,
@@ -500,6 +507,59 @@ pub struct DirectConversation {
 pub struct DirectInbox {
     pub summary: LocalSummary,
     pub conversations: Vec<DirectConversation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SearchResults {
+    pub messages: Vec<SearchMessageResult>,
+    pub locations: Vec<SearchLocationResult>,
+    pub people: Vec<SearchPersonResult>,
+    pub has_more_history: bool,
+    pub older_scopes: Vec<SearchHistoryScope>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SearchHistoryScope {
+    pub group_id: Option<String>,
+    pub topic_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SearchMessageResult {
+    pub event_id: String,
+    pub author_public_key: String,
+    pub username: String,
+    pub avatar: Option<ProfileImage>,
+    pub text: String,
+    pub attachment: Option<MediaAttachment>,
+    pub created_at_millis: u64,
+    pub group_id: Option<String>,
+    pub group_name: Option<String>,
+    pub topic_id: Option<String>,
+    pub topic_name: Option<String>,
+    pub direct_public_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SearchLocationResult {
+    pub group_id: String,
+    pub group_name: String,
+    pub group_avatar: Option<ProfileImage>,
+    pub topic_id: Option<String>,
+    pub topic_name: Option<String>,
+    pub topic_icon: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SearchPersonResult {
+    pub public_key: String,
+    pub username: String,
+    pub bio: String,
+    pub avatar: Option<ProfileImage>,
+    pub album: Option<ProfileAlbum>,
+    pub accepts_direct_messages: bool,
+    pub direct_message_policy: DirectMessagePolicy,
+    pub has_direct: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -629,6 +689,8 @@ struct ClientState {
     profile: Profile,
     #[serde(default)]
     profile_sequence: u64,
+    #[serde(default)]
+    contact_signal_published_sequence: u64,
     identity_secret_base64: String,
     #[serde(default)]
     local_device_id: String,
@@ -653,6 +715,8 @@ struct ClientState {
     mls_control_logs: HashMap<String, MlsControlLog>,
     #[serde(default)]
     group_event_caches: HashMap<String, GroupEventCache>,
+    #[serde(default)]
+    direct_event_cache: DirectEventCache,
     groups: Vec<GroupMembership>,
     #[serde(default)]
     group_memberships: HashMap<String, GroupMembershipRecord>,
@@ -671,6 +735,8 @@ struct ClientState {
     active_direct_public_key: Option<String>,
     #[serde(default)]
     direct_deleted_before: HashMap<String, u64>,
+    #[serde(default)]
+    direct_policy_rejected_through: HashMap<String, DirectMessageMarker>,
     #[serde(default)]
     direct_closed_periods: Vec<DirectClosedPeriod>,
     #[serde(default)]
@@ -724,6 +790,8 @@ struct AccountVaultContents {
     profile: Profile,
     #[serde(default)]
     profile_sequence: u64,
+    #[serde(default)]
+    contact_signal_published_sequence: u64,
     identity_secret_base64: String,
     #[serde(default)]
     devices: HashMap<String, DeviceRecord>,
@@ -745,6 +813,8 @@ struct AccountVaultContents {
     blocked_by_states: HashMap<String, BlockState>,
     active_direct_public_key: Option<String>,
     direct_deleted_before: HashMap<String, u64>,
+    #[serde(default)]
+    direct_policy_rejected_through: HashMap<String, DirectMessageMarker>,
     direct_closed_periods: Vec<DirectClosedPeriod>,
     #[serde(default)]
     direct_read_through: HashMap<String, DirectMessageMarker>,
@@ -796,6 +866,16 @@ struct GroupEventCache {
     topic_streams: HashMap<String, TopicStreamCache>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     portable_conversation: Option<Conversation>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct DirectEventCache {
+    #[serde(default)]
+    events: Vec<SignedEvent>,
+    #[serde(default)]
+    latest_cursor: Option<GroupEventCursor>,
+    #[serde(default)]
+    has_older_events: bool,
 }
 
 fn control_hydration_needed() -> bool {
@@ -872,7 +952,19 @@ struct DirectContact {
     #[serde(default = "default_true")]
     accepts_direct_messages: bool,
     #[serde(default)]
+    direct_message_policy: DirectMessagePolicy,
+    #[serde(default)]
     profile_sequence: u64,
+}
+
+impl DirectContact {
+    fn effective_direct_message_policy(&self) -> DirectMessagePolicy {
+        if self.accepts_direct_messages {
+            self.direct_message_policy
+        } else {
+            DirectMessagePolicy::Nobody
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -926,6 +1018,129 @@ fn merge_read_markers(
             .or_insert_with(|| marker.clone());
     }
     *current != before
+}
+
+fn advance_message_marker(
+    markers: &mut HashMap<String, MessageMarker>,
+    key: &str,
+    candidate: MessageMarker,
+) -> bool {
+    match markers.get_mut(key) {
+        Some(existing) if *existing >= candidate => false,
+        Some(existing) => {
+            *existing = candidate;
+            true
+        }
+        None => {
+            markers.insert(key.to_owned(), candidate);
+            true
+        }
+    }
+}
+
+fn search_score<'a>(query: &str, fields: impl IntoIterator<Item = &'a str>) -> Option<u32> {
+    let query = query.to_lowercase();
+    let tokens = query.split_whitespace().collect::<Vec<_>>();
+    let fields = fields
+        .into_iter()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+    let combined = fields.join(" ");
+    if !tokens.iter().all(|token| combined.contains(token)) {
+        return None;
+    }
+    let mut score = 10 + tokens.len() as u32;
+    for field in &fields {
+        if field == &query {
+            score += 100;
+        } else if field.starts_with(&query) {
+            score += 55;
+        } else if field.contains(&query) {
+            score += 30;
+        }
+    }
+    Some(score)
+}
+
+fn search_attachment_label(attachment: Option<&MediaAttachment>) -> &'static str {
+    match attachment.map(|attachment| attachment.mime_type.as_str()) {
+        Some(mime_type) if mime_type.starts_with("image/") => "photo image",
+        Some(mime_type) if mime_type.starts_with("video/") => "video",
+        Some(mime_type) if mime_type.starts_with("audio/") => "audio",
+        Some(_) => "attachment media",
+        None => "",
+    }
+}
+
+fn normalize_contact_signal(value: &str) -> anyhow::Result<String> {
+    let normalized = value
+        .chars()
+        .filter(|character| !character.is_whitespace() && *character != '-')
+        .flat_map(char::to_uppercase)
+        .collect::<String>();
+    const ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    if normalized.len() != 12
+        || !normalized
+            .chars()
+            .all(|character| ALPHABET.contains(character))
+    {
+        bail!("enter a 12-character noise signature")
+    }
+    Ok(normalized)
+}
+
+fn contact_signal_for_public_key(public_key: &str) -> anyhow::Result<String> {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let bytes = STANDARD_NO_PAD
+        .decode(public_key)
+        .context("noise signature public key is invalid")?;
+    if bytes.len() != 32 {
+        bail!("noise signature public key is invalid")
+    }
+    let mut signature = String::with_capacity(13);
+    for character_index in 0..12 {
+        let mut value = 0usize;
+        for bit_index in 0..5 {
+            let source_bit = character_index * 5 + bit_index;
+            value =
+                (value << 1) | usize::from((bytes[source_bit / 8] >> (7 - (source_bit % 8))) & 1);
+        }
+        signature.push(ALPHABET[value] as char);
+        if character_index == 5 {
+            signature.push('-');
+        }
+    }
+    Ok(signature)
+}
+
+fn contact_signal_membership(signature: &str) -> anyhow::Result<GroupMembership> {
+    let normalized = normalize_contact_signal(signature)?;
+    let group_id = blake3::derive_key(
+        "xyz.gnosyslabs.noise.contact-signal-locator.v1",
+        normalized.as_bytes(),
+    )
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
+    let secret = blake3::derive_key(
+        "xyz.gnosyslabs.noise.contact-signal-key.v1",
+        normalized.as_bytes(),
+    );
+    Ok(GroupMembership {
+        group_id,
+        name: "noise contact signal".to_owned(),
+        description: String::new(),
+        rules: String::new(),
+        avatar: None,
+        background: None,
+        mobile_background: None,
+        accent_color: "#7758ed".to_owned(),
+        members_can_send_messages: false,
+        members_can_send_media: false,
+        owner_public_key: String::new(),
+        authority_nonce_base64: String::new(),
+        secret_base64: STANDARD_NO_PAD.encode(secret),
+    })
 }
 
 fn merge_block_states(
@@ -1112,6 +1327,7 @@ impl ClientState {
                 avatar: member.avatar,
                 album: member.album,
                 accepts_direct_messages: member.accepts_direct_messages,
+                direct_message_policy: member.direct_message_policy,
                 profile_sequence: member.profile_sequence,
             })
             .collect::<Vec<_>>();
@@ -1460,6 +1676,7 @@ impl ClientState {
             version: 1,
             profile: self.profile.clone(),
             profile_sequence: self.profile_sequence,
+            contact_signal_published_sequence: self.contact_signal_published_sequence,
             identity_secret_base64: self.identity_secret_base64.clone(),
             devices: self.devices.clone(),
             mls_group_states: self.vault_mls_group_states(),
@@ -1486,6 +1703,7 @@ impl ClientState {
             blocked_by_states: self.blocked_by_states.clone(),
             active_direct_public_key: self.active_direct_public_key.clone(),
             direct_deleted_before: self.direct_deleted_before.clone(),
+            direct_policy_rejected_through: self.direct_policy_rejected_through.clone(),
             direct_closed_periods: self.direct_closed_periods.clone(),
             direct_read_through: self.direct_read_through.clone(),
             direct_latest_activity: self.direct_latest_activity.clone(),
@@ -1517,6 +1735,7 @@ impl ClientState {
             version: 3,
             profile: contents.profile,
             profile_sequence: contents.profile_sequence,
+            contact_signal_published_sequence: contents.contact_signal_published_sequence,
             identity_secret_base64: contents.identity_secret_base64,
             local_device_id: String::new(),
             devices: contents.devices,
@@ -1527,6 +1746,7 @@ impl ClientState {
             mls_local_geneses: HashMap::new(),
             mls_control_logs: contents.mls_control_logs,
             group_event_caches: contents.group_event_caches,
+            direct_event_cache: DirectEventCache::default(),
             groups: contents.groups,
             group_memberships: contents.group_memberships,
             active_group_id: contents.active_group_id,
@@ -1537,6 +1757,7 @@ impl ClientState {
             blocked_by_states: contents.blocked_by_states,
             active_direct_public_key: contents.active_direct_public_key,
             direct_deleted_before: contents.direct_deleted_before,
+            direct_policy_rejected_through: contents.direct_policy_rejected_through,
             direct_closed_periods: contents.direct_closed_periods,
             direct_latest_incoming: HashMap::new(),
             direct_latest_activity: contents.direct_latest_activity,
@@ -1610,6 +1831,21 @@ impl ClientState {
                 && period
                     .reopened_at_millis
                     .is_none_or(|reopened| created_at_millis < reopened)
+        })
+    }
+
+    fn shares_active_group_with(&self, public_key: &str) -> bool {
+        self.groups.iter().any(|group| {
+            if let Some(log) = self.mls_control_logs.get(&group.group_id) {
+                let (epoch, _) = log.head();
+                if log
+                    .member_accounts_at(epoch)
+                    .is_some_and(|members| members.iter().any(|member| member == public_key))
+                {
+                    return true;
+                }
+            }
+            cached_group_view(self, group).is_ok_and(|view| view.members.contains_key(public_key))
         })
     }
 
@@ -1732,21 +1968,15 @@ impl ClientState {
         incoming.dedup();
 
         if let Some(latest) = activity.last().cloned() {
-            self.group_latest_activity
-                .insert(group_id.to_owned(), latest);
-        } else {
-            self.group_latest_activity.remove(group_id);
+            advance_message_marker(&mut self.group_latest_activity, group_id, latest);
         }
         if let Some(latest) = incoming.last().cloned() {
-            self.group_latest_incoming
-                .insert(group_id.to_owned(), latest);
-        } else {
-            self.group_latest_incoming.remove(group_id);
+            advance_message_marker(&mut self.group_latest_incoming, group_id, latest);
         }
 
         if self.group_activity_initialized.insert(group_id.to_owned()) {
             if let Some(latest) = incoming.last().cloned() {
-                self.group_read_through.insert(group_id.to_owned(), latest);
+                advance_message_marker(&mut self.group_read_through, group_id, latest);
             }
             self.group_unread_messages.remove(group_id);
         } else {
@@ -1781,8 +2011,7 @@ impl ClientState {
             topic_incoming.sort();
             topic_incoming.dedup();
             if let Some(latest) = topic_incoming.last().cloned() {
-                self.topic_latest_incoming
-                    .insert(topic_key.clone(), latest.clone());
+                advance_message_marker(&mut self.topic_latest_incoming, &topic_key, latest.clone());
             }
             if self.topic_activity_initialized.insert(topic_key.clone()) {
                 let initial_read = if topic_key == topic_activity_key(group_id, None) {
@@ -1794,7 +2023,7 @@ impl ClientState {
                     topic_incoming.last().cloned()
                 };
                 if let Some(marker) = initial_read {
-                    self.topic_read_through.insert(topic_key.clone(), marker);
+                    advance_message_marker(&mut self.topic_read_through, &topic_key, marker);
                 }
                 self.topic_unread_messages.remove(&topic_key);
             } else {
@@ -2016,7 +2245,9 @@ impl ClientState {
                 bio: self.profile.bio.clone(),
                 avatar: self.profile.avatar.clone(),
                 album: self.profile.album.clone(),
-                accepts_direct_messages: self.profile.accepts_direct_messages,
+                accepts_direct_messages: self.profile.effective_direct_message_policy()
+                    != DirectMessagePolicy::Nobody,
+                direct_message_policy: self.profile.effective_direct_message_policy(),
             },
             devices: {
                 let mut devices = self
@@ -2036,11 +2267,7 @@ impl ClientState {
                     right
                         .is_current
                         .cmp(&left.is_current)
-                        .then_with(|| {
-                            right
-                                .last_seen_at_millis
-                                .cmp(&left.last_seen_at_millis)
-                        })
+                        .then_with(|| right.last_seen_at_millis.cmp(&left.last_seen_at_millis))
                         .then_with(|| left.device_id.cmp(&right.device_id))
                 });
                 devices
@@ -2112,6 +2339,7 @@ impl ClientState {
                         avatar: contact.avatar.clone(),
                         album: contact.album.clone(),
                         accepts_direct_messages: contact.accepts_direct_messages,
+                        direct_message_policy: contact.effective_direct_message_policy(),
                         is_active: self.active_direct_public_key.as_deref()
                             == Some(&contact.public_key),
                         has_unread: self.direct_has_unread(&contact.public_key),
@@ -2129,6 +2357,7 @@ impl ClientState {
                     avatar: contact.avatar.clone(),
                     album: contact.album.clone(),
                     accepts_direct_messages: contact.accepts_direct_messages,
+                    direct_message_policy: contact.effective_direct_message_policy(),
                     is_active: false,
                     has_unread: false,
                 })
@@ -2239,8 +2468,10 @@ impl NoiseClient {
                 avatar,
                 album: None,
                 accepts_direct_messages: true,
+                direct_message_policy: DirectMessagePolicy::Everyone,
             },
             profile_sequence: current_nanos(),
+            contact_signal_published_sequence: 0,
             identity_secret_base64: identity.secret_base64(),
             local_device_id: String::new(),
             devices: HashMap::new(),
@@ -2251,6 +2482,7 @@ impl NoiseClient {
             mls_local_geneses: HashMap::new(),
             mls_control_logs: HashMap::new(),
             group_event_caches: HashMap::new(),
+            direct_event_cache: DirectEventCache::default(),
             groups: Vec::new(),
             group_memberships: HashMap::new(),
             active_group_id: None,
@@ -2261,6 +2493,7 @@ impl NoiseClient {
             blocked_by_states: HashMap::new(),
             active_direct_public_key: None,
             direct_deleted_before: HashMap::new(),
+            direct_policy_rejected_through: HashMap::new(),
             direct_closed_periods: Vec::new(),
             direct_latest_incoming: HashMap::new(),
             direct_latest_activity: HashMap::new(),
@@ -2570,8 +2803,7 @@ impl NoiseClient {
                 state.group_activity_initialized.contains(group_id);
             conversation.general_unread_count = state.topic_unread_count(group_id, None);
             for topic in &mut conversation.topics {
-                topic.unread_count =
-                    state.topic_unread_count(group_id, Some(&topic.topic_id));
+                topic.unread_count = state.topic_unread_count(group_id, Some(&topic.topic_id));
             }
         }
         Ok(cached)
@@ -2968,7 +3200,7 @@ impl NoiseClient {
         avatar_data_base64: Option<String>,
         avatar_mime_type: Option<String>,
         remove_avatar: bool,
-        accepts_direct_messages: bool,
+        direct_message_policy: DirectMessagePolicy,
         relays: Vec<String>,
     ) -> anyhow::Result<LocalSummary> {
         let path = path.as_ref();
@@ -3009,13 +3241,17 @@ impl NoiseClient {
             state.profile.avatar.clone()
         };
 
-        if state.profile.accepts_direct_messages && !accepts_direct_messages {
+        let previous_direct_message_policy = state.profile.effective_direct_message_policy();
+        let accepts_direct_messages = direct_message_policy != DirectMessagePolicy::Nobody;
+        if previous_direct_message_policy != DirectMessagePolicy::Nobody
+            && direct_message_policy == DirectMessagePolicy::Nobody
+        {
             state.direct_closed_periods.push(DirectClosedPeriod {
                 closed_at_millis: current_millis(),
                 reopened_at_millis: None,
             });
-        } else if !state.profile.accepts_direct_messages
-            && accepts_direct_messages
+        } else if previous_direct_message_policy == DirectMessagePolicy::Nobody
+            && direct_message_policy != DirectMessagePolicy::Nobody
             && let Some(period) = state
                 .direct_closed_periods
                 .iter_mut()
@@ -3028,6 +3264,7 @@ impl NoiseClient {
         state.profile.bio = bio;
         state.profile.avatar = avatar;
         state.profile.accepts_direct_messages = accepts_direct_messages;
+        state.profile.direct_message_policy = direct_message_policy;
         state.profile_sequence = state.take_sequence();
         let identity = state.identity()?;
         let mut profile_events = Vec::with_capacity(state.groups.len());
@@ -3067,6 +3304,9 @@ impl NoiseClient {
                 }
             }
         }
+        let _ = self
+            .ensure_contact_signal_published(&mut state, &relays)
+            .await;
         save_state(path, &state)?;
         if !failures.is_empty() {
             bail!("{}", failures.join("; "))
@@ -3220,6 +3460,9 @@ impl NoiseClient {
                 }
             }
         }
+        let _ = self
+            .ensure_contact_signal_published(&mut state, &relays)
+            .await;
         save_state(path, &state)?;
         if !failures.is_empty() {
             bail!("{}", failures.join("; "))
@@ -4103,12 +4346,11 @@ impl NoiseClient {
             .await
     }
 
-    /// Whether this identity could admit somebody into a group right now.
+    /// Whether this group needs an encrypted-membership reconciliation pass.
     ///
-    /// This reads relay state and never writes local state, so a client can ask
-    /// it for every group it belongs to without serializing behind the work that
-    /// sends messages and opens conversations. It answers conservatively: a true
-    /// answer means the full pass is worth running, not that it will commit.
+    /// A group with no local MLS epoch always needs a pass so the client can
+    /// publish its signed KeyPackage even before the founder creates genesis.
+    /// Established members additionally use the pass to admit waiting devices.
     pub async fn group_has_pending_admissions(
         &self,
         path: impl AsRef<Path>,
@@ -4124,11 +4366,14 @@ impl NoiseClient {
             .context("unknown group")?;
         let self_public_key = state.identity()?.public_key_base64();
         let Some(mls) = state.mls_group_state(group_id) else {
-            return Ok(false);
+            return Ok(true);
+        };
+        if mls.epoch(group_id).is_err() {
+            return Ok(true);
         };
         let relays = relay_list(relays)?;
         let Some(control_log) = self.fetch_mls_control_log(&relays, group_id).await? else {
-            return Ok(false);
+            return Ok(true);
         };
         let (head_epoch, _) = control_log.head();
         if control_log
@@ -4220,6 +4465,45 @@ impl NoiseClient {
                     .collect::<HashSet<_>>()
             })
             .unwrap_or_else(|| legacy_view.members.keys().cloned().collect::<HashSet<_>>());
+        let local_has_mls_group = state
+            .mls_group_state(&group.group_id)
+            .is_some_and(|mls| mls.epoch(&group.group_id).is_ok());
+        if !local_has_mls_group {
+            let needs_membership_proof =
+                state
+                    .mls_join_requests
+                    .get(&group.group_id)
+                    .is_none_or(|request| {
+                        request.account_public_key != self_public_key
+                            || join_request_membership_profile(request, &group).is_none()
+                    });
+            if needs_membership_proof {
+                let sequence = state.take_sequence();
+                let membership_proof =
+                    SignedEvent::member_joined(&identity, &group, &state.profile, sequence)?;
+                let request = {
+                    let mls = state.ensure_mls_group_state(&group.group_id)?;
+                    MlsJoinRequest::create_with_membership_proof(
+                        &identity,
+                        mls,
+                        group.group_id.clone(),
+                        membership_proof,
+                    )
+                    .context("could not create this device's MLS join request")?
+                };
+                state
+                    .mls_join_requests
+                    .insert(group.group_id.clone(), request);
+                save_state(path, &state)?;
+            }
+            let join_request = state
+                .mls_join_requests
+                .get(&group.group_id)
+                .cloned()
+                .context("this device's MLS join request is missing")?;
+            self.publish_mls_join_request(&relays, &join_request)
+                .await?;
+        }
         let has_pending_membership_proof = state
             .mls_join_requests
             .get(&group.group_id)
@@ -4260,28 +4544,6 @@ impl NoiseClient {
             });
         }
 
-        let local_has_mls_group = state.mls_group_state(&group.group_id).is_some();
-        if !local_has_mls_group && !admissions_only {
-            if !state.mls_join_requests.contains_key(&group.group_id) {
-                let request = {
-                    let mls = state.ensure_mls_group_state(&group.group_id)?;
-                    MlsJoinRequest::create(&identity, mls, group.group_id.clone())
-                        .context("could not create this device's MLS join request")?
-                };
-                state
-                    .mls_join_requests
-                    .insert(group.group_id.clone(), request);
-                save_state(path, &state)?;
-            }
-            let join_request = state
-                .mls_join_requests
-                .get(&group.group_id)
-                .cloned()
-                .context("this device's MLS join request is missing")?;
-            self.publish_mls_join_request(&relays, &join_request)
-                .await?;
-        }
-
         let is_owner = group.owner_public_key == self_public_key;
         if control_log.is_none() {
             // Only the founder can sign a genesis for this group's identifier,
@@ -4295,31 +4557,6 @@ impl NoiseClient {
                     missing_member_public_keys: Vec::new(),
                 });
             }
-            let requests = self
-                .fetch_mls_join_requests(&relays, &group.group_id)
-                .await?;
-            let requested_accounts = requests
-                .iter()
-                .map(|request| request.account_public_key.clone())
-                .collect::<HashSet<_>>();
-            let mut missing_member_public_keys = active_members
-                .iter()
-                .filter(|member| {
-                    member.as_str() != self_public_key && !requested_accounts.contains(*member)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            missing_member_public_keys.sort();
-            if !missing_member_public_keys.is_empty() {
-                save_state(path, &state)?;
-                return Ok(GroupEncryptionStatus {
-                    group_id: group.group_id,
-                    phase: "waiting_for_members".into(),
-                    epoch: None,
-                    missing_member_public_keys,
-                });
-            }
-
             if !state.mls_local_geneses.contains_key(&group.group_id) {
                 let mut candidate = state.ensure_mls_group_state(&group.group_id)?.clone();
                 let genesis = candidate
@@ -4421,11 +4658,11 @@ impl NoiseClient {
                 .iter()
                 .cloned()
                 .collect::<HashSet<_>>();
-            // A legacy group's genesis holds the founder alone until the cutover
-            // adds everyone its plaintext history already listed. That cutover
-            // needs the history itself, so a background pass leaves it to the
-            // open group and admits only people arriving with an invitation.
-            let admitted_members =
+            // At the initial cutover, an open group can also authorize older
+            // proof-less requests from its decrypted legacy membership. A
+            // background pass admits only requests carrying their own signed
+            // membership proof, so it never has to download group history.
+            let eligible_members =
                 if head_epoch == 0 && control_log.epochs.is_empty() && !admissions_only {
                     legacy_view.members.keys().cloned().collect::<HashSet<_>>()
                 } else {
@@ -4434,7 +4671,7 @@ impl NoiseClient {
             let pending = pending_admission_requests(
                 &state,
                 &group,
-                &admitted_members,
+                &eligible_members,
                 &latest_removal_by_account,
                 join_requests,
             )?;
@@ -4476,7 +4713,7 @@ impl NoiseClient {
                         &state,
                         &identity,
                         &group,
-                        &admitted_members,
+                        &epoch_members,
                         &control_log,
                         &admitted,
                     )?;
@@ -4519,7 +4756,9 @@ impl NoiseClient {
                     bio: state.profile.bio.clone(),
                     avatar: state.profile.avatar.clone(),
                     album: state.profile.album.clone(),
-                    accepts_direct_messages: state.profile.accepts_direct_messages,
+                    accepts_direct_messages: state.profile.effective_direct_message_policy()
+                        != DirectMessagePolicy::Nobody,
+                    direct_message_policy: state.profile.effective_direct_message_policy(),
                 },
                 sequence,
             )?;
@@ -4642,33 +4881,33 @@ impl NoiseClient {
         let group = state.active_group()?.clone();
         let identity = state.identity()?;
         let control_log = self.fetch_mls_control_log(&relays, &group.group_id).await?;
+        let sequence = state.take_sequence();
+        let membership_proof =
+            SignedEvent::member_joined(&identity, &group, &state.profile, sequence)?;
+        let request = {
+            let mls = state.ensure_mls_group_state(&group.group_id)?;
+            MlsJoinRequest::create_with_membership_proof(
+                &identity,
+                mls,
+                group.group_id.clone(),
+                membership_proof.clone(),
+            )
+            .context("could not create the encrypted-group join request")?
+        };
+        state
+            .mls_join_requests
+            .insert(group.group_id.clone(), request.clone());
+        let has_control_log = control_log.is_some();
         if let Some(control_log) = control_log {
-            let sequence = state.take_sequence();
-            let membership_proof =
-                SignedEvent::member_joined(&identity, &group, &state.profile, sequence)?;
-            let request = {
-                let mls = state.ensure_mls_group_state(&group.group_id)?;
-                MlsJoinRequest::create_with_membership_proof(
-                    &identity,
-                    mls,
-                    group.group_id.clone(),
-                    membership_proof,
-                )
-                .context("could not create the encrypted-group join request")?
-            };
-            self.publish_mls_join_request(&relays, &request).await?;
-            state
-                .mls_join_requests
-                .insert(group.group_id.clone(), request);
             state
                 .mls_control_logs
                 .insert(group.group_id.clone(), control_log);
-        } else {
-            let sequence = state.take_sequence();
-            let joined = SignedEvent::member_joined(&identity, &group, &state.profile, sequence)?;
-            self.publish_event(&relays, &joined).await?;
         }
         save_state(path, &state)?;
+        self.publish_mls_join_request(&relays, &request).await?;
+        if !has_control_log {
+            self.publish_event(&relays, &membership_proof).await?;
+        }
         Ok(JoinResult {
             group: GroupSummary {
                 group_id: group.group_id,
@@ -4699,7 +4938,7 @@ impl NoiseClient {
         bio: impl Into<String>,
         avatar: Option<ProfileImage>,
         album: Option<ProfileAlbum>,
-        accepts_direct_messages: bool,
+        direct_message_policy: DirectMessagePolicy,
     ) -> anyhow::Result<LocalSummary> {
         let path = path.as_ref();
         let mut state = load_state(path)?;
@@ -4717,8 +4956,13 @@ impl NoiseClient {
         if bio.chars().count() > 160 {
             bail!("bios can contain at most 160 characters")
         }
-        if !accepts_direct_messages {
+        if direct_message_policy == DirectMessagePolicy::Nobody {
             bail!("this person is not accepting direct messages")
+        }
+        if direct_message_policy == DirectMessagePolicy::SharedGroups
+            && !state.shares_active_group_with(public_key)
+        {
+            bail!("this person only accepts direct messages from shared groups")
         }
         let profile_sequence = state.known_profile_sequence(public_key);
         state.add_direct(DirectContact {
@@ -4727,11 +4971,106 @@ impl NoiseClient {
             bio,
             avatar,
             album,
-            accepts_direct_messages,
+            accepts_direct_messages: true,
+            direct_message_policy,
             profile_sequence,
         });
         save_state(path, &state)?;
         state.summary()
+    }
+
+    pub async fn publish_contact_signal(
+        &self,
+        path: impl AsRef<Path>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<String> {
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        let signature = self
+            .ensure_contact_signal_published(&mut state, &relay_list(relays)?)
+            .await?;
+        save_state(path, &state)?;
+        Ok(signature)
+    }
+
+    async fn ensure_contact_signal_published(
+        &self,
+        state: &mut ClientState,
+        relays: &[RelayDescriptor],
+    ) -> anyhow::Result<String> {
+        let identity = state.identity()?;
+        let signature = contact_signal_for_public_key(&identity.public_key_base64())?;
+        if state.profile_sequence > 0
+            && state.contact_signal_published_sequence >= state.profile_sequence
+        {
+            return Ok(signature);
+        }
+        let membership = contact_signal_membership(&signature)?;
+        let sequence = if state.profile_sequence == 0 {
+            let sequence = state.take_sequence();
+            state.profile_sequence = sequence;
+            sequence
+        } else {
+            state.profile_sequence
+        };
+        let event = SignedEvent::profile_updated(&identity, &membership, &state.profile, sequence)?;
+        self.publish_event(relays, &event).await?;
+        state.contact_signal_published_sequence = sequence;
+        Ok(signature)
+    }
+
+    pub async fn resolve_contact_signal(
+        &self,
+        signature: &str,
+        relays: Vec<String>,
+    ) -> anyhow::Result<DirectSummary> {
+        let normalized = normalize_contact_signal(signature)?;
+        let membership = contact_signal_membership(&normalized)?;
+        let events = self
+            .fetch_events_for_id(&membership.group_id, relay_list(relays)?)
+            .await?;
+        let mut profiles = HashMap::<String, (u64, Profile)>::new();
+        for event in events {
+            if normalize_contact_signal(&contact_signal_for_public_key(&event.author_public_key)?)?
+                != normalized
+            {
+                continue;
+            }
+            let Ok(GroupEventPayload::ProfileUpdated { profile }) = event.decrypt(&membership)
+            else {
+                continue;
+            };
+            if !valid_direct_profile(&profile) {
+                continue;
+            }
+            profiles
+                .entry(event.author_public_key)
+                .and_modify(|current| {
+                    if event.author_sequence > current.0 {
+                        *current = (event.author_sequence, profile.clone());
+                    }
+                })
+                .or_insert((event.author_sequence, profile));
+        }
+        if profiles.len() > 1 {
+            bail!("that noise signature is ambiguous; ask for a fresh contact signal")
+        }
+        let (public_key, (_, profile)) = profiles
+            .into_iter()
+            .next()
+            .context("no user has published that noise signature yet")?;
+        let direct_message_policy = profile.effective_direct_message_policy();
+        Ok(DirectSummary {
+            public_key,
+            username: profile.username,
+            bio: profile.bio,
+            avatar: profile.avatar,
+            album: profile.album,
+            accepts_direct_messages: direct_message_policy != DirectMessagePolicy::Nobody,
+            direct_message_policy,
+            is_active: false,
+            has_unread: false,
+        })
     }
 
     pub async fn set_block(
@@ -4755,6 +5094,21 @@ impl NoiseClient {
         }
         direct_mailbox_id(public_key).context("that identity has an invalid public key")?;
         let profile_sequence = state.known_profile_sequence(public_key);
+        let direct_message_policy = state
+            .direct_contacts
+            .iter()
+            .chain(state.known_people.iter())
+            .find(|person| person.public_key == public_key)
+            .map_or_else(
+                || {
+                    if accepts_direct_messages {
+                        DirectMessagePolicy::Everyone
+                    } else {
+                        DirectMessagePolicy::Nobody
+                    }
+                },
+                |person| person.direct_message_policy,
+            );
         let person = DirectContact {
             public_key: public_key.to_owned(),
             username: username.into(),
@@ -4762,6 +5116,7 @@ impl NoiseClient {
             avatar,
             album,
             accepts_direct_messages,
+            direct_message_policy,
             profile_sequence,
         };
         validate_username(&person.username)?;
@@ -4845,42 +5200,288 @@ impl NoiseClient {
         let (state, messages) = self
             .sync_direct_inbox(path, cache_path.as_ref(), relay_list(relays)?)
             .await?;
-        let identity = state.identity()?;
-        let self_public_key = identity.public_key_base64();
-        let mut messages_by_contact = HashMap::<String, Vec<DirectMessageSummary>>::new();
-        for message in messages {
-            messages_by_contact
-                .entry(message.counterparty_public_key)
-                .or_default()
-                .push(message.message);
+        direct_inbox_from_messages(&state, messages)
+    }
+
+    pub fn cached_direct_inbox(&self, path: impl AsRef<Path>) -> anyhow::Result<DirectInbox> {
+        let state = load_state(path.as_ref())?;
+        let messages = cached_direct_messages(&state)?;
+        direct_inbox_from_messages(&state, messages)
+    }
+
+    pub fn search_local(
+        &self,
+        path: impl AsRef<Path>,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<SearchResults> {
+        let path = path.as_ref();
+        let state = load_state(path)?;
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(SearchResults {
+                messages: Vec::new(),
+                locations: Vec::new(),
+                people: Vec::new(),
+                has_more_history: state.direct_event_cache.has_older_events
+                    || state.group_event_caches.values().any(|cache| {
+                        cache.has_older_messages
+                            || cache
+                                .topic_streams
+                                .values()
+                                .any(|topic| topic.has_older_messages)
+                    }),
+                older_scopes: Vec::new(),
+            });
         }
-        let conversations = state
+        if query.chars().count() > 128 {
+            bail!("search queries can contain at most 128 characters")
+        }
+        let limit = limit.clamp(1, 100);
+        let hidden = state.active_hidden_keys();
+        let group_summaries = state
+            .summary()?
+            .groups
+            .into_iter()
+            .map(|group| (group.group_id.clone(), group))
+            .collect::<HashMap<_, _>>();
+        let mut message_matches = Vec::<(u32, SearchMessageResult)>::new();
+        let mut location_matches = Vec::<(u32, SearchLocationResult)>::new();
+
+        for group in &state.groups {
+            let Some(group_summary) = group_summaries.get(&group.group_id) else {
+                continue;
+            };
+            if let Some(score) = search_score(
+                query,
+                [
+                    group_summary.name.as_str(),
+                    group_summary.description.as_str(),
+                    group_summary.rules.as_str(),
+                ],
+            ) {
+                location_matches.push((
+                    score,
+                    SearchLocationResult {
+                        group_id: group.group_id.clone(),
+                        group_name: group_summary.name.clone(),
+                        group_avatar: group_summary.avatar.clone(),
+                        topic_id: None,
+                        topic_name: None,
+                        topic_icon: None,
+                    },
+                ));
+            }
+            if let Some(score) = search_score(query, ["General"]) {
+                location_matches.push((
+                    score,
+                    SearchLocationResult {
+                        group_id: group.group_id.clone(),
+                        group_name: group_summary.name.clone(),
+                        group_avatar: group_summary.avatar.clone(),
+                        topic_id: None,
+                        topic_name: Some("General".to_owned()),
+                        topic_icon: Some("💬".to_owned()),
+                    },
+                ));
+            }
+            let Some(conversation) = self.cached_conversation(path, &group.group_id)? else {
+                continue;
+            };
+            for topic in conversation.topics.iter().filter(|topic| !topic.archived) {
+                if let Some(score) = search_score(query, [topic.name.as_str(), topic.icon.as_str()])
+                {
+                    location_matches.push((
+                        score,
+                        SearchLocationResult {
+                            group_id: group.group_id.clone(),
+                            group_name: group_summary.name.clone(),
+                            group_avatar: group_summary.avatar.clone(),
+                            topic_id: Some(topic.topic_id.clone()),
+                            topic_name: Some(topic.name.clone()),
+                            topic_icon: Some(topic.icon.clone()),
+                        },
+                    ));
+                }
+            }
+            let topic_names = conversation
+                .topics
+                .iter()
+                .map(|topic| (topic.topic_id.as_str(), topic.name.as_str()))
+                .collect::<HashMap<_, _>>();
+            for message in conversation.messages {
+                if hidden.contains(&message.author_public_key) {
+                    continue;
+                }
+                let topic_name = message
+                    .topic_id
+                    .as_deref()
+                    .and_then(|topic_id| topic_names.get(topic_id).copied())
+                    .unwrap_or("General");
+                let attachment_label = search_attachment_label(message.attachment.as_ref());
+                let Some(score) = search_score(query, [message.text.as_str(), attachment_label])
+                else {
+                    continue;
+                };
+                message_matches.push((
+                    score,
+                    SearchMessageResult {
+                        event_id: message.event_id,
+                        author_public_key: message.author_public_key,
+                        username: message.username,
+                        avatar: message.avatar,
+                        text: message.text,
+                        attachment: message.attachment,
+                        created_at_millis: message.created_at_millis,
+                        group_id: Some(group.group_id.clone()),
+                        group_name: Some(group_summary.name.clone()),
+                        topic_id: message.topic_id,
+                        topic_name: Some(topic_name.to_owned()),
+                        direct_public_key: None,
+                    },
+                ));
+            }
+        }
+
+        let direct_contacts = state
             .direct_contacts
             .iter()
-            .map(|contact| {
-                let mut messages = messages_by_contact
-                    .remove(&contact.public_key)
-                    .unwrap_or_default();
-                apply_current_direct_profiles(
-                    &mut messages,
-                    &self_public_key,
-                    &state.profile,
-                    contact,
-                );
-                Ok(DirectConversation {
-                    contact: direct_summary(
-                        contact,
-                        state.active_direct_public_key.as_deref() == Some(&contact.public_key),
-                        state.direct_has_unread(&contact.public_key),
-                    ),
-                    media_scope_id: identity.direct_scope_id(&contact.public_key)?,
-                    messages,
+            .map(|contact| (contact.public_key.as_str(), contact))
+            .collect::<HashMap<_, _>>();
+        for decrypted in cached_direct_messages(&state)? {
+            let message = decrypted.message;
+            let Some(contact) = direct_contacts.get(decrypted.counterparty_public_key.as_str())
+            else {
+                continue;
+            };
+            let attachment_label = search_attachment_label(message.attachment.as_ref());
+            let Some(score) = search_score(query, [message.text.as_str(), attachment_label]) else {
+                continue;
+            };
+            message_matches.push((
+                score,
+                SearchMessageResult {
+                    event_id: message.event_id,
+                    author_public_key: message.author_public_key,
+                    username: message.username,
+                    avatar: message.avatar,
+                    text: message.text,
+                    attachment: message.attachment,
+                    created_at_millis: message.created_at_millis,
+                    group_id: None,
+                    group_name: None,
+                    topic_id: None,
+                    topic_name: None,
+                    direct_public_key: Some(contact.public_key.clone()),
+                },
+            ));
+        }
+
+        let direct_keys = state
+            .direct_contacts
+            .iter()
+            .map(|contact| contact.public_key.as_str())
+            .collect::<HashSet<_>>();
+        let mut people_by_key = HashMap::<String, DirectContact>::new();
+        for person in state
+            .known_people
+            .iter()
+            .chain(state.direct_contacts.iter())
+        {
+            if !hidden.contains(&person.public_key) {
+                people_by_key.insert(person.public_key.clone(), person.clone());
+            }
+        }
+        let mut people_matches = people_by_key
+            .into_values()
+            .filter_map(|person| {
+                search_score(query, [person.username.as_str(), person.bio.as_str()]).map(|score| {
+                    (
+                        score,
+                        SearchPersonResult {
+                            direct_message_policy: person.effective_direct_message_policy(),
+                            has_direct: direct_keys.contains(person.public_key.as_str()),
+                            public_key: person.public_key,
+                            username: person.username,
+                            bio: person.bio,
+                            avatar: person.avatar,
+                            album: person.album,
+                            accepts_direct_messages: person.accepts_direct_messages,
+                        },
+                    )
                 })
             })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(DirectInbox {
-            summary: state.summary()?,
-            conversations,
+            .collect::<Vec<_>>();
+
+        message_matches.sort_by(|(left_score, left), (right_score, right)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| right.created_at_millis.cmp(&left.created_at_millis))
+        });
+        location_matches.sort_by(|(left_score, left), (right_score, right)| {
+            right_score.cmp(left_score).then_with(|| {
+                left.topic_name
+                    .as_deref()
+                    .unwrap_or(&left.group_name)
+                    .cmp(right.topic_name.as_deref().unwrap_or(&right.group_name))
+            })
+        });
+        people_matches.sort_by(|(left_score, left), (right_score, right)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| left.username.cmp(&right.username))
+        });
+
+        let mut older_scopes =
+            state
+                .group_event_caches
+                .iter()
+                .flat_map(|(group_id, cache)| {
+                    let mut scopes = Vec::new();
+                    if cache.has_older_messages {
+                        scopes.push(SearchHistoryScope {
+                            group_id: Some(group_id.clone()),
+                            topic_id: None,
+                        });
+                    }
+                    scopes.extend(cache.topic_streams.iter().filter_map(
+                        |(topic_id, topic_cache)| {
+                            topic_cache.has_older_messages.then(|| SearchHistoryScope {
+                                group_id: Some(group_id.clone()),
+                                topic_id: Some(topic_id.clone()),
+                            })
+                        },
+                    ));
+                    scopes
+                })
+                .collect::<Vec<_>>();
+        if state.direct_event_cache.has_older_events {
+            older_scopes.insert(
+                0,
+                SearchHistoryScope {
+                    group_id: None,
+                    topic_id: None,
+                },
+            );
+        }
+        Ok(SearchResults {
+            messages: message_matches
+                .into_iter()
+                .take(limit)
+                .map(|(_, result)| result)
+                .collect(),
+            locations: location_matches
+                .into_iter()
+                .take(limit.min(30))
+                .map(|(_, result)| result)
+                .collect(),
+            people: people_matches
+                .into_iter()
+                .take(limit.min(30))
+                .map(|(_, result)| result)
+                .collect(),
+            has_more_history: !older_scopes.is_empty(),
+            older_scopes,
         })
     }
 
@@ -4918,7 +5519,7 @@ impl NoiseClient {
         let path = path.as_ref();
         let relays = relay_list(relays)?;
         let (mut state, messages) = self
-            .sync_direct_inbox(path, cache_path.as_ref(), relays.clone())
+            .sync_complete_direct_inbox(path, cache_path.as_ref(), relays.clone())
             .await?;
         let public_key = state
             .active_direct_public_key
@@ -5040,6 +5641,11 @@ impl NoiseClient {
         }
         if !contact.accepts_direct_messages {
             bail!("this person is not accepting direct messages")
+        }
+        if contact.effective_direct_message_policy() == DirectMessagePolicy::SharedGroups
+            && !state.shares_active_group_with(&contact.public_key)
+        {
+            bail!("this person only accepts direct messages from shared groups")
         }
         let identity = state.identity()?;
         let self_public_key = identity.public_key_base64();
@@ -5867,6 +6473,7 @@ impl NoiseClient {
                         avatar: message.avatar.clone(),
                         album: message.album.clone(),
                         accepts_direct_messages: message.accepts_direct_messages,
+                        direct_message_policy: message.direct_message_policy,
                         text: message.text.clone(),
                         attachment: message.attachment.clone(),
                         reply_to_message_id: message.reply_to_message_id.clone(),
@@ -6810,6 +7417,48 @@ impl NoiseClient {
         Ok(conversation)
     }
 
+    pub async fn load_older_direct_history(
+        &self,
+        path: impl AsRef<Path>,
+        cache_path: impl AsRef<Path>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<bool> {
+        let path = path.as_ref();
+        let cache_path = cache_path.as_ref();
+        let mut state = load_state(path)?;
+        let identity = state.identity()?;
+        let mailbox_id = direct_mailbox_id(&identity.public_key_base64())?;
+        let mut cache = state.direct_event_cache.clone();
+        if !cache.has_older_events {
+            return Ok(false);
+        }
+        let cursor = cache
+            .events
+            .iter()
+            .filter(|event| event.stream_locator.is_none())
+            .map(GroupEventCursor::from_event)
+            .min_by(|left, right| left.key().cmp(&right.key()))
+            .context("direct-message history cursor is unavailable")?;
+        let relay_descriptors = relay_list(relays)?;
+        let page = self
+            .fetch_group_event_page(
+                &mailbox_id,
+                None,
+                GroupEventPageRequest::Before(&cursor),
+                &relay_descriptors,
+            )
+            .await?
+            .context("the configured relays do not support direct-message history pages")?;
+        cache.events.extend(page.events);
+        cache.events = merge_group_events(&mailbox_id, cache.events);
+        cache.has_older_events = page.has_more;
+        let events = cache.events.clone();
+        state.direct_event_cache = cache;
+        self.apply_direct_events(path, cache_path, state, events, relay_descriptors, true)
+            .await?;
+        Ok(page.has_more)
+    }
+
     pub async fn fetch_group_activity(
         &self,
         path: impl AsRef<Path>,
@@ -6847,8 +7496,7 @@ impl NoiseClient {
         if state.group_event_caches.get(group_id).is_some_and(|cache| {
             cache.needs_control_hydration
                 && !group_cache_has_usable_control_state(&state, &group, cache)
-        })
-        {
+        }) {
             let mut events = self.fetch_events(&group, relays.clone()).await?;
             let topic_events = self
                 .fetch_latest_topic_events(&state, &group, &events, &relays)
@@ -7016,9 +7664,9 @@ impl NoiseClient {
         let identity_public_key = state.identity()?.public_key_base64();
         let group_id = group.group_id.clone();
         let existing_cache = state.group_event_caches.get(&group_id).cloned();
-        let existing_control_is_usable = existing_cache.as_ref().is_some_and(|cache| {
-            group_cache_has_usable_control_state(&state, &group, cache)
-        });
+        let existing_control_is_usable = existing_cache
+            .as_ref()
+            .is_some_and(|cache| group_cache_has_usable_control_state(&state, &group, cache));
         let full_snapshot = update.full_snapshot;
         let portable_group_state = existing_cache
             .as_ref()
@@ -7088,11 +7736,9 @@ impl NoiseClient {
             topic_streams,
         )?;
         cache.needs_control_hydration = !full_snapshot
-            && existing_cache
-                .as_ref()
-                .map_or(true, |cache| {
-                    cache.needs_control_hydration && !existing_control_is_usable
-                });
+            && existing_cache.as_ref().map_or(true, |cache| {
+                cache.needs_control_hydration && !existing_control_is_usable
+            });
         if !full_snapshot {
             cache.portable_conversation = portable_group_state.clone();
         }
@@ -7133,6 +7779,7 @@ impl NoiseClient {
                 avatar: member.avatar.clone(),
                 album: member.album.clone(),
                 accepts_direct_messages: member.accepts_direct_messages,
+                direct_message_policy: member.direct_message_policy,
                 profile_sequence: member.profile_sequence,
             });
         }
@@ -7221,21 +7868,16 @@ impl NoiseClient {
         let mut changed = false;
         for topic_key in topic_keys {
             changed |= state.topic_activity_initialized.insert(topic_key.clone());
-            if let Some(marker) = state.topic_latest_incoming.get(&topic_key).cloned()
-                && state.topic_read_through.get(&topic_key) != Some(&marker)
-            {
-                state.topic_read_through.insert(topic_key.clone(), marker);
-                changed = true;
+            if let Some(marker) = state.topic_latest_incoming.get(&topic_key).cloned() {
+                changed |=
+                    advance_message_marker(&mut state.topic_read_through, &topic_key, marker);
             }
             changed |= state.topic_unread_messages.remove(&topic_key).is_some();
         }
 
         changed |= state.group_activity_initialized.insert(group_id.to_owned());
-        if let Some(marker) = state.group_latest_incoming.get(group_id).cloned()
-            && state.group_read_through.get(group_id) != Some(&marker)
-        {
-            state.group_read_through.insert(group_id.to_owned(), marker);
-            changed = true;
+        if let Some(marker) = state.group_latest_incoming.get(group_id).cloned() {
+            changed |= advance_message_marker(&mut state.group_read_through, group_id, marker);
         }
         changed |= state.group_unread_messages.remove(group_id).is_some();
 
@@ -7278,25 +7920,25 @@ impl NoiseClient {
         }
         let topic_key = topic_activity_key(group_id, topic_id);
         let topic_was_initialized = state.topic_activity_initialized.insert(topic_key.clone());
-        let topic_latest = state.topic_latest_incoming.get(&topic_key).cloned();
-        let topic_marker_changed = topic_latest
-            .as_ref()
-            .is_some_and(|marker| state.topic_read_through.get(&topic_key) != Some(marker));
-        if let Some(marker) = topic_latest {
-            state.topic_read_through.insert(topic_key.clone(), marker);
-        }
+        let topic_marker_changed = state
+            .topic_latest_incoming
+            .get(&topic_key)
+            .cloned()
+            .is_some_and(|marker| {
+                advance_message_marker(&mut state.topic_read_through, &topic_key, marker)
+            });
         let topic_had_unread = state.topic_unread_messages.remove(&topic_key).is_some();
 
         let mut legacy_changed = false;
         if topic_id.is_none() {
             let was_initialized = state.group_activity_initialized.insert(group_id.to_owned());
-            let latest = state.group_latest_incoming.get(group_id).cloned();
-            let marker_changed = latest
-                .as_ref()
-                .is_some_and(|marker| state.group_read_through.get(group_id) != Some(marker));
-            if let Some(marker) = latest {
-                state.group_read_through.insert(group_id.to_owned(), marker);
-            }
+            let marker_changed = state
+                .group_latest_incoming
+                .get(group_id)
+                .cloned()
+                .is_some_and(|marker| {
+                    advance_message_marker(&mut state.group_read_through, group_id, marker)
+                });
             let had_unread = state.group_unread_messages.remove(group_id).is_some();
             legacy_changed = was_initialized || marker_changed || had_unread;
         }
@@ -7346,7 +7988,9 @@ impl NoiseClient {
                     bio: state.profile.bio.clone(),
                     avatar: state.profile.avatar.clone(),
                     album: state.profile.album.clone(),
-                    accepts_direct_messages: state.profile.accepts_direct_messages,
+                    accepts_direct_messages: state.profile.effective_direct_message_policy()
+                        != DirectMessagePolicy::Nobody,
+                    direct_message_policy: state.profile.effective_direct_message_policy(),
                 },
                 sequence,
             )?;
@@ -7394,6 +8038,7 @@ impl NoiseClient {
                 avatar: member.avatar.clone(),
                 album: member.album.clone(),
                 accepts_direct_messages: member.accepts_direct_messages,
+                direct_message_policy: member.direct_message_policy,
                 profile_sequence: member.profile_sequence,
             });
         }
@@ -7462,6 +8107,7 @@ impl NoiseClient {
                         avatar: message.avatar.clone(),
                         album: message.album.clone(),
                         accepts_direct_messages: message.accepts_direct_messages,
+                        direct_message_policy: message.direct_message_policy,
                         text: message.text.clone(),
                         attachment: message.attachment.clone(),
                         reply_to_message_id: message.reply_to_message_id.clone(),
@@ -7488,6 +8134,7 @@ impl NoiseClient {
                 avatar: member.avatar,
                 album: member.album,
                 accepts_direct_messages: member.accepts_direct_messages,
+                direct_message_policy: member.direct_message_policy,
             })
             .collect::<Vec<_>>();
         members.sort_by(|left, right| left.username.cmp(&right.username));
@@ -7533,6 +8180,7 @@ impl NoiseClient {
                         avatar: message.avatar,
                         album: message.album,
                         accepts_direct_messages: message.accepts_direct_messages,
+                        direct_message_policy: message.direct_message_policy,
                         text: message.text,
                         attachment: message.attachment,
                         reply_to_message_id: message.reply_to_message_id,
@@ -7568,19 +8216,79 @@ impl NoiseClient {
         let identity = state.identity()?;
         let self_public_key = identity.public_key_base64();
         let mailbox_id = direct_mailbox_id(&self_public_key)?;
+        let previous_cache = state.direct_event_cache.clone();
+        let cache = self
+            .fetch_direct_event_cache(&mailbox_id, previous_cache.clone(), &relays)
+            .await?;
+        let events = cache.events.clone();
+        state.direct_event_cache = cache;
+        let cache_changed = previous_cache != state.direct_event_cache;
+        self.apply_direct_events(path, cache_path, state, events, relays, cache_changed)
+            .await
+    }
+
+    async fn sync_complete_direct_inbox(
+        &self,
+        path: &Path,
+        cache_path: &Path,
+        relays: Vec<RelayDescriptor>,
+    ) -> anyhow::Result<(ClientState, Vec<DecryptedDirectMessage>)> {
+        let mut state = load_state(path)?;
+        let identity = state.identity()?;
+        let mailbox_id = direct_mailbox_id(&identity.public_key_base64())?;
         let events = self
             .fetch_events_for_id(&mailbox_id, relays.clone())
             .await?;
+        let previous_cache = state.direct_event_cache.clone();
+        state.direct_event_cache = compact_direct_event_cache(&mailbox_id, events.clone(), false);
+        let cache_changed = previous_cache != state.direct_event_cache;
+        self.apply_direct_events(path, cache_path, state, events, relays, cache_changed)
+            .await
+    }
+
+    async fn apply_direct_events(
+        &self,
+        path: &Path,
+        cache_path: &Path,
+        mut state: ClientState,
+        events: Vec<SignedEvent>,
+        relays: Vec<RelayDescriptor>,
+        cache_changed: bool,
+    ) -> anyhow::Result<(ClientState, Vec<DecryptedDirectMessage>)> {
+        let identity = state.identity()?;
+        let self_public_key = identity.public_key_base64();
         let contacts_before = state.direct_contacts.clone();
         let active_before = state.active_direct_public_key.clone();
         let deletions_before = state.direct_deleted_before.clone();
         let blocked_by_before = state.blocked_by_states.clone();
+        let policy_rejections_before = state.direct_policy_rejected_through.clone();
         let latest_incoming_before = state.direct_latest_incoming.clone();
         let latest_activity_before = state.direct_latest_activity.clone();
         let decoded = events
             .iter()
             .filter_map(|event| decrypt_direct_event(&identity, &state, event))
             .collect::<Vec<_>>();
+        if state.profile.effective_direct_message_policy() == DirectMessagePolicy::SharedGroups {
+            for event in &decoded {
+                let DecryptedDirectEvent::Message(message) = event else {
+                    continue;
+                };
+                if message.message.author_public_key == self_public_key
+                    || state.shares_active_group_with(&message.counterparty_public_key)
+                {
+                    continue;
+                }
+                let marker = DirectMessageMarker {
+                    created_at_millis: message.message.created_at_millis,
+                    event_id: message.message.event_id.clone(),
+                };
+                state
+                    .direct_policy_rejected_through
+                    .entry(message.counterparty_public_key.clone())
+                    .and_modify(|existing| *existing = existing.clone().max(marker.clone()))
+                    .or_insert(marker);
+            }
+        }
         for event in &decoded {
             match event {
                 DecryptedDirectEvent::ThreadDeleted {
@@ -7662,8 +8370,23 @@ impl NoiseClient {
                             .unwrap_or_default()
                         && !state.is_hidden(&message.counterparty_public_key)
                         && (message.message.author_public_key == self_public_key
-                            || !state
-                                .direct_messages_blocked_at(message.message.created_at_millis)) =>
+                            || state
+                                .direct_policy_rejected_through
+                                .get(&message.counterparty_public_key)
+                                .is_none_or(|cutoff| {
+                                    &DirectMessageMarker {
+                                        created_at_millis: message.message.created_at_millis,
+                                        event_id: message.message.event_id.clone(),
+                                    } > cutoff
+                                }))
+                        && (message.message.author_public_key == self_public_key
+                            || (!state.direct_messages_blocked_at(
+                                message.message.created_at_millis,
+                            ) && (state.profile.effective_direct_message_policy()
+                                != DirectMessagePolicy::SharedGroups
+                                || state.shares_active_group_with(
+                                    &message.counterparty_public_key,
+                                )))) =>
                 {
                     Some(message)
                 }
@@ -7725,9 +8448,11 @@ impl NoiseClient {
         if blocked_by_changed && state.account.is_some() {
             let _ = self.publish_account_state(&mut state, &relays).await;
         }
-        if state.direct_contacts != contacts_before
+        if cache_changed
+            || state.direct_contacts != contacts_before
             || state.active_direct_public_key != active_before
             || state.direct_deleted_before != deletions_before
+            || state.direct_policy_rejected_through != policy_rejections_before
             || state.blocked_by_states != blocked_by_before
             || state.direct_latest_incoming != latest_incoming_before
             || state.direct_latest_activity != latest_activity_before
@@ -7911,7 +8636,11 @@ impl NoiseClient {
                 return;
             }
         }
-        for record in newest.epochs.iter().skip(observed.map_or(0, |log| log.epochs.len())) {
+        for record in newest
+            .epochs
+            .iter()
+            .skip(observed.map_or(0, |log| log.epochs.len()))
+        {
             let Ok(body) = serde_json::to_vec(record) else {
                 return;
             };
@@ -8053,6 +8782,11 @@ impl NoiseClient {
         if let Ok(remote) = self.fetch_account_vault(relays, &credentials.locator).await {
             Self::merge_remote_account_state(state, &credentials, &remote)?;
         }
+        // Contact discovery is identity infrastructure, not a copy-button side
+        // effect. Keep the signed card current whenever the account is
+        // published. A failed relay attempt does not block account recovery;
+        // the persisted version marker leaves it eligible for the next sync.
+        let _ = self.ensure_contact_signal_published(state, relays).await;
 
         let mut last_error = None;
         for _ in 0..4 {
@@ -8123,6 +8857,11 @@ impl NoiseClient {
             state.profile = contents.profile.clone();
             state.profile_sequence = contents.profile_sequence;
         }
+        let contact_signal_changed =
+            contents.contact_signal_published_sequence > state.contact_signal_published_sequence;
+        state.contact_signal_published_sequence = state
+            .contact_signal_published_sequence
+            .max(contents.contact_signal_published_sequence);
         let devices_changed = merge_device_records(&mut state.devices, contents.devices.clone());
         if state.current_device_is_revoked() {
             bail!(DEVICE_SESSION_REVOKED_ERROR)
@@ -8229,16 +8968,16 @@ impl NoiseClient {
             // poison the established local cache on every account refresh.
             // Doing so turns every ordinary incoming message into a complete
             // group-history download and decrypt.
-            let needs_control_hydration = local.as_ref().map_or(
-                remote_cache.needs_control_hydration,
-                |cache| {
-                    if cache.events.is_empty() {
-                        cache.needs_control_hydration || remote_cache.needs_control_hydration
-                    } else {
-                        cache.needs_control_hydration
-                    }
-                },
-            );
+            let needs_control_hydration =
+                local
+                    .as_ref()
+                    .map_or(remote_cache.needs_control_hydration, |cache| {
+                        if cache.events.is_empty() {
+                            cache.needs_control_hydration || remote_cache.needs_control_hydration
+                        } else {
+                            cache.needs_control_hydration
+                        }
+                    });
             let mut remote_portable_conversation = remote_cache.portable_conversation;
             if remote_portable_conversation
                 .as_ref()
@@ -8374,6 +9113,10 @@ impl NoiseClient {
             || groups_before != state.groups
             || frequencies_before != state.group_frequencies;
         let direct_reads_changed = state.merge_direct_read_through(&contents.direct_read_through);
+        let direct_policy_rejections_changed = merge_read_markers(
+            &mut state.direct_policy_rejected_through,
+            &contents.direct_policy_rejected_through,
+        );
         let group_reads_changed = state.merge_group_read_through(&contents.group_read_through);
         let topic_reads_changed = state.merge_topic_read_through(&contents.topic_read_through);
         let blocks_changed = merge_block_states(&mut state.block_states, &contents.block_states);
@@ -8403,7 +9146,9 @@ impl NoiseClient {
         let revision_changed = remote.revision > account.revision;
         account.revision = account.revision.max(remote.revision);
         Ok(direct_reads_changed
+            || direct_policy_rejections_changed
             || profile_changed
+            || contact_signal_changed
             || devices_changed
             || memberships_changed
             || group_reads_changed
@@ -8581,13 +9326,7 @@ impl NoiseClient {
             let body = body.clone();
             let request = async move {
                 let result = client
-                    .relay_request(
-                        std::slice::from_ref(&relay),
-                        0,
-                        "POST",
-                        "/v1/events",
-                        &body,
-                    )
+                    .relay_request(std::slice::from_ref(&relay), 0, "POST", "/v1/events", &body)
                     .await;
                 (index, result)
             };
@@ -8932,6 +9671,61 @@ impl NoiseClient {
         relays: Vec<RelayDescriptor>,
     ) -> anyhow::Result<Vec<SignedEvent>> {
         self.fetch_events_for_id(&group.group_id, relays).await
+    }
+
+    async fn fetch_direct_event_cache(
+        &self,
+        mailbox_id: &str,
+        existing: DirectEventCache,
+        relays: &[RelayDescriptor],
+    ) -> anyhow::Result<DirectEventCache> {
+        let latest_cursor =
+            max_group_event_cursor(existing.latest_cursor.clone(), &existing.events, None);
+        let request = latest_cursor
+            .as_ref()
+            .map_or(GroupEventPageRequest::Latest, GroupEventPageRequest::After);
+        let Some(mut page) = self
+            .fetch_group_event_page(mailbox_id, None, request, relays)
+            .await?
+        else {
+            // Compatibility for relays that predate bounded pages. The result
+            // is compacted before it reaches disk, so this fallback never
+            // recreates the old unbounded device state.
+            let events = self
+                .fetch_events_for_id(mailbox_id, relays.to_vec())
+                .await?;
+            return Ok(compact_direct_event_cache(mailbox_id, events, false));
+        };
+
+        let mut events = existing.events;
+        events.extend(page.events);
+        while latest_cursor.is_some() && page.has_more {
+            let cursor = page
+                .continuation_cursor
+                .context("relay direct-message page has no continuation cursor")?;
+            page = self
+                .fetch_group_event_page(
+                    mailbox_id,
+                    None,
+                    GroupEventPageRequest::After(&cursor),
+                    relays,
+                )
+                .await?
+                .context("the configured relays stopped paginating direct messages")?;
+            if let Some(next_cursor) = page.continuation_cursor.as_ref()
+                && next_cursor.key() <= cursor.key()
+            {
+                bail!("relay returned a non-advancing direct-message page")
+            }
+            events.extend(page.events);
+        }
+        let has_older_events =
+            existing.has_older_events || (latest_cursor.is_none() && page.has_more);
+        Ok(compact_direct_event_cache(
+            mailbox_id,
+            events,
+            has_older_events,
+        ))
     }
 
     async fn fetch_group_event_page(
@@ -9338,6 +10132,7 @@ fn decrypt_direct_event(
                     && validate_forwarded_from(forwarded_from.as_ref()).is_ok()
                     && validate_reply_reference(reply_to_message_id.as_deref()).is_ok() =>
                 {
+                    let direct_message_policy = sender_profile.effective_direct_message_policy();
                     return Some(DecryptedDirectEvent::Message(DecryptedDirectMessage {
                         counterparty_public_key: contact.public_key.clone(),
                         contact: contact.clone(),
@@ -9352,7 +10147,9 @@ fn decrypt_direct_event(
                             bio: sender_profile.bio,
                             avatar: sender_profile.avatar,
                             album: sender_profile.album,
-                            accepts_direct_messages: sender_profile.accepts_direct_messages,
+                            accepts_direct_messages: direct_message_policy
+                                != DirectMessagePolicy::Nobody,
+                            direct_message_policy,
                             text,
                             attachment,
                             reply_to_message_id,
@@ -9392,13 +10189,15 @@ fn decrypt_direct_event(
             && validate_forwarded_from(forwarded_from.as_ref()).is_ok()
             && validate_reply_reference(reply_to_message_id.as_deref()).is_ok() =>
         {
+            let direct_message_policy = sender_profile.effective_direct_message_policy();
             let contact = DirectContact {
                 public_key: event.author_public_key.clone(),
                 username: sender_profile.username.clone(),
                 bio: sender_profile.bio.clone(),
                 avatar: sender_profile.avatar.clone(),
                 album: sender_profile.album.clone(),
-                accepts_direct_messages: sender_profile.accepts_direct_messages,
+                accepts_direct_messages: direct_message_policy != DirectMessagePolicy::Nobody,
+                direct_message_policy,
                 profile_sequence: event.author_sequence,
             };
             Some(DecryptedDirectEvent::Message(DecryptedDirectMessage {
@@ -9412,7 +10211,8 @@ fn decrypt_direct_event(
                     bio: sender_profile.bio,
                     avatar: sender_profile.avatar,
                     album: sender_profile.album,
-                    accepts_direct_messages: sender_profile.accepts_direct_messages,
+                    accepts_direct_messages: direct_message_policy != DirectMessagePolicy::Nobody,
+                    direct_message_policy,
                     text,
                     attachment,
                     reply_to_message_id,
@@ -9432,13 +10232,15 @@ fn decrypt_direct_event(
             sender_profile,
             blocked,
         } if recipient_public_key == self_public_key && valid_direct_profile(&sender_profile) => {
+            let direct_message_policy = sender_profile.effective_direct_message_policy();
             let contact = DirectContact {
                 public_key: event.author_public_key.clone(),
                 username: sender_profile.username,
                 bio: sender_profile.bio,
                 avatar: sender_profile.avatar,
                 album: sender_profile.album,
-                accepts_direct_messages: sender_profile.accepts_direct_messages,
+                accepts_direct_messages: direct_message_policy != DirectMessagePolicy::Nobody,
+                direct_message_policy,
                 profile_sequence: event.author_sequence,
             };
             Some(DecryptedDirectEvent::BlockChanged {
@@ -9776,6 +10578,7 @@ fn cached_conversation_from_view(
                     avatar: message.avatar.clone(),
                     album: message.album.clone(),
                     accepts_direct_messages: message.accepts_direct_messages,
+                    direct_message_policy: message.direct_message_policy,
                     text: message.text.clone(),
                     attachment: message.attachment.clone(),
                     reply_to_message_id: message.reply_to_message_id.clone(),
@@ -9803,6 +10606,7 @@ fn cached_conversation_from_view(
             avatar: member.avatar,
             album: member.album,
             accepts_direct_messages: member.accepts_direct_messages,
+            direct_message_policy: member.direct_message_policy,
         })
         .collect::<Vec<_>>();
     members.sort_by(|left, right| left.username.cmp(&right.username));
@@ -9849,6 +10653,7 @@ fn cached_conversation_from_view(
                     avatar: message.avatar,
                     album: message.album,
                     accepts_direct_messages: message.accepts_direct_messages,
+                    direct_message_policy: message.direct_message_policy,
                     text: message.text,
                     attachment: message.attachment,
                     reply_to_message_id: message.reply_to_message_id,
@@ -9937,7 +10742,9 @@ fn group_cache_has_usable_control_state(
     if cache.events.is_empty() {
         return false;
     }
-    let Ok(identity_public_key) = state.identity().map(|identity| identity.public_key_base64())
+    let Ok(identity_public_key) = state
+        .identity()
+        .map(|identity| identity.public_key_base64())
     else {
         return false;
     };
@@ -9975,6 +10782,98 @@ fn max_group_event_cursor(
         .map(GroupEventCursor::from_event)
         .chain(existing)
         .max_by(|left, right| left.key().cmp(&right.key()))
+}
+
+fn compact_direct_event_cache(
+    mailbox_id: &str,
+    events: Vec<SignedEvent>,
+    has_older_hint: bool,
+) -> DirectEventCache {
+    let mut events = merge_group_events(mailbox_id, events);
+    let latest_cursor = max_group_event_cursor(None, &events, None);
+    let was_truncated = events.len() > DIRECT_EVENT_CACHE_LIMIT;
+    if was_truncated {
+        let retained_start = events.len() - DIRECT_EVENT_CACHE_LIMIT;
+        events.drain(..retained_start);
+    }
+    DirectEventCache {
+        events,
+        latest_cursor,
+        has_older_events: has_older_hint || was_truncated,
+    }
+}
+
+fn cached_direct_messages(state: &ClientState) -> anyhow::Result<Vec<DecryptedDirectMessage>> {
+    let identity = state.identity()?;
+    let self_public_key = identity.public_key_base64();
+    let mut messages = state
+        .direct_event_cache
+        .events
+        .iter()
+        .filter_map(|event| decrypt_direct_event(&identity, state, event))
+        .filter_map(|event| match event {
+            DecryptedDirectEvent::Message(message)
+                if message.message.created_at_millis
+                    > state
+                        .direct_deleted_before
+                        .get(&message.counterparty_public_key)
+                        .copied()
+                        .unwrap_or_default()
+                    && !state.is_hidden(&message.counterparty_public_key)
+                    && (message.message.author_public_key == self_public_key
+                        || !state
+                            .direct_messages_blocked_at(message.message.created_at_millis)) =>
+            {
+                Some(message)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    messages.sort_by(|left, right| {
+        left.message
+            .created_at_millis
+            .cmp(&right.message.created_at_millis)
+            .then_with(|| left.message.event_id.cmp(&right.message.event_id))
+    });
+    Ok(messages)
+}
+
+fn direct_inbox_from_messages(
+    state: &ClientState,
+    messages: Vec<DecryptedDirectMessage>,
+) -> anyhow::Result<DirectInbox> {
+    let identity = state.identity()?;
+    let self_public_key = identity.public_key_base64();
+    let mut messages_by_contact = HashMap::<String, Vec<DirectMessageSummary>>::new();
+    for message in messages {
+        messages_by_contact
+            .entry(message.counterparty_public_key)
+            .or_default()
+            .push(message.message);
+    }
+    let conversations = state
+        .direct_contacts
+        .iter()
+        .map(|contact| {
+            let mut messages = messages_by_contact
+                .remove(&contact.public_key)
+                .unwrap_or_default();
+            apply_current_direct_profiles(&mut messages, &self_public_key, &state.profile, contact);
+            Ok(DirectConversation {
+                contact: direct_summary(
+                    contact,
+                    state.active_direct_public_key.as_deref() == Some(&contact.public_key),
+                    state.direct_has_unread(&contact.public_key),
+                ),
+                media_scope_id: identity.direct_scope_id(&contact.public_key)?,
+                messages,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(DirectInbox {
+        summary: state.summary()?,
+        conversations,
+    })
 }
 
 fn compact_group_event_cache(
@@ -10264,7 +11163,7 @@ fn prepare_member_add_epoch(
     state: &ClientState,
     identity: &Identity,
     group: &GroupMembership,
-    active_members: &HashSet<String>,
+    current_members: &HashSet<String>,
     log: &MlsControlLog,
     requests: &[MlsJoinRequest],
 ) -> anyhow::Result<(MlsAccountState, MlsEpochRecord)> {
@@ -10283,7 +11182,7 @@ fn prepare_member_add_epoch(
     let record = candidate
         .create_epoch_record(identity, previous_record_id, bundle)
         .context("could not sign the next MLS epoch")?;
-    let mut expected = active_members.iter().cloned().collect::<Vec<_>>();
+    let mut expected = current_members.iter().cloned().collect::<Vec<_>>();
     expected.extend(
         requests
             .iter()
@@ -10483,6 +11382,7 @@ fn join_request_membership_profile(
         avatar,
         album,
         accepts_direct_messages,
+        direct_message_policy,
     } = proof.decrypt(group).ok()?
     else {
         return None;
@@ -10493,6 +11393,7 @@ fn join_request_membership_profile(
         avatar,
         album,
         accepts_direct_messages,
+        direct_message_policy,
     };
     valid_direct_profile(&profile).then_some(profile)
 }
@@ -10524,6 +11425,7 @@ fn direct_summary(contact: &DirectContact, is_active: bool, has_unread: bool) ->
         avatar: contact.avatar.clone(),
         album: contact.album.clone(),
         accepts_direct_messages: contact.accepts_direct_messages,
+        direct_message_policy: contact.effective_direct_message_policy(),
         is_active,
         has_unread,
     }
@@ -10541,13 +11443,16 @@ fn apply_current_direct_profiles(
             message.bio = self_profile.bio.clone();
             message.avatar = self_profile.avatar.clone();
             message.album = self_profile.album.clone();
-            message.accepts_direct_messages = self_profile.accepts_direct_messages;
+            message.direct_message_policy = self_profile.effective_direct_message_policy();
+            message.accepts_direct_messages =
+                message.direct_message_policy != DirectMessagePolicy::Nobody;
         } else if message.author_public_key == contact.public_key {
             message.username = contact.username.clone();
             message.bio = contact.bio.clone();
             message.avatar = contact.avatar.clone();
             message.album = contact.album.clone();
             message.accepts_direct_messages = contact.accepts_direct_messages;
+            message.direct_message_policy = contact.effective_direct_message_policy();
         }
     }
 }
@@ -10573,6 +11478,7 @@ fn apply_current_group_profiles(
             avatar: person.avatar.clone(),
             album: person.album.clone(),
             accepts_direct_messages: person.accepts_direct_messages,
+            direct_message_policy: person.effective_direct_message_policy(),
         };
         match profiles.get_mut(&person.public_key) {
             Some((sequence, current)) if person.profile_sequence >= *sequence => {
@@ -11441,6 +12347,7 @@ mod tests {
             version: 3,
             profile,
             profile_sequence,
+            contact_signal_published_sequence: 0,
             identity_secret_base64: identity.secret_base64(),
             local_device_id: String::new(),
             devices: HashMap::new(),
@@ -11451,6 +12358,7 @@ mod tests {
             mls_local_geneses: HashMap::new(),
             mls_control_logs: HashMap::new(),
             group_event_caches: HashMap::new(),
+            direct_event_cache: DirectEventCache::default(),
             groups: Vec::new(),
             group_memberships: HashMap::new(),
             active_group_id: None,
@@ -11461,6 +12369,7 @@ mod tests {
             blocked_by_states: HashMap::new(),
             active_direct_public_key: None,
             direct_deleted_before: HashMap::new(),
+            direct_policy_rejected_through: HashMap::new(),
             direct_closed_periods: Vec::new(),
             direct_latest_incoming: HashMap::new(),
             direct_latest_activity: HashMap::new(),
@@ -11493,6 +12402,7 @@ mod tests {
             avatar: None,
             album,
             accepts_direct_messages: true,
+            direct_message_policy: DirectMessagePolicy::Everyone,
         }
     }
 
@@ -11544,6 +12454,24 @@ mod tests {
     }
 
     #[test]
+    fn latest_message_marker_cannot_regress_to_an_older_relay_page() {
+        let mut latest = HashMap::from([("group:topic".to_owned(), marker(300, "event-c"))]);
+
+        assert!(!advance_message_marker(
+            &mut latest,
+            "group:topic",
+            marker(100, "event-a"),
+        ));
+        assert_eq!(latest.get("group:topic"), Some(&marker(300, "event-c")));
+        assert!(advance_message_marker(
+            &mut latest,
+            "group:topic",
+            marker(400, "event-d"),
+        ));
+        assert_eq!(latest.get("group:topic"), Some(&marker(400, "event-d")));
+    }
+
+    #[test]
     fn repeated_sign_in_for_the_restored_account_is_idempotent() {
         let noise_id = "482109376144";
         let password = "correct horse battery staple";
@@ -11562,12 +12490,7 @@ mod tests {
             .build()
             .unwrap();
         let summary = runtime
-            .block_on(NoiseClient::default().sign_in(
-                &path,
-                noise_id,
-                password,
-                Vec::new(),
-            ))
+            .block_on(NoiseClient::default().sign_in(&path, noise_id, password, Vec::new()))
             .unwrap();
 
         assert_eq!(summary.identity.public_key, identity.public_key_base64());
@@ -12178,6 +13101,98 @@ mod tests {
     }
 
     #[test]
+    fn initial_mls_admission_does_not_wait_for_the_whole_legacy_roster() {
+        let founder_identity = Identity::generate();
+        let available_identity = Identity::generate();
+        let offline_identity = Identity::generate();
+        let group =
+            GroupMembership::create_owned("partial cutover", founder_identity.public_key_base64());
+        let group_id = group.group_id.clone();
+        let mut founder_mls = MlsAccountState::create(&founder_identity).unwrap();
+        let mut available_mls = MlsAccountState::create(&available_identity).unwrap();
+        let available_request = MlsJoinRequest::create_with_membership_proof(
+            &available_identity,
+            &mut available_mls,
+            group_id.clone(),
+            SignedEvent::member_joined(&available_identity, &group, &test_profile(None), 1)
+                .unwrap(),
+        )
+        .unwrap();
+        let genesis = founder_mls
+            .create_group_genesis(&founder_identity, &group)
+            .unwrap();
+        let log = MlsControlLog {
+            genesis: genesis.clone(),
+            epochs: Vec::new(),
+        };
+        let mut state = account_state(
+            &founder_identity,
+            &test_credentials(),
+            test_profile(None),
+            1,
+            1,
+        );
+        state.add_group(group.clone());
+        state.set_mls_group_state(&group_id, founder_mls);
+        state.mls_control_logs.insert(group_id.clone(), log.clone());
+
+        let current_members = log
+            .member_accounts_at(0)
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let eligible_legacy_members = HashSet::from([
+            founder_identity.public_key_base64(),
+            available_identity.public_key_base64(),
+            offline_identity.public_key_base64(),
+        ]);
+        let pending = pending_admission_requests(
+            &state,
+            &group,
+            &eligible_legacy_members,
+            &HashMap::new(),
+            vec![available_request],
+        )
+        .unwrap();
+        let (_, record) = prepare_member_add_epoch(
+            &state,
+            &founder_identity,
+            &group,
+            &current_members,
+            &log,
+            &pending,
+        )
+        .unwrap();
+        assert!(
+            record
+                .member_accounts
+                .contains(&available_identity.public_key_base64())
+        );
+        assert!(
+            !record
+                .member_accounts
+                .contains(&offline_identity.public_key_base64())
+        );
+
+        let joined_epoch = available_mls
+            .join_group(&group_id, record.bundle.welcome_base64.as_deref().unwrap())
+            .unwrap();
+        let history = HistoryKeyLink::unlock_history(
+            &group_id,
+            joined_epoch.epoch,
+            &joined_epoch.archive_key_base64,
+            &[record.bundle.history_link],
+        )
+        .unwrap();
+        let epoch_zero_key = history.get(&0).unwrap();
+        assert_eq!(
+            genesis.legacy_history_bridge.open(epoch_zero_key).unwrap(),
+            group.secret_base64
+        );
+    }
+
+    #[test]
     fn a_replica_that_is_behind_is_not_a_fork_but_a_competing_epoch_is() {
         let founder_identity = Identity::generate();
         let group =
@@ -12196,7 +13211,9 @@ mod tests {
         let accepted_record = founder_mls
             .create_epoch_record(&founder_identity, &genesis.record_id, accepted)
             .unwrap();
-        let competing = competing_mls.add_member(&group_id, &second_package).unwrap();
+        let competing = competing_mls
+            .add_member(&group_id, &second_package)
+            .unwrap();
         let competing_record = competing_mls
             .create_epoch_record(&founder_identity, &genesis.record_id, competing)
             .unwrap();

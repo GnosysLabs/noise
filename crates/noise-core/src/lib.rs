@@ -548,6 +548,15 @@ fn account_vault_aad(
     format!("noise-account-v1:{locator}:{revision}:{identity_public_key}:{deleted}").into_bytes()
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectMessagePolicy {
+    #[default]
+    Everyone,
+    SharedGroups,
+    Nobody,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Profile {
     pub username: String,
@@ -559,6 +568,19 @@ pub struct Profile {
     pub album: Option<ProfileAlbum>,
     #[serde(default = "default_true")]
     pub accepts_direct_messages: bool,
+    #[serde(default)]
+    pub direct_message_policy: DirectMessagePolicy,
+}
+
+impl Profile {
+    #[must_use]
+    pub fn effective_direct_message_policy(&self) -> DirectMessagePolicy {
+        if self.accepts_direct_messages {
+            self.direct_message_policy
+        } else {
+            DirectMessagePolicy::Nobody
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -1539,6 +1561,8 @@ pub enum GroupEventPayload {
         album: Option<ProfileAlbum>,
         #[serde(default = "default_true")]
         accepts_direct_messages: bool,
+        #[serde(default)]
+        direct_message_policy: DirectMessagePolicy,
     },
     ProfileUpdated {
         profile: Profile,
@@ -1731,6 +1755,7 @@ impl SignedEvent {
                 avatar: profile.avatar.clone(),
                 album: profile.album.clone(),
                 accepts_direct_messages: profile.accepts_direct_messages,
+                direct_message_policy: profile.effective_direct_message_policy(),
             },
             author_sequence,
         )
@@ -2383,6 +2408,7 @@ pub struct MemberState {
     pub avatar: Option<ProfileImage>,
     pub album: Option<ProfileAlbum>,
     pub accepts_direct_messages: bool,
+    pub direct_message_policy: DirectMessagePolicy,
     pub joined_at_millis: u64,
     pub profile_sequence: u64,
 }
@@ -2397,6 +2423,7 @@ pub struct AcceptedMessage {
     pub avatar: Option<ProfileImage>,
     pub album: Option<ProfileAlbum>,
     pub accepts_direct_messages: bool,
+    pub direct_message_policy: DirectMessagePolicy,
     pub text: String,
     pub attachment: Option<MediaAttachment>,
     pub reply_to_message_id: Option<String>,
@@ -2513,6 +2540,7 @@ impl GroupState {
                     avatar,
                     album,
                     accepts_direct_messages,
+                    direct_message_policy,
                 } => {
                     if state.banned_members.contains(&event.author_public_key) {
                         state.rejected_events += 1;
@@ -2521,6 +2549,11 @@ impl GroupState {
                     if state.owner_public_key.is_none() {
                         state.owner_public_key = Some(event.author_public_key.clone());
                     }
+                    let direct_message_policy = if accepts_direct_messages {
+                        direct_message_policy
+                    } else {
+                        DirectMessagePolicy::Nobody
+                    };
                     state.members.insert(
                         event.author_public_key.clone(),
                         MemberState {
@@ -2529,7 +2562,9 @@ impl GroupState {
                             bio: bio.clone(),
                             avatar: avatar.clone(),
                             album: album.clone(),
-                            accepts_direct_messages,
+                            accepts_direct_messages: direct_message_policy
+                                != DirectMessagePolicy::Nobody,
+                            direct_message_policy,
                             joined_at_millis: event.created_at_millis,
                             profile_sequence: event.author_sequence,
                         },
@@ -2541,7 +2576,8 @@ impl GroupState {
                         &bio,
                         &avatar,
                         &album,
-                        accepts_direct_messages,
+                        direct_message_policy != DirectMessagePolicy::Nobody,
+                        direct_message_policy,
                     );
                 }
                 GroupEventPayload::ProfileUpdated { profile } => {
@@ -2553,7 +2589,9 @@ impl GroupState {
                     member.bio = profile.bio.clone();
                     member.avatar = profile.avatar.clone();
                     member.album = profile.album.clone();
-                    member.accepts_direct_messages = profile.accepts_direct_messages;
+                    member.direct_message_policy = profile.effective_direct_message_policy();
+                    member.accepts_direct_messages =
+                        member.direct_message_policy != DirectMessagePolicy::Nobody;
                     member.profile_sequence = event.author_sequence;
                     update_message_profiles(
                         &mut state.messages,
@@ -2562,7 +2600,8 @@ impl GroupState {
                         &profile.bio,
                         &profile.avatar,
                         &profile.album,
-                        profile.accepts_direct_messages,
+                        profile.effective_direct_message_policy() != DirectMessagePolicy::Nobody,
+                        profile.effective_direct_message_policy(),
                     );
                 }
                 GroupEventPayload::GroupProfileUpdated { mut profile } => {
@@ -2950,6 +2989,7 @@ impl GroupState {
                         avatar: member.avatar.clone(),
                         album: member.album.clone(),
                         accepts_direct_messages: member.accepts_direct_messages,
+                        direct_message_policy: member.direct_message_policy,
                         text,
                         attachment,
                         reply_to_message_id,
@@ -3009,6 +3049,7 @@ impl GroupState {
                         avatar: member.avatar.clone(),
                         album: member.album.clone(),
                         accepts_direct_messages: member.accepts_direct_messages,
+                        direct_message_policy: member.direct_message_policy,
                         text,
                         attachment,
                         reply_to_message_id,
@@ -3180,6 +3221,7 @@ fn update_message_profiles(
     avatar: &Option<ProfileImage>,
     album: &Option<ProfileAlbum>,
     accepts_direct_messages: bool,
+    direct_message_policy: DirectMessagePolicy,
 ) {
     for message in messages
         .iter_mut()
@@ -3190,6 +3232,7 @@ fn update_message_profiles(
         message.avatar = avatar.clone();
         message.album = album.clone();
         message.accepts_direct_messages = accepts_direct_messages;
+        message.direct_message_policy = direct_message_policy;
     }
 }
 
@@ -3357,6 +3400,7 @@ mod tests {
                 avatar: None,
                 album: None,
                 accepts_direct_messages: true,
+                direct_message_policy: DirectMessagePolicy::Everyone,
             },
             0,
         )
@@ -3371,6 +3415,7 @@ mod tests {
                 avatar: None,
                 album: None,
                 accepts_direct_messages: true,
+                direct_message_policy: DirectMessagePolicy::Everyone,
             },
             2,
         )
@@ -3397,6 +3442,7 @@ mod tests {
             avatar: None,
             album: None,
             accepts_direct_messages: true,
+            direct_message_policy: DirectMessagePolicy::Everyone,
         };
         let joined = SignedEvent::member_joined(&identity, &group, &profile, 1).unwrap();
         let archive_key = STANDARD_NO_PAD.encode([7u8; 32]);
@@ -3501,6 +3547,7 @@ mod tests {
             avatar: None,
             album: None,
             accepts_direct_messages: true,
+            direct_message_policy: DirectMessagePolicy::Everyone,
         };
         let mut events = Vec::new();
         events.push(SignedEvent::member_joined(&founder, &group, &profile("founder"), 0).unwrap());
@@ -3549,6 +3596,7 @@ mod tests {
             avatar: None,
             album: None,
             accepts_direct_messages: true,
+            direct_message_policy: DirectMessagePolicy::Everyone,
         };
         let mut events =
             vec![SignedEvent::member_joined(&founder, &group, &profile("founder"), 0).unwrap()];
@@ -3588,6 +3636,7 @@ mod tests {
             avatar: None,
             album: None,
             accepts_direct_messages: true,
+            direct_message_policy: DirectMessagePolicy::Everyone,
         };
         let mut events =
             vec![SignedEvent::member_joined(&founder, &group, &profile("founder"), 0).unwrap()];
@@ -3638,6 +3687,7 @@ mod tests {
             avatar: None,
             album: None,
             accepts_direct_messages: true,
+            direct_message_policy: DirectMessagePolicy::Everyone,
         };
         let mut events =
             vec![SignedEvent::member_joined(&founder, &group, &profile("founder"), 0).unwrap()];
@@ -3683,6 +3733,7 @@ mod tests {
             avatar: None,
             album: None,
             accepts_direct_messages: true,
+            direct_message_policy: DirectMessagePolicy::Everyone,
         };
         let mut events =
             vec![SignedEvent::member_joined(&founder, &group, &profile("founder"), 0).unwrap()];
@@ -3745,6 +3796,7 @@ mod tests {
             avatar: None,
             album: None,
             accepts_direct_messages: true,
+            direct_message_policy: DirectMessagePolicy::Everyone,
         };
         let mobile_background = ProfileImage {
             blob_id: "a".repeat(64),
@@ -3837,6 +3889,7 @@ mod tests {
                 avatar: None,
                 album: None,
                 accepts_direct_messages: true,
+                direct_message_policy: DirectMessagePolicy::Everyone,
             },
             "secret hello",
             None,
@@ -3877,6 +3930,7 @@ mod tests {
                 avatar: None,
                 album: None,
                 accepts_direct_messages: true,
+                direct_message_policy: DirectMessagePolicy::Everyone,
             },
             true,
             2,

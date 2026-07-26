@@ -56,6 +56,8 @@ const browserConcurrentActions = new Set([
   "group_has_pending_admissions",
   "heartbeat_presence",
   "reply_notification_snapshot",
+  "resolve_contact_signal",
+  "search_local",
   "status",
   "upload_direct_media_chunk",
   "upload_direct_media_chunk_to",

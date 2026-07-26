@@ -11,11 +11,16 @@ use std::{
 
 use futures_util::future::{AbortHandle, Abortable};
 use noise_client::{
-    ForwardedFrom, MediaAttachment, NoiseClient, ProfileAlbum, ProfileAlbumItem, ProfileImage,
+    DirectMessagePolicy, ForwardedFrom, MediaAttachment, NoiseClient, ProfileAlbum,
+    ProfileAlbumItem, ProfileImage,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
+
+fn default_search_limit() -> usize {
+    60
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -26,6 +31,20 @@ enum Request {
     },
     Status {
         state_path: String,
+    },
+    SearchLocal {
+        state_path: String,
+        query: String,
+        #[serde(default = "default_search_limit")]
+        limit: usize,
+    },
+    PublishContactSignal {
+        state_path: String,
+        relays: Vec<String>,
+    },
+    ResolveContactSignal {
+        signature: String,
+        relays: Vec<String>,
     },
     Initialize {
         state_path: String,
@@ -86,6 +105,8 @@ enum Request {
         avatar_mime_type: Option<String>,
         remove_avatar: bool,
         accepts_direct_messages: bool,
+        #[serde(default)]
+        direct_message_policy: Option<DirectMessagePolicy>,
         relays: Vec<String>,
     },
     FetchProfileAlbum {
@@ -237,6 +258,11 @@ enum Request {
         topic_id: String,
         relays: Vec<String>,
     },
+    LoadOlderDirectHistory {
+        state_path: String,
+        cache_path: String,
+        relays: Vec<String>,
+    },
     MarkGroupRead {
         state_path: String,
         group_id: String,
@@ -303,6 +329,8 @@ enum Request {
         avatar: Option<ProfileImage>,
         album: Option<ProfileAlbum>,
         accepts_direct_messages: bool,
+        #[serde(default)]
+        direct_message_policy: Option<DirectMessagePolicy>,
     },
     SetBlock {
         state_path: String,
@@ -324,6 +352,9 @@ enum Request {
         state_path: String,
         cache_path: String,
         relays: Vec<String>,
+    },
+    CachedDirectInbox {
+        state_path: String,
     },
     DirectInbox {
         state_path: String,
@@ -466,6 +497,7 @@ enum Request {
         relays: Vec<String>,
     },
     CancelGroupLoading,
+    CancelDirectLoading,
     CancelBackgroundLoading,
     CancelMediaLoading,
 }
@@ -475,6 +507,7 @@ struct SessionRuntime(&'static Runtime);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoadingClass {
     Group,
+    Direct,
     Background,
     Media,
 }
@@ -589,10 +622,12 @@ fn cancel_session_operations() {
 
 fn loading_generation(class: LoadingClass) -> &'static AtomicU64 {
     static GROUP: AtomicU64 = AtomicU64::new(1);
+    static DIRECT: AtomicU64 = AtomicU64::new(1);
     static BACKGROUND: AtomicU64 = AtomicU64::new(1);
     static MEDIA: AtomicU64 = AtomicU64::new(1);
     match class {
         LoadingClass::Group => &GROUP,
+        LoadingClass::Direct => &DIRECT,
         LoadingClass::Background => &BACKGROUND,
         LoadingClass::Media => &MEDIA,
     }
@@ -646,8 +681,10 @@ fn request_loading_ticket(request: &Request) -> Option<LoadingTicket> {
             ..
         }
         | Request::SyncGroupActivity { .. }
-        | Request::SyncTopicActivity { .. }
-        | Request::DirectConversation { .. } => LoadingClass::Background,
+        | Request::SyncTopicActivity { .. } => LoadingClass::Background,
+        Request::DirectConversation { .. } | Request::LoadOlderDirectHistory { .. } => {
+            LoadingClass::Direct
+        }
         Request::FetchAttachment { .. } | Request::FetchAttachmentRange { .. } => {
             LoadingClass::Media
         }
@@ -680,6 +717,10 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             cancel_loading_operations(LoadingClass::Group);
             return Ok(Value::Null);
         }
+        Request::CancelDirectLoading => {
+            cancel_loading_operations(LoadingClass::Direct);
+            return Ok(Value::Null);
+        }
         Request::CancelBackgroundLoading => {
             cancel_loading_operations(LoadingClass::Background);
             return Ok(Value::Null);
@@ -702,6 +743,8 @@ fn invoke(request_json: &str) -> Result<Value, String> {
     let _state_guard = if matches!(
         &request,
         Request::DiscoverRelayMasks { .. }
+            | Request::SearchLocal { .. }
+            | Request::ResolveContactSignal { .. }
             | Request::WatchGroup { .. }
             | Request::WatchGroupId { .. }
             | Request::SyncAccount { .. }
@@ -710,6 +753,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             | Request::SyncTopicActivity { .. }
             | Request::GroupHasPendingAdmissions { .. }
             | Request::CachedConversation { .. }
+            | Request::CachedDirectInbox { .. }
             | Request::HeartbeatPresence { .. }
             | Request::ReplyNotificationSnapshot { .. }
             | Request::WatchDirect { .. }
@@ -761,6 +805,28 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             )
             .map_err(|error| error.to_string())
         }
+        Request::SearchLocal {
+            state_path,
+            query,
+            limit,
+        } => serde_json::to_value(
+            client
+                .search_local(state_path, &query, limit)
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::PublishContactSignal { state_path, relays } => serde_json::to_value(
+            runtime()?
+                .block_on(client.publish_contact_signal(state_path, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::ResolveContactSignal { signature, relays } => serde_json::to_value(
+            runtime()?
+                .block_on(client.resolve_contact_signal(&signature, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         Request::Initialize {
             state_path,
             username,
@@ -918,6 +984,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             avatar_mime_type,
             remove_avatar,
             accepts_direct_messages,
+            direct_message_policy,
             relays,
         } => serde_json::to_value(
             runtime()?
@@ -928,7 +995,11 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                     avatar_data_base64,
                     avatar_mime_type,
                     remove_avatar,
-                    accepts_direct_messages,
+                    direct_message_policy.unwrap_or(if accepts_direct_messages {
+                        DirectMessagePolicy::Everyone
+                    } else {
+                        DirectMessagePolicy::Nobody
+                    }),
                     relays,
                 ))
                 .map_err(|error| error.to_string())?,
@@ -1245,11 +1316,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|_| "local state lock is unavailable".to_owned())?;
             serde_json::to_value(
                 if mark_read {
-                    client.apply_group_activity_and_mark_read(
-                        state_path,
-                        update,
-                        Some(&topic_id),
-                    )
+                    client.apply_group_activity_and_mark_read(state_path, update, Some(&topic_id))
                 } else {
                     client.apply_group_activity(state_path, update)
                 }
@@ -1280,6 +1347,19 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .block_on_loading(
                     client.load_older_topic_history(state_path, &group_id, &topic_id, relays),
                     loading_ticket.ok_or_else(|| "group loading ticket is missing".to_owned())?,
+                )
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::LoadOlderDirectHistory {
+            state_path,
+            cache_path,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on_loading(
+                    client.load_older_direct_history(state_path, cache_path, relays),
+                    loading_ticket.ok_or_else(|| "direct loading ticket is missing".to_owned())?,
                 )
                 .map_err(|error| error.to_string())?,
         )
@@ -1423,6 +1503,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             avatar,
             album,
             accepts_direct_messages,
+            direct_message_policy,
         } => serde_json::to_value(
             client
                 .start_direct(
@@ -1432,7 +1513,11 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                     bio,
                     avatar,
                     album,
-                    accepts_direct_messages,
+                    direct_message_policy.unwrap_or(if accepts_direct_messages {
+                        DirectMessagePolicy::Everyone
+                    } else {
+                        DirectMessagePolicy::Nobody
+                    }),
                 )
                 .map_err(|error| error.to_string())?,
         )
@@ -1481,6 +1566,12 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         } => serde_json::to_value(
             runtime()?
                 .block_on(client.sync_directs(state_path, cache_path, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::CachedDirectInbox { state_path } => serde_json::to_value(
+            client
+                .cached_direct_inbox(state_path)
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
@@ -1799,6 +1890,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             Ok(Value::Null)
         }
         Request::CancelGroupLoading
+        | Request::CancelDirectLoading
         | Request::CancelBackgroundLoading
         | Request::CancelMediaLoading => {
             unreachable!("loading cancellation is handled before dispatch")

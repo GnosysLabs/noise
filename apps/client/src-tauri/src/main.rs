@@ -198,7 +198,10 @@ fn update_active_account_metadata(account_id: &str, response: &Value) -> Result<
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
-        avatar: identity.get("avatar").cloned().filter(|value| !value.is_null()),
+        avatar: identity
+            .get("avatar")
+            .cloned()
+            .filter(|value| !value.is_null()),
         pending: false,
     };
     if let Some(existing) = registry

@@ -28,6 +28,7 @@ import {
   Radio,
   Reply,
   ScrollText,
+  Search,
   Settings2,
   Shield,
   ShieldOff,
@@ -71,6 +72,7 @@ import type {
   BannedMemberSummary,
   Conversation,
   DirectConversation,
+  DirectMessagePolicy,
   DirectInbox,
   DirectSummary,
   DeviceSummary,
@@ -91,6 +93,11 @@ import type {
   ProfileImage,
   ReactionSummary,
   ReportSummary,
+  SearchLocationResult,
+  SearchHistoryScope,
+  SearchMessageResult,
+  SearchPersonResult,
+  SearchResults,
   SentMessageResult,
   TopicSummary,
 } from "./types";
@@ -116,11 +123,13 @@ type Dialog =
   | { type: "delete_direct"; direct: DirectSummary }
   | { type: "delete_account" }
   | { type: "logout" }
+  | { type: "search" }
+  | { type: "new_direct" }
   | { type: "block_person"; person: PersonSummary }
   | { type: "album"; person: PersonSummary; editable: boolean }
   | { type: "person"; person: PersonSummary };
 
-type PersonSummary = Pick<MemberSummary, "public_key" | "username" | "bio" | "avatar" | "album" | "accepts_direct_messages"> & {
+type PersonSummary = Pick<MemberSummary, "public_key" | "username" | "bio" | "avatar" | "album" | "accepts_direct_messages" | "direct_message_policy"> & {
   presence_status?: PresenceStatus;
 };
 type SidebarMode = "groups" | "directs";
@@ -205,6 +214,7 @@ function withCurrentDirectProfile(
     avatar: profile.avatar,
     album: profile.album,
     accepts_direct_messages: profile.accepts_direct_messages,
+    direct_message_policy: profile.direct_message_policy,
   };
 }
 
@@ -525,6 +535,10 @@ function CopyButton({
       {!iconOnly && (copied ? "copied" : label)}
     </button>
   );
+}
+
+function ContactSignalCopyButton({ publicKey }: { publicKey: string }) {
+  return <CopyButton value={noiseSignature(publicKey)} label="copy signal" />;
 }
 
 const avatarCache = new Map<string, string>();
@@ -1298,6 +1312,7 @@ async function optimisticMessage(
     avatar: identity.avatar,
     album: identity.album,
     accepts_direct_messages: identity.accepts_direct_messages,
+    direct_message_policy: identity.direct_message_policy,
     text,
     attachment: null,
     reply_to_message_id: replyToMessageId,
@@ -1445,6 +1460,13 @@ export default function App() {
   const [pendingTopicId, setPendingTopicId] = useState<string | null>(null);
   const [loadingTopicId, setLoadingTopicId] = useState<string | null>(null);
   const [dialog, setDialog] = useState<Dialog | null>(null);
+  const [messageJump, setMessageJump] = useState<{
+    eventId: string;
+    groupId?: string;
+    topicId?: string | null;
+    directPublicKey?: string;
+    nonce: number;
+  } | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1510,6 +1532,19 @@ export default function App() {
   const lastPresenceActivityAt = useRef(Date.now());
   const selfPresenceActive = useRef(true);
   const [selfPresenceStatus, setSelfPresenceStatus] = useState<PresenceStatus>("online");
+
+  useEffect(() => {
+    const handleSearchShortcut = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setDialog({ type: "search" });
+      } else if (event.key === "Escape") {
+        setDialog((current) => current?.type === "search" ? null : current);
+      }
+    };
+    window.addEventListener("keydown", handleSearchShortcut);
+    return () => window.removeEventListener("keydown", handleSearchShortcut);
+  }, []);
 
   const refreshLocalAccountList = useCallback(async () => {
     try {
@@ -2650,7 +2685,13 @@ export default function App() {
         }
       }
     };
-    for (const group of groups) void watch(group);
+    for (const group of groups) {
+      // Publish this device's group-scoped KeyPackage before the user opens
+      // the conversation. Founders can then start MLS immediately and admit
+      // every available member without waiting for the whole roster.
+      queueAdmissionPass(group.group_id);
+      void watch(group);
+    }
     return () => {
       stopped = true;
     };
@@ -2659,6 +2700,7 @@ export default function App() {
     groupWatchKey,
     handleDeletedGroup,
     identityPublicKey,
+    queueAdmissionPass,
     scheduleAccountCacheSync,
     sidebarMode,
     syncChangedGroupStreams,
@@ -3021,6 +3063,7 @@ export default function App() {
             avatar: identity.avatar,
             album: identity.album,
             accepts_direct_messages: identity.accepts_direct_messages,
+            direct_message_policy: identity.direct_message_policy,
           }
         : item;
     const updateGroupConversation = (current: Conversation): Conversation => ({
@@ -3034,6 +3077,7 @@ export default function App() {
               avatar: identity.avatar,
               album: identity.album,
               accepts_direct_messages: identity.accepts_direct_messages,
+              direct_message_policy: identity.direct_message_policy,
             }
           : member
       ),
@@ -3074,6 +3118,7 @@ export default function App() {
         avatar: person.avatar,
         album: person.album,
         accepts_direct_messages: person.accepts_direct_messages,
+        direct_message_policy: person.direct_message_policy,
         blocked,
         relays,
       });
@@ -3356,6 +3401,7 @@ export default function App() {
         avatar: person.avatar,
         album: person.album,
         accepts_direct_messages: person.accepts_direct_messages,
+        direct_message_policy: person.direct_message_policy,
       });
       if (!local) throw new Error("the direct conversation could not be started");
       const contact = local.directs.find((direct) => direct.public_key === person.public_key);
@@ -3394,6 +3440,49 @@ export default function App() {
     }).catch(() => {
       // The DM is already available locally; encrypted account sync retries normally.
     });
+  }
+
+  async function openOrStartDirect(person: PersonSummary) {
+    if (!summary) return;
+    const existing = summary.directs.find(
+      (direct) => direct.public_key === person.public_key,
+    );
+    if (!existing) {
+      await startDirect(person);
+      return;
+    }
+    setDialog(null);
+    await switchSidebarMode("directs");
+    await selectDirect(existing);
+  }
+
+  async function startDirectFromSignal(value: string) {
+    if (!summary) return;
+    const normalized = value.replace(/[\s-]/g, "").toUpperCase();
+    const known = [...summary.directs, ...summary.known_people].find(
+      (person) => noiseSignature(person.public_key).replace("-", "") === normalized,
+    );
+    if (known) {
+      await openOrStartDirect({
+        ...known,
+        presence_status: presenceStatuses.get(known.public_key) ?? "offline",
+      });
+      return;
+    }
+    try {
+      const resolved = await noise<DirectSummary>({
+        action: "resolve_contact_signal",
+        signature: value,
+        relays,
+      });
+      if (!resolved) throw new Error("that noise signature could not be resolved");
+      await openOrStartDirect({
+        ...resolved,
+        presence_status: "offline",
+      });
+    } catch (cause) {
+      setError(message(cause));
+    }
   }
 
   async function switchSidebarMode(nextMode: SidebarMode) {
@@ -3617,10 +3706,73 @@ export default function App() {
             avatar: known.avatar,
             album: known.album,
             accepts_direct_messages: known.accepts_direct_messages,
+            direct_message_policy: known.direct_message_policy,
             presence_status: selectedPresenceStatuses.get(known.public_key) ?? "offline",
           }
         : person,
     });
+  };
+  const openSearchLocation = async (result: SearchLocationResult) => {
+    const group = summary.groups.find((candidate) => candidate.group_id === result.group_id);
+    if (!group) return;
+    setDialog(null);
+    setSidebarMode("groups");
+    await selectGroup(group);
+    activeTopicIdRef.current = result.topic_id;
+    setActiveTopicId(result.topic_id);
+    if (result.topic_id) {
+      void markActiveTopicRead(result.group_id, result.topic_id);
+    } else {
+      void markActiveGroupRead(result.group_id);
+    }
+  };
+  const openSearchMessage = async (result: SearchMessageResult) => {
+    setDialog(null);
+    if (result.direct_public_key) {
+      const direct = summary.directs.find(
+        (candidate) => candidate.public_key === result.direct_public_key,
+      );
+      if (!direct) return;
+      await switchSidebarMode("directs");
+      await selectDirect(direct);
+      setMessageJump({
+        eventId: result.event_id,
+        directPublicKey: result.direct_public_key,
+        nonce: Date.now(),
+      });
+      return;
+    }
+    if (!result.group_id) return;
+    const group = summary.groups.find((candidate) => candidate.group_id === result.group_id);
+    if (!group) return;
+    setSidebarMode("groups");
+    await selectGroup(group);
+    activeTopicIdRef.current = result.topic_id;
+    setActiveTopicId(result.topic_id);
+    if (result.topic_id) {
+      void markActiveTopicRead(result.group_id, result.topic_id);
+    } else {
+      void markActiveGroupRead(result.group_id);
+    }
+    setMessageJump({
+      eventId: result.event_id,
+      groupId: result.group_id,
+      topicId: result.topic_id,
+      nonce: Date.now(),
+    });
+  };
+  const openSearchPerson = (result: SearchPersonResult) => {
+    const person: PersonSummary = {
+      public_key: result.public_key,
+      username: result.username,
+      bio: result.bio,
+      avatar: result.avatar,
+      album: result.album,
+      accepts_direct_messages: result.accepts_direct_messages,
+      direct_message_policy: result.direct_message_policy,
+      presence_status: presenceStatuses.get(result.public_key) ?? "offline",
+    };
+    openPerson(person);
   };
   const visibleSummary = activeGroupId ? {
     ...summary,
@@ -3653,6 +3805,8 @@ export default function App() {
         onMode={(mode) => void switchSidebarMode(mode)}
         onMake={() => setDialog({ type: "make" })}
         onJoin={() => setDialog({ type: "join" })}
+        onSearch={() => setDialog({ type: "search" })}
+        onNewDirect={() => setDialog({ type: "new_direct" })}
         onSettings={() => setDialog({ type: "profile", profile: summary.identity })}
         onAddAccount={() => void beginAddingAccount()}
         onSwitchAccount={(account) => void selectLocalAccount(account)}
@@ -3684,6 +3838,10 @@ export default function App() {
               hasBackground={Boolean(appBackgroundSource)}
               canEditGroup={selectedConversation.group.owner_public_key === summary.identity.public_key}
               unreadCount={selectedTopic?.unread_count ?? selectedConversation.general_unread_count}
+              messageJump={messageJump?.groupId === selectedConversation.group.group_id
+                && (messageJump.topicId ?? null) === (effectiveTopicId ?? null)
+                ? messageJump
+                : null}
               selfPublicKey={summary.identity.public_key}
               presenceStatuses={selectedPresenceStatuses}
               onGroupSettings={() => setDialog({ type: "group", group: selectedConversation.group })}
@@ -3879,6 +4037,9 @@ export default function App() {
               self={summary.identity}
               selfPresence={selfPresenceStatus}
               contactPresence={presenceStatuses.get(selectedDirectConversation.contact.public_key) ?? "offline"}
+              messageJump={messageJump?.directPublicKey === selectedDirectConversation.contact.public_key
+                ? messageJump
+                : null}
               onPerson={openPerson}
               onAlbum={(person) => setDialog({ type: "album", person, editable: false })}
               onBlock={(person) => setDialog({ type: "block_person", person })}
@@ -4017,7 +4178,7 @@ export default function App() {
               setSummary(local);
             }, false)
           }
-          onSave={(username, bio, avatar, removeAvatar, acceptsDirectMessages) =>
+          onSave={(username, bio, avatar, removeAvatar, directMessagePolicy) =>
             perform(async () => {
               const local = await noise<LocalSummary>({
                 action: "update_profile",
@@ -4026,7 +4187,8 @@ export default function App() {
                 avatar_data_base64: avatar,
                 avatar_mime_type: avatar ? "image/jpeg" : null,
                 remove_avatar: removeAvatar,
-                accepts_direct_messages: acceptsDirectMessages,
+                accepts_direct_messages: directMessagePolicy !== "nobody",
+                direct_message_policy: directMessagePolicy,
                 relays,
               });
               if (!local) throw new Error("the relay did not return the updated profile");
@@ -4396,6 +4558,38 @@ export default function App() {
           onClose={() => setDialog(null)}
         />
       )}
+      {dialog?.type === "search" && (
+        <GlobalSearchModal
+          onClose={() => setDialog(null)}
+          onLocation={(result) => void openSearchLocation(result)}
+          onMessage={(result) => void openSearchMessage(result)}
+          onPerson={(result) => void openSearchPerson(result)}
+          onLoadOlder={async (scope) => {
+            if (!scope.group_id) {
+              await noise({
+                action: "load_older_direct_history",
+                relays,
+              });
+              return;
+            }
+            if (scope.topic_id) {
+              await loadOlderTopicHistory(scope.group_id, scope.topic_id);
+            } else {
+              await loadOlderGroupHistory(scope.group_id);
+            }
+          }}
+        />
+      )}
+      {dialog?.type === "new_direct" && (
+        <NewDirectDialog
+          people={[...summary.directs, ...summary.known_people]}
+          selfPublicKey={summary.identity.public_key}
+          busy={busy}
+          onClose={() => setDialog(null)}
+          onChoose={(person) => openOrStartDirect(person)}
+          onSignal={(signal) => startDirectFromSignal(signal)}
+        />
+      )}
       {dialog?.type === "album" && (
         <ProfileAlbumDialog
           person={dialog.person}
@@ -4469,6 +4663,8 @@ function Sidebar({
   onMode,
   onMake,
   onJoin,
+  onSearch,
+  onNewDirect,
   onSettings,
   onAddAccount,
   onSwitchAccount,
@@ -4496,6 +4692,8 @@ function Sidebar({
   onMode: (mode: SidebarMode) => void;
   onMake: () => void;
   onJoin: () => void;
+  onSearch: () => void;
+  onNewDirect: () => void;
   onSettings: () => void;
   onAddAccount: () => void;
   onSwitchAccount: (account: LocalAccount) => void;
@@ -4548,6 +4746,11 @@ function Sidebar({
       {mode === "groups" && <div className="sidebar-actions">
         <button className="wide-button" onClick={onMake}><Plus size={15} /> create group</button>
         <button className="square-button" onClick={onJoin} title="join group" aria-label="join group"><Radio size={16} /></button>
+        <button className="square-button" onClick={onSearch} title="search (⌘K)" aria-label="search"><Search size={16} /></button>
+      </div>}
+      {mode === "directs" && <div className="sidebar-actions direct-actions">
+        <button className="wide-button" onClick={onNewDirect}><Plus size={15} /> direct message</button>
+        <button className="square-button" onClick={onSearch} title="search (⌘K)" aria-label="search"><Search size={16} /></button>
       </div>}
       <div className="group-list">
         {mode === "groups" ? summary.groups.map((group) => {
@@ -5075,6 +5278,18 @@ function useChunkedMessageList<T extends { event_id: string }>(
     if (element.scrollTop <= OLDER_MESSAGE_TRIGGER_DISTANCE) loadOlder();
   }, [loadOlder, saveScrollPosition]);
 
+  const revealMessage = useCallback((messageId: string) => {
+    const index = messages.findIndex((item) => item.event_id === messageId);
+    if (index < 0) return false;
+    const requiredCount = messages.length - index;
+    setVisibleCount((current) => {
+      const next = Math.max(current, requiredCount);
+      renderedMessageCounts.set(conversationKey, next);
+      return next;
+    });
+    return true;
+  }, [conversationKey, messages]);
+
   return {
     ref,
     olderSentinel,
@@ -5084,6 +5299,7 @@ function useChunkedMessageList<T extends { event_id: string }>(
     atBottom,
     canLoadOlder,
     loadingOlder: loadingOlderHistory,
+    revealMessage,
   };
 }
 
@@ -5110,6 +5326,7 @@ function ConversationPanel({
   hasBackground,
   canEditGroup,
   unreadCount,
+  messageJump,
   selfPublicKey,
   presenceStatuses,
   onGroupSettings,
@@ -5139,6 +5356,7 @@ function ConversationPanel({
   hasBackground: boolean;
   canEditGroup: boolean;
   unreadCount: number;
+  messageJump: { eventId: string; nonce: number } | null;
   selfPublicKey: string;
   presenceStatuses: Map<string, PresenceStatus>;
   onGroupSettings: () => void;
@@ -5186,6 +5404,21 @@ function ConversationPanel({
     onLoadOlder,
   );
   useEffect(() => {
+    if (!messageJump || !messageList.revealMessage(messageJump.eventId)) return;
+    const timer = window.setTimeout(() => {
+      const row = messageList.ref.current?.querySelector<HTMLElement>(
+        `[data-message-id="${CSS.escape(messageJump.eventId)}"]`,
+      );
+      if (!row) return;
+      row.scrollIntoView({ block: "center", behavior: "smooth" });
+      row.classList.remove("search-highlight");
+      void row.offsetWidth;
+      row.classList.add("search-highlight");
+      window.setTimeout(() => row.classList.remove("search-highlight"), 1900);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [messageJump?.eventId, messageJump?.nonce]);
+  useEffect(() => {
     if (messageList.atBottom && unreadCount > 0) onReachedBottom();
   }, [conversation.messages.length, messageList.atBottom, onReachedBottom, unreadCount]);
   const selfMember = conversation.members.find((member) => member.public_key === selfPublicKey);
@@ -5212,6 +5445,26 @@ function ConversationPanel({
   const regularMembers = sortedMembers.filter((member) =>
     member.public_key !== conversation.group.owner_public_key && !member.is_moderator
   );
+  const reactionPeople = new Map<string, PersonSummary>();
+  for (const member of conversation.members) {
+    reactionPeople.set(member.public_key, {
+      ...member,
+      presence_status: presenceStatuses.get(member.public_key) ?? "offline",
+    });
+  }
+  for (const item of conversation.messages) {
+    if (reactionPeople.has(item.author_public_key)) continue;
+    reactionPeople.set(item.author_public_key, {
+      public_key: item.author_public_key,
+      username: item.username,
+      bio: item.bio,
+      avatar: item.avatar,
+      album: item.album,
+      accepts_direct_messages: item.accepts_direct_messages,
+      direct_message_policy: item.direct_message_policy,
+      presence_status: presenceStatuses.get(item.author_public_key) ?? "offline",
+    });
+  }
   const renderMember = (member: MemberSummary) => (
     <div key={member.public_key} className="member-sidebar-row">
       <button className="member-sidebar-main" onClick={() => onPerson({
@@ -5319,7 +5572,7 @@ function ConversationPanel({
           />
         )}
         {messageList.visibleMessages.map((item) => (
-          <MessageRow key={item.event_id} message={item} own={item.author_public_key === selfPublicKey} presence={presenceStatuses.get(item.author_public_key) ?? "offline"} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onToggleReaction={(emoji) => void onReaction(item, emoji)} onPerson={onPerson} mediaScopeId={conversation.group.group_id} />
+          <MessageRow key={item.event_id} message={item} own={item.author_public_key === selfPublicKey} presence={presenceStatuses.get(item.author_public_key) ?? "offline"} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onToggleReaction={(emoji) => void onReaction(item, emoji)} reactionPeople={reactionPeople} onPerson={onPerson} mediaScopeId={conversation.group.group_id} />
         ))}
       </div>
       {selfMember && (canSendMessages || canSendMedia) ? <div className="composer">
@@ -5400,6 +5653,7 @@ function ConversationPanel({
             avatar: messageMenu.message.avatar,
             album: messageMenu.message.album,
             accepts_direct_messages: messageMenu.message.accepts_direct_messages,
+            direct_message_policy: messageMenu.message.direct_message_policy,
             presence_status: presenceStatuses.get(messageMenu.message.author_public_key) ?? "offline",
           });
           setMessageMenu(null);
@@ -5428,7 +5682,7 @@ function ConversationPanel({
   );
 }
 
-function DirectConversationPanel({ conversation, contact, active, busy, self, selfPresence, contactPresence, onPerson, onAlbum, onBlock, onDelete, onDownload, onForward, onSend }: { conversation: DirectConversation; contact: DirectSummary; active: boolean; busy: boolean; self: IdentitySummary; selfPresence: PresenceStatus; contactPresence: PresenceStatus; onPerson: (person: PersonSummary) => void; onAlbum: (person: PersonSummary) => void; onBlock: (person: PersonSummary) => void; onDelete: () => void; onDownload: (message: MessageSummary) => Promise<boolean>; onForward: (message: MessageSummary) => void; onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null, signal: AbortSignal) => Promise<boolean> }) {
+function DirectConversationPanel({ conversation, contact, active, busy, self, selfPresence, contactPresence, messageJump, onPerson, onAlbum, onBlock, onDelete, onDownload, onForward, onSend }: { conversation: DirectConversation; contact: DirectSummary; active: boolean; busy: boolean; self: IdentitySummary; selfPresence: PresenceStatus; contactPresence: PresenceStatus; messageJump: { eventId: string; nonce: number } | null; onPerson: (person: PersonSummary) => void; onAlbum: (person: PersonSummary) => void; onBlock: (person: PersonSummary) => void; onDelete: () => void; onDownload: (message: MessageSummary) => Promise<boolean>; onForward: (message: MessageSummary) => void; onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null, signal: AbortSignal) => Promise<boolean> }) {
   const [draft, setDraft] = useState("");
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const composerUploadKey = `direct:${contact.public_key}`;
@@ -5449,6 +5703,21 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
     contact.public_key,
     conversation.messages,
   );
+  useEffect(() => {
+    if (!messageJump || !messageList.revealMessage(messageJump.eventId)) return;
+    const timer = window.setTimeout(() => {
+      const row = messageList.ref.current?.querySelector<HTMLElement>(
+        `[data-message-id="${CSS.escape(messageJump.eventId)}"]`,
+      );
+      if (!row) return;
+      row.scrollIntoView({ block: "center", behavior: "smooth" });
+      row.classList.remove("search-highlight");
+      void row.offsetWidth;
+      row.classList.add("search-highlight");
+      window.setTimeout(() => row.classList.remove("search-highlight"), 1900);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [messageJump?.eventId, messageJump?.nonce]);
   const chooseMedia = useCallback((file?: File) => {
     if (!file) return;
     setAttachmentError(null);
@@ -5513,7 +5782,7 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
       setReplyingTo((current) => current ?? submittedReply);
     }
   }
-  const person = { public_key: contact.public_key, username: contact.username, bio: contact.bio, avatar: contact.avatar, album: contact.album, accepts_direct_messages: contact.accepts_direct_messages, presence_status: contactPresence };
+  const person = { public_key: contact.public_key, username: contact.username, bio: contact.bio, avatar: contact.avatar, album: contact.album, accepts_direct_messages: contact.accepts_direct_messages, direct_message_policy: contact.direct_message_policy, presence_status: contactPresence };
   return (
     <div className="conversation direct-conversation">
       {mediaDragging && <div className="media-drop-overlay" aria-hidden="true"><Images size={34} /><strong>drop media to attach</strong><span>images, video, or audio</span></div>}
@@ -5561,7 +5830,7 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
           <button className="profile-album" onClick={() => onAlbum(person)}><Images size={14} /> {albumButtonLabel(contact.album)}</button>
           <button className="profile-block" onClick={() => onBlock(person)}><ShieldOff size={14} /> block</button>
         </div>
-        <span className={`direct-profile-status ${contact.accepts_direct_messages ? "open" : "closed"}`}><i />{contact.accepts_direct_messages ? "accepting DMs" : "DMs closed"}</span>
+        <span className={`direct-profile-status ${contact.direct_message_policy !== "nobody" ? "open" : "closed"}`}><i />{contact.direct_message_policy === "everyone" ? "accepting DMs" : contact.direct_message_policy === "shared_groups" ? "shared groups only" : "DMs closed"}</span>
       </aside>
       <AppVersionFooter />
       {messageMenu && <MessageContextMenu x={messageMenu.x} y={messageMenu.y} busy={busy} onClose={() => setMessageMenu(null)} onReply={() => { setReplyingTo(messageMenu.message); setMessageMenu(null); window.setTimeout(() => composerInput.current?.focus(), 0); }} onForward={() => { onForward(messageMenu.message); setMessageMenu(null); }} onDownload={messageMenu.message.attachment ? () => onDownload(messageMenu.message) : undefined} />}
@@ -5596,9 +5865,16 @@ function AppVersionFooter() {
       : "Download desktop app";
   return <>
     <div className="member-sidebar-footer">
-      {isTauri
-        ? <span>{version ? `Beta V.${version}` : "Beta"}</span>
-        : <a href="https://makenoise.chat/#download" target="_blank" rel="noreferrer"><Download size={13} />{desktopDownloadLabel}</a>}
+      <div className="member-sidebar-footer-details">
+        <CopyButton
+          value="8402 6053 0554"
+          label="Official: 8402 6053 0554"
+          className="official-frequency"
+        />
+        {isTauri
+          ? <span>{version ? `Beta V.${version}` : "Beta"}</span>
+          : <a href="https://makenoise.chat/#download" target="_blank" rel="noreferrer"><Download size={12} />{desktopDownloadLabel}</a>}
+      </div>
       <button onClick={() => setShowAbout(true)} aria-label="about noise" title="about noise"><Info size={13} /></button>
     </div>
     {showAbout && <AboutNoiseDialog onClose={() => setShowAbout(false)} />}
@@ -5640,10 +5916,9 @@ function AboutNoiseDialog({ onClose }: { onClose: () => void }) {
         </section>
         <section className="about-source">
           <strong>open source</strong>
-          <p>Noise is licensed under AGPL-3.0-only. <a href="https://github.com/GnosysLabs/noise" target="_blank" rel="noreferrer">Read or download the source code.</a></p>
+          <p>noise is licensed under AGPL-3.0-only. <a href="https://github.com/GnosysLabs/noise" target="_blank" rel="noreferrer">Read or download the source code.</a></p>
         </section>
       </div>
-      <DialogButtons><button className="primary" onClick={onClose}>done</button></DialogButtons>
     </Modal>
   );
 }
@@ -5655,6 +5930,7 @@ function MessageRow({
   replyTo,
   onContextMenu,
   onToggleReaction,
+  reactionPeople,
   onPerson,
   mediaScopeId,
 }: {
@@ -5664,10 +5940,11 @@ function MessageRow({
   replyTo?: MessageSummary;
   onContextMenu?: (event: React.MouseEvent<HTMLElement>) => void;
   onToggleReaction?: (emoji: string) => void;
+  reactionPeople?: Map<string, PersonSummary>;
   onPerson: (person: PersonSummary) => void;
   mediaScopeId?: string;
 }) {
-  const person = { public_key: message.author_public_key, username: message.username, bio: message.bio, avatar: message.avatar, album: message.album, accepts_direct_messages: message.accepts_direct_messages, presence_status: presence };
+  const person = { public_key: message.author_public_key, username: message.username, bio: message.bio, avatar: message.avatar, album: message.album, accepts_direct_messages: message.accepts_direct_messages, direct_message_policy: message.direct_message_policy, presence_status: presence };
   const forwardedPerson = message.forwarded_from
     ? {
         public_key: message.forwarded_from.public_key,
@@ -5676,6 +5953,7 @@ function MessageRow({
         avatar: null,
         album: null,
         accepts_direct_messages: false,
+        direct_message_policy: "nobody" as const,
       }
     : null;
   const localAttachment = message.local_attachment ?? sentMediaPreviewCache.get(message.event_id);
@@ -5705,7 +5983,7 @@ function MessageRow({
           ? <LocalMessageMedia attachment={localAttachment} manifest={message.attachment} scopeId={mediaScopeId} uploadProgress={message.upload_progress} uploadError={message.upload_error} />
           : message.attachment && <MessageMedia attachment={message.attachment} scopeId={mediaScopeId} />}
         <time className="message-time">{formatTime(message.created_at_millis)}</time>
-        {message.reactions && message.reactions.length > 0 && <MessageReactions reactions={message.reactions} onToggle={onToggleReaction} />}
+        {message.reactions && message.reactions.length > 0 && <MessageReactions reactions={message.reactions} people={reactionPeople} onToggle={onToggleReaction} onPerson={onPerson} />}
       </div>
     </article>
   );
@@ -5744,27 +6022,135 @@ function previewHost(preview: LinkPreview) {
 
 function MessageReactions({
   reactions,
+  people,
   onToggle,
+  onPerson,
 }: {
   reactions: ReactionSummary[];
+  people?: Map<string, PersonSummary>;
   onToggle?: (emoji: string) => void;
+  onPerson: (person: PersonSummary) => void;
 }) {
   return (
     <div className="message-reactions">
       {reactions.map((reaction) => (
-        <button
+        <ReactionChip
           key={reaction.emoji}
-          type="button"
-          className={reaction.reacted_by_self ? "mine" : undefined}
-          disabled={!onToggle}
-          title={reaction.reacted_by_self ? "remove reaction" : `react ${reaction.emoji}`}
-          onClick={() => onToggle?.(reaction.emoji)}
-        >
-          <span>{reaction.emoji}</span>
-          <small>{reaction.count}</small>
-        </button>
+          reaction={reaction}
+          people={people}
+          onToggle={onToggle}
+          onPerson={onPerson}
+        />
       ))}
     </div>
+  );
+}
+
+function ReactionChip({
+  reaction,
+  people,
+  onToggle,
+  onPerson,
+}: {
+  reaction: ReactionSummary;
+  people?: Map<string, PersonSummary>;
+  onToggle?: (emoji: string) => void;
+  onPerson: (person: PersonSummary) => void;
+}) {
+  const trigger = useRef<HTMLButtonElement>(null);
+  const openTimer = useRef<number | null>(null);
+  const closeTimer = useRef<number | null>(null);
+  const [position, setPosition] = useState<{ left: number; top?: number; bottom?: number } | null>(null);
+  const reactors: PersonSummary[] = reaction.reactor_public_keys.map((publicKey) =>
+    people?.get(publicKey) ?? {
+      public_key: publicKey,
+      username: "noise user",
+      bio: "",
+      avatar: null,
+      album: null,
+      accepts_direct_messages: false,
+      direct_message_policy: "nobody" as const,
+    }
+  );
+  const clearTimer = (timer: React.MutableRefObject<number | null>) => {
+    if (timer.current !== null) window.clearTimeout(timer.current);
+    timer.current = null;
+  };
+  const open = () => {
+    clearTimer(closeTimer);
+    if (position || openTimer.current !== null) return;
+    openTimer.current = window.setTimeout(() => {
+      openTimer.current = null;
+      const rect = trigger.current?.getBoundingClientRect();
+      if (!rect) return;
+      const estimatedHeight = Math.min(260, 10 + reactors.length * 40);
+      const left = Math.max(
+        12,
+        Math.min(rect.left + rect.width / 2 - 100, window.innerWidth - 212),
+      );
+      setPosition(rect.bottom + 8 + estimatedHeight <= window.innerHeight
+        ? { left, top: rect.bottom + 8 }
+        : { left, bottom: window.innerHeight - rect.top + 8 });
+    }, 240);
+  };
+  const close = () => {
+    clearTimer(openTimer);
+    clearTimer(closeTimer);
+    closeTimer.current = window.setTimeout(() => {
+      closeTimer.current = null;
+      setPosition(null);
+    }, 120);
+  };
+  useEffect(() => () => {
+    clearTimer(openTimer);
+    clearTimer(closeTimer);
+  }, []);
+  return (
+    <span className="reaction-chip-wrap" onMouseEnter={open} onMouseLeave={close}>
+      <button
+        ref={trigger}
+        type="button"
+        className={reaction.reacted_by_self ? "mine" : undefined}
+        disabled={!onToggle}
+        aria-haspopup="dialog"
+        aria-expanded={Boolean(position)}
+        aria-label={reaction.reacted_by_self ? `remove ${reaction.emoji} reaction` : `react ${reaction.emoji}`}
+        onFocus={open}
+        onBlur={close}
+        onClick={() => onToggle?.(reaction.emoji)}
+      >
+        <span>{reaction.emoji}</span>
+        <small>{reaction.count}</small>
+      </button>
+      {position && createPortal(
+        <div
+          className="reaction-users-popover"
+          role="dialog"
+          aria-label={`People who reacted ${reaction.emoji}`}
+          style={position}
+          onMouseEnter={() => clearTimer(closeTimer)}
+          onMouseLeave={close}
+        >
+          <div className="reaction-users-list">
+            {reactors.map((person) => (
+              <button
+                key={person.public_key}
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setPosition(null);
+                  onPerson(person);
+                }}
+              >
+                <PresenceAvatar name={person.username} image={person.avatar} size={30} status={person.presence_status ?? "offline"} />
+                <span className="reaction-user-copy"><strong>{person.username}</strong>{person.username === "noise user" && <small>{noiseSignature(person.public_key)}</small>}</span>
+              </button>
+            ))}
+          </div>
+        </div>,
+        document.body,
+      )}
+    </span>
   );
 }
 
@@ -7275,6 +7661,7 @@ function profileAlbumMessage(person: PersonSummary, item: ProfileAlbumItem): Med
     avatar: person.avatar,
     album: person.album,
     accepts_direct_messages: person.accepts_direct_messages,
+    direct_message_policy: person.direct_message_policy,
     text: "",
     attachment: item.attachment,
     reply_to_message_id: null,
@@ -7859,7 +8246,373 @@ function EmptyGroup({ onMake, onJoin }: { onMake: () => void; onJoin: () => void
 }
 
 function EmptyDirects() {
-  return <div className="empty-group"><MessagesSquare size={38} /><h2>no direct messages</h2><p>open someone from a shared group to message them privately</p></div>;
+  return <div className="empty-group"><MessagesSquare size={38} /><h2>no direct messages</h2><p>start a conversation with a person or noise signature</p></div>;
+}
+
+type GlobalSearchChoice =
+  | { kind: "message"; result: SearchMessageResult }
+  | { kind: "location"; result: SearchLocationResult }
+  | { kind: "person"; result: SearchPersonResult };
+
+function NewDirectDialog({
+  people,
+  selfPublicKey,
+  busy,
+  onClose,
+  onChoose,
+  onSignal,
+}: {
+  people: DirectSummary[];
+  selfPublicKey: string;
+  busy: boolean;
+  onClose: () => void;
+  onChoose: (person: PersonSummary) => Promise<void>;
+  onSignal: (signal: string) => Promise<void>;
+}) {
+  const [query, setQuery] = useState("");
+  const [signal, setSignal] = useState("");
+  const [resolving, setResolving] = useState(false);
+  const uniquePeople = new Map<string, DirectSummary>();
+  for (const person of people) {
+    if (person.public_key !== selfPublicKey) uniquePeople.set(person.public_key, person);
+  }
+  const normalizedQuery = query.trim().toLowerCase();
+  const matches = [...uniquePeople.values()]
+    .filter((person) => !normalizedQuery
+      || person.username.toLowerCase().includes(normalizedQuery)
+      || person.bio.toLowerCase().includes(normalizedQuery)
+      || noiseSignature(person.public_key).toLowerCase().includes(normalizedQuery))
+    .sort((left, right) => left.username.localeCompare(right.username))
+    .slice(0, 12);
+  const normalizedSignal = signal.replace(/[\s-]/g, "").toUpperCase();
+  const signalReady = /^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{12}$/.test(normalizedSignal);
+  const submitSignal = async () => {
+    if (!signalReady || busy || resolving) return;
+    setResolving(true);
+    try {
+      await onSignal(normalizedSignal);
+    } finally {
+      setResolving(false);
+    }
+  };
+
+  return (
+    <Modal onClose={onClose} className="new-direct-modal">
+      <DialogHeading
+        icon={<MessageCircle />}
+        title="new direct message"
+        detail="choose someone you know or enter their noise signature"
+      />
+      <label className="new-direct-search">
+        <Search size={15} />
+        <input
+          autoFocus
+          value={query}
+          placeholder="Search people"
+          onChange={(event) => setQuery(event.target.value)}
+        />
+      </label>
+      <div className="new-direct-people">
+        {matches.length ? matches.map((person) => (
+          <button
+            key={person.public_key}
+            disabled={busy}
+            onClick={() => void onChoose({
+              ...person,
+              presence_status: "offline",
+            })}
+          >
+            <PresenceAvatar
+              name={person.username}
+              image={person.avatar}
+              size={34}
+              status="offline"
+            />
+            <span className="new-direct-person-copy">
+              <strong>{person.username}</strong>
+              {person.bio && <small>{person.bio}</small>}
+              <small className="new-direct-person-signature">{noiseSignature(person.public_key)}</small>
+            </span>
+          </button>
+        )) : (
+          <p>{query.trim() ? "No known people match that search." : "People from shared groups will appear here."}</p>
+        )}
+      </div>
+      <div className="new-direct-divider"><span>or use a signal</span></div>
+      <div className="new-direct-signal">
+        <label>
+          <small>noise signature</small>
+          <input
+            value={signal}
+            spellCheck={false}
+            autoCapitalize="none"
+            autoCorrect="off"
+            placeholder="TW5TKT-VZNX4D"
+            onChange={(event) => setSignal(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && signalReady && !busy && !resolving) {
+                event.preventDefault();
+                void submitSignal();
+              }
+            }}
+          />
+        </label>
+        <button
+          className="primary"
+          disabled={!signalReady || busy || resolving}
+          onClick={() => void submitSignal()}
+        >
+          {busy || resolving ? <LoaderCircle className="spinner" size={14} /> : <ArrowUp size={14} />}
+          start dm
+        </button>
+      </div>
+      <p className="new-direct-privacy">
+        Enter the signature exactly as shown in the other person’s settings. It does not reveal the private Noise ID used to sign in.
+      </p>
+    </Modal>
+  );
+}
+
+const emptySearchResults: SearchResults = {
+  messages: [],
+  locations: [],
+  people: [],
+  has_more_history: false,
+  older_scopes: [],
+};
+
+function GlobalSearchModal({
+  onClose,
+  onMessage,
+  onLocation,
+  onPerson,
+  onLoadOlder,
+}: {
+  onClose: () => void;
+  onMessage: (result: SearchMessageResult) => void;
+  onLocation: (result: SearchLocationResult) => void;
+  onPerson: (result: SearchPersonResult) => void;
+  onLoadOlder: (scope: SearchHistoryScope) => Promise<void>;
+}) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<SearchResults>(emptySearchResults);
+  const [loading, setLoading] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const searchSequence = useRef(0);
+  const selectedRef = useRef<HTMLButtonElement | null>(null);
+  const groupMessages = results.messages.filter((result) => !result.direct_public_key);
+  const directMessages = results.messages.filter((result) => result.direct_public_key);
+  const choices: GlobalSearchChoice[] = [
+    ...groupMessages.map((result): GlobalSearchChoice => ({ kind: "message", result })),
+    ...directMessages.map((result): GlobalSearchChoice => ({ kind: "message", result })),
+    ...results.locations.map((result): GlobalSearchChoice => ({ kind: "location", result })),
+    ...results.people.map((result): GlobalSearchChoice => ({ kind: "person", result })),
+  ];
+
+  const runSearch = useCallback(async (value: string) => {
+    const trimmed = value.trim();
+    const sequence = ++searchSequence.current;
+    if (!trimmed) {
+      setResults(emptySearchResults);
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    try {
+      const found = await noise<SearchResults>({
+        action: "search_local",
+        query: trimmed,
+        limit: 60,
+      });
+      if (sequence === searchSequence.current) {
+        setResults(found ?? emptySearchResults);
+        setSelectedIndex(0);
+      }
+    } finally {
+      if (sequence === searchSequence.current) setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void runSearch(query);
+    }, 120);
+    return () => window.clearTimeout(timer);
+  }, [query, runSearch]);
+
+  useEffect(() => {
+    selectedRef.current?.scrollIntoView({ block: "nearest" });
+  }, [selectedIndex]);
+
+  const openChoice = (choice?: GlobalSearchChoice) => {
+    if (!choice) return;
+    if (choice.kind === "message") onMessage(choice.result);
+    else if (choice.kind === "location") onLocation(choice.result);
+    else onPerson(choice.result);
+  };
+  const messageDescription = (result: SearchMessageResult) =>
+    result.text.trim()
+      || (result.attachment?.mime_type.startsWith("video/") ? "Video"
+        : result.attachment?.mime_type.startsWith("audio/") ? "Audio"
+          : result.attachment ? "Photo" : "Message");
+  let itemIndex = -1;
+  const nextIndex = () => {
+    itemIndex += 1;
+    return itemIndex;
+  };
+
+  return (
+    <Modal onClose={onClose} className="global-search-modal">
+      <div className="global-search-input">
+        <Search size={18} />
+        <input
+          autoFocus
+          value={query}
+          placeholder="Search messages, groups, topics, and people"
+          aria-label="search noise"
+          onChange={(event) => setQuery(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowDown") {
+              event.preventDefault();
+              if (choices.length) {
+                setSelectedIndex((current) => Math.min(choices.length - 1, current + 1));
+              }
+            } else if (event.key === "ArrowUp") {
+              event.preventDefault();
+              setSelectedIndex((current) => Math.max(0, current - 1));
+            } else if (event.key === "Enter") {
+              event.preventDefault();
+              openChoice(choices[selectedIndex]);
+            }
+          }}
+        />
+        {loading && <LoaderCircle className="spinner" size={16} />}
+        <kbd>{navigator.platform.toLowerCase().includes("mac") ? "⌘K" : "Ctrl K"}</kbd>
+      </div>
+      <div className="global-search-results">
+        {!query.trim() && (
+          <div className="global-search-empty">
+            <Search size={28} />
+            <strong>search your noise</strong>
+            <span>Decrypted messages are searched privately on this device.</span>
+          </div>
+        )}
+        {query.trim() && !loading && choices.length === 0 && (
+          <div className="global-search-empty">
+            <Search size={28} />
+            <strong>no matches yet</strong>
+            <span>Try another word, or search older history below.</span>
+          </div>
+        )}
+        {[
+          { title: "Group messages", messages: groupMessages },
+          { title: "Direct messages", messages: directMessages },
+        ].map((section) => section.messages.length > 0 && (
+          <section className="global-search-section" key={section.title}>
+            <h3>{section.title}</h3>
+            {section.messages.map((result) => {
+              const index = nextIndex();
+              const poster = result.attachment ? mediaPoster(result.attachment) : undefined;
+              const location = result.direct_public_key
+                ? "Direct message"
+                : [result.group_name, result.topic_name].filter(Boolean).join(" / ");
+              return (
+                <button
+                  key={`message:${result.event_id}`}
+                  ref={index === selectedIndex ? selectedRef : undefined}
+                  className={`global-search-row message-result ${index === selectedIndex ? "selected" : ""}`}
+                  onMouseMove={() => setSelectedIndex(index)}
+                  onClick={() => onMessage(result)}
+                >
+                  <span className="search-result-avatar"><Avatar name={result.username} image={result.avatar} size={34} /></span>
+                  <span className="search-result-copy">
+                    <span><strong>{result.username}</strong><time>{new Date(result.created_at_millis).toLocaleDateString([], { month: "short", day: "numeric", year: new Date(result.created_at_millis).getFullYear() === new Date().getFullYear() ? undefined : "numeric" })}</time></span>
+                    <small>{messageDescription(result)}</small>
+                    <em>{location}</em>
+                  </span>
+                  {result.attachment && (
+                    <span className="search-result-media">
+                      {poster ? <img src={poster} alt="" /> : result.attachment.mime_type.startsWith("video/") ? <Play size={15} /> : <Images size={15} />}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </section>
+        ))}
+        {results.locations.length > 0 && (
+          <section className="global-search-section">
+            <h3>Groups &amp; Topics</h3>
+            {results.locations.map((result) => {
+              const index = nextIndex();
+              return (
+                <button
+                  key={`location:${result.group_id}:${result.topic_id ?? result.topic_name ?? "group"}`}
+                  ref={index === selectedIndex ? selectedRef : undefined}
+                  className={`global-search-row ${index === selectedIndex ? "selected" : ""}`}
+                  onMouseMove={() => setSelectedIndex(index)}
+                  onClick={() => onLocation(result)}
+                >
+                  {result.topic_name
+                    ? <span className="search-topic-icon">{result.topic_icon || "💬"}</span>
+                    : <Avatar name={result.group_name} image={result.group_avatar} size={34} square />}
+                  <span className="search-result-copy">
+                    <strong>{result.topic_name ?? result.group_name}</strong>
+                    <small>{result.topic_name ? result.group_name : "Group"}</small>
+                  </span>
+                </button>
+              );
+            })}
+          </section>
+        )}
+        {results.people.length > 0 && (
+          <section className="global-search-section">
+            <h3>People &amp; DMs</h3>
+            {results.people.map((result) => {
+              const index = nextIndex();
+              return (
+                <button
+                  key={`person:${result.public_key}`}
+                  ref={index === selectedIndex ? selectedRef : undefined}
+                  className={`global-search-row ${index === selectedIndex ? "selected" : ""}`}
+                  onMouseMove={() => setSelectedIndex(index)}
+                  onClick={() => onPerson(result)}
+                >
+                  <Avatar name={result.username} image={result.avatar} size={34} />
+                  <span className="search-result-copy">
+                    <strong>{result.username}</strong>
+                    <small>{result.bio || (result.has_direct ? "Direct message" : "noise profile")}</small>
+                  </span>
+                </button>
+              );
+            })}
+          </section>
+        )}
+        {query.trim() && results.has_more_history && (
+          <button
+            className="search-older-history"
+            disabled={loadingOlder}
+            onClick={() => {
+              const scope = results.older_scopes[0];
+              if (!scope) return;
+              setLoadingOlder(true);
+              void onLoadOlder(scope)
+                .then(() => runSearch(query))
+                .finally(() => setLoadingOlder(false));
+            }}
+          >
+            {loadingOlder ? <LoaderCircle className="spinner" size={14} /> : <Search size={14} />}
+            {loadingOlder ? "searching an older page…" : "search older history"}
+          </button>
+        )}
+      </div>
+      <div className="global-search-footer">
+        <span>↑↓ navigate</span><span>↵ open</span><span>esc close</span>
+        <strong><Shield size={11} /> local, decrypted search</strong>
+      </div>
+    </Modal>
+  );
 }
 
 function MakeDialog({ busy, onClose, onSubmit }: { busy: boolean; onClose: () => void; onSubmit: (name: string) => Promise<boolean> }) {
@@ -7881,17 +8634,17 @@ function NoiseIdDialog({ noiseId, onClose }: { noiseId: string; onClose: () => v
   return <Modal onClose={onClose}><DialogHeading icon={<NoiseMark size={28} />} title="this is your noise ID" detail="you’ll use it with your password to sign in on any device" /><div className="frequency-card">{noiseId}</div><p className="noise-id-warning">Save this somewhere private. noise cannot recover it for you.</p><DialogButtons><CopyButton value={noiseId} label="copy noise ID" /><button className="primary" onClick={onClose}>I saved it</button></DialogButtons></Modal>;
 }
 
-function SettingsDialog({ profile, devices, blockedPeople, busy, onClose, onSave, onUnblock, onRevokeDevice, onSummary, onLogout, onDeleteAccount }: { profile: IdentitySummary; devices: DeviceSummary[]; blockedPeople: DirectSummary[]; busy: boolean; onClose: () => void; onSave: (username: string, bio: string, avatar: string | null, remove: boolean, acceptsDirectMessages: boolean) => Promise<boolean>; onUnblock: (person: DirectSummary) => Promise<boolean>; onRevokeDevice: (device: DeviceSummary) => Promise<boolean>; onSummary: (summary: LocalSummary) => void; onLogout: () => void; onDeleteAccount: () => void }) {
+function SettingsDialog({ profile, devices, blockedPeople, busy, onClose, onSave, onUnblock, onRevokeDevice, onSummary, onLogout, onDeleteAccount }: { profile: IdentitySummary; devices: DeviceSummary[]; blockedPeople: DirectSummary[]; busy: boolean; onClose: () => void; onSave: (username: string, bio: string, avatar: string | null, remove: boolean, directMessagePolicy: DirectMessagePolicy) => Promise<boolean>; onUnblock: (person: DirectSummary) => Promise<boolean>; onRevokeDevice: (device: DeviceSummary) => Promise<boolean>; onSummary: (summary: LocalSummary) => void; onLogout: () => void; onDeleteAccount: () => void }) {
   const [tab, setTab] = useState<"identity" | "album" | "privacy" | "blocks" | "account">("identity");
   const [username, setUsername] = useState(profile.username);
   const [bio, setBio] = useState(profile.bio);
-  const [acceptsDirectMessages, setAcceptsDirectMessages] = useState(profile.accepts_direct_messages);
+  const [directMessagePolicy, setDirectMessagePolicy] = useState<DirectMessagePolicy>(profile.direct_message_policy);
   const [saving, setSaving] = useState(false);
   const [confirmingDeviceId, setConfirmingDeviceId] = useState<string | null>(null);
   const image = useImageSelection();
   const settingsChanged = username.trim() !== profile.username
     || bio !== profile.bio
-    || acceptsDirectMessages !== profile.accepts_direct_messages
+    || directMessagePolicy !== profile.direct_message_policy
     || image.base64 !== null
     || image.removed;
   const displayNameLength = Array.from(username.trim()).length;
@@ -7905,7 +8658,7 @@ function SettingsDialog({ profile, devices, blockedPeople, busy, onClose, onSave
         bio,
         image.base64,
         image.removed,
-        acceptsDirectMessages,
+        directMessagePolicy,
       );
     } finally {
       setSaving(false);
@@ -7923,9 +8676,19 @@ function SettingsDialog({ profile, devices, blockedPeople, busy, onClose, onSave
       </div>
       <div className="group-settings-panel user-settings-panel" role="tabpanel">
         {tab === "identity" && <div className="group-settings-identity">
-          <div className="identity-editor"><ImagePicker name={username} existing={profile.avatar} selection={image} disabled={locked} /><small>public identity</small></div>
-          <LabeledArea label="display name" count={`${displayNameLength}/${MAX_DISPLAY_NAME_LENGTH}`}><input disabled={locked} value={username} maxLength={MAX_DISPLAY_NAME_LENGTH} onChange={(event) => setUsername(event.target.value)} /></LabeledArea>
+          <div className="identity-profile-row">
+            <div className="identity-editor"><ImagePicker name={username} existing={profile.avatar} selection={image} disabled={locked} /><small>public identity</small></div>
+            <LabeledArea label="display name" count={`${displayNameLength}/${MAX_DISPLAY_NAME_LENGTH}`}><input disabled={locked} value={username} maxLength={MAX_DISPLAY_NAME_LENGTH} onChange={(event) => setUsername(event.target.value)} /></LabeledArea>
+          </div>
           <LabeledArea label="bio" count={`${bio.length}/160`}><textarea disabled={locked} value={bio} onChange={(event) => setBio(event.target.value)} /></LabeledArea>
+          <section className="settings-section identity-signal-setting">
+            <h3>noise signature</h3>
+            <div className="noise-id-setting">
+              <strong>{noiseSignature(profile.public_key)}</strong>
+              <ContactSignalCopyButton publicKey={profile.public_key} />
+            </div>
+            <p>Share this signature so someone can start an encrypted DM with you. Noise keeps it discoverable automatically, and it does not reveal your private Noise ID.</p>
+          </section>
         </div>}
         {tab === "album" && <ProfileAlbumDialog
           embedded
@@ -7937,13 +8700,33 @@ function SettingsDialog({ profile, devices, blockedPeople, busy, onClose, onSave
             avatar: profile.avatar,
             album: profile.album,
             accepts_direct_messages: profile.accepts_direct_messages,
+            direct_message_policy: profile.direct_message_policy,
             presence_status: "online",
           }}
           onSummary={onSummary}
         />}
         {tab === "privacy" && <section className="settings-section user-privacy-settings">
           <h3>direct messages</h3>
-          <label className="settings-toggle-row"><span><strong>accept direct messages</strong><small>allow people from shared groups to message you</small></span><input disabled={locked} type="checkbox" role="switch" checked={acceptsDirectMessages} onChange={(event) => setAcceptsDirectMessages(event.target.checked)} /></label>
+          <div className="direct-message-policy" role="radiogroup" aria-label="who can direct message you">
+            {([
+              ["everyone", "everyone", "allow anyone with your noise signature or a shared group to message you"],
+              ["shared_groups", "shared groups only", "only allow messages from current members of your groups"],
+              ["nobody", "nobody", "do not accept incoming direct messages"],
+            ] as const).map(([value, label, detail]) => (
+              <button
+                type="button"
+                role="radio"
+                aria-checked={directMessagePolicy === value}
+                className={directMessagePolicy === value ? "selected" : ""}
+                disabled={locked}
+                key={value}
+                onClick={() => setDirectMessagePolicy(value)}
+              >
+                <span><strong>{label}</strong><small>{detail}</small></span>
+                <i>{directMessagePolicy === value && <Check size={13} />}</i>
+              </button>
+            ))}
+          </div>
         </section>}
         {tab === "blocks" && <section className="settings-section user-block-settings">
           <h3>blocked users</h3>

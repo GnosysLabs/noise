@@ -1384,7 +1384,7 @@ fn member_leaves(group: &MlsGroup, account_public_key: &str) -> Vec<LeafNodeInde
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Identity, Profile, SignedEvent};
+    use crate::{DirectMessagePolicy, Identity, Profile, SignedEvent};
 
     #[test]
     fn mls_epochs_preserve_history_for_new_members_and_cut_off_removed_members() {
@@ -1406,6 +1406,7 @@ mod tests {
             avatar: None,
             album: None,
             accepts_direct_messages: true,
+            direct_message_policy: DirectMessagePolicy::Everyone,
         };
         let membership_proof =
             SignedEvent::member_joined(&bob_identity, &group, &bob_profile, 1).unwrap();
@@ -1530,7 +1531,11 @@ mod tests {
             .add_member(group_id, &charlie_request.key_package_base64)
             .unwrap();
         let add_charlie_record = bob
-            .create_epoch_record(&bob_identity, &add_bob_record.record_id, add_charlie.clone())
+            .create_epoch_record(
+                &bob_identity,
+                &add_bob_record.record_id,
+                add_charlie.clone(),
+            )
             .unwrap();
         MlsControlLog {
             genesis: genesis.clone(),

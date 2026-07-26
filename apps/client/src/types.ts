@@ -6,6 +6,8 @@ export type ProfileImage = {
   storage?: StorageManifest | null;
 };
 
+export type DirectMessagePolicy = "everyone" | "shared_groups" | "nobody";
+
 export type ProfileAlbum = {
   blob_id: string;
   key_base64: string;
@@ -33,6 +35,7 @@ export type IdentitySummary = {
   avatar: ProfileImage | null;
   album: ProfileAlbum | null;
   accepts_direct_messages: boolean;
+  direct_message_policy: DirectMessagePolicy;
 };
 
 export type GroupSummary = {
@@ -80,6 +83,7 @@ export type DirectSummary = {
   avatar: ProfileImage | null;
   album: ProfileAlbum | null;
   accepts_direct_messages: boolean;
+  direct_message_policy: DirectMessagePolicy;
   is_active: boolean;
   has_unread: boolean;
 };
@@ -91,6 +95,7 @@ export type MemberSummary = {
   avatar: ProfileImage | null;
   album: ProfileAlbum | null;
   accepts_direct_messages: boolean;
+  direct_message_policy: DirectMessagePolicy;
   is_moderator: boolean;
 };
 
@@ -146,6 +151,7 @@ export type MessageSummary = {
   avatar: ProfileImage | null;
   album: ProfileAlbum | null;
   accepts_direct_messages: boolean;
+  direct_message_policy: DirectMessagePolicy;
   text: string;
   attachment: MediaAttachment | null;
   reply_to_message_id: string | null;
@@ -245,6 +251,7 @@ export type DirectMessageSummary = {
   avatar: ProfileImage | null;
   album: ProfileAlbum | null;
   accepts_direct_messages: boolean;
+  direct_message_policy: DirectMessagePolicy;
   text: string;
   attachment: MediaAttachment | null;
   reply_to_message_id: string | null;
@@ -278,6 +285,54 @@ export type DirectConversation = {
 export type DirectInbox = {
   summary: LocalSummary;
   conversations: DirectConversation[];
+};
+
+export type SearchResults = {
+  messages: SearchMessageResult[];
+  locations: SearchLocationResult[];
+  people: SearchPersonResult[];
+  has_more_history: boolean;
+  older_scopes: SearchHistoryScope[];
+};
+
+export type SearchHistoryScope = {
+  group_id: string | null;
+  topic_id: string | null;
+};
+
+export type SearchMessageResult = {
+  event_id: string;
+  author_public_key: string;
+  username: string;
+  avatar: ProfileImage | null;
+  text: string;
+  attachment: MediaAttachment | null;
+  created_at_millis: number;
+  group_id: string | null;
+  group_name: string | null;
+  topic_id: string | null;
+  topic_name: string | null;
+  direct_public_key: string | null;
+};
+
+export type SearchLocationResult = {
+  group_id: string;
+  group_name: string;
+  group_avatar: ProfileImage | null;
+  topic_id: string | null;
+  topic_name: string | null;
+  topic_icon: string | null;
+};
+
+export type SearchPersonResult = {
+  public_key: string;
+  username: string;
+  bio: string;
+  avatar: ProfileImage | null;
+  album: ProfileAlbum | null;
+  accepts_direct_messages: boolean;
+  direct_message_policy: DirectMessagePolicy;
+  has_direct: boolean;
 };
 
 export type GroupWatch = {
