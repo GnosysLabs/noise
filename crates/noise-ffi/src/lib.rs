@@ -84,7 +84,23 @@ enum Request {
         #[serde(default)]
         interruptible: bool,
     },
+    RefreshAccountState {
+        state_path: String,
+        cache_path: String,
+        relays: Vec<String>,
+        #[serde(default)]
+        interruptible: bool,
+    },
+    PublishReadState {
+        state_path: String,
+        relays: Vec<String>,
+    },
     WatchAccount {
+        state_path: String,
+        since: Option<u64>,
+        relays: Vec<String>,
+    },
+    WatchReadState {
         state_path: String,
         since: Option<u64>,
         relays: Vec<String>,
@@ -676,6 +692,10 @@ fn request_loading_ticket(request: &Request) -> Option<LoadingTicket> {
             interruptible: true,
             ..
         }
+        | Request::RefreshAccountState {
+            interruptible: true,
+            ..
+        }
         | Request::DirectInbox {
             interruptible: true,
             ..
@@ -749,6 +769,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             | Request::WatchGroupId { .. }
             | Request::SyncAccount { .. }
             | Request::SyncReadState { .. }
+            | Request::RefreshAccountState { .. }
             | Request::SyncGroupActivity { .. }
             | Request::SyncTopicActivity { .. }
             | Request::GroupHasPendingAdmissions { .. }
@@ -758,6 +779,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             | Request::ReplyNotificationSnapshot { .. }
             | Request::WatchDirect { .. }
             | Request::WatchAccount { .. }
+            | Request::WatchReadState { .. }
             | Request::FetchAvatar { .. }
             | Request::FetchAttachment { .. }
             | Request::FetchAttachmentRange { .. }
@@ -948,6 +970,47 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             .map_err(|error| error.to_string())?;
             serde_json::to_value(result).map_err(|error| error.to_string())
         }
+        Request::PublishReadState { state_path, relays } => serde_json::to_value(
+            runtime()?
+                .block_on(client.publish_read_state(state_path, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::RefreshAccountState {
+            state_path,
+            cache_path,
+            relays,
+            interruptible,
+        } => {
+            let runtime = runtime()?;
+            let future = client.prepare_account_state_refresh(&state_path, relays);
+            let update = if interruptible {
+                runtime.block_on_loading(
+                    future,
+                    loading_ticket
+                        .ok_or_else(|| "background loading ticket is missing".to_owned())?,
+                )
+            } else {
+                runtime.block_on(future)
+            }
+            .map_err(|error| error.to_string())?;
+            if session_ending().load(Ordering::Acquire) {
+                return Err("session ended".to_owned());
+            }
+            let _state_guard = state_lock()
+                .lock()
+                .map_err(|_| "local state lock is unavailable".to_owned())?;
+            if session_ending().load(Ordering::Acquire) {
+                return Err("session ended".to_owned());
+            }
+            let result = if let Some(update) = update {
+                client.apply_read_state_update(&state_path, &cache_path, update)
+            } else {
+                client.local_summary(&state_path)
+            }
+            .map_err(|error| error.to_string())?;
+            serde_json::to_value(result).map_err(|error| error.to_string())
+        }
         Request::WatchAccount {
             state_path,
             since,
@@ -955,6 +1018,16 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         } => serde_json::to_value(
             runtime()?
                 .block_on(client.watch_account(state_path, since, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::WatchReadState {
+            state_path,
+            since,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.watch_read_state(state_path, since, relays))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),

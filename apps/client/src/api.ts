@@ -65,6 +65,7 @@ const browserConcurrentActions = new Set([
   "upload_media_chunk_to_group",
   "upload_profile_media_chunk",
   "watch_account",
+  "watch_read_state",
   "watch_direct",
   "watch_group",
   "watch_group_id",

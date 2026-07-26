@@ -16,10 +16,16 @@ use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
 mod production_e2ee;
+mod safety;
 pub use production_e2ee::{
     HistoryKeyLink, MlsAccountState, MlsCommitBundle, MlsControlLog, MlsDeviceCredential,
     MlsEpochRecord, MlsEpochSummary, MlsGroupGenesis, MlsJoinRequest, MlsLegacyHistoryBridge,
     MlsRemovalReason, MlsRemovalRequest,
+};
+pub use safety::{
+    SafetyEncryptedObjectV1, SafetyEncryptedShardV1, SafetyEncryptionKeyPair,
+    SafetyMediaFingerprintV1, SafetyMediaHashAlgorithmV1, SafetyReportCategoryV1, SafetyReportV1,
+    SealedSafetyReportV1,
 };
 
 const FREQUENCY_SPACE: u64 = 1_000_000_000_000;
