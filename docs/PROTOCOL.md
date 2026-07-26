@@ -2,9 +2,12 @@
 
 These are product constraints, not implementation details.
 
-1. **No PII is required.** An identity is a locally generated key plus a
-   self-authored profile. The protocol never requires a phone number, email,
-   legal name, address book, birthday, or location.
+1. **No identity PII is retained.** An identity is a locally generated key plus
+   a self-authored profile. The protocol never requires a phone number, email,
+   legal name, address book, or location. Official clients transiently check a
+   self-declared birth date at account creation because Noise launches as an
+   18+ service; only the pass result is retained in the encrypted account
+   vault, never the birth date.
 2. **Groups are entered by frequency.** There is no group directory, search,
    recommendation system, or public discovery endpoint.
 3. **Relays provide availability, not authority.** A relay may store and
@@ -31,8 +34,10 @@ These are product constraints, not implementation details.
     relay constellation, and put only its encrypted manifest in the group
     event.
 11. **Groups have signed identities.** A frequency has a name, short
-    description, and encrypted icon reference. Updates are events in the same
-    replicated history rather than mutable relay-owned records.
+    description, content rating, and encrypted icon reference. Updates are
+    events in the same replicated history rather than mutable relay-owned
+    records. Once a group is marked adult, signed history prevents it from
+    returning to the general rating.
 
 ## Profiles and constellation storage
 

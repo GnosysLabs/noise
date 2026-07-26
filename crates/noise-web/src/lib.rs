@@ -1,6 +1,6 @@
 use noise_client::{
-    DirectMessagePolicy, ForwardedFrom, MediaAttachment, NoiseClient, ProfileAlbum,
-    ProfileAlbumItem, ProfileImage,
+    DirectMessagePolicy, ForwardedFrom, GroupContentRating, MediaAttachment, NoiseClient,
+    ProfileAlbum, ProfileAlbumItem, ProfileImage,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -88,8 +88,19 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                     STATE_PATH,
                     required::<String>(&request, "username")?,
                     required::<String>(&request, "password")?,
+                    &required::<String>(&request, "birth_date")?,
                     optional::<String>(&request, "avatar_data_base64")?,
                     optional::<String>(&request, "avatar_mime_type")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "set_adult_content_enabled" => data(
+            client
+                .set_adult_content_enabled(
+                    STATE_PATH,
+                    required::<bool>(&request, "enabled")?,
                     relays(&request)?,
                 )
                 .await
@@ -232,6 +243,7 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                     required::<String>(&request, "name")?,
                     required::<String>(&request, "description")?,
                     optional::<String>(&request, "rules")?.unwrap_or_default(),
+                    optional::<GroupContentRating>(&request, "content_rating")?,
                     optional::<String>(&request, "avatar_data_base64")?,
                     optional::<String>(&request, "avatar_mime_type")?,
                     required::<bool>(&request, "remove_avatar")?,
@@ -358,6 +370,7 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .make(
                     STATE_PATH,
                     required::<String>(&request, "name")?,
+                    optional::<GroupContentRating>(&request, "content_rating")?.unwrap_or_default(),
                     optional::<String>(&request, "avatar_data_base64")?,
                     optional::<String>(&request, "avatar_mime_type")?,
                     relays(&request)?,

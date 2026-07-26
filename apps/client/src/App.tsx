@@ -66,6 +66,7 @@ import { firstLink, linkify, openExternalLink } from "./linkify";
 import { ReactionPicker } from "./ReactionPicker";
 import { useLinkPreview } from "./useLinkPreview";
 import type {
+  AdultAccessSummary,
   AttachmentData,
   AttachmentRangeData,
   AvatarData,
@@ -78,6 +79,7 @@ import type {
   DeviceSummary,
   GroupActivityResult,
   GroupEncryptionStatus,
+  GroupContentRating,
   GroupSummary,
   GroupWatch,
   IdentitySummary,
@@ -298,6 +300,7 @@ function withCurrentGroupProfile(
     name: current.name,
     description: current.description,
     rules: current.rules,
+    content_rating: current.content_rating,
     avatar: current.avatar,
     background: current.background,
     mobile_background: current.mobile_background,
@@ -3622,13 +3625,14 @@ export default function App() {
         busy={busy}
         addingAccount={localAccounts.adding_account}
         onCancelAdd={cancelAddingAccount}
-        onCreate={(username, password) =>
+        onCreate={(username, password, birthDate) =>
           perform(async () => {
             const avatar = await generateUserAvatar(`${username}:${crypto.randomUUID()}`);
             const local = await noise<LocalSummary>({
               action: "initialize",
               username,
               password,
+              birth_date: birthDate,
               avatar_data_base64: avatar,
               avatar_mime_type: "image/png",
               relays,
@@ -4144,13 +4148,15 @@ export default function App() {
       {dialog?.type === "make" && (
         <MakeDialog
           busy={busy}
+          adultContentEnabled={summary.adult_access.adult_content_enabled}
           onClose={() => setDialog(null)}
-          onSubmit={(name) =>
+          onSubmit={(name, contentRating) =>
             perform(async () => {
               const avatar = await generateGroupAvatar(`${name}:${crypto.randomUUID()}`);
               const result = await noise<MakeResult>({
                 action: "make",
                 name,
+                content_rating: contentRating,
                 avatar_data_base64: avatar,
                 avatar_mime_type: "image/png",
                 relays,
@@ -4190,6 +4196,7 @@ export default function App() {
       {dialog?.type === "profile" && (
         <SettingsDialog
           profile={dialog.profile}
+          adultAccess={summary.adult_access}
           devices={summary.devices}
           blockedPeople={summary.blocked_people}
           busy={busy}
@@ -4201,6 +4208,17 @@ export default function App() {
             setDialog({ type: "profile", profile: local.identity });
           }}
           onUnblock={(person) => updateBlock(person, false)}
+          onAdultContentChange={(enabled) =>
+            perform(async () => {
+              const local = await noise<LocalSummary>({
+                action: "set_adult_content_enabled",
+                enabled,
+                relays,
+              });
+              if (!local) throw new Error("the content preference was not updated");
+              setSummary(local);
+            }, false)
+          }
           onRevokeDevice={(device) =>
             perform(async () => {
               const local = await noise<LocalSummary>({
@@ -4291,6 +4309,7 @@ export default function App() {
       {dialog?.type === "group" && (
         <GroupSettingsDialog
           group={dialog.group}
+          adultContentEnabled={summary.adult_access.adult_content_enabled}
           bannedMembers={conversation?.group.group_id === dialog.group.group_id ? conversation.banned_members : []}
           presenceStatuses={selectedPresenceStatuses}
           busy={busy}
@@ -4306,7 +4325,7 @@ export default function App() {
             const updatedGroup = local.groups.find((group) => group.group_id === dialog.group.group_id);
             if (updatedGroup) setDialog({ type: "group", group: updatedGroup });
           })}
-          onSave={(name, description, accentColor, avatar, removeAvatar, background, removeBackground, mobileBackground, removeMobileBackground, membersCanSendMessages, membersCanSendMedia) =>
+          onSave={(name, description, accentColor, contentRating, avatar, removeAvatar, background, removeBackground, mobileBackground, removeMobileBackground, membersCanSendMessages, membersCanSendMedia) =>
             perform(async () => {
               const local = await noise<LocalSummary>({
                 action: "update_group_profile",
@@ -4314,6 +4333,7 @@ export default function App() {
                 description,
                 rules: dialog.group.rules,
                 accent_color: accentColor,
+                content_rating: contentRating,
                 avatar_data_base64: avatar,
                 avatar_mime_type: avatar ? "image/jpeg" : null,
                 remove_avatar: removeAvatar,
@@ -4329,6 +4349,16 @@ export default function App() {
               });
               if (!local) throw new Error("the relay did not return the updated group");
               applySavedGroup(local, dialog.group.group_id);
+              if (dialog.group.content_rating === "general" && contentRating === "adult") {
+                const updatedGroup = local.groups.find((group) => group.group_id === dialog.group.group_id);
+                if (updatedGroup?.frequency) {
+                  setDialog({
+                    type: "frequency",
+                    group: updatedGroup.name,
+                    frequency: updatedGroup.frequency,
+                  });
+                }
+              }
             }, false)
           }
         />
@@ -4804,7 +4834,7 @@ function Sidebar({
                 }}
               >
                 <Avatar name={group.name} image={group.avatar} size={27} square />
-                <span>{group.name}</span>
+                <span>{group.name}{group.content_rating === "adult" && <i className="adult-badge">18+</i>}</span>
                 {group.unread_count > 0 && (
                   <span
                     className="group-unread-count"
@@ -5580,7 +5610,7 @@ function ConversationPanel({
         <div className="group-identity static" data-tauri-drag-region>
           <Avatar name={conversation.group.name} image={conversation.group.avatar} size={36} square />
           <span>
-            <strong>{conversation.group.name}{topic ? ` / ${topic.name}` : ""}</strong>
+            <strong>{conversation.group.name}{conversation.group.content_rating === "adult" && <i className="adult-badge">18+</i>}{topic ? ` / ${topic.name}` : ""}</strong>
             <small>{topic?.locked ? "locked topic" : conversation.group.description || "group"}</small>
           </span>
         </div>
@@ -8207,7 +8237,7 @@ function Onboarding({
   busy: boolean;
   addingAccount: boolean;
   onCancelAdd: () => void;
-  onCreate: (username: string, password: string) => Promise<boolean>;
+  onCreate: (username: string, password: string, birthDate: string) => Promise<boolean>;
   onSignIn: (noiseId: string, password: string) => Promise<boolean>;
 }) {
   const [mode, setMode] = useState<"create" | "signin">("create");
@@ -8215,6 +8245,7 @@ function Onboarding({
   const [noiseId, setNoiseId] = useState("");
   const [password, setPassword] = useState("");
   const [confirmation, setConfirmation] = useState("");
+  const [birthDate, setBirthDate] = useState("");
   const [createAttempted, setCreateAttempted] = useState(false);
   const displayedNoiseId = noiseId.match(/.{1,4}/g)?.join(" ") ?? "";
   const passwordLength = Array.from(password).length;
@@ -8232,11 +8263,12 @@ function Onboarding({
   const usernameReady = username.trim().length > 0
     && Array.from(username.trim()).length <= MAX_DISPLAY_NAME_LENGTH;
   const passwordReady = passwordRequirements.every((requirement) => requirement.met);
-  const createReady = usernameReady && passwordReady;
+  const birthDateReady = /^\d{4}-\d{2}-\d{2}$/.test(birthDate);
+  const createReady = usernameReady && passwordReady && birthDateReady;
   const submitCreate = () => {
     setCreateAttempted(true);
     if (busy || !createReady) return;
-    void onCreate(username.trim(), password);
+    void onCreate(username.trim(), password, birthDate);
   };
   return (
     <div className="onboarding" data-tauri-drag-region>
@@ -8254,6 +8286,11 @@ function Onboarding({
       </div>
       {mode === "create" ? <>
         <input autoFocus value={username} maxLength={MAX_DISPLAY_NAME_LENGTH} aria-invalid={createAttempted && !usernameReady} onChange={(event) => setUsername(event.target.value)} placeholder="display name" />
+        <label className="onboarding-birth-date">
+          <span>birth date · Noise is 18+</span>
+          <input type="date" autoComplete="bday" value={birthDate} aria-invalid={createAttempted && !birthDateReady} onChange={(event) => setBirthDate(event.target.value)} />
+          <small>checked for 18+ eligibility, then discarded</small>
+        </label>
         <input type="password" autoComplete="new-password" value={password} aria-describedby="password-requirements" aria-invalid={createAttempted && !passwordReady} onChange={(event) => setPassword(event.target.value)} placeholder="strong password" />
         <input type="password" autoComplete="new-password" value={confirmation} aria-describedby="password-requirements" aria-invalid={createAttempted && password !== confirmation} onChange={(event) => setConfirmation(event.target.value)} placeholder="confirm password" onKeyDown={(event) => { if (event.key === "Enter") submitCreate(); }} />
         <div id="password-requirements" className={`password-requirements${createAttempted && !createReady ? " invalid" : ""}`} aria-live="polite">
@@ -8261,7 +8298,7 @@ function Onboarding({
           <ul>
             {passwordRequirements.map((requirement) => <li key={requirement.label} className={requirement.met ? "met" : ""}><Check size={11} /> {requirement.label}</li>)}
           </ul>
-          {createAttempted && !createReady && <span><TriangleAlert size={12} /> {usernameReady ? "complete the requirements above to continue" : "enter a display name to continue"}</span>}
+          {createAttempted && !createReady && <span><TriangleAlert size={12} /> {!usernameReady ? "enter a display name to continue" : !birthDateReady ? "enter your birth date to continue" : "complete the requirements above to continue"}</span>}
         </div>
         <button disabled={!createReady || busy} onClick={submitCreate}>{busy && <LoaderCircle className="spinner" size={14} />} create identity</button>
         <small>use a password manager or a long, memorable passphrase</small>
@@ -8767,9 +8804,10 @@ function GlobalSearchModal({
   );
 }
 
-function MakeDialog({ busy, onClose, onSubmit }: { busy: boolean; onClose: () => void; onSubmit: (name: string) => Promise<boolean> }) {
+function MakeDialog({ busy, adultContentEnabled, onClose, onSubmit }: { busy: boolean; adultContentEnabled: boolean; onClose: () => void; onSubmit: (name: string, contentRating: GroupContentRating) => Promise<boolean> }) {
   const [name, setName] = useState("");
-  return <Modal onClose={onClose}><DialogHeading icon={<UsersRound />} title="create group" detail="give the group a name" /><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="group name" /><DialogButtons onClose={onClose}><button className="primary" disabled={!name.trim() || busy} onClick={() => void onSubmit(name.trim())}>create group</button></DialogButtons></Modal>;
+  const [adult, setAdult] = useState(false);
+  return <Modal onClose={onClose}><DialogHeading icon={<UsersRound />} title="create group" detail="give the group a name" /><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="group name" /><label className="settings-toggle-row make-adult-group"><span><strong>18+ group</strong><small>{adultContentEnabled ? "allows consensual adult content and adds a permanent 18+ label" : "enable adult groups in Settings → Content first"}</small></span><input type="checkbox" role="switch" checked={adult} disabled={!adultContentEnabled} onChange={(event) => setAdult(event.target.checked)} /></label><DialogButtons onClose={onClose}><button className="primary" disabled={!name.trim() || busy} onClick={() => void onSubmit(name.trim(), adult ? "adult" : "general")}>create group</button></DialogButtons></Modal>;
 }
 
 function JoinDialog({ busy, onClose, onSubmit }: { busy: boolean; onClose: () => void; onSubmit: (frequency: string) => Promise<boolean> }) {
@@ -8786,12 +8824,13 @@ function NoiseIdDialog({ noiseId, onClose }: { noiseId: string; onClose: () => v
   return <Modal onClose={onClose}><DialogHeading icon={<NoiseMark size={28} />} title="this is your noise ID" detail="you’ll use it with your password to sign in on any device" /><div className="frequency-card">{noiseId}</div><p className="noise-id-warning">Save this somewhere private. noise cannot recover it for you.</p><DialogButtons><CopyButton value={noiseId} label="copy noise ID" /><button className="primary" onClick={onClose}>I saved it</button></DialogButtons></Modal>;
 }
 
-function SettingsDialog({ profile, devices, blockedPeople, busy, onClose, onSave, onUnblock, onRevokeDevice, onSummary, onLogout, onDeleteAccount }: { profile: IdentitySummary; devices: DeviceSummary[]; blockedPeople: DirectSummary[]; busy: boolean; onClose: () => void; onSave: (username: string, bio: string, avatar: string | null, remove: boolean, directMessagePolicy: DirectMessagePolicy) => Promise<boolean>; onUnblock: (person: DirectSummary) => Promise<boolean>; onRevokeDevice: (device: DeviceSummary) => Promise<boolean>; onSummary: (summary: LocalSummary) => void; onLogout: () => void; onDeleteAccount: () => void }) {
-  const [tab, setTab] = useState<"identity" | "album" | "privacy" | "blocks" | "account">("identity");
+function SettingsDialog({ profile, adultAccess, devices, blockedPeople, busy, onClose, onSave, onUnblock, onAdultContentChange, onRevokeDevice, onSummary, onLogout, onDeleteAccount }: { profile: IdentitySummary; adultAccess: AdultAccessSummary; devices: DeviceSummary[]; blockedPeople: DirectSummary[]; busy: boolean; onClose: () => void; onSave: (username: string, bio: string, avatar: string | null, remove: boolean, directMessagePolicy: DirectMessagePolicy) => Promise<boolean>; onUnblock: (person: DirectSummary) => Promise<boolean>; onAdultContentChange: (enabled: boolean) => Promise<boolean>; onRevokeDevice: (device: DeviceSummary) => Promise<boolean>; onSummary: (summary: LocalSummary) => void; onLogout: () => void; onDeleteAccount: () => void }) {
+  const [tab, setTab] = useState<"identity" | "album" | "privacy" | "content" | "blocks" | "account">("identity");
   const [username, setUsername] = useState(profile.username);
   const [bio, setBio] = useState(profile.bio);
   const [directMessagePolicy, setDirectMessagePolicy] = useState<DirectMessagePolicy>(profile.direct_message_policy);
   const [saving, setSaving] = useState(false);
+  const [contentSaving, setContentSaving] = useState(false);
   const [confirmingDeviceId, setConfirmingDeviceId] = useState<string | null>(null);
   const image = useImageSelection();
   const settingsChanged = username.trim() !== profile.username
@@ -8800,7 +8839,7 @@ function SettingsDialog({ profile, devices, blockedPeople, busy, onClose, onSave
     || image.base64 !== null
     || image.removed;
   const displayNameLength = Array.from(username.trim()).length;
-  const locked = busy || saving;
+  const locked = busy || saving || contentSaving;
   const saveSettings = async () => {
     if (locked || !settingsChanged) return;
     setSaving(true);
@@ -8817,14 +8856,15 @@ function SettingsDialog({ profile, devices, blockedPeople, busy, onClose, onSave
     }
   };
   return (
-    <Modal onClose={onClose} closeDisabled={saving} className="user-settings-modal">
+    <Modal onClose={onClose} closeDisabled={saving || contentSaving} className="user-settings-modal">
       <DialogHeading icon={<Settings2 />} title="settings" detail="your noise identity" />
       <div className="group-settings-tabs user-tabs" role="tablist" aria-label="user settings sections">
-        <button disabled={saving} className={tab === "identity" ? "active" : ""} role="tab" aria-selected={tab === "identity"} onClick={() => setTab("identity")}>Identity</button>
-        <button disabled={saving} className={tab === "album" ? "active" : ""} role="tab" aria-selected={tab === "album"} onClick={() => setTab("album")}>Album</button>
-        <button disabled={saving} className={tab === "privacy" ? "active" : ""} role="tab" aria-selected={tab === "privacy"} onClick={() => setTab("privacy")}>Privacy</button>
-        <button disabled={saving} className={tab === "blocks" ? "active" : ""} role="tab" aria-selected={tab === "blocks"} onClick={() => setTab("blocks")}>Blocks{blockedPeople.length > 0 && <i>{blockedPeople.length}</i>}</button>
-        <button disabled={saving} className={tab === "account" ? "active" : ""} role="tab" aria-selected={tab === "account"} onClick={() => setTab("account")}>Account</button>
+        <button disabled={locked} className={tab === "identity" ? "active" : ""} role="tab" aria-selected={tab === "identity"} onClick={() => setTab("identity")}>Identity</button>
+        <button disabled={locked} className={tab === "album" ? "active" : ""} role="tab" aria-selected={tab === "album"} onClick={() => setTab("album")}>Album</button>
+        <button disabled={locked} className={tab === "privacy" ? "active" : ""} role="tab" aria-selected={tab === "privacy"} onClick={() => setTab("privacy")}>Privacy</button>
+        <button disabled={locked} className={tab === "content" ? "active" : ""} role="tab" aria-selected={tab === "content"} onClick={() => setTab("content")}>Content</button>
+        <button disabled={locked} className={tab === "blocks" ? "active" : ""} role="tab" aria-selected={tab === "blocks"} onClick={() => setTab("blocks")}>Blocks{blockedPeople.length > 0 && <i>{blockedPeople.length}</i>}</button>
+        <button disabled={locked} className={tab === "account" ? "active" : ""} role="tab" aria-selected={tab === "account"} onClick={() => setTab("account")}>Account</button>
       </div>
       <div className="group-settings-panel user-settings-panel" role="tabpanel">
         {tab === "identity" && <div className="group-settings-identity">
@@ -8880,6 +8920,27 @@ function SettingsDialog({ profile, devices, blockedPeople, busy, onClose, onSave
             ))}
           </div>
         </section>}
+        {tab === "content" && <section className="settings-section user-content-settings">
+          <h3>adult groups</h3>
+          <label className="settings-toggle-row">
+            <span>
+              <strong>show 18+ groups</strong>
+              <small>consensual adult content is allowed in groups marked 18+. These groups stay hidden unless you turn this on.</small>
+            </span>
+            <input
+              type="checkbox"
+              role="switch"
+              checked={adultAccess.adult_content_enabled}
+              disabled={locked || !adultAccess.age_attested}
+              onChange={(event) => {
+                const enabled = event.target.checked;
+                setContentSaving(true);
+                void onAdultContentChange(enabled).finally(() => setContentSaving(false));
+              }}
+            />
+          </label>
+          <p>Your birth date is not stored. Existing launch accounts were migrated as known adults; this separate preference still started off.</p>
+        </section>}
         {tab === "blocks" && <section className="settings-section user-block-settings">
           <h3>blocked users</h3>
           {blockedPeople.length ? <div className="banned-user-list">{blockedPeople.map((person) => <div className="banned-user-row" key={person.public_key}><Avatar name={person.username} image={person.avatar} size={30} /><span><strong>{person.username}</strong><small>{person.bio || "hidden from your noise"}</small></span><button disabled={locked} onClick={() => void onUnblock(person)}>unblock</button></div>)}</div> : <p className="empty-banned-users">you have not blocked anyone</p>}
@@ -8915,7 +8976,7 @@ function SettingsDialog({ profile, devices, blockedPeople, busy, onClose, onSave
           <section className="settings-danger"><span><strong>delete account</strong><small>erase this identity and its encrypted account vault</small></span><button className="danger" disabled={locked} onClick={onDeleteAccount}>delete account</button></section>
         </div>}
       </div>
-      <DialogButtons onClose={onClose} closeDisabled={saving} closeLabel={settingsChanged ? "cancel" : "close"}>
+      <DialogButtons onClose={onClose} closeDisabled={saving || contentSaving} closeLabel={settingsChanged ? "cancel" : "close"}>
         {tab === "identity" && (profile.avatar || image.preview) && <button className="danger" disabled={locked} onClick={image.remove}>remove photo</button>}
         {settingsChanged && <button className="primary" disabled={!username.trim() || displayNameLength > MAX_DISPLAY_NAME_LENGTH || bio.length > 160 || locked} onClick={() => void saveSettings()}>
           {saving && <LoaderCircle className="spinner" size={13} />} {saving ? "saving" : "save settings"}
@@ -8925,12 +8986,13 @@ function SettingsDialog({ profile, devices, blockedPeople, busy, onClose, onSave
   );
 }
 
-function GroupSettingsDialog({ group, bannedMembers, presenceStatuses, busy, onClose, onSave, onUnban, onRotateFrequency }: { group: GroupSummary; bannedMembers: BannedMemberSummary[]; presenceStatuses: Map<string, PresenceStatus>; busy: boolean; onClose: () => void; onSave: (name: string, description: string, accentColor: string, avatar: string | null, removeAvatar: boolean, background: string | null, removeBackground: boolean, mobileBackground: string | null, removeMobileBackground: boolean, membersCanSendMessages: boolean, membersCanSendMedia: boolean) => Promise<boolean>; onUnban: (member: BannedMemberSummary) => Promise<boolean>; onRotateFrequency: (revokeOnly: boolean) => Promise<boolean> }) {
+function GroupSettingsDialog({ group, adultContentEnabled, bannedMembers, presenceStatuses, busy, onClose, onSave, onUnban, onRotateFrequency }: { group: GroupSummary; adultContentEnabled: boolean; bannedMembers: BannedMemberSummary[]; presenceStatuses: Map<string, PresenceStatus>; busy: boolean; onClose: () => void; onSave: (name: string, description: string, accentColor: string, contentRating: GroupContentRating, avatar: string | null, removeAvatar: boolean, background: string | null, removeBackground: boolean, mobileBackground: string | null, removeMobileBackground: boolean, membersCanSendMessages: boolean, membersCanSendMedia: boolean) => Promise<boolean>; onUnban: (member: BannedMemberSummary) => Promise<boolean>; onRotateFrequency: (revokeOnly: boolean) => Promise<boolean> }) {
   const [tab, setTab] = useState<"identity" | "appearance" | "general" | "banned">("identity");
   const [revokeArmed, setRevokeArmed] = useState(false);
   const [name, setName] = useState(group.name);
   const [description, setDescription] = useState(group.description);
   const [accentColor, setAccentColor] = useState(group.accent_color || DEFAULT_ACCENT_COLOR);
+  const [contentRating, setContentRating] = useState<GroupContentRating>(group.content_rating);
   const [membersCanSendMessages, setMembersCanSendMessages] = useState(group.members_can_send_messages);
   const [membersCanSendMedia, setMembersCanSendMedia] = useState(group.members_can_send_media);
   const image = useImageSelection();
@@ -8940,6 +9002,7 @@ function GroupSettingsDialog({ group, bannedMembers, presenceStatuses, busy, onC
   const settingsChanged = name.trim() !== group.name
     || description !== group.description
     || accentColor !== group.accent_color
+    || contentRating !== group.content_rating
     || membersCanSendMessages !== group.members_can_send_messages
     || membersCanSendMedia !== group.members_can_send_media
     || image.base64 !== null
@@ -8991,6 +9054,8 @@ function GroupSettingsDialog({ group, bannedMembers, presenceStatuses, busy, onC
           <h3>what can members do?</h3>
           <label className="settings-toggle-row"><span><strong>send messages</strong><small>moderators can always send messages</small></span><input type="checkbox" role="switch" checked={membersCanSendMessages} onChange={(event) => setMembersCanSendMessages(event.target.checked)} /></label>
           <label className="settings-toggle-row"><span><strong>send media</strong><small>moderators can always upload media</small></span><input type="checkbox" role="switch" checked={membersCanSendMedia} onChange={(event) => setMembersCanSendMedia(event.target.checked)} /></label>
+          <h3>content label</h3>
+          <label className="settings-toggle-row"><span><strong>18+ group</strong><small>{group.content_rating === "adult" ? "this permanent label cannot be removed" : adultContentEnabled ? "permanently marks the group and replaces its frequency so old unlabeled invites stop working" : "enable adult groups in your Content settings first"}</small></span><input type="checkbox" role="switch" checked={contentRating === "adult"} disabled={group.content_rating === "adult" || !adultContentEnabled} onChange={(event) => setContentRating(event.target.checked ? "adult" : "general")} /></label>
           <h3 className="frequency-heading">frequency</h3>
           <div className="group-frequency-settings">
             <div className="group-frequency-value">
@@ -9009,7 +9074,7 @@ function GroupSettingsDialog({ group, bannedMembers, presenceStatuses, busy, onC
         </section>}
       </div>
       <DialogButtons onClose={onClose} closeLabel={settingsChanged ? "cancel" : "close"}>
-        {settingsChanged && <button className="primary" disabled={!name.trim() || name.length > 80 || description.length > 200 || background.busy || mobileBackground.busy || busy} onClick={() => void onSave(name.trim(), description, accentColor, image.base64, image.removed, background.base64, background.removed, mobileBackground.base64, mobileBackground.removed, membersCanSendMessages, membersCanSendMedia)}>save settings</button>}
+        {settingsChanged && <button className="primary" disabled={!name.trim() || name.length > 80 || description.length > 200 || background.busy || mobileBackground.busy || busy} onClick={() => void onSave(name.trim(), description, accentColor, contentRating, image.base64, image.removed, background.base64, background.removed, mobileBackground.base64, mobileBackground.removed, membersCanSendMessages, membersCanSendMedia)}>save settings</button>}
       </DialogButtons>
     </Modal>
   );

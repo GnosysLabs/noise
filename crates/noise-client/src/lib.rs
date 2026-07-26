@@ -62,8 +62,8 @@ use noise_core::{
     profile_media_scope_id, reconstruct_blob_from_storage_payloads, valid_reaction_emoji,
 };
 pub use noise_core::{
-    DirectMessagePolicy, ForwardedFrom, MediaAttachment, MediaChunk, ProfileAlbum,
-    ProfileAlbumItem, ProfileImage,
+    DirectMessagePolicy, ForwardedFrom, GroupContentRating, MediaAttachment, MediaChunk,
+    ProfileAlbum, ProfileAlbumItem, ProfileImage,
 };
 pub use noise_transport::LinkPreview;
 use noise_transport::{
@@ -73,6 +73,7 @@ use noise_transport::{
 };
 use ohttp::ClientRequest;
 use serde::{Deserialize, Serialize};
+use time::{Date, Month, OffsetDateTime};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod relay_pool;
@@ -309,6 +310,8 @@ pub struct GroupSummary {
     pub name: String,
     pub description: String,
     pub rules: String,
+    #[serde(default)]
+    pub content_rating: GroupContentRating,
     pub avatar: Option<ProfileImage>,
     pub background: Option<ProfileImage>,
     pub mobile_background: Option<ProfileImage>,
@@ -323,15 +326,42 @@ pub struct GroupSummary {
     pub read_state_initialized: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdultAccessSummary {
+    pub age_attested: bool,
+    pub adult_content_enabled: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LocalSummary {
     pub identity: IdentitySummary,
+    pub adult_access: AdultAccessSummary,
     pub devices: Vec<DeviceSummary>,
     pub groups: Vec<GroupSummary>,
     pub directs: Vec<DirectSummary>,
     pub known_people: Vec<DirectSummary>,
     pub blocked_people: Vec<DirectSummary>,
     pub hidden_public_keys: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct AdultAccessSettings {
+    age_attested: bool,
+    adult_content_enabled: bool,
+    preference_updated_at_millis: u64,
+}
+
+impl Default for AdultAccessSettings {
+    fn default() -> Self {
+        // Noise had a handful of known-adult accounts before this setting
+        // existed. Missing legacy data is deliberately migrated once as
+        // attested, while adult groups remain hidden by default.
+        Self {
+            age_attested: true,
+            adult_content_enabled: false,
+            preference_updated_at_millis: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -689,6 +719,8 @@ struct ClientState {
     version: u32,
     profile: Profile,
     #[serde(default)]
+    adult_access: AdultAccessSettings,
+    #[serde(default)]
     profile_sequence: u64,
     #[serde(default)]
     contact_signal_published_sequence: u64,
@@ -802,6 +834,8 @@ struct AccountReadStateContents {
 struct AccountVaultContents {
     version: u32,
     profile: Profile,
+    #[serde(default)]
+    adult_access: AdultAccessSettings,
     #[serde(default)]
     profile_sequence: u64,
     #[serde(default)]
@@ -1196,6 +1230,7 @@ fn contact_signal_membership(signature: &str) -> anyhow::Result<GroupMembership>
         name: "noise contact signal".to_owned(),
         description: String::new(),
         rules: String::new(),
+        content_rating: GroupContentRating::General,
         avatar: None,
         background: None,
         mobile_background: None,
@@ -1231,13 +1266,21 @@ fn merge_group_membership_records(
     incoming: HashMap<String, GroupMembershipRecord>,
 ) -> bool {
     let before = current.clone();
-    for (group_id, candidate) in incoming {
+    for (group_id, mut candidate) in incoming {
         match current.entry(group_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(candidate);
             }
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 let existing = entry.get();
+                if existing
+                    .group
+                    .as_ref()
+                    .is_some_and(|group| group.content_rating == GroupContentRating::Adult)
+                    && let Some(candidate_group) = candidate.group.as_mut()
+                {
+                    candidate_group.content_rating = GroupContentRating::Adult;
+                }
                 let candidate_wins = candidate.sequence > existing.sequence
                     || (candidate.sequence == existing.sequence
                         && candidate.group.is_none()
@@ -1411,10 +1454,22 @@ impl ClientState {
         let Some(group_id) = self.active_group_id.as_deref() else {
             bail!("no active group; make a group or join with a frequency first")
         };
-        self.groups
+        let group = self
+            .groups
             .iter()
             .find(|group| group.group_id == group_id)
-            .context("active group is missing from local state")
+            .context("active group is missing from local state")?;
+        self.ensure_group_access(group)?;
+        Ok(group)
+    }
+
+    fn ensure_group_access(&self, group: &GroupMembership) -> anyhow::Result<()> {
+        if group.content_rating == GroupContentRating::Adult
+            && !self.adult_access.adult_content_enabled
+        {
+            bail!("enable adult groups in settings before opening this group")
+        }
+        Ok(())
     }
 
     fn mls_group_state(&self, group_id: &str) -> Option<&MlsAccountState> {
@@ -1633,6 +1688,7 @@ impl ClientState {
         let group_changed = group.name != profile.name
             || group.description != profile.description
             || group.rules != profile.rules
+            || group.content_rating != profile.content_rating
             || group.avatar != profile.avatar
             || group.background != profile.background
             || group.mobile_background != profile.mobile_background
@@ -1644,6 +1700,7 @@ impl ClientState {
             group.name = profile.name.clone();
             group.description = profile.description.clone();
             group.rules = profile.rules.clone();
+            group.content_rating = profile.content_rating;
             group.avatar = profile.avatar.clone();
             group.background = profile.background.clone();
             group.mobile_background = profile.mobile_background.clone();
@@ -1765,6 +1822,7 @@ impl ClientState {
         AccountVaultContents {
             version: 1,
             profile: self.profile.clone(),
+            adult_access: self.adult_access.clone(),
             profile_sequence: self.profile_sequence,
             contact_signal_published_sequence: self.contact_signal_published_sequence,
             identity_secret_base64: self.identity_secret_base64.clone(),
@@ -1824,6 +1882,7 @@ impl ClientState {
         let mut state = Self {
             version: 3,
             profile: contents.profile,
+            adult_access: contents.adult_access,
             profile_sequence: contents.profile_sequence,
             contact_signal_published_sequence: contents.contact_signal_published_sequence,
             identity_secret_base64: contents.identity_secret_base64,
@@ -2339,6 +2398,10 @@ impl ClientState {
                     != DirectMessagePolicy::Nobody,
                 direct_message_policy: self.profile.effective_direct_message_policy(),
             },
+            adult_access: AdultAccessSummary {
+                age_attested: self.adult_access.age_attested,
+                adult_content_enabled: self.adult_access.adult_content_enabled,
+            },
             devices: {
                 let mut devices = self
                     .devices
@@ -2363,7 +2426,14 @@ impl ClientState {
                 devices
             },
             groups: {
-                let mut groups = self.groups.iter().collect::<Vec<_>>();
+                let mut groups = self
+                    .groups
+                    .iter()
+                    .filter(|group| {
+                        group.content_rating != GroupContentRating::Adult
+                            || self.adult_access.adult_content_enabled
+                    })
+                    .collect::<Vec<_>>();
                 groups.sort_by(|left, right| {
                     let left_unread = self.group_unread_count(&left.group_id) > 0;
                     let right_unread = self.group_unread_count(&right.group_id) > 0;
@@ -2388,6 +2458,7 @@ impl ClientState {
                         name: group.name.clone(),
                         description: group.description.clone(),
                         rules: group.rules.clone(),
+                        content_rating: group.content_rating,
                         avatar: group.avatar.clone(),
                         background: group.background.clone(),
                         mobile_background: group.mobile_background.clone(),
@@ -2508,6 +2579,7 @@ impl NoiseClient {
         path: impl AsRef<Path>,
         username: impl Into<String>,
         password: impl Into<String>,
+        birth_date: &str,
         avatar_data_base64: Option<String>,
         avatar_mime_type: Option<String>,
         relays: Vec<String>,
@@ -2520,6 +2592,7 @@ impl NoiseClient {
         validate_display_name(&username)?;
         let password = password.into();
         validate_password(&password)?;
+        validate_adult_birth_date(birth_date)?;
         let noise_id = generate_noise_id();
         let credentials = derive_account_credentials(&noise_id, &password)?;
         let relays = relay_list(relays)?;
@@ -2559,6 +2632,11 @@ impl NoiseClient {
                 album: None,
                 accepts_direct_messages: true,
                 direct_message_policy: DirectMessagePolicy::Everyone,
+            },
+            adult_access: AdultAccessSettings {
+                age_attested: true,
+                adult_content_enabled: false,
+                preference_updated_at_millis: current_millis(),
             },
             profile_sequence: current_nanos(),
             contact_signal_published_sequence: 0,
@@ -2675,6 +2753,41 @@ impl NoiseClient {
         if !has_read_state {
             let _ = self.publish_read_state_for_state(&mut state, &relays).await;
         }
+        save_state(path, &state)?;
+        state.summary()
+    }
+
+    pub async fn set_adult_content_enabled(
+        &self,
+        path: impl AsRef<Path>,
+        enabled: bool,
+        relays: Vec<String>,
+    ) -> anyhow::Result<LocalSummary> {
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        if !state.adult_access.age_attested {
+            bail!("adult access requires an 18+ age attestation")
+        }
+        if state.adult_access.adult_content_enabled == enabled {
+            return state.summary();
+        }
+        state.adult_access.adult_content_enabled = enabled;
+        state.adult_access.preference_updated_at_millis = current_millis().max(1);
+        if !enabled
+            && state
+                .active_group_id
+                .as_ref()
+                .is_some_and(|active_group_id| {
+                    state.groups.iter().any(|group| {
+                        group.group_id == *active_group_id
+                            && group.content_rating == GroupContentRating::Adult
+                    })
+                })
+        {
+            state.active_group_id = None;
+        }
+        self.publish_account_state(&mut state, &relay_list(relays)?)
+            .await?;
         save_state(path, &state)?;
         state.summary()
     }
@@ -2960,6 +3073,7 @@ impl NoiseClient {
             .iter()
             .find(|group| group.group_id == group_id)
             .context("unknown group")?;
+        state.ensure_group_access(group)?;
         let mut cached = state.group_conversation_cache.get(group_id).cloned();
         if cached.is_none()
             && let Some(event_cache) = state.group_event_caches.get(group_id)
@@ -3009,9 +3123,12 @@ impl NoiseClient {
     ) -> anyhow::Result<LocalSummary> {
         let path = path.as_ref();
         let mut state = load_state(path)?;
-        if !state.groups.iter().any(|group| group.group_id == group_id) {
-            bail!("unknown group")
-        }
+        let group = state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .context("unknown group")?;
+        state.ensure_group_access(group)?;
         state.active_group_id = Some(group_id.to_owned());
         save_state(path, &state)?;
         state.summary()
@@ -3046,6 +3163,7 @@ impl NoiseClient {
             .find(|group| group.group_id == group_id)
             .cloned()
             .context("unknown group")?;
+        state.ensure_group_access(&group)?;
         drop(state);
         self.watch_group_membership(path, group, since, relay_list(relays)?)
             .await
@@ -3738,6 +3856,7 @@ impl NoiseClient {
         name: impl Into<String>,
         description: impl Into<String>,
         rules: impl Into<String>,
+        content_rating: Option<GroupContentRating>,
         avatar_data_base64: Option<String>,
         avatar_mime_type: Option<String>,
         remove_avatar: bool,
@@ -3788,6 +3907,7 @@ impl NoiseClient {
                     name: current_group.name.clone(),
                     description: current_group.description.clone(),
                     rules: current_group.rules.clone(),
+                    content_rating: current_group.content_rating,
                     avatar: current_group.avatar.clone(),
                     background: current_group.background.clone(),
                     mobile_background: current_group.mobile_background.clone(),
@@ -3806,6 +3926,18 @@ impl NoiseClient {
             members_can_send_messages.unwrap_or(current_profile.members_can_send_messages);
         let members_can_send_media =
             members_can_send_media.unwrap_or(current_profile.members_can_send_media);
+        let content_rating = content_rating.unwrap_or(current_profile.content_rating);
+        let became_adult = current_profile.content_rating == GroupContentRating::General
+            && content_rating == GroupContentRating::Adult;
+        if current_profile.content_rating == GroupContentRating::Adult
+            && content_rating != GroupContentRating::Adult
+        {
+            bail!("an adult group cannot be changed back to general")
+        }
+        if content_rating == GroupContentRating::Adult && !state.adult_access.adult_content_enabled
+        {
+            bail!("enable adult groups in settings before marking this group adult")
+        }
         let accent_color = normalize_group_accent_color(
             accent_color.unwrap_or_else(|| current_profile.accent_color.clone()),
         )?;
@@ -3906,6 +4038,7 @@ impl NoiseClient {
             name,
             description,
             rules,
+            content_rating,
             avatar,
             background,
             mobile_background,
@@ -3920,6 +4053,25 @@ impl NoiseClient {
             &owner_public_key,
         );
         let group = state.groups[group_index].clone();
+        if became_adult {
+            if group.authority_nonce_base64.is_empty() {
+                bail!("this legacy group cannot safely revoke its unlabeled invitation")
+            }
+            let new_frequency = generate_frequency();
+            let new_invite = InviteRecord::create(&identity, &new_frequency, group.clone())?;
+            let rotation_sequence = state.take_sequence();
+            let rotation =
+                InviteRotation::create(&identity, &group, Some(new_invite), rotation_sequence)?;
+            self.publish_invite_rotation(&relays, &rotation).await?;
+            state
+                .group_frequencies
+                .insert(group.group_id.clone(), new_frequency);
+            // Persist the newly rotated invitation before publishing the
+            // profile event. If that later write is interrupted, retrying can
+            // finish the signed profile change without reviving the old,
+            // unlabeled invitation.
+            save_state(path, &state)?;
+        }
         let sequence = state.take_sequence();
         let event = create_group_event(
             &state,
@@ -5009,6 +5161,7 @@ impl NoiseClient {
         &self,
         path: impl AsRef<Path>,
         name: impl Into<String>,
+        content_rating: GroupContentRating,
         avatar_data_base64: Option<String>,
         avatar_mime_type: Option<String>,
         relays: Vec<String>,
@@ -5020,9 +5173,14 @@ impl NoiseClient {
             bail!("group names must contain between 1 and 80 characters")
         }
         let mut state = load_state(path)?;
+        if content_rating == GroupContentRating::Adult && !state.adult_access.adult_content_enabled
+        {
+            bail!("enable adult groups in settings before creating an adult group")
+        }
         let identity = state.identity()?;
         let relays = relay_list(relays)?;
         let mut group = GroupMembership::create_owned(name, identity.public_key_base64());
+        group.content_rating = content_rating;
         if let Some(encoded) = avatar_data_base64 {
             let mime_type = avatar_mime_type.context("group icon media type is missing")?;
             if !matches!(
@@ -5066,6 +5224,7 @@ impl NoiseClient {
                 name: group.name,
                 description: group.description,
                 rules: group.rules,
+                content_rating: group.content_rating,
                 avatar: group.avatar,
                 background: group.background,
                 mobile_background: group.mobile_background,
@@ -5099,6 +5258,7 @@ impl NoiseClient {
         let payload = invitation
             .open(&frequency)
             .context("the frequency could not open its invitation")?;
+        state.ensure_group_access(&payload.group)?;
         state.add_group(payload.group);
         let group = state.active_group()?.clone();
         let identity = state.identity()?;
@@ -5136,6 +5296,7 @@ impl NoiseClient {
                 name: group.name,
                 description: group.description,
                 rules: group.rules,
+                content_rating: group.content_rating,
                 avatar: group.avatar,
                 background: group.background,
                 mobile_background: group.mobile_background,
@@ -8366,6 +8527,7 @@ impl NoiseClient {
                 name: resolved_profile.name,
                 description: resolved_profile.description,
                 rules: resolved_profile.rules,
+                content_rating: resolved_profile.content_rating,
                 avatar: resolved_profile.avatar,
                 background: resolved_profile.background,
                 mobile_background: resolved_profile.mobile_background,
@@ -9157,6 +9319,30 @@ impl NoiseClient {
             state.profile = contents.profile.clone();
             state.profile_sequence = contents.profile_sequence;
         }
+        if contents.adult_access.adult_content_enabled && !contents.adult_access.age_attested {
+            bail!("encrypted account vault contains invalid adult access settings")
+        }
+        let adult_access_changed = contents.adult_access.preference_updated_at_millis
+            > state.adult_access.preference_updated_at_millis
+            || (contents.adult_access.preference_updated_at_millis
+                == state.adult_access.preference_updated_at_millis
+                && remote.revision > local_account_revision);
+        if adult_access_changed {
+            state.adult_access = contents.adult_access.clone();
+            if !state.adult_access.adult_content_enabled
+                && state
+                    .active_group_id
+                    .as_ref()
+                    .is_some_and(|active_group_id| {
+                        state.groups.iter().any(|group| {
+                            group.group_id == *active_group_id
+                                && group.content_rating == GroupContentRating::Adult
+                        })
+                    })
+            {
+                state.active_group_id = None;
+            }
+        }
         let contact_signal_changed =
             contents.contact_signal_published_sequence > state.contact_signal_published_sequence;
         state.contact_signal_published_sequence = state
@@ -9402,10 +9588,14 @@ impl NoiseClient {
             || control_logs_before != state.mls_control_logs;
         let event_caches_changed = event_caches_before != state.group_event_caches;
         if state.active_group_id.is_none()
-            && contents
-                .active_group_id
-                .as_ref()
-                .is_some_and(|group_id| present_group_ids.contains(group_id))
+            && contents.active_group_id.as_ref().is_some_and(|group_id| {
+                present_group_ids.contains(group_id)
+                    && state.groups.iter().any(|group| {
+                        group.group_id == *group_id
+                            && (group.content_rating != GroupContentRating::Adult
+                                || state.adult_access.adult_content_enabled)
+                    })
+            })
         {
             state.active_group_id = contents.active_group_id.clone();
         }
@@ -9448,6 +9638,7 @@ impl NoiseClient {
         Ok(direct_reads_changed
             || direct_policy_rejections_changed
             || profile_changed
+            || adult_access_changed
             || contact_signal_changed
             || devices_changed
             || memberships_changed
@@ -10908,6 +11099,7 @@ fn cached_conversation_from_view(
             name: resolved_profile.name,
             description: resolved_profile.description,
             rules: resolved_profile.rules,
+            content_rating: resolved_profile.content_rating,
             avatar: resolved_profile.avatar,
             background: resolved_profile.background,
             mobile_background: resolved_profile.mobile_background,
@@ -12078,6 +12270,38 @@ fn validate_password(password: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_adult_birth_date(birth_date: &str) -> anyhow::Result<()> {
+    let today = OffsetDateTime::from_unix_timestamp((current_millis() / 1_000) as i64)
+        .context("system clock is outside the supported range")?
+        .date();
+    validate_adult_birth_date_on(birth_date, today)
+}
+
+fn validate_adult_birth_date_on(birth_date: &str, today: Date) -> anyhow::Result<()> {
+    let parts = birth_date.split('-').collect::<Vec<_>>();
+    if parts.len() != 3 || parts[0].len() != 4 || parts[1].len() != 2 || parts[2].len() != 2 {
+        bail!("birth date must use YYYY-MM-DD")
+    }
+    let year = parts[0]
+        .parse::<i32>()
+        .context("birth date must use YYYY-MM-DD")?;
+    let month = parts[1]
+        .parse::<u8>()
+        .ok()
+        .and_then(|month| Month::try_from(month).ok())
+        .context("birth date is invalid")?;
+    let day = parts[2].parse::<u8>().context("birth date is invalid")?;
+    let birth_date = Date::from_calendar_date(year, month, day).context("birth date is invalid")?;
+    let mut age = today.year() - birth_date.year();
+    if (today.month() as u8, today.day()) < (birth_date.month() as u8, birth_date.day()) {
+        age -= 1;
+    }
+    if age < 18 {
+        bail!("Noise is for adults 18 and older")
+    }
+    Ok(())
+}
+
 fn normalize_group_rules(rules: String) -> anyhow::Result<String> {
     let rules = rules
         .lines()
@@ -12628,6 +12852,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn adult_birth_date_gate_uses_the_birthday_boundary() {
+        let today = Date::from_calendar_date(2026, Month::July, 26).unwrap();
+        assert!(validate_adult_birth_date_on("2008-07-26", today).is_ok());
+        assert!(validate_adult_birth_date_on("2008-07-27", today).is_err());
+        assert!(validate_adult_birth_date_on("not-a-date", today).is_err());
+    }
+
+    #[test]
+    fn legacy_accounts_migrate_as_adults_with_adult_groups_hidden() {
+        let identity = Identity::generate();
+        let credentials = AccountCredentials {
+            noise_id: "123456789012".to_owned(),
+            locator: "ab".repeat(32),
+            vault_key_base64: STANDARD_NO_PAD.encode([7_u8; 32]),
+        };
+        let state = account_state(&identity, &credentials, test_profile(None), 1, 1);
+        let mut encoded = serde_json::to_value(state).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("adult_access")
+            .unwrap();
+
+        let migrated: ClientState = serde_json::from_value(encoded).unwrap();
+        assert!(migrated.adult_access.age_attested);
+        assert!(!migrated.adult_access.adult_content_enabled);
+    }
+
+    #[test]
     fn message_search_only_matches_literal_message_text() {
         assert_eq!(search_message_score("image", ""), None);
         assert_eq!(search_message_score("photo", ""), None);
@@ -12691,6 +12944,7 @@ mod tests {
         ClientState {
             version: 3,
             profile,
+            adult_access: AdultAccessSettings::default(),
             profile_sequence,
             contact_signal_published_sequence: 0,
             identity_secret_base64: identity.secret_base64(),
@@ -12997,6 +13251,7 @@ mod tests {
             name: "current group".to_owned(),
             description: "current description".to_owned(),
             rules: String::new(),
+            content_rating: GroupContentRating::General,
             avatar: Some(avatar.clone()),
             background: Some(background.clone()),
             mobile_background: None,

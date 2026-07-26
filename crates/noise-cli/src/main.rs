@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use noise_client::NoiseClient;
+use noise_client::{GroupContentRating, NoiseClient};
 
 #[derive(Debug, Parser)]
 #[command(name = "noise", about = "The Noise protocol laboratory client")]
@@ -28,6 +28,8 @@ enum Command {
         #[arg(long)]
         password: String,
         #[arg(long)]
+        birth_date: String,
+        #[arg(long)]
         relay: Vec<String>,
     },
     /// Restore an identity with its Noise ID and password.
@@ -47,6 +49,8 @@ enum Command {
         state: PathBuf,
         #[arg(long)]
         name: String,
+        #[arg(long)]
+        adult: bool,
         #[arg(long)]
         relay: Vec<String>,
     },
@@ -142,10 +146,11 @@ async fn main() -> anyhow::Result<()> {
             state,
             username,
             password,
+            birth_date,
             relay,
         } => {
             let summary = client
-                .initialize(state, username, password, None, None, relay)
+                .initialize(state, username, password, &birth_date, None, None, relay)
                 .await?;
             println!("identity ready: {}", summary.identity.username);
             println!(
@@ -167,8 +172,20 @@ async fn main() -> anyhow::Result<()> {
             let summary = client.sign_in(state, &noise_id, password, relay).await?;
             println!("signed in as {}", summary.identity.username);
         }
-        Command::Make { state, name, relay } => {
-            let result = client.make(&state, name, None, None, relay.clone()).await?;
+        Command::Make {
+            state,
+            name,
+            adult,
+            relay,
+        } => {
+            let content_rating = if adult {
+                GroupContentRating::Adult
+            } else {
+                GroupContentRating::General
+            };
+            let result = client
+                .make(&state, name, content_rating, None, None, relay.clone())
+                .await?;
             client.sync_account(&state, relay).await?;
             println!("created group: {}", result.group.name);
             println!("frequency");
@@ -242,6 +259,7 @@ async fn main() -> anyhow::Result<()> {
                     name,
                     description,
                     rules,
+                    None,
                     None,
                     None,
                     false,

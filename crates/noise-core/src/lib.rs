@@ -144,6 +144,7 @@ impl Identity {
             name: String::new(),
             description: String::new(),
             rules: String::new(),
+            content_rating: GroupContentRating::General,
             avatar: None,
             background: None,
             mobile_background: None,
@@ -1042,6 +1043,14 @@ fn valid_hex_id(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupContentRating {
+    #[default]
+    General,
+    Adult,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupProfile {
     pub name: String,
@@ -1049,6 +1058,8 @@ pub struct GroupProfile {
     pub description: String,
     #[serde(default)]
     pub rules: String,
+    #[serde(default)]
+    pub content_rating: GroupContentRating,
     #[serde(default)]
     pub avatar: Option<ProfileImage>,
     #[serde(default)]
@@ -1073,6 +1084,8 @@ pub struct GroupMembership {
     pub description: String,
     #[serde(default)]
     pub rules: String,
+    #[serde(default)]
+    pub content_rating: GroupContentRating,
     #[serde(default)]
     pub avatar: Option<ProfileImage>,
     #[serde(default)]
@@ -1101,6 +1114,7 @@ impl GroupMembership {
             name: name.into(),
             description: String::new(),
             rules: String::new(),
+            content_rating: GroupContentRating::General,
             avatar: None,
             background: None,
             mobile_background: None,
@@ -1122,6 +1136,7 @@ impl GroupMembership {
             name: name.into(),
             description: String::new(),
             rules: String::new(),
+            content_rating: GroupContentRating::General,
             avatar: None,
             background: None,
             mobile_background: None,
@@ -1139,6 +1154,7 @@ impl GroupMembership {
             name: self.name.clone(),
             description: self.description.clone(),
             rules: self.rules.clone(),
+            content_rating: self.content_rating,
             avatar: self.avatar.clone(),
             background: self.background.clone(),
             mobile_background: self.mobile_background.clone(),
@@ -2614,7 +2630,14 @@ impl GroupState {
                     let is_owner =
                         state.owner_public_key.as_deref() == Some(event.author_public_key.as_str());
                     let is_active = state.members.contains_key(&event.author_public_key);
-                    if !is_owner || !is_active || !valid_group_profile(&profile) {
+                    let removes_adult_label = state.profile.content_rating
+                        == GroupContentRating::Adult
+                        && profile.content_rating != GroupContentRating::Adult;
+                    if !is_owner
+                        || !is_active
+                        || removes_adult_label
+                        || !valid_group_profile(&profile)
+                    {
                         state.rejected_events += 1;
                         continue;
                     }
@@ -3754,6 +3777,7 @@ mod tests {
                     name: "locked".into(),
                     description: String::new(),
                     rules: String::new(),
+                    content_rating: GroupContentRating::General,
                     avatar: None,
                     background: None,
                     mobile_background: None,
@@ -3815,6 +3839,7 @@ mod tests {
             name: "background".into(),
             description: String::new(),
             rules: String::new(),
+            content_rating: GroupContentRating::General,
             avatar: None,
             background: None,
             mobile_background,
@@ -3858,6 +3883,33 @@ mod tests {
                 .mobile_background
                 .is_none()
         );
+    }
+
+    #[test]
+    fn adult_group_label_cannot_be_removed_by_a_later_profile_event() {
+        let founder = Identity::generate();
+        let group = GroupMembership::create_owned("after dark", founder.public_key_base64());
+        let founder_profile = Profile {
+            username: "founder".into(),
+            bio: String::new(),
+            avatar: None,
+            album: None,
+            accepts_direct_messages: true,
+            direct_message_policy: DirectMessagePolicy::Everyone,
+        };
+        let mut adult_profile = group.profile();
+        adult_profile.content_rating = GroupContentRating::Adult;
+        let mut downgrade = adult_profile.clone();
+        downgrade.content_rating = GroupContentRating::General;
+        let events = vec![
+            SignedEvent::member_joined(&founder, &group, &founder_profile, 0).unwrap(),
+            SignedEvent::group_profile_updated(&founder, &group, &adult_profile, 1).unwrap(),
+            SignedEvent::group_profile_updated(&founder, &group, &downgrade, 2).unwrap(),
+        ];
+
+        let state = GroupState::rebuild(&group, &events);
+        assert_eq!(state.profile.content_rating, GroupContentRating::Adult);
+        assert_eq!(state.rejected_events, 1);
     }
 
     #[test]

@@ -11,8 +11,8 @@ use std::{
 
 use futures_util::future::{AbortHandle, Abortable};
 use noise_client::{
-    DirectMessagePolicy, ForwardedFrom, MediaAttachment, NoiseClient, ProfileAlbum,
-    ProfileAlbumItem, ProfileImage,
+    DirectMessagePolicy, ForwardedFrom, GroupContentRating, MediaAttachment, NoiseClient,
+    ProfileAlbum, ProfileAlbumItem, ProfileImage,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -50,6 +50,7 @@ enum Request {
         state_path: String,
         username: String,
         password: String,
+        birth_date: String,
         avatar_data_base64: Option<String>,
         avatar_mime_type: Option<String>,
         relays: Vec<String>,
@@ -58,6 +59,11 @@ enum Request {
         state_path: String,
         noise_id: String,
         password: String,
+        relays: Vec<String>,
+    },
+    SetAdultContentEnabled {
+        state_path: String,
+        enabled: bool,
         relays: Vec<String>,
     },
     RegisterDevice {
@@ -142,6 +148,8 @@ enum Request {
         description: String,
         #[serde(default)]
         rules: String,
+        #[serde(default)]
+        content_rating: Option<GroupContentRating>,
         avatar_data_base64: Option<String>,
         avatar_mime_type: Option<String>,
         remove_avatar: bool,
@@ -223,6 +231,8 @@ enum Request {
     Make {
         state_path: String,
         name: String,
+        #[serde(default)]
+        content_rating: GroupContentRating,
         avatar_data_base64: Option<String>,
         avatar_mime_type: Option<String>,
         relays: Vec<String>,
@@ -853,6 +863,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             state_path,
             username,
             password,
+            birth_date,
             avatar_data_base64,
             avatar_mime_type,
             relays,
@@ -862,10 +873,21 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                     state_path,
                     username,
                     password,
+                    &birth_date,
                     avatar_data_base64,
                     avatar_mime_type,
                     relays,
                 ))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::SetAdultContentEnabled {
+            state_path,
+            enabled,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.set_adult_content_enabled(state_path, enabled, relays))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
@@ -1104,6 +1126,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             name,
             description,
             rules,
+            content_rating,
             avatar_data_base64,
             avatar_mime_type,
             remove_avatar,
@@ -1124,6 +1147,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                     name,
                     description,
                     rules,
+                    content_rating,
                     avatar_data_base64,
                     avatar_mime_type,
                     remove_avatar,
@@ -1272,6 +1296,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         Request::Make {
             state_path,
             name,
+            content_rating,
             avatar_data_base64,
             avatar_mime_type,
             relays,
@@ -1280,6 +1305,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .block_on(client.make(
                     state_path,
                     name,
+                    content_rating,
                     avatar_data_base64,
                     avatar_mime_type,
                     relays,
