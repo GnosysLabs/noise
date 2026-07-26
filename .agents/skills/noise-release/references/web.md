@@ -13,6 +13,15 @@ pnpm --dir apps/client build:web
 
 Inspect `dist/index.html`, the hashed JS asset, `dist/media-sw.js` when present, and the hashed files under `dist/wasm/`. Do not deploy a plain `pnpm build` as the production web client because it omits the canonical WASM packaging flow.
 
+`apps/client/dist/` is also the Tauri frontend output. A concurrent or later
+macOS desktop build can overwrite a correct web bundle with a plain desktop
+bundle that has no `VITE_NOISE_WASM_VERSION`. For a coordinated release,
+finish all local Tauri builds first, then run `build:web` immediately before
+the production sync. Before syncing, require the content-hashed WASM version
+from `dist/wasm/noise_web_bg-<version>.wasm` to appear in the main bundled JS,
+and require the bundled failure text `this noise web build is missing its WASM
+version` to be absent.
+
 ## Deploy
 
 Production is served at `https://app.makenoise.chat` from `/var/www/app.makenoise.chat` on `cyphers-vps`. Use the `cyphers-vps-ssh` skill for live access.

@@ -46,6 +46,11 @@ jobs:
           '{"bundle":{"createUpdaterArtifacts":false}}' |
             Set-Content apps/client/src-tauri/tauri.ci.conf.json
 
+      - name: Remove stale installer output
+        shell: pwsh
+        run: |
+          Remove-Item target/release/bundle/nsis -Recurse -Force -ErrorAction SilentlyContinue
+
       - name: Build Windows installer
         run: >
           pnpm --dir apps/client tauri build
