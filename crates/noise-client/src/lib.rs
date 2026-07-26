@@ -98,10 +98,6 @@ const TOPIC_RECOVERY_CONCURRENCY: usize = 4;
 /// pending admission before taking the turn itself.
 const ADMISSION_HANDOFF_MILLIS: u64 = 4_000;
 const MAX_ADMISSION_HANDOFF_STEPS: usize = 8;
-/// How long an installation waits for the encrypted account vault to deliver a
-/// leaf another installation of the same account advanced, before retiring its
-/// own stale copy and asking the group to admit a fresh one.
-const STALE_LEAF_RECOVERY_MILLIS: u64 = 20_000;
 pub const DEVICE_SESSION_REVOKED_ERROR: &str = "this device was logged out remotely";
 const DEVICE_LAST_SEEN_REFRESH_MILLIS: u64 = 5 * 60_000;
 
@@ -1062,14 +1058,26 @@ fn search_score<'a>(query: &str, fields: impl IntoIterator<Item = &'a str>) -> O
     Some(score)
 }
 
-fn search_attachment_label(attachment: Option<&MediaAttachment>) -> &'static str {
-    match attachment.map(|attachment| attachment.mime_type.as_str()) {
-        Some(mime_type) if mime_type.starts_with("image/") => "photo image",
-        Some(mime_type) if mime_type.starts_with("video/") => "video",
-        Some(mime_type) if mime_type.starts_with("audio/") => "audio",
-        Some(_) => "attachment media",
-        None => "",
+fn search_message_score(query: &str, text: &str) -> Option<u32> {
+    let query = query.trim().to_lowercase();
+    let tokens = query.split_whitespace().collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return None;
     }
+    let text = text.to_lowercase();
+    if !tokens.iter().all(|token| text.contains(token)) {
+        return None;
+    }
+
+    let mut score = 10 + tokens.len() as u32;
+    if text == query {
+        score += 100;
+    } else if text.starts_with(&query) {
+        score += 55;
+    } else if text.contains(&query) {
+        score += 30;
+    }
+    Some(score)
 }
 
 fn normalize_contact_signal(value: &str) -> anyhow::Result<String> {
@@ -2781,7 +2789,10 @@ impl NoiseClient {
         {
             if let Some(portable) = event_cache.portable_conversation.as_ref() {
                 cached = Some(portable.clone());
-            } else {
+            } else if state
+                .mls_group_state(group_id)
+                .is_some_and(|mls| mls.epoch(group_id).is_ok())
+            {
                 let identity_public_key = state.identity()?.public_key_base64();
                 let view = rebuild_group_state(&state, group, &event_cache.events)?;
                 if view.members.contains_key(&identity_public_key) {
@@ -5318,9 +5329,7 @@ impl NoiseClient {
                     .as_deref()
                     .and_then(|topic_id| topic_names.get(topic_id).copied())
                     .unwrap_or("General");
-                let attachment_label = search_attachment_label(message.attachment.as_ref());
-                let Some(score) = search_score(query, [message.text.as_str(), attachment_label])
-                else {
+                let Some(score) = search_message_score(query, message.text.as_str()) else {
                     continue;
                 };
                 message_matches.push((
@@ -5354,8 +5363,7 @@ impl NoiseClient {
             else {
                 continue;
             };
-            let attachment_label = search_attachment_label(message.attachment.as_ref());
-            let Some(score) = search_score(query, [message.text.as_str(), attachment_label]) else {
+            let Some(score) = search_message_score(query, message.text.as_str()) else {
                 continue;
             };
             message_matches.push((
@@ -10329,20 +10337,11 @@ fn sync_mls_state_from_log(
             }
             // Every installation of one account shares that account's
             // recoverable MLS leaf, and a leaf cannot replay a commit it
-            // authored itself. So this copy is simply behind another
-            // installation of this same account: the post-commit leaf reaches
-            // it through the encrypted account vault, and reporting that it is
-            // still restoring keeps that recovery running. Only retire the
-            // stale leaf and ask the group for a new one if the vault never
-            // delivers, which would otherwise leave this group unreadable.
-            if observation_wait_millis(&format!("stale-leaf:{group_id}"), &record.record_id)
-                >= STALE_LEAF_RECOVERY_MILLIS
-            {
-                state
-                    .forget_mls_group(group_id)
-                    .context("could not retire superseded group encryption state")?;
-                state.mls_join_requests.remove(group_id);
-            }
+            // authored itself. Keep the last decryptable leaf intact until the
+            // post-commit snapshot arrives through the encrypted account
+            // vault. Discarding it on a timer destroys readable history and can
+            // strand the installation before the recovery loop gets another
+            // chance to merge the newer snapshot.
             return Ok(None);
         }
         validate_mls_member_accounts(&candidate, &log.genesis.group_id, &record.member_accounts)?;
@@ -12335,6 +12334,15 @@ fn temporary_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_search_only_matches_literal_message_text() {
+        assert_eq!(search_message_score("image", ""), None);
+        assert_eq!(search_message_score("photo", ""), None);
+        assert_eq!(search_message_score("video", ""), None);
+        assert!(search_message_score("ma", "marketing").is_some());
+        assert!(search_message_score("photo", "Here is a photo from today").is_some());
+    }
 
     fn account_state(
         identity: &Identity,
