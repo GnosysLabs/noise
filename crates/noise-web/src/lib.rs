@@ -96,9 +96,9 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .await
                 .map_err(|error| error.to_string())?,
         ),
-        "set_adult_content_enabled" => data(
+        "set_explicit_content_enabled" | "set_adult_content_enabled" => data(
             client
-                .set_adult_content_enabled(
+                .set_explicit_content_enabled(
                     STATE_PATH,
                     required::<bool>(&request, "enabled")?,
                     relays(&request)?,

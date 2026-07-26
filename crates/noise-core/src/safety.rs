@@ -37,7 +37,7 @@ pub enum SafetyReportCategoryV1 {
     ThreatsOrImmediateDanger,
     SexualExploitationOrNonConsensualSexualContent,
     ChildSafety,
-    AdultContentNotProperlyLabeled,
+    ExplicitContentNotProperlyLabeled,
     Other,
 }
 

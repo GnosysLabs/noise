@@ -49,8 +49,8 @@ enum Command {
         state: PathBuf,
         #[arg(long)]
         name: String,
-        #[arg(long)]
-        adult: bool,
+        #[arg(long, alias = "adult")]
+        explicit: bool,
         #[arg(long)]
         relay: Vec<String>,
     },
@@ -175,11 +175,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Make {
             state,
             name,
-            adult,
+            explicit,
             relay,
         } => {
-            let content_rating = if adult {
-                GroupContentRating::Adult
+            let content_rating = if explicit {
+                GroupContentRating::Explicit
             } else {
                 GroupContentRating::General
             };

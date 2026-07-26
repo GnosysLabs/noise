@@ -7,7 +7,7 @@ export type ProfileImage = {
 };
 
 export type DirectMessagePolicy = "everyone" | "shared_groups" | "nobody";
-export type GroupContentRating = "general" | "adult";
+export type GroupContentRating = "general" | "explicit";
 
 export type ProfileAlbum = {
   blob_id: string;
@@ -61,7 +61,7 @@ export type GroupSummary = {
 
 export type AdultAccessSummary = {
   age_attested: boolean;
-  adult_content_enabled: boolean;
+  explicit_content_enabled: boolean;
 };
 
 export type LocalSummary = {

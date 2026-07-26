@@ -1048,7 +1048,8 @@ fn valid_hex_id(value: &str) -> bool {
 pub enum GroupContentRating {
     #[default]
     General,
-    Adult,
+    #[serde(alias = "adult")]
+    Explicit,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2630,12 +2631,12 @@ impl GroupState {
                     let is_owner =
                         state.owner_public_key.as_deref() == Some(event.author_public_key.as_str());
                     let is_active = state.members.contains_key(&event.author_public_key);
-                    let removes_adult_label = state.profile.content_rating
-                        == GroupContentRating::Adult
-                        && profile.content_rating != GroupContentRating::Adult;
+                    let removes_explicit_label = state.profile.content_rating
+                        == GroupContentRating::Explicit
+                        && profile.content_rating != GroupContentRating::Explicit;
                     if !is_owner
                         || !is_active
-                        || removes_adult_label
+                        || removes_explicit_label
                         || !valid_group_profile(&profile)
                     {
                         state.rejected_events += 1;
@@ -3886,7 +3887,11 @@ mod tests {
     }
 
     #[test]
-    fn adult_group_label_cannot_be_removed_by_a_later_profile_event() {
+    fn explicit_group_label_cannot_be_removed_by_a_later_profile_event() {
+        assert_eq!(
+            serde_json::from_str::<GroupContentRating>("\"adult\"").unwrap(),
+            GroupContentRating::Explicit
+        );
         let founder = Identity::generate();
         let group = GroupMembership::create_owned("after dark", founder.public_key_base64());
         let founder_profile = Profile {
@@ -3897,18 +3902,18 @@ mod tests {
             accepts_direct_messages: true,
             direct_message_policy: DirectMessagePolicy::Everyone,
         };
-        let mut adult_profile = group.profile();
-        adult_profile.content_rating = GroupContentRating::Adult;
-        let mut downgrade = adult_profile.clone();
+        let mut explicit_profile = group.profile();
+        explicit_profile.content_rating = GroupContentRating::Explicit;
+        let mut downgrade = explicit_profile.clone();
         downgrade.content_rating = GroupContentRating::General;
         let events = vec![
             SignedEvent::member_joined(&founder, &group, &founder_profile, 0).unwrap(),
-            SignedEvent::group_profile_updated(&founder, &group, &adult_profile, 1).unwrap(),
+            SignedEvent::group_profile_updated(&founder, &group, &explicit_profile, 1).unwrap(),
             SignedEvent::group_profile_updated(&founder, &group, &downgrade, 2).unwrap(),
         ];
 
         let state = GroupState::rebuild(&group, &events);
-        assert_eq!(state.profile.content_rating, GroupContentRating::Adult);
+        assert_eq!(state.profile.content_rating, GroupContentRating::Explicit);
         assert_eq!(state.rejected_events, 1);
     }
 

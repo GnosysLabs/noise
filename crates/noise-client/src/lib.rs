@@ -329,7 +329,8 @@ pub struct GroupSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdultAccessSummary {
     pub age_attested: bool,
-    pub adult_content_enabled: bool,
+    #[serde(default, alias = "adult_content_enabled")]
+    pub explicit_content_enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -347,7 +348,8 @@ pub struct LocalSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct AdultAccessSettings {
     age_attested: bool,
-    adult_content_enabled: bool,
+    #[serde(default, alias = "adult_content_enabled")]
+    explicit_content_enabled: bool,
     preference_updated_at_millis: u64,
 }
 
@@ -355,10 +357,10 @@ impl Default for AdultAccessSettings {
     fn default() -> Self {
         // Noise had a handful of known-adult accounts before this setting
         // existed. Missing legacy data is deliberately migrated once as
-        // attested, while adult groups remain hidden by default.
+        // attested, while sexually explicit groups remain hidden by default.
         Self {
             age_attested: true,
-            adult_content_enabled: false,
+            explicit_content_enabled: false,
             preference_updated_at_millis: 0,
         }
     }
@@ -1276,10 +1278,10 @@ fn merge_group_membership_records(
                 if existing
                     .group
                     .as_ref()
-                    .is_some_and(|group| group.content_rating == GroupContentRating::Adult)
+                    .is_some_and(|group| group.content_rating == GroupContentRating::Explicit)
                     && let Some(candidate_group) = candidate.group.as_mut()
                 {
-                    candidate_group.content_rating = GroupContentRating::Adult;
+                    candidate_group.content_rating = GroupContentRating::Explicit;
                 }
                 let candidate_wins = candidate.sequence > existing.sequence
                     || (candidate.sequence == existing.sequence
@@ -1464,10 +1466,10 @@ impl ClientState {
     }
 
     fn ensure_group_access(&self, group: &GroupMembership) -> anyhow::Result<()> {
-        if group.content_rating == GroupContentRating::Adult
-            && !self.adult_access.adult_content_enabled
+        if group.content_rating == GroupContentRating::Explicit
+            && !self.adult_access.explicit_content_enabled
         {
-            bail!("enable adult groups in settings before opening this group")
+            bail!("enable explicit groups in settings before opening this group")
         }
         Ok(())
     }
@@ -2400,7 +2402,7 @@ impl ClientState {
             },
             adult_access: AdultAccessSummary {
                 age_attested: self.adult_access.age_attested,
-                adult_content_enabled: self.adult_access.adult_content_enabled,
+                explicit_content_enabled: self.adult_access.explicit_content_enabled,
             },
             devices: {
                 let mut devices = self
@@ -2430,8 +2432,8 @@ impl ClientState {
                     .groups
                     .iter()
                     .filter(|group| {
-                        group.content_rating != GroupContentRating::Adult
-                            || self.adult_access.adult_content_enabled
+                        group.content_rating != GroupContentRating::Explicit
+                            || self.adult_access.explicit_content_enabled
                     })
                     .collect::<Vec<_>>();
                 groups.sort_by(|left, right| {
@@ -2635,7 +2637,7 @@ impl NoiseClient {
             },
             adult_access: AdultAccessSettings {
                 age_attested: true,
-                adult_content_enabled: false,
+                explicit_content_enabled: false,
                 preference_updated_at_millis: current_millis(),
             },
             profile_sequence: current_nanos(),
@@ -2757,7 +2759,7 @@ impl NoiseClient {
         state.summary()
     }
 
-    pub async fn set_adult_content_enabled(
+    pub async fn set_explicit_content_enabled(
         &self,
         path: impl AsRef<Path>,
         enabled: bool,
@@ -2766,12 +2768,12 @@ impl NoiseClient {
         let path = path.as_ref();
         let mut state = load_state(path)?;
         if !state.adult_access.age_attested {
-            bail!("adult access requires an 18+ age attestation")
+            bail!("explicit content requires an 18+ age attestation")
         }
-        if state.adult_access.adult_content_enabled == enabled {
+        if state.adult_access.explicit_content_enabled == enabled {
             return state.summary();
         }
-        state.adult_access.adult_content_enabled = enabled;
+        state.adult_access.explicit_content_enabled = enabled;
         state.adult_access.preference_updated_at_millis = current_millis().max(1);
         if !enabled
             && state
@@ -2780,7 +2782,7 @@ impl NoiseClient {
                 .is_some_and(|active_group_id| {
                     state.groups.iter().any(|group| {
                         group.group_id == *active_group_id
-                            && group.content_rating == GroupContentRating::Adult
+                            && group.content_rating == GroupContentRating::Explicit
                     })
                 })
         {
@@ -3927,16 +3929,17 @@ impl NoiseClient {
         let members_can_send_media =
             members_can_send_media.unwrap_or(current_profile.members_can_send_media);
         let content_rating = content_rating.unwrap_or(current_profile.content_rating);
-        let became_adult = current_profile.content_rating == GroupContentRating::General
-            && content_rating == GroupContentRating::Adult;
-        if current_profile.content_rating == GroupContentRating::Adult
-            && content_rating != GroupContentRating::Adult
+        let became_explicit = current_profile.content_rating == GroupContentRating::General
+            && content_rating == GroupContentRating::Explicit;
+        if current_profile.content_rating == GroupContentRating::Explicit
+            && content_rating != GroupContentRating::Explicit
         {
-            bail!("an adult group cannot be changed back to general")
+            bail!("an explicit group cannot be changed back to general")
         }
-        if content_rating == GroupContentRating::Adult && !state.adult_access.adult_content_enabled
+        if content_rating == GroupContentRating::Explicit
+            && !state.adult_access.explicit_content_enabled
         {
-            bail!("enable adult groups in settings before marking this group adult")
+            bail!("enable explicit groups in settings before marking this group explicit")
         }
         let accent_color = normalize_group_accent_color(
             accent_color.unwrap_or_else(|| current_profile.accent_color.clone()),
@@ -4053,7 +4056,7 @@ impl NoiseClient {
             &owner_public_key,
         );
         let group = state.groups[group_index].clone();
-        if became_adult {
+        if became_explicit {
             if group.authority_nonce_base64.is_empty() {
                 bail!("this legacy group cannot safely revoke its unlabeled invitation")
             }
@@ -5173,9 +5176,10 @@ impl NoiseClient {
             bail!("group names must contain between 1 and 80 characters")
         }
         let mut state = load_state(path)?;
-        if content_rating == GroupContentRating::Adult && !state.adult_access.adult_content_enabled
+        if content_rating == GroupContentRating::Explicit
+            && !state.adult_access.explicit_content_enabled
         {
-            bail!("enable adult groups in settings before creating an adult group")
+            bail!("enable explicit groups in settings before creating an explicit group")
         }
         let identity = state.identity()?;
         let relays = relay_list(relays)?;
@@ -9319,7 +9323,7 @@ impl NoiseClient {
             state.profile = contents.profile.clone();
             state.profile_sequence = contents.profile_sequence;
         }
-        if contents.adult_access.adult_content_enabled && !contents.adult_access.age_attested {
+        if contents.adult_access.explicit_content_enabled && !contents.adult_access.age_attested {
             bail!("encrypted account vault contains invalid adult access settings")
         }
         let adult_access_changed = contents.adult_access.preference_updated_at_millis
@@ -9329,14 +9333,14 @@ impl NoiseClient {
                 && remote.revision > local_account_revision);
         if adult_access_changed {
             state.adult_access = contents.adult_access.clone();
-            if !state.adult_access.adult_content_enabled
+            if !state.adult_access.explicit_content_enabled
                 && state
                     .active_group_id
                     .as_ref()
                     .is_some_and(|active_group_id| {
                         state.groups.iter().any(|group| {
                             group.group_id == *active_group_id
-                                && group.content_rating == GroupContentRating::Adult
+                                && group.content_rating == GroupContentRating::Explicit
                         })
                     })
             {
@@ -9592,8 +9596,8 @@ impl NoiseClient {
                 present_group_ids.contains(group_id)
                     && state.groups.iter().any(|group| {
                         group.group_id == *group_id
-                            && (group.content_rating != GroupContentRating::Adult
-                                || state.adult_access.adult_content_enabled)
+                            && (group.content_rating != GroupContentRating::Explicit
+                                || state.adult_access.explicit_content_enabled)
                     })
             })
         {
@@ -12860,7 +12864,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_accounts_migrate_as_adults_with_adult_groups_hidden() {
+    fn legacy_accounts_migrate_as_adults_with_explicit_groups_hidden() {
         let identity = Identity::generate();
         let credentials = AccountCredentials {
             noise_id: "123456789012".to_owned(),
@@ -12868,7 +12872,7 @@ mod tests {
             vault_key_base64: STANDARD_NO_PAD.encode([7_u8; 32]),
         };
         let state = account_state(&identity, &credentials, test_profile(None), 1, 1);
-        let mut encoded = serde_json::to_value(state).unwrap();
+        let mut encoded = serde_json::to_value(&state).unwrap();
         encoded
             .as_object_mut()
             .unwrap()
@@ -12877,7 +12881,18 @@ mod tests {
 
         let migrated: ClientState = serde_json::from_value(encoded).unwrap();
         assert!(migrated.adult_access.age_attested);
-        assert!(!migrated.adult_access.adult_content_enabled);
+        assert!(!migrated.adult_access.explicit_content_enabled);
+
+        let mut renamed_preference = serde_json::to_value(state).unwrap();
+        let access = renamed_preference
+            .get_mut("adult_access")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        access.remove("explicit_content_enabled").unwrap();
+        access.insert("adult_content_enabled".to_owned(), serde_json::json!(true));
+        let migrated_preference: ClientState = serde_json::from_value(renamed_preference).unwrap();
+        assert!(migrated_preference.adult_access.explicit_content_enabled);
     }
 
     #[test]

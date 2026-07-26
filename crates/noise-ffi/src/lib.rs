@@ -61,7 +61,8 @@ enum Request {
         password: String,
         relays: Vec<String>,
     },
-    SetAdultContentEnabled {
+    #[serde(alias = "set_adult_content_enabled")]
+    SetExplicitContentEnabled {
         state_path: String,
         enabled: bool,
         relays: Vec<String>,
@@ -881,13 +882,13 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
-        Request::SetAdultContentEnabled {
+        Request::SetExplicitContentEnabled {
             state_path,
             enabled,
             relays,
         } => serde_json::to_value(
             runtime()?
-                .block_on(client.set_adult_content_enabled(state_path, enabled, relays))
+                .block_on(client.set_explicit_content_enabled(state_path, enabled, relays))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
