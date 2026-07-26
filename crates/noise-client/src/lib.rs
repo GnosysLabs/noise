@@ -417,6 +417,7 @@ pub struct MemberSummary {
     pub avatar: Option<ProfileImage>,
     pub album: Option<ProfileAlbum>,
     pub accepts_direct_messages: bool,
+    #[serde(default)]
     pub direct_message_policy: DirectMessagePolicy,
     pub is_moderator: bool,
 }
@@ -431,6 +432,7 @@ pub struct MessageSummary {
     pub avatar: Option<ProfileImage>,
     pub album: Option<ProfileAlbum>,
     pub accepts_direct_messages: bool,
+    #[serde(default)]
     pub direct_message_policy: DirectMessagePolicy,
     pub text: String,
     pub attachment: Option<MediaAttachment>,
@@ -1952,6 +1954,7 @@ impl ClientState {
                 bail!("encrypted account vault contains invalid cached conversation")
             }
             if let Some(conversation) = portable_conversation.as_mut() {
+                normalize_legacy_conversation_direct_message_policies(conversation);
                 strip_conversation_media_previews(conversation);
             }
             let needs_recent_hydration =
@@ -9479,6 +9482,7 @@ impl NoiseClient {
                 bail!("encrypted account vault contains invalid cached conversation")
             }
             if let Some(conversation) = remote_portable_conversation.as_mut() {
+                normalize_legacy_conversation_direct_message_policies(conversation);
                 strip_conversation_media_previews(conversation);
             }
             let preserve_remote_portable = remote_cache.needs_recent_hydration
@@ -10895,6 +10899,34 @@ fn strip_conversation_media_previews(conversation: &mut Conversation) {
     {
         attachment.preview_data_base64 = None;
         attachment.preview_mime_type = None;
+    }
+}
+
+fn normalize_legacy_conversation_direct_message_policies(conversation: &mut Conversation) {
+    for member in &mut conversation.members {
+        if !member.accepts_direct_messages {
+            member.direct_message_policy = DirectMessagePolicy::Nobody;
+        }
+    }
+    for message in conversation.messages.iter_mut().chain(
+        conversation
+            .reports
+            .iter_mut()
+            .map(|report| &mut report.message),
+    ) {
+        if !message.accepts_direct_messages {
+            message.direct_message_policy = DirectMessagePolicy::Nobody;
+        }
+    }
+}
+
+fn normalize_legacy_state_direct_message_policies(state: &mut ClientState) {
+    for conversation in state
+        .group_event_caches
+        .values_mut()
+        .filter_map(|cache| cache.portable_conversation.as_mut())
+    {
+        normalize_legacy_conversation_direct_message_policies(conversation);
     }
 }
 
@@ -12712,6 +12744,7 @@ fn load_state(path: &Path) -> anyhow::Result<ClientState> {
     let bytes = fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
     let mut state: ClientState =
         serde_json::from_slice(&bytes).context("local state is invalid")?;
+    normalize_legacy_state_direct_message_policies(&mut state);
     state.ensure_group_membership_records();
     state.hydrate_known_profile_versions();
     let cache = native_state_cache();
@@ -12737,6 +12770,7 @@ fn load_state(path: &Path) -> anyhow::Result<ClientState> {
     let bytes = fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
     let mut state: ClientState =
         serde_json::from_slice(&bytes).context("local state is invalid")?;
+    normalize_legacy_state_direct_message_policies(&mut state);
     state.ensure_group_membership_records();
     state.hydrate_known_profile_versions();
     Ok(state)
@@ -12750,6 +12784,7 @@ fn load_state(path: &Path) -> anyhow::Result<ClientState> {
         .with_context(|| format!("could not read {}", path.display()))?;
     let mut state: ClientState =
         serde_json::from_slice(&bytes).context("local state is invalid")?;
+    normalize_legacy_state_direct_message_policies(&mut state);
     state.ensure_group_membership_records();
     state.hydrate_known_profile_versions();
     Ok(state)
@@ -13911,6 +13946,77 @@ mod tests {
         assert_eq!(
             cache.get("a", 2).as_deref().map(Vec::as_slice),
             Some(&[2, 2][..])
+        );
+    }
+
+    #[test]
+    fn legacy_cached_conversation_defaults_direct_message_policy() {
+        let member: MemberSummary = serde_json::from_value(serde_json::json!({
+            "public_key": "legacy-member",
+            "username": "legacy",
+            "bio": "",
+            "avatar": null,
+            "album": null,
+            "accepts_direct_messages": false,
+            "is_moderator": false
+        }))
+        .unwrap();
+        let message: MessageSummary = serde_json::from_value(serde_json::json!({
+            "event_id": "event",
+            "message_id": "message",
+            "author_public_key": "legacy-member",
+            "username": "legacy",
+            "bio": "",
+            "avatar": null,
+            "album": null,
+            "accepts_direct_messages": false,
+            "text": "hello",
+            "attachment": null,
+            "reply_to_message_id": null,
+            "created_at_millis": 1,
+            "reactions": []
+        }))
+        .unwrap();
+        let mut conversation = Conversation {
+            group: GroupSummary {
+                group_id: "legacy-group".to_owned(),
+                name: "legacy".to_owned(),
+                description: String::new(),
+                rules: String::new(),
+                content_rating: GroupContentRating::General,
+                avatar: None,
+                background: None,
+                mobile_background: None,
+                accent_color: "#7758ed".to_owned(),
+                members_can_send_messages: true,
+                members_can_send_media: true,
+                frequency: None,
+                owner_public_key: String::new(),
+                remote_deletion_supported: false,
+                is_active: false,
+                unread_count: 0,
+                read_state_initialized: false,
+            },
+            topics: Vec::new(),
+            general_unread_count: 0,
+            members: vec![member],
+            banned_members: Vec::new(),
+            messages: vec![message],
+            reports: Vec::new(),
+            reported_message_event_ids: Vec::new(),
+            rejected_events: 0,
+            has_older_messages: false,
+        };
+
+        normalize_legacy_conversation_direct_message_policies(&mut conversation);
+
+        assert_eq!(
+            conversation.members[0].direct_message_policy,
+            DirectMessagePolicy::Nobody
+        );
+        assert_eq!(
+            conversation.messages[0].direct_message_policy,
+            DirectMessagePolicy::Nobody
         );
     }
 }
