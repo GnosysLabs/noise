@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 430 140" role="img" aria-labelledby="title">
+  <title id="title">noise</title>
+  <defs>
+    <linearGradient id="wave" x1="20" y1="70" x2="170" y2="70" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A890FF"/>
+      <stop offset="1" stop-color="#6E4FE8"/>
+    </linearGradient>
+    <style>
+      .word { fill: #19171d; }
+      @media (prefers-color-scheme: dark) {
+        .word { fill: #f3eff6; }
+      }
+    </style>
+  </defs>
+  <path
+    d="M20 70h18l13-25 23 51 22-67 23 82 21-66 13 25h17"
+    fill="none"
+    stroke="url(#wave)"
+    stroke-width="12"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <text
+    class="word"
+    x="198"
+    y="96"
+    font-family="Arial, Helvetica, sans-serif"
+    font-size="76"
+    font-weight="700"
+    letter-spacing="-4"
+  >noise</text>
+</svg>

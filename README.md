@@ -1,8 +1,6 @@
 <p align="center">
-  <img src="apps/marketing/public/noise-wave.png" width="72" alt="Noise waveform">
+  <img src="docs/assets/noise-wordmark.svg" width="280" alt="noise">
 </p>
-
-<h1 align="center">noise</h1>
 
 <p align="center">
   <strong>A private, group-first messenger built around the people you actually choose.</strong>
