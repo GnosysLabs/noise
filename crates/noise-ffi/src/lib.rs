@@ -212,12 +212,18 @@ enum Request {
     SyncGroupActivity {
         state_path: String,
         group_id: String,
+        #[serde(default)]
+        mark_read: bool,
+        #[serde(default)]
+        read_topic_id: Option<String>,
         relays: Vec<String>,
     },
     SyncTopicActivity {
         state_path: String,
         group_id: String,
         topic_id: String,
+        #[serde(default)]
+        mark_read: bool,
         relays: Vec<String>,
     },
     LoadOlderGroupHistory {
@@ -1183,6 +1189,8 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         Request::SyncGroupActivity {
             state_path,
             group_id,
+            mark_read,
+            read_topic_id,
             relays,
         } => {
             let update = runtime()?
@@ -1202,9 +1210,16 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 return Err("session ended".to_owned());
             }
             serde_json::to_value(
-                client
-                    .apply_group_activity(state_path, update)
-                    .map_err(|error| error.to_string())?,
+                if mark_read {
+                    client.apply_group_activity_and_mark_read(
+                        state_path,
+                        update,
+                        read_topic_id.as_deref(),
+                    )
+                } else {
+                    client.apply_group_activity(state_path, update)
+                }
+                .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())
         }
@@ -1212,6 +1227,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             state_path,
             group_id,
             topic_id,
+            mark_read,
             relays,
         } => {
             let update = runtime()?
@@ -1228,9 +1244,16 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .lock()
                 .map_err(|_| "local state lock is unavailable".to_owned())?;
             serde_json::to_value(
-                client
-                    .apply_group_activity(state_path, update)
-                    .map_err(|error| error.to_string())?,
+                if mark_read {
+                    client.apply_group_activity_and_mark_read(
+                        state_path,
+                        update,
+                        Some(&topic_id),
+                    )
+                } else {
+                    client.apply_group_activity(state_path, update)
+                }
+                .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())
         }

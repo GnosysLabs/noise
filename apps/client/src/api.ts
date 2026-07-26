@@ -43,6 +43,7 @@ type BrowserAdapter = {
 };
 let browserAdapterPromise: Promise<BrowserAdapter> | null = null;
 let browserMutationQueue = Promise.resolve();
+let localAccountTransitioning = false;
 
 const browserConcurrentActions = new Set([
   "discover_relay_masks",
@@ -107,6 +108,10 @@ async function invokeBrowser<T>(request: NoiseRequest): Promise<T | null> {
   };
 
   if (browserConcurrentActions.has(request.action)) return operation();
+  return enqueueBrowserMutation(operation);
+}
+
+function enqueueBrowserMutation<T>(operation: () => Promise<T>): Promise<T> {
   const queued = browserMutationQueue.then(operation, operation);
   browserMutationQueue = queued.then(() => undefined, () => undefined);
   return queued;
@@ -135,6 +140,9 @@ function startRelayDiscovery() {
 }
 
 export async function noise<T>(request: NoiseRequest): Promise<T | null> {
+  if (localAccountTransitioning) {
+    throw new Error("local account transition in progress");
+  }
   if (!isTauri) {
     return invokeBrowser<T>(request);
   }
@@ -170,33 +178,50 @@ export async function listLocalAccounts(): Promise<LocalAccountList> {
 }
 
 export async function startAddingLocalAccount() {
-  if (!isTauri) {
-    const adapter = await browserAdapter();
-    await startAddingBrowserAccount(adapter);
-    return;
-  }
-  const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("start_adding_local_account");
+  await runLocalAccountTransition(async () => {
+    if (!isTauri) {
+      const adapter = await browserAdapter();
+      await enqueueBrowserMutation(() => startAddingBrowserAccount(adapter));
+      return;
+    }
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("start_adding_local_account");
+  });
 }
 
 export async function cancelAddingLocalAccount() {
-  if (!isTauri) {
-    const adapter = await browserAdapter();
-    await cancelAddingBrowserAccount(adapter);
-    return;
-  }
-  const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("cancel_adding_local_account");
+  await runLocalAccountTransition(async () => {
+    if (!isTauri) {
+      const adapter = await browserAdapter();
+      await enqueueBrowserMutation(() => cancelAddingBrowserAccount(adapter));
+      return;
+    }
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("cancel_adding_local_account");
+  });
 }
 
 export async function switchLocalAccount(accountId: string) {
-  if (!isTauri) {
-    const adapter = await browserAdapter();
-    await switchBrowserAccount(adapter, accountId);
-    return;
+  await runLocalAccountTransition(async () => {
+    if (!isTauri) {
+      const adapter = await browserAdapter();
+      await enqueueBrowserMutation(() => switchBrowserAccount(adapter, accountId));
+      return;
+    }
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("switch_local_account", { accountId });
+  });
+}
+
+async function runLocalAccountTransition(operation: () => Promise<void>) {
+  if (localAccountTransitioning) return;
+  localAccountTransitioning = true;
+  try {
+    await operation();
+  } catch (cause) {
+    localAccountTransitioning = false;
+    throw cause;
   }
-  const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("switch_local_account", { accountId });
 }
 
 export async function registerMediaStream(request: NoiseRequest) {

@@ -429,25 +429,49 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?,
         ),
         "sync_group_activity" => data(
-            client
-                .sync_group_activity(
-                    STATE_PATH,
-                    &required::<String>(&request, "group_id")?,
-                    relays(&request)?,
-                )
-                .await
-                .map_err(|error| error.to_string())?,
+            if optional::<bool>(&request, "mark_read")?.unwrap_or_default() {
+                client
+                    .sync_group_activity_and_mark_read(
+                        STATE_PATH,
+                        &required::<String>(&request, "group_id")?,
+                        optional::<String>(&request, "read_topic_id")?.as_deref(),
+                        relays(&request)?,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+            } else {
+                client
+                    .sync_group_activity(
+                        STATE_PATH,
+                        &required::<String>(&request, "group_id")?,
+                        relays(&request)?,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+            },
         ),
         "sync_topic_activity" => data(
-            client
-                .sync_topic_activity(
-                    STATE_PATH,
-                    &required::<String>(&request, "group_id")?,
-                    &required::<String>(&request, "topic_id")?,
-                    relays(&request)?,
-                )
-                .await
-                .map_err(|error| error.to_string())?,
+            if optional::<bool>(&request, "mark_read")?.unwrap_or_default() {
+                client
+                    .sync_topic_activity_and_mark_read(
+                        STATE_PATH,
+                        &required::<String>(&request, "group_id")?,
+                        &required::<String>(&request, "topic_id")?,
+                        relays(&request)?,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+            } else {
+                client
+                    .sync_topic_activity(
+                        STATE_PATH,
+                        &required::<String>(&request, "group_id")?,
+                        &required::<String>(&request, "topic_id")?,
+                        relays(&request)?,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+            },
         ),
         "mark_group_read" => data(
             client

@@ -2112,7 +2112,9 @@ export default function App() {
       let latestActivityError: unknown = null;
       try {
         await cancelBackgroundLoading();
-        latestActivity = await syncGroupActivity(activeGroup.group_id);
+        latestActivity = await syncGroupActivity(activeGroup.group_id, {
+          topicId: activeTopicIdRef.current,
+        });
       } catch (cause) {
         if (!isSupersededLoading(cause)) latestActivityError = cause;
       }
@@ -2156,7 +2158,9 @@ export default function App() {
       // affected by v0.1.12 (artwork, membership, and topic definitions).
       if (latestActivity) {
         try {
-          const recovered = await syncGroupActivity(activeGroup.group_id);
+          const recovered = await syncGroupActivity(activeGroup.group_id, {
+            topicId: activeTopicIdRef.current,
+          });
           if (generation !== refreshGeneration.current) return;
           if (recovered) {
             setSummary(recovered.summary);
@@ -2174,7 +2178,9 @@ export default function App() {
       // group is active. Normal fresh logins never take this second path.
       if (!latestActivity) {
         try {
-          latestActivity = await syncGroupActivity(activeGroup.group_id);
+          latestActivity = await syncGroupActivity(activeGroup.group_id, {
+            topicId: activeTopicIdRef.current,
+          });
         } catch (cause) {
           if (!isSupersededLoading(cause)) latestActivityError = cause;
         }
@@ -2369,7 +2375,9 @@ export default function App() {
             return;
           }
           if (encryption?.phase === "active") {
-            const activity = await syncGroupActivity(activeGroupId);
+            const activity = await syncGroupActivity(activeGroupId, {
+              topicId: activeTopicIdRef.current,
+            });
             if (stopped || desiredGroupIdRef.current !== activeGroupId) return;
             if (activity) {
               setSummary(activity.summary);
@@ -2464,11 +2472,15 @@ export default function App() {
     syncInitialGroup?: (groupId: string) => ReturnType<typeof syncGroupActivity>,
   ) => {
     const hintsComplete = change.change_hints_complete === true;
+    const isVisibleGroup = desiredGroupIdRef.current === groupId;
+    const readTarget = isVisibleGroup
+      ? { topicId: activeTopicIdRef.current }
+      : undefined;
     let topicSource = groupConversationCache.current.get(groupId);
     if (initial || !hintsComplete || change.control_changed) {
       const activity = initial && syncInitialGroup
         ? await syncInitialGroup(groupId)
-        : await syncGroupActivity(groupId);
+        : await syncGroupActivity(groupId, readTarget);
       if (!activity || isStopped()) return false;
       setSummary(activity.summary);
       if (activity.conversation) {
@@ -2504,7 +2516,11 @@ export default function App() {
     });
     for (const topicId of immediateTopicIds) {
       try {
-        const topicActivity = await syncTopicActivity(groupId, topicId);
+        const topicActivity = await syncTopicActivity(
+          groupId,
+          topicId,
+          isVisibleGroup && activeTopicIdRef.current === topicId,
+        );
         if (isStopped()) return false;
         if (!topicActivity) continue;
         setSummary(topicActivity.summary);
@@ -2877,8 +2893,18 @@ export default function App() {
         });
         if (destination.groupId === desiredGroupIdRef.current) {
           const activity = destination.topicId
-            ? await syncTopicActivity(destination.groupId, destination.topicId)
-            : await syncGroupActivity(destination.groupId);
+            ? await syncTopicActivity(
+                destination.groupId,
+                destination.topicId,
+                desiredGroupIdRef.current === destination.groupId
+                  && activeTopicIdRef.current === destination.topicId,
+              )
+            : await syncGroupActivity(
+                destination.groupId,
+                desiredGroupIdRef.current === destination.groupId
+                  ? { topicId: activeTopicIdRef.current }
+                  : undefined,
+              );
           if (activity) {
             setSummary(activity.summary);
             if (activity.conversation) {
@@ -3166,8 +3192,8 @@ export default function App() {
       }
       await cancelBackgroundLoading();
       const activity = topicId
-        ? await syncTopicActivity(activeGroupId, topicId)
-        : await syncGroupActivity(activeGroupId);
+        ? await syncTopicActivity(activeGroupId, topicId, true)
+        : await syncGroupActivity(activeGroupId, { topicId: null });
       if (generation !== topicSelectionGeneration.current
         || desiredGroupIdRef.current !== activeGroupId) return;
       if (activity) {
@@ -3223,7 +3249,9 @@ export default function App() {
         return;
       }
 
-      const activity = await syncGroupActivity(group.group_id);
+      const activity = await syncGroupActivity(group.group_id, {
+        topicId: activeTopicIdRef.current,
+      });
       if (generation !== refreshGeneration.current) return;
       if (activity) {
         setSummary(activity.summary);
@@ -3236,7 +3264,9 @@ export default function App() {
         throw new Error("the selected group has no locally available conversation");
       }
       if (activity) {
-        const recovered = await syncGroupActivity(group.group_id);
+        const recovered = await syncGroupActivity(group.group_id, {
+          topicId: activeTopicIdRef.current,
+        });
         if (generation !== refreshGeneration.current) return;
         if (recovered) {
           setSummary(recovered.summary);
@@ -3409,6 +3439,7 @@ export default function App() {
   async function beginAddingAccount() {
     if (busy) return;
     setBusy(true);
+    setLoading(true);
     setError(null);
     try {
       await Promise.all([
@@ -3421,12 +3452,14 @@ export default function App() {
     } catch (cause) {
       setError(message(cause));
       setBusy(false);
+      setLoading(false);
     }
   }
 
   async function cancelAddingAccount() {
     if (busy) return;
     setBusy(true);
+    setLoading(true);
     setError(null);
     try {
       await cancelAddingLocalAccount();
@@ -3434,12 +3467,14 @@ export default function App() {
     } catch (cause) {
       setError(message(cause));
       setBusy(false);
+      setLoading(false);
     }
   }
 
   async function selectLocalAccount(account: LocalAccount) {
     if (busy || account.id === localAccounts.active_account_id) return;
     setBusy(true);
+    setLoading(true);
     setError(null);
     try {
       await Promise.all([
@@ -3452,6 +3487,7 @@ export default function App() {
     } catch (cause) {
       setError(message(cause));
       setBusy(false);
+      setLoading(false);
     }
   }
 
@@ -3481,12 +3517,23 @@ export default function App() {
         onSignIn={(noiseId, password) =>
           perform(async () => {
             const local = await noise<LocalSummary>({ action: "sign_in", noise_id: noiseId, password, relays });
+            if (!local) throw new Error("sign in completed without restoring the local identity");
             desiredGroupIdRef.current =
-              local?.groups.find((group) => group.is_active)?.group_id ?? null;
+              local.groups.find((group) => group.is_active)?.group_id ?? null;
             desiredDirectPublicKeyRef.current =
-              local?.directs.find((direct) => direct.is_active)?.public_key ?? null;
-            await refresh();
-          })
+              local.directs.find((direct) => direct.is_active)?.public_key ?? null;
+            setConversation(null);
+            setDirectConversation(null);
+            setGroupEncryption(null);
+            // The identity is durable once sign_in returns. Leave onboarding
+            // immediately; group hydration is an authenticated background
+            // transition and must never leave a live sign-in form behind.
+            setSummary(local);
+            setLoading(false);
+            void refresh().catch((cause) => {
+              if (!isSupersededLoading(cause)) setError(message(cause));
+            });
+          }, false)
         }
       />
       {error && <ErrorToast error={error} onClose={() => setError(null)} />}
@@ -3544,6 +3591,37 @@ export default function App() {
     : null;
   const selectedPresenceStatuses = new Map(presenceStatuses);
   selectedPresenceStatuses.set(summary.identity.public_key, selfPresenceStatus);
+  const openPerson = (person: PersonSummary) => {
+    const known = summary.directs.find(
+      (candidate) => candidate.public_key === person.public_key,
+    )
+      ?? summary.known_people.find(
+        (candidate) => candidate.public_key === person.public_key,
+      )
+      ?? selectedConversationState?.members.find(
+        (candidate) => candidate.public_key === person.public_key,
+      )
+      ?? (selectedDirectConversationState?.contact.public_key === person.public_key
+        ? selectedDirectConversationState.contact
+        : null)
+      ?? (summary.identity.public_key === person.public_key
+        ? summary.identity
+        : null);
+    setDialog({
+      type: "person",
+      person: known
+        ? {
+            public_key: known.public_key,
+            username: known.username,
+            bio: known.bio,
+            avatar: known.avatar,
+            album: known.album,
+            accepts_direct_messages: known.accepts_direct_messages,
+            presence_status: selectedPresenceStatuses.get(known.public_key) ?? "offline",
+          }
+        : person,
+    });
+  };
   const visibleSummary = activeGroupId ? {
     ...summary,
     groups: summary.groups.map((group) => {
@@ -3619,7 +3697,7 @@ export default function App() {
               onReports={() => setDialog({ type: "reports" })}
               onMedia={() => setDialog({ type: "media" })}
               onRules={() => setDialog({ type: "rules", group: selectedConversation.group })}
-              onPerson={(person) => setDialog({ type: "person", person })}
+              onPerson={openPerson}
               onMessage={(person) => void startDirect(person)}
               onBlock={(person) => setDialog({ type: "block_person", person })}
               onDeleteMessage={(item) => setDialog({
@@ -3801,7 +3879,7 @@ export default function App() {
               self={summary.identity}
               selfPresence={selfPresenceStatus}
               contactPresence={presenceStatuses.get(selectedDirectConversation.contact.public_key) ?? "offline"}
-              onPerson={(person) => setDialog({ type: "person", person })}
+              onPerson={openPerson}
               onAlbum={(person) => setDialog({ type: "album", person, editable: false })}
               onBlock={(person) => setDialog({ type: "block_person", person })}
               onDelete={() => setDialog({ type: "delete_direct", direct: selectedDirectConversation.contact })}
@@ -8477,11 +8555,20 @@ function isRelayConnectivityError(error: string) {
   return error.toLowerCase().includes("no relay was reachable");
 }
 
-async function syncGroupActivity(groupId: string): Promise<GroupActivityResult | null> {
+type GroupActivityReadTarget = {
+  topicId: string | null;
+};
+
+async function syncGroupActivity(
+  groupId: string,
+  readTarget?: GroupActivityReadTarget,
+): Promise<GroupActivityResult | null> {
   try {
     const result = await noise<GroupActivityResult | LocalSummary>({
       action: "sync_group_activity",
       group_id: groupId,
+      mark_read: Boolean(readTarget),
+      read_topic_id: readTarget?.topicId ?? undefined,
       relays,
     });
     if (!result) return null;
@@ -8501,11 +8588,13 @@ async function syncGroupActivity(groupId: string): Promise<GroupActivityResult |
 async function syncTopicActivity(
   groupId: string,
   topicId: string,
+  markRead = false,
 ): Promise<GroupActivityResult | null> {
   return noise<GroupActivityResult>({
     action: "sync_topic_activity",
     group_id: groupId,
     topic_id: topicId,
+    mark_read: markRead,
     relays,
   });
 }

@@ -2297,14 +2297,23 @@ impl NoiseClient {
         relays: Vec<String>,
     ) -> anyhow::Result<LocalSummary> {
         let path = path.as_ref();
-        if state_exists(path) {
-            bail!("an identity is already active on this device")
-        }
         let password = password.into();
         if password.is_empty() || password.chars().count() > 256 {
             bail!("noise ID or password is incorrect")
         }
         let credentials = derive_account_credentials(noise_id, &password)?;
+        if state_exists(path) {
+            let state = load_state(path)?;
+            let is_same_account = state.account.as_ref().is_some_and(|account| {
+                account.noise_id == credentials.noise_id
+                    && account.locator == credentials.locator
+                    && account.vault_key_base64 == credentials.vault_key_base64
+            });
+            if is_same_account {
+                return state.summary();
+            }
+            bail!("an identity is already active on this device")
+        }
         let vault = self
             .fetch_account_vault(&relay_list(relays)?, &credentials.locator)
             .await
@@ -6412,6 +6421,18 @@ impl NoiseClient {
         self.apply_group_activity(path, update)
     }
 
+    pub async fn sync_group_activity_and_mark_read(
+        &self,
+        path: impl AsRef<Path>,
+        group_id: &str,
+        topic_id: Option<&str>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<GroupActivityResult> {
+        let path = path.as_ref();
+        let update = self.fetch_group_activity(path, group_id, relays).await?;
+        self.apply_group_activity_and_mark_read(path, update, topic_id)
+    }
+
     pub async fn sync_topic_activity(
         &self,
         path: impl AsRef<Path>,
@@ -6423,6 +6444,20 @@ impl NoiseClient {
             .fetch_topic_activity(path.as_ref(), group_id, topic_id, relays)
             .await?;
         self.apply_group_activity(path, update)
+    }
+
+    pub async fn sync_topic_activity_and_mark_read(
+        &self,
+        path: impl AsRef<Path>,
+        group_id: &str,
+        topic_id: &str,
+        relays: Vec<String>,
+    ) -> anyhow::Result<GroupActivityResult> {
+        let path = path.as_ref();
+        let update = self
+            .fetch_topic_activity(path, group_id, topic_id, relays)
+            .await?;
+        self.apply_group_activity_and_mark_read(path, update, Some(topic_id))
     }
 
     pub async fn fetch_topic_activity(
@@ -7132,6 +7167,23 @@ impl NoiseClient {
         }
         Ok(GroupActivityResult {
             summary: state.summary()?,
+            conversation,
+        })
+    }
+
+    pub fn apply_group_activity_and_mark_read(
+        &self,
+        path: impl AsRef<Path>,
+        update: GroupActivityUpdate,
+        topic_id: Option<&str>,
+    ) -> anyhow::Result<GroupActivityResult> {
+        let path = path.as_ref();
+        let group_id = update.group_id.clone();
+        self.apply_group_activity(path, update)?;
+        let summary = self.mark_topic_read(path, &group_id, topic_id)?;
+        let conversation = self.cached_conversation(path, &group_id)?;
+        Ok(GroupActivityResult {
+            summary,
             conversation,
         })
     }
@@ -11489,6 +11541,37 @@ mod tests {
         assert!(merge_read_markers(&mut current, &newer));
         assert_eq!(current.get("alice"), Some(&marker(300, "event-d")));
         assert!(!merge_read_markers(&mut current, &newer));
+    }
+
+    #[test]
+    fn repeated_sign_in_for_the_restored_account_is_idempotent() {
+        let noise_id = "482109376144";
+        let password = "correct horse battery staple";
+        let credentials = derive_account_credentials(noise_id, password).unwrap();
+        let identity = Identity::generate();
+        let state = account_state(&identity, &credentials, test_profile(None), 1, 1);
+        let path = std::env::temp_dir().join(format!(
+            "noise-idempotent-sign-in-{}-{}.json",
+            std::process::id(),
+            current_nanos(),
+        ));
+        save_state(&path, &state).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let summary = runtime
+            .block_on(NoiseClient::default().sign_in(
+                &path,
+                noise_id,
+                password,
+                Vec::new(),
+            ))
+            .unwrap();
+
+        assert_eq!(summary.identity.public_key, identity.public_key_base64());
+        remove_state(&path).unwrap();
     }
 
     #[test]
