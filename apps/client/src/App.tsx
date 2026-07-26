@@ -5638,6 +5638,10 @@ function AboutNoiseDialog({ onClose }: { onClose: () => void }) {
           <strong>fyi</strong>
           <p>noise cannot stop someone from taking a screenshot, exporting content, or reading an unlocked or compromised device. Its security design has not yet received an independent audit.</p>
         </section>
+        <section className="about-source">
+          <strong>open source</strong>
+          <p>Noise is licensed under AGPL-3.0-only. <a href="https://github.com/GnosysLabs/noise" target="_blank" rel="noreferrer">Read or download the source code.</a></p>
+        </section>
       </div>
       <DialogButtons><button className="primary" onClick={onClose}>done</button></DialogButtons>
     </Modal>

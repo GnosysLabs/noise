@@ -2,6 +2,8 @@
 name = "noise-relay"
 version = "0.1.5"
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 a2 = { version = "0.10.0", default-features = false, features = ["ring"] }

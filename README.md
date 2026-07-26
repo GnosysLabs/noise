@@ -1,7 +1,19 @@
-# noise
+<p align="center">
+  <img src="apps/marketing/public/noise-wave.png" width="72" alt="Noise waveform">
+</p>
 
-**Noise is a private, group-first messenger built around the people you
-actually choose.**
+<h1 align="center">noise</h1>
+
+<p align="center">
+  <strong>A private, group-first messenger built around the people you actually choose.</strong>
+</p>
+
+![Noise desktop app](docs/assets/noise-desktop.png)
+
+<p align="center">
+  <strong>Join the official Noise group</strong><br>
+  Open Noise and tune to <code>8402 6053 0554</code>
+</p>
 
 There is no public directory, algorithmic feed, phone number, or email signup.
 Create a group, share its secret 12-digit frequency, and the right people can
@@ -224,3 +236,14 @@ Protocol details live in [`docs/PROTOCOL.md`](docs/PROTOCOL.md), client notes in
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). The signed relay publication
 process is documented in
 [`docs/RELAY_RELEASES.md`](docs/RELAY_RELEASES.md).
+
+## License
+
+Noise-authored code in this repository is licensed under the
+[GNU Affero General Public License, version 3 only](LICENSE)
+(`AGPL-3.0-only`), copyright © 2026 Gnosys Labs LLC.
+
+If you modify Noise and make that modified version available for people to use
+over a network, you must offer those users the corresponding source code as
+required by section 13 of the AGPL. Third-party dependencies and assets remain
+under their respective licenses.
