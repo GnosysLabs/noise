@@ -1080,6 +1080,45 @@ fn search_message_score(query: &str, text: &str) -> Option<u32> {
     Some(score)
 }
 
+fn current_profiles_by_public_key(
+    state: &ClientState,
+    self_public_key: &str,
+) -> HashMap<String, (u64, Profile)> {
+    let mut profiles = HashMap::<String, (u64, Profile)>::new();
+    profiles.insert(
+        self_public_key.to_owned(),
+        (u64::MAX, state.profile.clone()),
+    );
+    for person in state
+        .known_people
+        .iter()
+        .chain(state.direct_contacts.iter())
+    {
+        let profile = Profile {
+            username: person.username.clone(),
+            bio: person.bio.clone(),
+            avatar: person.avatar.clone(),
+            album: person.album.clone(),
+            accepts_direct_messages: person.accepts_direct_messages,
+            direct_message_policy: person.effective_direct_message_policy(),
+        };
+        match profiles.get_mut(&person.public_key) {
+            Some((sequence, current)) if person.profile_sequence >= *sequence => {
+                *sequence = person.profile_sequence;
+                *current = profile;
+            }
+            None => {
+                profiles.insert(
+                    person.public_key.clone(),
+                    (person.profile_sequence, profile),
+                );
+            }
+            _ => {}
+        }
+    }
+    profiles
+}
+
 fn normalize_contact_signal(value: &str) -> anyhow::Result<String> {
     let normalized = value
         .chars()
@@ -5250,6 +5289,8 @@ impl NoiseClient {
         }
         let limit = limit.clamp(1, 100);
         let hidden = state.active_hidden_keys();
+        let identity_public_key = state.identity()?.public_key_base64();
+        let current_profiles = current_profiles_by_public_key(&state, identity_public_key.as_str());
         let group_summaries = state
             .summary()?
             .groups
@@ -5332,13 +5373,17 @@ impl NoiseClient {
                 let Some(score) = search_message_score(query, message.text.as_str()) else {
                     continue;
                 };
+                let (username, avatar) = current_profiles
+                    .get(&message.author_public_key)
+                    .map(|(_, profile)| (profile.username.clone(), profile.avatar.clone()))
+                    .unwrap_or_else(|| (message.username.clone(), message.avatar.clone()));
                 message_matches.push((
                     score,
                     SearchMessageResult {
                         event_id: message.event_id,
                         author_public_key: message.author_public_key,
-                        username: message.username,
-                        avatar: message.avatar,
+                        username,
+                        avatar,
                         text: message.text,
                         attachment: message.attachment,
                         created_at_millis: message.created_at_millis,
@@ -5366,13 +5411,17 @@ impl NoiseClient {
             let Some(score) = search_message_score(query, message.text.as_str()) else {
                 continue;
             };
+            let (username, avatar) = current_profiles
+                .get(&message.author_public_key)
+                .map(|(_, profile)| (profile.username.clone(), profile.avatar.clone()))
+                .unwrap_or_else(|| (message.username.clone(), message.avatar.clone()));
             message_matches.push((
                 score,
                 SearchMessageResult {
                     event_id: message.event_id,
                     author_public_key: message.author_public_key,
-                    username: message.username,
-                    avatar: message.avatar,
+                    username,
+                    avatar,
                     text: message.text,
                     attachment: message.attachment,
                     created_at_millis: message.created_at_millis,
@@ -5390,26 +5439,19 @@ impl NoiseClient {
             .iter()
             .map(|contact| contact.public_key.as_str())
             .collect::<HashSet<_>>();
-        let mut people_by_key = HashMap::<String, DirectContact>::new();
-        for person in state
-            .known_people
-            .iter()
-            .chain(state.direct_contacts.iter())
-        {
-            if !hidden.contains(&person.public_key) {
-                people_by_key.insert(person.public_key.clone(), person.clone());
-            }
-        }
-        let mut people_matches = people_by_key
-            .into_values()
-            .filter_map(|person| {
+        let mut people_matches = current_profiles
+            .into_iter()
+            .filter(|(public_key, _)| {
+                public_key != &identity_public_key && !hidden.contains(public_key)
+            })
+            .filter_map(|(public_key, (_, person))| {
                 search_score(query, [person.username.as_str(), person.bio.as_str()]).map(|score| {
                     (
                         score,
                         SearchPersonResult {
                             direct_message_policy: person.effective_direct_message_policy(),
-                            has_direct: direct_keys.contains(person.public_key.as_str()),
-                            public_key: person.public_key,
+                            has_direct: direct_keys.contains(public_key.as_str()),
+                            public_key,
                             username: person.username,
                             bio: person.bio,
                             avatar: person.avatar,
@@ -12342,6 +12384,51 @@ mod tests {
         assert_eq!(search_message_score("video", ""), None);
         assert!(search_message_score("ma", "marketing").is_some());
         assert!(search_message_score("photo", "Here is a photo from today").is_some());
+    }
+
+    #[test]
+    fn search_profile_resolution_uses_the_newest_avatar() {
+        let identity = Identity::generate();
+        let credentials = AccountCredentials {
+            noise_id: "123456789012".to_owned(),
+            locator: "ab".repeat(32),
+            vault_key_base64: STANDARD_NO_PAD.encode([7_u8; 32]),
+        };
+        let mut state = account_state(&identity, &credentials, test_profile(None), 1, 1);
+        let public_key = "search-result-person".to_owned();
+        state.direct_contacts.push(DirectContact {
+            public_key: public_key.clone(),
+            username: "old name".to_owned(),
+            bio: String::new(),
+            avatar: None,
+            album: None,
+            accepts_direct_messages: true,
+            direct_message_policy: DirectMessagePolicy::Everyone,
+            profile_sequence: 10,
+        });
+        let avatar = ProfileImage {
+            blob_id: "11".repeat(32),
+            key_base64: STANDARD.encode([8_u8; 32]),
+            mime_type: "image/png".to_owned(),
+            byte_length: 128,
+            storage: None,
+        };
+        state.known_people.push(DirectContact {
+            public_key: public_key.clone(),
+            username: "current name".to_owned(),
+            bio: String::new(),
+            avatar: Some(avatar.clone()),
+            album: None,
+            accepts_direct_messages: true,
+            direct_message_policy: DirectMessagePolicy::Everyone,
+            profile_sequence: 20,
+        });
+
+        let profiles =
+            current_profiles_by_public_key(&state, identity.public_key_base64().as_str());
+        let (_, resolved) = profiles.get(&public_key).unwrap();
+        assert_eq!(resolved.username, "current name");
+        assert_eq!(resolved.avatar, Some(avatar));
     }
 
     fn account_state(

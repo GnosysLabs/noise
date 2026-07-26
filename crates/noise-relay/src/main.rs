@@ -1830,9 +1830,7 @@ async fn dispatch_private_request(
     }
 
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", RELAY_CAPABILITIES_PATH) => {
-            private_json(StatusCode::OK, &relay_capability_set())
-        }
+        ("GET", RELAY_CAPABILITIES_PATH) => private_json(StatusCode::OK, &relay_capability_set()),
         ("POST", "/v1/link-preview") => {
             let Ok(request) = serde_json::from_slice::<LinkPreviewRequest>(&request.body) else {
                 return private_error(StatusCode::BAD_REQUEST, "invalid link preview request");
@@ -2533,14 +2531,14 @@ async fn wait_for_group_change(
                 )
             })
             .collect::<Vec<_>>();
-        group_events.sort_by(|left, right| {
-            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
-        });
+        group_events.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
         let current = group_events.len() as u64;
         if current == 0 {
             return Err(StatusCode::NOT_FOUND);
         }
-        let history_start = group_events.len().saturating_sub(GROUP_CHANGE_HISTORY_LIMIT);
+        let history_start = group_events
+            .len()
+            .saturating_sub(GROUP_CHANGE_HISTORY_LIMIT);
         let recent = group_events
             .into_iter()
             .skip(history_start)
@@ -2625,9 +2623,9 @@ fn group_watch_response(
         .filter(|change| change.revision > since)
         .collect::<Vec<_>>();
     let change_hints_complete = state.revision == since
-        || relevant.first().is_some_and(|change| {
-            change.revision == since.saturating_add(1)
-        });
+        || relevant
+            .first()
+            .is_some_and(|change| change.revision == since.saturating_add(1));
     let mut changed_stream_locators = relevant
         .iter()
         .filter_map(|change| change.stream_locator.clone())
