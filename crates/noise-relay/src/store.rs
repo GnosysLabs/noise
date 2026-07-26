@@ -27,6 +27,16 @@ pub struct ShardMetadata {
     pub byte_length: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct PushSubscription {
+    pub mailbox_id: String,
+    pub public_key: String,
+    pub installation_id: String,
+    pub device_token: String,
+    pub environment: String,
+    pub topic: String,
+}
+
 pub struct RecoveredState {
     pub accounts: HashMap<String, AccountVault>,
     pub invites: HashMap<String, InviteRecord>,
@@ -94,6 +104,25 @@ impl DurableStore {
              );
              CREATE TABLE IF NOT EXISTS relay_shard_tombstones (
                  shard_id TEXT PRIMARY KEY
+             );
+             CREATE TABLE IF NOT EXISTS push_subscriptions (
+                 mailbox_id TEXT NOT NULL,
+                 public_key TEXT NOT NULL,
+                 installation_id TEXT NOT NULL,
+                 device_token TEXT NOT NULL,
+                 environment TEXT NOT NULL,
+                 topic TEXT NOT NULL,
+                 updated_at_millis INTEGER NOT NULL,
+                 PRIMARY KEY (mailbox_id, installation_id)
+             );
+             CREATE INDEX IF NOT EXISTS push_subscriptions_mailbox_idx
+                 ON push_subscriptions (mailbox_id);
+             CREATE TABLE IF NOT EXISTS push_deliveries (
+                 mailbox_id TEXT NOT NULL,
+                 installation_id TEXT NOT NULL,
+                 event_id TEXT NOT NULL,
+                 delivered_at_millis INTEGER NOT NULL,
+                 PRIMARY KEY (mailbox_id, installation_id, event_id)
              );",
             )
             .await?;
@@ -129,6 +158,109 @@ impl DurableStore {
             )
             .await?;
         Ok(changed == 1)
+    }
+
+    pub async fn upsert_push_subscription(
+        &self,
+        subscription: &PushSubscription,
+        updated_at_millis: u64,
+    ) -> anyhow::Result<()> {
+        let connection = self.connection.lock().await;
+        connection
+            .execute(
+                "INSERT INTO push_subscriptions (
+                    mailbox_id, public_key, installation_id, device_token,
+                    environment, topic, updated_at_millis
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(mailbox_id, installation_id) DO UPDATE SET
+                    public_key = excluded.public_key,
+                    device_token = excluded.device_token,
+                    environment = excluded.environment,
+                    topic = excluded.topic,
+                    updated_at_millis = excluded.updated_at_millis",
+                params![
+                    subscription.mailbox_id.clone(),
+                    subscription.public_key.clone(),
+                    subscription.installation_id.clone(),
+                    subscription.device_token.clone(),
+                    subscription.environment.clone(),
+                    subscription.topic.clone(),
+                    i64::try_from(updated_at_millis)
+                        .context("push subscription timestamp is too large")?,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn push_subscriptions(
+        &self,
+        mailbox_id: &str,
+    ) -> anyhow::Result<Vec<PushSubscription>> {
+        let connection = self.connection.lock().await;
+        let mut rows = connection
+            .query(
+                "SELECT mailbox_id, public_key, installation_id, device_token,
+                        environment, topic
+                 FROM push_subscriptions
+                 WHERE mailbox_id = ?1",
+                params![mailbox_id],
+            )
+            .await?;
+        let mut subscriptions = Vec::new();
+        while let Some(row) = rows.next().await? {
+            subscriptions.push(PushSubscription {
+                mailbox_id: row.get(0)?,
+                public_key: row.get(1)?,
+                installation_id: row.get(2)?,
+                device_token: row.get(3)?,
+                environment: row.get(4)?,
+                topic: row.get(5)?,
+            });
+        }
+        Ok(subscriptions)
+    }
+
+    pub async fn claim_push_delivery(
+        &self,
+        mailbox_id: &str,
+        installation_id: &str,
+        event_id: &str,
+        delivered_at_millis: u64,
+    ) -> anyhow::Result<bool> {
+        let connection = self.connection.lock().await;
+        let changed = connection
+            .execute(
+                "INSERT OR IGNORE INTO push_deliveries (
+                    mailbox_id, installation_id, event_id, delivered_at_millis
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    mailbox_id,
+                    installation_id,
+                    event_id,
+                    i64::try_from(delivered_at_millis)
+                        .context("push delivery timestamp is too large")?,
+                ],
+            )
+            .await?;
+        Ok(changed == 1)
+    }
+
+    pub async fn release_push_delivery(
+        &self,
+        mailbox_id: &str,
+        installation_id: &str,
+        event_id: &str,
+    ) -> anyhow::Result<()> {
+        let connection = self.connection.lock().await;
+        connection
+            .execute(
+                "DELETE FROM push_deliveries
+                 WHERE mailbox_id = ?1 AND installation_id = ?2 AND event_id = ?3",
+                params![mailbox_id, installation_id, event_id],
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn shard_metadata(&self, shard_id: &str) -> anyhow::Result<Option<ShardMetadata>> {

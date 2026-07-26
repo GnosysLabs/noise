@@ -13,10 +13,13 @@ import {
   GripVertical,
   Images,
   Info,
+  Laptop,
   LoaderCircle,
   LogOut,
+  Maximize,
   MessageCircle,
   MessagesSquare,
+  Minimize,
   MoreHorizontal,
   Paperclip,
   Pause,
@@ -31,6 +34,7 @@ import {
   SmilePlus,
   Trash2,
   TriangleAlert,
+  UserPlus,
   UserRoundX,
   UsersRound,
   Volume2,
@@ -39,9 +43,22 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { CSSProperties, RefObject } from "react";
+import { createPortal } from "react-dom";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
-import { isTauri, noise, prepareGroupBackground, prepareImage, registerMediaStream, relays } from "./api";
+import {
+  cancelAddingLocalAccount,
+  isTauri,
+  listLocalAccounts,
+  noise,
+  prepareGroupBackground,
+  prepareImage,
+  registerMediaStream,
+  relays,
+  startAddingLocalAccount,
+  switchLocalAccount,
+} from "./api";
+import type { LocalAccount, LocalAccountList } from "./api";
 import { registerWebMediaStream, webMediaStreamReady } from "./mediaStream";
 import { generateGroupAvatar, generateUserAvatar } from "./groupAvatar";
 import { firstLink, linkify, openExternalLink } from "./linkify";
@@ -56,6 +73,7 @@ import type {
   DirectConversation,
   DirectInbox,
   DirectSummary,
+  DeviceSummary,
   GroupActivityResult,
   GroupEncryptionStatus,
   GroupSummary,
@@ -203,6 +221,25 @@ function withoutMessage(conversation: Conversation, messageEventId: string): Con
   };
 }
 
+function withoutMessages(
+  conversation: Conversation,
+  messageEventIds: ReadonlySet<string>,
+): Conversation {
+  if (messageEventIds.size === 0) return conversation;
+  return {
+    ...conversation,
+    messages: conversation.messages.filter(
+      (message) => !messageEventIds.has(message.event_id),
+    ),
+    reports: conversation.reports.filter(
+      (report) => !messageEventIds.has(report.message.event_id),
+    ),
+    reported_message_event_ids: conversation.reported_message_event_ids.filter(
+      (eventId) => !messageEventIds.has(eventId),
+    ),
+  };
+}
+
 function restoreMessage(
   conversation: Conversation,
   snapshot: Conversation,
@@ -267,6 +304,30 @@ const PRESENCE_OBSERVATION_STALE_MILLIS = 70_000;
 const DEFAULT_ACCENT_COLOR = "#7758ED";
 const MAX_DISPLAY_NAME_LENGTH = 16;
 const ACCENT_PRESETS = ["#7758ED", "#E84D8A", "#F06A3C", "#E0A82E", "#43B581", "#24A6A6", "#4D82F0", "#A45EE5"];
+const DEVICE_SESSION_REVOKED_ERROR = "this device was logged out remotely";
+
+function currentDeviceDescriptor() {
+  const userAgent = navigator.userAgent;
+  const isMac = /Macintosh|Mac OS X/i.test(userAgent);
+  const isWindows = /Windows/i.test(userAgent);
+  const isLinux = /Linux/i.test(userAgent) && !/Android/i.test(userAgent);
+  if (isTauri) {
+    const platform = isMac ? "macOS" : isWindows ? "Windows" : isLinux ? "Linux" : "Desktop";
+    return { name: `${platform} desktop`, platform: `${platform} · Noise desktop` };
+  }
+  const platform = /iPhone|iPad/i.test(userAgent)
+    ? "iOS"
+    : /Android/i.test(userAgent)
+      ? "Android"
+      : isMac
+        ? "macOS"
+        : isWindows
+          ? "Windows"
+          : isLinux
+            ? "Linux"
+            : "Web";
+  return { name: `${platform} browser`, platform: `${platform} · Noise web` };
+}
 
 function presenceStatusesFromWatch(change: GroupWatch) {
   const statuses = new Map<string, PresenceStatus>();
@@ -278,6 +339,37 @@ function presenceStatusesFromWatch(change: GroupWatch) {
   }
   return statuses;
 }
+
+function mergeGroupWatchChanges(current: GroupWatch, incoming: GroupWatch): GroupWatch {
+  return {
+    ...incoming,
+    changed: current.changed || incoming.changed,
+    deleted: current.deleted || incoming.deleted,
+    changed_stream_locators: Array.from(new Set([
+      ...(current.changed_stream_locators ?? []),
+      ...(incoming.changed_stream_locators ?? []),
+    ])),
+    control_changed: current.control_changed || incoming.control_changed,
+    change_hints_complete:
+      current.change_hints_complete === true
+      && incoming.change_hints_complete === true,
+  };
+}
+
+type PendingGroupWatch = { change: GroupWatch; initial: boolean };
+
+function mergePendingGroupWatch(
+  current: PendingGroupWatch | null,
+  incoming: PendingGroupWatch,
+): PendingGroupWatch {
+  return current
+    ? {
+      change: mergeGroupWatchChanges(current.change, incoming.change),
+      initial: current.initial || incoming.initial,
+    }
+    : incoming;
+}
+
 const UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
 const UPDATE_CHECK_HEARTBEAT_MS = 60 * 1000;
 let cachedAppVersion: string | null = null;
@@ -370,6 +462,28 @@ function MediaLoadStatus({
   );
 }
 
+function OlderMessagesSentinel({
+  loading,
+  sentinel,
+}: {
+  loading: boolean;
+  sentinel: RefObject<HTMLDivElement | null>;
+}) {
+  return (
+    <div className="messages-older" ref={sentinel}>
+      {loading && (
+        <span
+          className="messages-older-loading"
+          role="status"
+          aria-label="loading older messages"
+        >
+          <NoiseMark size={26} className="noise-loading-indicator" monochrome />
+        </span>
+      )}
+    </div>
+  );
+}
+
 function CopyButton({
   value,
   label,
@@ -431,6 +545,11 @@ let mediaCacheGeneration = 0;
 
 const INITIAL_MESSAGE_COUNT = 24;
 const MESSAGE_PAGE_SIZE = 40;
+// How close to the top of the list counts as "asking for older messages".
+const OLDER_MESSAGE_TRIGGER_DISTANCE = 320;
+// A relay page can be entirely made of messages the current topic filters out,
+// so walk back a few pages before giving the scroll gesture back to the user.
+const REMOTE_HISTORY_ATTEMPTS = 4;
 const GENERAL_TOPIC_LOADING_KEY = "__noise_general_topic__";
 type MediaLoadPriority = "visible" | "nearby" | "background";
 const MEDIA_PRIORITY_RANK: Record<MediaLoadPriority, number> = {
@@ -1011,6 +1130,34 @@ async function pendingMediaFromNativePath(sourcePath: string) {
   } satisfies PendingMedia;
 }
 
+// The shared core validates the base64 encoding of a media preview rather
+// than the JPEG itself, and rejects anything longer than 80,000 characters.
+// Base64 expands every 3 bytes into 4 characters, so the JPEG has to stay
+// within 60,000 bytes to survive that check.
+const MAX_PREVIEW_BASE64_LENGTH = 80_000;
+const MAX_PREVIEW_BYTES = 60_000;
+
+// A message without a preview shows a generic placeholder everywhere it is
+// referenced, so every profile is attempted before giving up on one.
+const IMAGE_PREVIEW_PROFILES = [
+  { edge: 360, quality: 0.62 },
+  { edge: 360, quality: 0.42 },
+  { edge: 288, quality: 0.5 },
+  { edge: 224, quality: 0.45 },
+];
+
+async function encodePreviewWithinBudget(
+  canvas: HTMLCanvasElement,
+  quality: number,
+): Promise<string | null> {
+  const preview = await new Promise<Blob | null>((done) =>
+    canvas.toBlob(done, "image/jpeg", quality)
+  );
+  if (!preview || preview.size > MAX_PREVIEW_BYTES) return null;
+  const encoded = await fileBase64(preview);
+  return encoded.length <= MAX_PREVIEW_BASE64_LENGTH ? encoded : null;
+}
+
 function prepareImagePreviewSource(source: string): Promise<MediaPreview | null> {
   const image = new Image();
   return new Promise((resolve) => {
@@ -1022,32 +1169,27 @@ function prepareImagePreviewSource(source: string): Promise<MediaPreview | null>
         const pixelWidth = image.naturalWidth;
         const pixelHeight = image.naturalHeight;
         if (!pixelWidth || !pixelHeight) return finish(null);
-        const scale = Math.min(1, 360 / Math.max(pixelWidth, pixelHeight));
-        const canvas = document.createElement("canvas");
-        canvas.width = Math.max(1, Math.round(pixelWidth * scale));
-        canvas.height = Math.max(1, Math.round(pixelHeight * scale));
-        const context = canvas.getContext("2d");
-        if (!context) return finish(null);
-        context.fillStyle = "#17161a";
-        context.fillRect(0, 0, canvas.width, canvas.height);
-        context.drawImage(image, 0, 0, canvas.width, canvas.height);
-        let preview = await new Promise<Blob | null>((done) =>
-          canvas.toBlob(done, "image/jpeg", 0.62)
-        );
-        if (preview && preview.size > 58_000) {
-          preview = await new Promise<Blob | null>((done) =>
-            canvas.toBlob(done, "image/jpeg", 0.42)
-          );
+        for (const profile of IMAGE_PREVIEW_PROFILES) {
+          const scale = Math.min(1, profile.edge / Math.max(pixelWidth, pixelHeight));
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.round(pixelWidth * scale));
+          canvas.height = Math.max(1, Math.round(pixelHeight * scale));
+          const context = canvas.getContext("2d");
+          if (!context) return finish(null);
+          context.fillStyle = "#17161a";
+          context.fillRect(0, 0, canvas.width, canvas.height);
+          context.drawImage(image, 0, 0, canvas.width, canvas.height);
+          const dataBase64 = await encodePreviewWithinBudget(canvas, profile.quality);
+          if (dataBase64) {
+            return finish({
+              dataBase64,
+              mimeType: "image/jpeg",
+              pixelWidth,
+              pixelHeight,
+            });
+          }
         }
-        if (!preview) return finish(null);
-        const dataBase64 = await fileBase64(preview);
-        if (dataBase64.length > 80_000) return finish(null);
-        finish({
-          dataBase64,
-          mimeType: "image/jpeg",
-          pixelWidth,
-          pixelHeight,
-        });
+        finish(null);
       } catch {
         finish(null);
       }
@@ -1094,6 +1236,9 @@ function prepareVideoPreviewSource(source: string): Promise<MediaPreview | null>
           { edge: 600, quality: 0.76 },
           { edge: 600, quality: 0.62 },
           { edge: 480, quality: 0.68 },
+          { edge: 480, quality: 0.52 },
+          { edge: 384, quality: 0.58 },
+          { edge: 288, quality: 0.48 },
         ];
         let dataBase64: string | null = null;
         for (const profile of profiles) {
@@ -1104,12 +1249,8 @@ function prepareVideoPreviewSource(source: string): Promise<MediaPreview | null>
           const context = canvas.getContext("2d");
           if (!context) return finish(null);
           context.drawImage(video, 0, 0, canvas.width, canvas.height);
-          const preview = await new Promise<Blob | null>((done) =>
-            canvas.toBlob(done, "image/jpeg", profile.quality)
-          );
-          if (!preview || preview.size > 58_000) continue;
-          const encoded = await fileBase64(preview);
-          if (encoded.length <= 80_000) {
+          const encoded = await encodePreviewWithinBudget(canvas, profile.quality);
+          if (encoded) {
             dataBase64 = encoded;
             break;
           }
@@ -1290,6 +1431,11 @@ function useAutoUpdater() {
 
 export default function App() {
   const [summary, setSummary] = useState<LocalSummary | null>(null);
+  const [localAccounts, setLocalAccounts] = useState<LocalAccountList>({
+    active_account_id: null,
+    adding_account: false,
+    accounts: [],
+  });
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [groupEncryption, setGroupEncryption] = useState<GroupEncryptionStatus | null>(null);
   const [directConversation, setDirectConversation] = useState<DirectConversation | null>(null);
@@ -1321,6 +1467,7 @@ export default function App() {
   const groupWatchRevisions = useRef(new Map<string, number>());
   const directConversationCache = useRef(new Map<string, DirectConversation>());
   const groupReadInFlight = useRef(new Set<string>());
+  const admissionQueue = useRef(Promise.resolve());
   const accountCacheSyncTimer = useRef<number | null>(null);
   const groupSelectionInFlight = useRef(false);
   const topicSelectionGeneration = useRef(0);
@@ -1345,6 +1492,9 @@ export default function App() {
   const [optimisticGroupMessages, setOptimisticGroupMessages] = useState(
     () => new Map<string, MessageSummary[]>(),
   );
+  const [deletedGroupMessageIds, setDeletedGroupMessageIds] = useState(
+    () => new Map<string, Set<string>>(),
+  );
   const [optimisticDirectMessages, setOptimisticDirectMessages] = useState(
     () => new Map<string, MessageSummary[]>(),
   );
@@ -1361,6 +1511,18 @@ export default function App() {
   const selfPresenceActive = useRef(true);
   const [selfPresenceStatus, setSelfPresenceStatus] = useState<PresenceStatus>("online");
 
+  const refreshLocalAccountList = useCallback(async () => {
+    try {
+      setLocalAccounts(await listLocalAccounts());
+    } catch (cause) {
+      console.error("noise could not read the local account list", cause);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshLocalAccountList();
+  }, [identityPublicKey, refreshLocalAccountList]);
+
   useEffect(() => {
     if (!error || !isRelayConnectivityError(error)) return;
     if (summary) {
@@ -1372,6 +1534,28 @@ export default function App() {
     }, 6_000);
     return () => window.clearTimeout(timer);
   }, [error, summary]);
+
+  useEffect(() => {
+    if (!identityPublicKey || !summary?.identity.noise_id) return;
+    const descriptor = currentDeviceDescriptor();
+    let stopped = false;
+    void noise<LocalSummary>({
+      action: "register_device",
+      name: descriptor.name,
+      platform: descriptor.platform,
+      relays,
+    })
+      .then((local) => {
+        if (!stopped && local) setSummary(local);
+      })
+      .catch((cause) => {
+        if (message(cause) !== DEVICE_SESSION_REVOKED_ERROR) return;
+        void noise({ action: "logout" }).finally(() => window.location.reload());
+      });
+    return () => {
+      stopped = true;
+    };
+  }, [identityPublicKey, summary?.identity.noise_id]);
 
   const scheduleAccountCacheSync = useCallback(() => {
     if (accountCacheSyncTimer.current !== null) {
@@ -1403,8 +1587,6 @@ export default function App() {
     if (identityPublicKey && conversation) scheduleAccountCacheSync();
   }, [
     conversation?.group.group_id,
-    conversation?.has_older_messages,
-    conversation?.messages.length,
     identityPublicKey,
     scheduleAccountCacheSync,
   ]);
@@ -1552,6 +1734,38 @@ export default function App() {
     });
   }
 
+  function updateVisibleGroupModerator(
+    groupId: string,
+    memberPublicKey: string,
+    enabled: boolean,
+  ) {
+    setConversation((current) => {
+      if (!current || current.group.group_id !== groupId) return current;
+      const next = {
+        ...current,
+        members: current.members.map((member) =>
+          member.public_key === memberPublicKey
+            ? { ...member, is_moderator: enabled }
+            : member
+        ),
+      };
+      groupConversationCache.current.set(groupId, next);
+      return next;
+    });
+  }
+
+  async function refreshCachedGroup(groupId: string) {
+    const cached = await noise<Conversation>({
+      action: "cached_conversation",
+      group_id: groupId,
+    });
+    if (!cached) return;
+    groupConversationCache.current.set(groupId, cached);
+    setConversation((current) =>
+      current?.group.group_id === groupId ? cached : current
+    );
+  }
+
   function addOptimisticDirectMessage(publicKey: string, item: MessageSummary) {
     setOptimisticDirectMessages((current) => {
       const next = new Map(current);
@@ -1695,16 +1909,40 @@ export default function App() {
   const markActiveGroupRead = useCallback(async (groupId: string) => {
     if (groupReadInFlight.current.has(groupId)) return;
     groupReadInFlight.current.add(groupId);
+    const unreadToClear =
+      groupConversationCache.current.get(groupId)?.general_unread_count ?? 0;
+    setSummary((current) => current ? {
+      ...current,
+      groups: current.groups.map((group) =>
+        group.group_id === groupId
+          ? { ...group, unread_count: Math.max(0, group.unread_count - unreadToClear) }
+          : group
+      ),
+    } : current);
+    const clearVisibleUnread = () => {
+      setConversation((current) => {
+        if (current?.group.group_id !== groupId) return current;
+        const updated = {
+          ...current,
+          group: {
+            ...current.group,
+            unread_count: Math.max(
+              0,
+              current.group.unread_count - current.general_unread_count,
+            ),
+          },
+          general_unread_count: 0,
+        };
+        groupConversationCache.current.set(groupId, updated);
+        return updated;
+      });
+    };
+    clearVisibleUnread();
     try {
       const marked = await markGroupRead(groupId);
       if (!marked) return;
       setSummary(marked);
-      setConversation((current) => {
-        if (current?.group.group_id !== groupId) return current;
-        const updated = { ...current, general_unread_count: 0 };
-        groupConversationCache.current.set(groupId, updated);
-        return updated;
-      });
+      clearVisibleUnread();
       void noise({ action: "sync_account", relays, interruptible: true }).catch(() => {
         // The local group read marker is immediate; cross-device sync retries normally.
       });
@@ -1717,14 +1955,30 @@ export default function App() {
     const readKey = `${groupId}:${topicId}`;
     if (groupReadInFlight.current.has(readKey)) return;
     groupReadInFlight.current.add(readKey);
-    try {
-      const marked = await markTopicRead(groupId, topicId);
-      if (!marked) return;
-      setSummary(marked);
+    const unreadToClear = groupConversationCache.current
+      .get(groupId)
+      ?.topics.find((topic) => topic.topic_id === topicId)
+      ?.unread_count ?? 0;
+    setSummary((current) => current ? {
+      ...current,
+      groups: current.groups.map((group) =>
+        group.group_id === groupId
+          ? { ...group, unread_count: Math.max(0, group.unread_count - unreadToClear) }
+          : group
+      ),
+    } : current);
+    const clearVisibleUnread = () => {
       setConversation((current) => {
         if (current?.group.group_id !== groupId) return current;
+        const topicUnread = current.topics.find(
+          (topic) => topic.topic_id === topicId,
+        )?.unread_count ?? 0;
         const updated = {
           ...current,
+          group: {
+            ...current.group,
+            unread_count: Math.max(0, current.group.unread_count - topicUnread),
+          },
           topics: current.topics.map((topic) =>
             topic.topic_id === topicId ? { ...topic, unread_count: 0 } : topic
           ),
@@ -1732,6 +1986,15 @@ export default function App() {
         groupConversationCache.current.set(groupId, updated);
         return updated;
       });
+    };
+    // Entering a topic is itself the read gesture. Clear the badge before any
+    // bridge or network work so navigation never waits on relay activity.
+    clearVisibleUnread();
+    try {
+      const marked = await markTopicRead(groupId, topicId);
+      if (!marked) return;
+      setSummary(marked);
+      clearVisibleUnread();
       void noise({ action: "sync_account", relays, interruptible: true }).catch(() => {
         // The local topic read marker is immediate; cross-device sync retries normally.
       });
@@ -2163,6 +2426,106 @@ export default function App() {
     });
   }, [refresh]);
 
+  const admitPendingGroupMembers = useCallback(async (groupId: string) => {
+    try {
+      // Ask first: the question is answered from relay state without touching
+      // local state, so sweeping every group cannot slow down sending a
+      // message. Only a group that has somebody waiting pays for the real pass.
+      const waiting = await noise<boolean>({
+        action: "group_has_pending_admissions",
+        group_id: groupId,
+        relays,
+      });
+      if (!waiting) return;
+      // An admission-only pass, even for the group on screen: it reads the
+      // signed control log instead of the group's history, and the phase this
+      // identity is in keeps coming from opening and recovering the group.
+      await syncGroupEncryption(groupId);
+    } catch {
+      // Admission retries on the next control change or when the group opens.
+    }
+  }, []);
+
+  const queueAdmissionPass = useCallback((groupId: string) => {
+    // One group at a time: signing in to a long member list must not fire a
+    // burst of relay round trips at the conversation the user is opening.
+    admissionQueue.current = admissionQueue.current
+      .then(() => new Promise<void>((resolve) => window.setTimeout(resolve, 250)))
+      .then(() => admitPendingGroupMembers(groupId))
+      .catch(() => undefined);
+  }, [admitPendingGroupMembers]);
+
+  const syncChangedGroupStreams = useCallback(async (
+    groupId: string,
+    change: GroupWatch,
+    initial: boolean,
+    preferredTopicId: string | null,
+    isStopped: () => boolean,
+    syncInitialGroup?: (groupId: string) => ReturnType<typeof syncGroupActivity>,
+  ) => {
+    const hintsComplete = change.change_hints_complete === true;
+    let topicSource = groupConversationCache.current.get(groupId);
+    if (initial || !hintsComplete || change.control_changed) {
+      const activity = initial && syncInitialGroup
+        ? await syncInitialGroup(groupId)
+        : await syncGroupActivity(groupId);
+      if (!activity || isStopped()) return false;
+      setSummary(activity.summary);
+      if (activity.conversation) {
+        topicSource = activity.conversation;
+        groupConversationCache.current.set(groupId, activity.conversation);
+        dirtyGroupIds.current.delete(groupId);
+        if (desiredGroupIdRef.current === groupId) {
+          setConversation(activity.conversation);
+        }
+      }
+    }
+
+    const topics = (topicSource?.topics ?? []).filter((topic) => !topic.archived);
+    const allTopicIds = topics.map((topic) => topic.topic_id);
+    const hintedLocators = new Set(change.changed_stream_locators ?? []);
+    const hintedTopicIds = hintsComplete
+      ? topics
+        .filter((topic) => hintedLocators.has(topic.stream_locator))
+        .map((topic) => topic.topic_id)
+      : allTopicIds;
+    const openTopicId = preferredTopicId && allTopicIds.includes(preferredTopicId)
+      ? preferredTopicId
+      : null;
+    const immediateTopicIds = hintsComplete
+      ? hintedTopicIds
+      : openTopicId
+        ? [openTopicId]
+        : [];
+    immediateTopicIds.sort((left, right) => {
+      if (left === openTopicId) return -1;
+      if (right === openTopicId) return 1;
+      return 0;
+    });
+    for (const topicId of immediateTopicIds) {
+      try {
+        const topicActivity = await syncTopicActivity(groupId, topicId);
+        if (isStopped()) return false;
+        if (!topicActivity) continue;
+        setSummary(topicActivity.summary);
+        if (topicActivity.conversation) {
+          topicSource = topicActivity.conversation;
+          groupConversationCache.current.set(groupId, topicActivity.conversation);
+          if (desiredGroupIdRef.current === groupId) {
+            setConversation(topicActivity.conversation);
+          }
+        }
+      } catch {
+        // This exact stream retries on its next revision or when opened.
+      }
+    }
+
+    // A published join request only changes control state, so this is where a
+    // member learns that somebody is waiting to be let in.
+    if (initial || change.control_changed) queueAdmissionPass(groupId);
+    return true;
+  }, [queueAdmissionPass]);
+
   useEffect(() => {
     if (!identityPublicKey || !summary) return;
     const groups = summary.groups
@@ -2176,6 +2539,68 @@ export default function App() {
     };
     const watch = async (group: GroupSummary) => {
       let revision: number | null = groupWatchRevisions.current.get(group.group_id) ?? null;
+      let pending: PendingGroupWatch | null = null;
+      let draining = false;
+      const requeue = (item: PendingGroupWatch) => {
+        pending = pending ? mergePendingGroupWatch(item, pending) : item;
+      };
+      const drain = async () => {
+        if (draining) return;
+        draining = true;
+        try {
+          while (!stopped && pending) {
+            const item = pending;
+            pending = null;
+            try {
+              const preferredTopicId = desiredGroupIdRef.current === group.group_id
+                ? activeTopicIdRef.current
+                : null;
+              const synced = await syncChangedGroupStreams(
+                group.group_id,
+                item.change,
+                item.initial,
+                preferredTopicId,
+                () => stopped,
+                syncInitialGroup,
+              );
+              if (!synced) {
+                if (!stopped) {
+                  requeue(item);
+                  await new Promise((resolve) => window.setTimeout(resolve, 1500));
+                }
+                continue;
+              }
+              groupWatchRevisions.current.set(group.group_id, item.change.revision);
+              if (item.initial) {
+                scheduleAccountCacheSync();
+                if (!group.read_state_initialized) {
+                  void noise<LocalSummary>({
+                    action: "sync_account",
+                    relays,
+                    interruptible: true,
+                  })
+                    .then((syncedSummary) => {
+                      if (!stopped && syncedSummary) setSummary(syncedSummary);
+                    })
+                    .catch(() => {
+                      // The local baseline is durable; encrypted cross-device sync retries normally.
+                    });
+                }
+              }
+            } catch {
+              requeue(item);
+              await new Promise((resolve) => window.setTimeout(resolve, 1500));
+            }
+          }
+        } finally {
+          draining = false;
+          if (!stopped && pending) void drain();
+        }
+      };
+      const enqueue = (change: GroupWatch, initial: boolean) => {
+        pending = mergePendingGroupWatch(pending, { change, initial });
+        void drain();
+      };
       while (!stopped) {
         try {
           const initial = revision === null;
@@ -2191,68 +2616,20 @@ export default function App() {
             return;
           }
           revision = change.revision;
-          groupWatchRevisions.current.set(group.group_id, change.revision);
           updatePresenceScope(
             `group:${group.group_id}`,
             presenceStatusesFromWatch(change),
           );
           if (initial || change.changed) {
             if (!initial && change.changed) dirtyGroupIds.current.add(group.group_id);
-            const activity = initial
-              ? await syncInitialGroup(group.group_id)
-              : await syncGroupActivity(group.group_id);
-            if (!stopped && activity) {
-              if (activity.conversation) {
-                groupConversationCache.current.set(group.group_id, activity.conversation);
-                dirtyGroupIds.current.delete(group.group_id);
-              }
-              setSummary(activity.summary);
-              const topicSource = activity.conversation
-                ?? groupConversationCache.current.get(group.group_id);
-              const preferredTopicId = desiredGroupIdRef.current === group.group_id
-                ? activeTopicIdRef.current
-                : null;
-              const topicIds = (topicSource?.topics ?? [])
-                .filter((topic) => !topic.archived)
-                .map((topic) => topic.topic_id)
-                .sort((left, right) =>
-                  Number(right === preferredTopicId) - Number(left === preferredTopicId)
-                );
-              for (const topicId of topicIds) {
-                try {
-                  const topicActivity = await syncTopicActivity(group.group_id, topicId);
-                  if (stopped || !topicActivity) break;
-                  setSummary(topicActivity.summary);
-                  if (topicActivity.conversation) {
-                    groupConversationCache.current.set(
-                      group.group_id,
-                      topicActivity.conversation,
-                    );
-                    if (desiredGroupIdRef.current === group.group_id) {
-                      setConversation(topicActivity.conversation);
-                    }
-                  }
-                } catch {
-                  // Topic streams retry on the next group revision or when opened.
-                }
-              }
-              if (initial) scheduleAccountCacheSync();
-            }
-            if (initial && !group.read_state_initialized) {
-              void noise<LocalSummary>({
-                action: "sync_account",
-                relays,
-                interruptible: true,
-              })
-                .then((synced) => {
-                  if (!stopped && synced) setSummary(synced);
-                })
-                .catch(() => {
-                  // The local baseline is durable; encrypted cross-device sync retries normally.
-                });
-            }
+            enqueue(change, initial);
           }
-        } catch {
+        } catch (cause) {
+          if (message(cause) === DEVICE_SESSION_REVOKED_ERROR) {
+            await noise({ action: "logout" }).catch(() => undefined);
+            window.location.reload();
+            return;
+          }
           await new Promise((resolve) => window.setTimeout(resolve, 1500));
         }
       }
@@ -2268,6 +2645,7 @@ export default function App() {
     identityPublicKey,
     scheduleAccountCacheSync,
     sidebarMode,
+    syncChangedGroupStreams,
     updatePresenceScope,
   ]);
 
@@ -2276,6 +2654,48 @@ export default function App() {
     let stopped = false;
     const watch = async () => {
       let revision: number | null = groupWatchRevisions.current.get(activeGroupId) ?? null;
+      let pending: PendingGroupWatch | null = null;
+      let draining = false;
+      const requeue = (item: PendingGroupWatch) => {
+        pending = pending ? mergePendingGroupWatch(item, pending) : item;
+      };
+      const drain = async () => {
+        if (draining) return;
+        draining = true;
+        try {
+          while (!stopped && pending) {
+            const item = pending;
+            pending = null;
+            try {
+              const synced = await syncChangedGroupStreams(
+                activeGroupId,
+                item.change,
+                item.initial,
+                activeTopicIdRef.current,
+                () => stopped,
+              );
+              if (!synced) {
+                if (!stopped) {
+                  requeue(item);
+                  await new Promise((resolve) => window.setTimeout(resolve, 1500));
+                }
+                continue;
+              }
+              groupWatchRevisions.current.set(activeGroupId, item.change.revision);
+            } catch {
+              requeue(item);
+              await new Promise((resolve) => window.setTimeout(resolve, 1500));
+            }
+          }
+        } finally {
+          draining = false;
+          if (!stopped && pending) void drain();
+        }
+      };
+      const enqueue = (change: GroupWatch, initial: boolean) => {
+        pending = mergePendingGroupWatch(pending, { change, initial });
+        void drain();
+      };
       while (!stopped) {
         try {
           const initial = revision === null;
@@ -2291,44 +2711,20 @@ export default function App() {
             return;
           }
           revision = change.revision;
-          groupWatchRevisions.current.set(activeGroupId, change.revision);
           updatePresenceScope(
             `group:${activeGroupId}`,
             presenceStatusesFromWatch(change),
           );
           if (initial || change.changed) {
             if (!initial) dirtyGroupIds.current.add(activeGroupId);
-            const activity = await syncGroupActivity(activeGroupId);
-            if (stopped || !activity) continue;
-            setSummary(activity.summary);
-            if (activity.conversation) {
-              groupConversationCache.current.set(activeGroupId, activity.conversation);
-              setConversation(activity.conversation);
-            }
-            const topicSource = activity.conversation
-              ?? groupConversationCache.current.get(activeGroupId);
-            const preferredTopicId = activeTopicIdRef.current;
-            const topicIds = (topicSource?.topics ?? [])
-              .filter((topic) => !topic.archived)
-              .map((topic) => topic.topic_id)
-              .sort((left, right) =>
-                Number(right === preferredTopicId) - Number(left === preferredTopicId)
-              );
-            for (const topicId of topicIds) {
-              try {
-                const topicActivity = await syncTopicActivity(activeGroupId, topicId);
-                if (stopped || !topicActivity) break;
-                setSummary(topicActivity.summary);
-                if (topicActivity.conversation) {
-                  groupConversationCache.current.set(activeGroupId, topicActivity.conversation);
-                  setConversation(topicActivity.conversation);
-                }
-              } catch {
-                // Topic streams retry on the next group revision or when opened.
-              }
-            }
+            enqueue(change, initial);
           }
-        } catch {
+        } catch (cause) {
+          if (message(cause) === DEVICE_SESSION_REVOKED_ERROR) {
+            await noise({ action: "logout" }).catch(() => undefined);
+            window.location.reload();
+            return;
+          }
           await new Promise((resolve) => window.setTimeout(resolve, 1500));
         }
       }
@@ -2337,7 +2733,14 @@ export default function App() {
     return () => {
       stopped = true;
     };
-  }, [activeGroupId, handleDeletedGroup, identityPublicKey, sidebarMode, updatePresenceScope]);
+  }, [
+    activeGroupId,
+    handleDeletedGroup,
+    identityPublicKey,
+    sidebarMode,
+    syncChangedGroupStreams,
+    updatePresenceScope,
+  ]);
 
   useEffect(() => {
     if (!identityPublicKey) return;
@@ -2386,7 +2789,12 @@ export default function App() {
             const reconciled = await noise<LocalSummary>({ action: "sync_read_state", relays });
             if (!stopped && reconciled) setSummary(reconciled);
           }
-        } catch {
+        } catch (cause) {
+          if (message(cause) === DEVICE_SESSION_REVOKED_ERROR) {
+            await noise({ action: "logout" }).catch(() => undefined);
+            window.location.reload();
+            return;
+          }
           await new Promise((resolve) => window.setTimeout(resolve, 1500));
         }
       }
@@ -2394,41 +2802,6 @@ export default function App() {
     void watch();
     return () => { stopped = true; };
   }, [identityPublicKey, summary?.identity.noise_id]);
-
-  const resetLocalSession = useCallback(() => {
-    refreshGeneration.current += 1;
-    if (accountCacheSyncTimer.current !== null) {
-      window.clearTimeout(accountCacheSyncTimer.current);
-      accountCacheSyncTimer.current = null;
-    }
-    groupSelectionInFlight.current = false;
-    desiredGroupIdRef.current = null;
-    desiredDirectPublicKeyRef.current = null;
-    groupConversationCache.current.clear();
-    directConversationCache.current.clear();
-    dirtyGroupIds.current.clear();
-    groupWatchRevisions.current.clear();
-    groupReadInFlight.current.clear();
-    presenceScopes.current.clear();
-    mediaLoadScheduler.cancelQueued();
-    clearMediaMemoryCache();
-    clearProfileImageMemoryCache();
-    setOptimisticGroupMessages(new Map());
-    setOptimisticDirectMessages(new Map());
-    setPresenceStatuses(new Map());
-    setPendingGroupId(null);
-    setPendingTopicId(null);
-    setLoadingTopicId(null);
-    setActiveTopicId(null);
-    setGroupEncryption(null);
-    setConversation(null);
-    setDirectConversation(null);
-    setGroupMenu(null);
-    setDirectMenu(null);
-    setSidebarMode("groups");
-    setDialog(null);
-    setSummary(null);
-  }, []);
 
   async function perform(operation: () => Promise<void>, syncAccount = true) {
     if (busy) return false;
@@ -2439,7 +2812,9 @@ export default function App() {
       if (syncAccount) await noise({ action: "sync_account", relays });
       return true;
     } catch (cause) {
-      if (message(cause) !== "media upload cancelled") setError(message(cause));
+      if (!["media upload cancelled", "media download cancelled"].includes(message(cause))) {
+        setError(message(cause));
+      }
       return false;
     } finally {
       setBusy(false);
@@ -2461,14 +2836,17 @@ export default function App() {
     source: MessageSummary,
     sourceScopeId: string,
     destination: ForwardDestination,
+    showOriginalAuthor: boolean,
     onProgress: (progress: number) => void,
   ) {
     const controller = new AbortController();
     let pending: PendingMedia | null = null;
-    const forwardedFrom = source.forwarded_from ?? {
-      public_key: source.author_public_key,
-      username: source.username,
-    };
+    const forwardedFrom = showOriginalAuthor
+      ? source.forwarded_from ?? {
+        public_key: source.author_public_key,
+        username: source.username,
+      }
+      : null;
     try {
       setError(null);
       let attachment: MediaAttachment | null = null;
@@ -2779,6 +3157,13 @@ export default function App() {
     setError(null);
     setLoadingTopicId(hasCachedMessages ? null : loadingKey);
     try {
+      // Record the navigation locally before relay reconciliation. A slow or
+      // failed topic refresh must not keep an already-open topic unread.
+      if (topicId) {
+        await markActiveTopicRead(activeGroupId, topicId);
+      } else {
+        await markActiveGroupRead(activeGroupId);
+      }
       await cancelBackgroundLoading();
       const activity = topicId
         ? await syncTopicActivity(activeGroupId, topicId)
@@ -2792,17 +3177,19 @@ export default function App() {
           setConversation(activity.conversation);
         }
       }
-      if (topicId) {
-        void markActiveTopicRead(activeGroupId, topicId);
-      } else {
-        void markActiveGroupRead(activeGroupId);
-      }
     } catch (cause) {
       if (generation === topicSelectionGeneration.current && !isSupersededLoading(cause)) {
         setError(message(cause));
       }
     } finally {
       if (generation === topicSelectionGeneration.current) {
+        // A failed refresh or an older in-flight snapshot must not be allowed
+        // to restore the unread state after the user has opened this topic.
+        if (topicId) {
+          await markActiveTopicRead(activeGroupId, topicId);
+        } else {
+          await markActiveGroupRead(activeGroupId);
+        }
         setPendingTopicId(null);
         setLoadingTopicId(null);
       }
@@ -3019,12 +3406,63 @@ export default function App() {
     }
   }
 
+  async function beginAddingAccount() {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await Promise.all([
+        cancelMediaDownloads(),
+        cancelGroupLoading(),
+        cancelBackgroundLoading(),
+      ]);
+      await startAddingLocalAccount();
+      window.location.reload();
+    } catch (cause) {
+      setError(message(cause));
+      setBusy(false);
+    }
+  }
+
+  async function cancelAddingAccount() {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await cancelAddingLocalAccount();
+      window.location.reload();
+    } catch (cause) {
+      setError(message(cause));
+      setBusy(false);
+    }
+  }
+
+  async function selectLocalAccount(account: LocalAccount) {
+    if (busy || account.id === localAccounts.active_account_id) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await Promise.all([
+        cancelMediaDownloads(),
+        cancelGroupLoading(),
+        cancelBackgroundLoading(),
+      ]);
+      await switchLocalAccount(account.id);
+      window.location.reload();
+    } catch (cause) {
+      setError(message(cause));
+      setBusy(false);
+    }
+  }
+
   if (loading) return <><Loading /><UpdateBanner {...updater} /></>;
   if (!summary) {
     return (
       <>
       <Onboarding
         busy={busy}
+        addingAccount={localAccounts.adding_account}
+        onCancelAdd={cancelAddingAccount}
         onCreate={(username, password) =>
           perform(async () => {
             const avatar = await generateUserAvatar(`${username}:${crypto.randomUUID()}`);
@@ -3057,7 +3495,14 @@ export default function App() {
     );
   }
 
-  const selectedConversationState = conversation?.group.group_id === activeGroupId ? conversation : null;
+  const rawSelectedConversationState =
+    conversation?.group.group_id === activeGroupId ? conversation : null;
+  const selectedConversationState = rawSelectedConversationState
+    ? withoutMessages(
+      rawSelectedConversationState,
+      deletedGroupMessageIds.get(rawSelectedConversationState.group.group_id) ?? new Set(),
+    )
+    : null;
   const selectedTopic = activeTopicId
     ? selectedConversationState?.topics.find(
         (topic) => topic.topic_id === activeTopicId && !topic.archived,
@@ -3124,10 +3569,16 @@ export default function App() {
         activeTopicId={effectiveTopicId}
         directPresenceStatuses={presenceStatuses}
         selfPresenceStatus={selfPresenceStatus}
+        accounts={localAccounts.accounts}
+        activeAccountId={localAccounts.active_account_id}
+        accountBusy={busy}
         onMode={(mode) => void switchSidebarMode(mode)}
         onMake={() => setDialog({ type: "make" })}
         onJoin={() => setDialog({ type: "join" })}
-        onProfile={() => setDialog({ type: "profile", profile: summary.identity })}
+        onSettings={() => setDialog({ type: "profile", profile: summary.identity })}
+        onAddAccount={() => void beginAddingAccount()}
+        onSwitchAccount={(account) => void selectLocalAccount(account)}
+        onSignOut={() => setDialog({ type: "logout" })}
         onContextMenu={(group, x, y) => {
           setGroupMenu({ group, x, y });
         }}
@@ -3178,7 +3629,12 @@ export default function App() {
               })}
               onDownload={(item) => perform(async () => {
                 if (!item.attachment) throw new Error("this message has no media");
-                await downloadAttachment(item.attachment, selectedConversation.group.group_id);
+                if (!await downloadAttachment(
+                  item.attachment,
+                  selectedConversation.group.group_id,
+                )) {
+                  throw new Error("media download cancelled");
+                }
               }, false)}
               onForward={(item) => setDialog({
                 type: "forward_message",
@@ -3205,7 +3661,6 @@ export default function App() {
                     enabled,
                     relays,
                   });
-                  await refresh();
                 } catch (cause) {
                   updateVisibleGroupReaction(
                     groupId,
@@ -3217,12 +3672,23 @@ export default function App() {
                   setError(message(cause));
                 }
               }}
-              onSetModerator={(member, enabled) =>
-                perform(async () => {
-                  await noise({ action: "set_moderator", member_public_key: member.public_key, enabled, relays });
-                  await refresh();
-                })
-              }
+              onSetModerator={async (member, enabled) => {
+                const groupId = selectedConversation.group.group_id;
+                updateVisibleGroupModerator(groupId, member.public_key, enabled);
+                try {
+                  await noise({
+                    action: "set_moderator",
+                    member_public_key: member.public_key,
+                    enabled,
+                    relays,
+                  });
+                  return true;
+                } catch (cause) {
+                  updateVisibleGroupModerator(groupId, member.public_key, !enabled);
+                  setError(message(cause));
+                  return false;
+                }
+              }}
               onBan={(member) => setDialog({ type: "ban_member", member })}
               onReport={(message) => setDialog({ type: "report_message", message })}
               onReachedBottom={markCurrentGroupRead}
@@ -3341,7 +3807,12 @@ export default function App() {
               onDelete={() => setDialog({ type: "delete_direct", direct: selectedDirectConversation.contact })}
               onDownload={(item) => perform(async () => {
                 if (!item.attachment) throw new Error("this message has no media");
-                await downloadAttachment(item.attachment, selectedDirectConversation.media_scope_id);
+                if (!await downloadAttachment(
+                  item.attachment,
+                  selectedDirectConversation.media_scope_id,
+                )) {
+                  throw new Error("media download cancelled");
+                }
               }, false)}
               onForward={(item) => setDialog({
                 type: "forward_message",
@@ -3446,6 +3917,7 @@ export default function App() {
       {dialog?.type === "profile" && (
         <SettingsDialog
           profile={dialog.profile}
+          devices={summary.devices}
           blockedPeople={summary.blocked_people}
           busy={busy}
           onClose={() => setDialog(null)}
@@ -3456,6 +3928,17 @@ export default function App() {
             setDialog({ type: "profile", profile: local.identity });
           }}
           onUnblock={(person) => updateBlock(person, false)}
+          onRevokeDevice={(device) =>
+            perform(async () => {
+              const local = await noise<LocalSummary>({
+                action: "revoke_device",
+                device_id: device.device_id,
+                relays,
+              });
+              if (!local) throw new Error("the device session was not updated");
+              setSummary(local);
+            }, false)
+          }
           onSave={(username, bio, avatar, removeAvatar, acceptsDirectMessages) =>
             perform(async () => {
               const local = await noise<LocalSummary>({
@@ -3540,13 +4023,12 @@ export default function App() {
           onClose={() => setDialog(null)}
           onUnban={(member) => perform(async () => {
             await noise({ action: "unban_member", member_public_key: member.public_key, relays });
-            await refresh();
+            await refreshCachedGroup(dialog.group.group_id);
           })}
           onRotateFrequency={(revokeOnly) => perform(async () => {
             const local = await noise<LocalSummary>({ action: "rotate_frequency", revoke_only: revokeOnly, relays });
             if (!local) throw new Error("the relay did not return the updated frequency");
             setSummary(local);
-            await refresh();
             const updatedGroup = local.groups.find((group) => group.group_id === dialog.group.group_id);
             if (updatedGroup) setDialog({ type: "group", group: updatedGroup });
           })}
@@ -3601,10 +4083,10 @@ export default function App() {
           }
         />
       )}
-      {dialog?.type === "media" && conversation && (
+      {dialog?.type === "media" && selectedConversationState && (
         <MediaGalleryDialog
-          group={conversation.group}
-          messages={conversation.messages}
+          group={selectedConversationState.group}
+          messages={selectedConversationState.messages}
           onClose={() => setDialog(null)}
         />
       )}
@@ -3619,11 +4101,12 @@ export default function App() {
           people={[...summary.directs, ...summary.known_people]}
           selfPublicKey={summary.identity.public_key}
           onClose={() => setDialog(null)}
-          onForward={(destination, onProgress) =>
+          onForward={(destination, showOriginalAuthor, onProgress) =>
             forwardMessage(
               dialog.message,
               dialog.sourceScopeId,
               destination,
+              showOriginalAuthor,
               onProgress,
             )}
         />
@@ -3635,7 +4118,7 @@ export default function App() {
           onClose={() => setDialog(null)}
           onReport={(reason) => perform(async () => {
             await noise({ action: "report_message", message_event_id: dialog.message.event_id, reason, relays });
-            await refresh();
+            if (activeGroupId) await refreshCachedGroup(activeGroupId);
             setDialog(null);
           })}
         />
@@ -3649,6 +4132,13 @@ export default function App() {
           onDelete={async () => {
             const groupId = dialog.scopeId;
             const messageEventId = dialog.message.event_id;
+            setDeletedGroupMessageIds((current) => {
+              const next = new Map(current);
+              const deleted = new Set(next.get(groupId) ?? []);
+              deleted.add(messageEventId);
+              next.set(groupId, deleted);
+              return next;
+            });
             const previous = groupConversationCache.current.get(groupId)
               ?? (conversation?.group.group_id === groupId ? conversation : null);
             if (previous) {
@@ -3671,6 +4161,14 @@ export default function App() {
               return true;
             } catch (cause) {
               setError(message(cause));
+              setDeletedGroupMessageIds((current) => {
+                const next = new Map(current);
+                const deleted = new Set(next.get(groupId) ?? []);
+                deleted.delete(messageEventId);
+                if (deleted.size > 0) next.set(groupId, deleted);
+                else next.delete(groupId);
+                return next;
+              });
               if (!previous) return false;
               const cached = groupConversationCache.current.get(groupId) ?? previous;
               groupConversationCache.current.set(
@@ -3687,21 +4185,21 @@ export default function App() {
           }}
         />
       )}
-      {dialog?.type === "reports" && conversation && (
+      {dialog?.type === "reports" && selectedConversationState && (
         <ReportsDialog
-          reports={conversation.reports}
+          reports={selectedConversationState.reports}
           presenceStatuses={selectedPresenceStatuses}
           busy={busy}
           onClose={() => setDialog(null)}
           onDismiss={(report) => perform(async () => {
             await noise({ action: "resolve_report", report_event_id: report.report_event_id, relays });
-            await refresh();
+            await refreshCachedGroup(selectedConversationState.group.group_id);
           })}
           onDelete={async (report) => {
             setDialog({
               type: "delete_message",
               message: report.message,
-              scopeId: conversation.group.group_id,
+              scopeId: selectedConversationState.group.group_id,
             });
             return true;
           }}
@@ -3720,7 +4218,7 @@ export default function App() {
                 delete_messages: deleteMessages,
                 relays,
               });
-              await refresh();
+              if (activeGroupId) await refreshCachedGroup(activeGroupId);
               setDialog(null);
             })
           }
@@ -3739,8 +4237,8 @@ export default function App() {
               groupConversationCache.current.delete(dialog.group.group_id);
               clearMediaMemoryCache();
               clearProfileImageMemoryCache();
-              await refresh();
               setDialog(null);
+              void refresh().catch((cause) => setError(message(cause)));
             })
           }
         />
@@ -3761,8 +4259,8 @@ export default function App() {
               groupConversationCache.current.delete(dialog.group.group_id);
               clearMediaMemoryCache();
               clearProfileImageMemoryCache();
-              await refresh();
               setDialog(null);
+              void refresh().catch((cause) => setError(message(cause)));
             })
           }
         />
@@ -3778,8 +4276,8 @@ export default function App() {
             setDirectConversation(null);
             directConversationCache.current.delete(dialog.direct.public_key);
             clearMediaMemoryCache();
-            await refresh();
             setDialog(null);
+            void refresh().catch((cause) => setError(message(cause)));
           })}
         />
       )}
@@ -3795,7 +4293,7 @@ export default function App() {
               delete_direct_threads: deleteDirectThreads,
               relays,
             });
-            resetLocalSession();
+            window.location.reload();
           }, false)}
         />
       )}
@@ -3805,7 +4303,7 @@ export default function App() {
           onClose={() => setDialog({ type: "profile", profile: summary.identity })}
           onLogout={() => perform(async () => {
             await noise({ action: "logout" });
-            resetLocalSession();
+            window.location.reload();
           }, false)}
         />
       )}
@@ -3887,10 +4385,16 @@ function Sidebar({
   activeTopicId,
   directPresenceStatuses,
   selfPresenceStatus,
+  accounts,
+  activeAccountId,
+  accountBusy,
   onMode,
   onMake,
   onJoin,
-  onProfile,
+  onSettings,
+  onAddAccount,
+  onSwitchAccount,
+  onSignOut,
   onContextMenu,
   onDirectContextMenu,
   onSelect,
@@ -3908,10 +4412,16 @@ function Sidebar({
   activeTopicId: string | null;
   directPresenceStatuses: Map<string, PresenceStatus>;
   selfPresenceStatus: PresenceStatus;
+  accounts: LocalAccount[];
+  activeAccountId: string | null;
+  accountBusy: boolean;
   onMode: (mode: SidebarMode) => void;
   onMake: () => void;
   onJoin: () => void;
-  onProfile: () => void;
+  onSettings: () => void;
+  onAddAccount: () => void;
+  onSwitchAccount: (account: LocalAccount) => void;
+  onSignOut: () => void;
   onContextMenu: (group: GroupSummary, x: number, y: number) => void;
   onDirectContextMenu: (direct: DirectSummary, x: number, y: number) => void;
   onSelect: (group: GroupSummary) => void;
@@ -3929,6 +4439,8 @@ function Sidebar({
   const canReorderTopics = conversation?.group.owner_public_key === summary.identity.public_key;
   const [draggedTopicId, setDraggedTopicId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ topicId: string; after: boolean } | null>(null);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const accountMenuRef = useRef<HTMLDivElement | null>(null);
   const topicDrag = useRef<{ pointerId: number; topicId: string; startY: number; moved: boolean } | null>(null);
   const dropTargetRef = useRef<{ topicId: string; after: boolean } | null>(null);
   const suppressTopicClick = useRef(false);
@@ -3936,6 +4448,16 @@ function Sidebar({
     dropTargetRef.current = target;
     setDropTarget(target);
   };
+  useEffect(() => {
+    if (!accountMenuOpen) return;
+    const close = (event: PointerEvent) => {
+      if (!accountMenuRef.current?.contains(event.target as Node)) {
+        setAccountMenuOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [accountMenuOpen]);
   return (
     <aside className="sidebar">
       <div className="sidebar-drag" data-tauri-drag-region>
@@ -4111,11 +4633,76 @@ function Sidebar({
         ))}
         {mode === "directs" && summary.directs.length === 0 && <div className="empty-direct-list">message someone from a shared group</div>}
       </div>
-      <button className="self-profile" onClick={onProfile}>
-        <PresenceAvatar name={summary.identity.username} image={summary.identity.avatar} size={32} status={selfPresenceStatus} />
-        <span><strong>{summary.identity.username}</strong><small>{summary.identity.bio || "build your identity"}</small></span>
-        <Settings2 size={13} />
-      </button>
+      <div className="self-account" ref={accountMenuRef}>
+        {accountMenuOpen && (
+          <div className="account-switcher" role="menu" aria-label="accounts">
+            <div className="account-switcher-list">
+              {accounts.map((account) => {
+                const active = account.id === activeAccountId;
+                return (
+                  <button
+                    key={account.id}
+                    className={active ? "active" : ""}
+                    disabled={accountBusy}
+                    onClick={() => {
+                      if (active) {
+                        setAccountMenuOpen(false);
+                      } else {
+                        onSwitchAccount(account);
+                      }
+                    }}
+                    role="menuitemradio"
+                    aria-checked={active}
+                  >
+                    <Avatar name={account.username} image={account.avatar} size={34} />
+                    <span>
+                      <strong>{account.username}</strong>
+                      <small>{account.bio || "Noise account"}</small>
+                    </span>
+                    {active && <Check size={15} />}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="account-switcher-actions">
+              <button
+                disabled={accountBusy}
+                onClick={() => {
+                  setAccountMenuOpen(false);
+                  onSettings();
+                }}
+                role="menuitem"
+              >
+                <Settings2 size={15} /> Settings
+              </button>
+              <button disabled={accountBusy} onClick={onAddAccount} role="menuitem">
+                <UserPlus size={15} /> Add account
+              </button>
+              <button
+                className="sign-out"
+                disabled={accountBusy}
+                onClick={() => {
+                  setAccountMenuOpen(false);
+                  onSignOut();
+                }}
+                role="menuitem"
+              >
+                <LogOut size={15} /> Sign out {summary.identity.username}
+              </button>
+            </div>
+          </div>
+        )}
+        <button
+          className="self-profile"
+          onClick={() => setAccountMenuOpen((open) => !open)}
+          aria-haspopup="menu"
+          aria-expanded={accountMenuOpen}
+        >
+          <PresenceAvatar name={summary.identity.username} image={summary.identity.avatar} size={32} status={selfPresenceStatus} />
+          <span><strong>{summary.identity.username}</strong><small>{summary.identity.bio || "build your identity"}</small></span>
+          <MoreHorizontal size={15} />
+        </button>
+      </div>
     </aside>
   );
 }
@@ -4241,8 +4828,15 @@ function useChunkedMessageList<T extends { event_id: string }>(
   const positionedConversation = useRef<string | null>(null);
   const previousMessageCount = useRef(messages.length);
   const savedScroll = useRef<SavedMessageScroll>({ stuckAtBottom: true });
+  const olderSentinel = useRef<HTMLDivElement>(null);
   const loadingOlder = useRef(false);
-  const loadingRemoteHistory = useRef(false);
+  const pendingLocalPage = useRef(false);
+  // Set once the relays answer without adding anything, so a conversation whose
+  // has_older_messages flag stays optimistically true cannot be asked forever.
+  // The ref is read synchronously while paging; the state retires the affordance.
+  const exhaustedRemoteHistory = useRef(false);
+  const [remoteHistoryExhausted, setRemoteHistoryExhausted] = useState(false);
+  const [loadingOlderHistory, setLoadingOlderHistory] = useState(false);
   const [atBottom, setAtBottom] = useState(true);
   const [visibleCount, setVisibleCount] = useState(() =>
     Math.min(
@@ -4254,7 +4848,7 @@ function useChunkedMessageList<T extends { event_id: string }>(
   const renderedCount = Math.min(messages.length, visibleCount + incomingCount);
   const visibleMessages = messages.slice(Math.max(0, messages.length - renderedCount));
   const hasOlder = renderedCount < messages.length;
-  const canLoadOlder = hasOlder || hasRemoteHistory;
+  const canLoadOlder = hasOlder || (hasRemoteHistory && !remoteHistoryExhausted);
 
   const saveScrollPosition = useCallback(() => {
     const element = ref.current;
@@ -4281,6 +4875,55 @@ function useChunkedMessageList<T extends { event_id: string }>(
     }
   }, []);
 
+  // The async history walk below outlives the render that started it, so read
+  // paging inputs through a ref instead of a captured closure.
+  const paging = useRef({ hasOlder, hasRemoteHistory, messageCount: messages.length, onLoadRemoteHistory });
+  paging.current = { hasOlder, hasRemoteHistory, messageCount: messages.length, onLoadRemoteHistory };
+
+  const loadOlder = useCallback(() => {
+    if (loadingOlder.current) return;
+    if (paging.current.hasOlder) {
+      // Older messages are already in memory, so widening the window is enough.
+      if (pendingLocalPage.current) return;
+      pendingLocalPage.current = true;
+      saveScrollPosition();
+      setVisibleCount((current) => {
+        const next = Math.min(paging.current.messageCount, current + MESSAGE_PAGE_SIZE);
+        renderedMessageCounts.set(conversationKey, next);
+        return next;
+      });
+      return;
+    }
+    if (!paging.current.hasRemoteHistory || !paging.current.onLoadRemoteHistory) return;
+    if (exhaustedRemoteHistory.current) return;
+    loadingOlder.current = true;
+    setLoadingOlderHistory(true);
+    void (async () => {
+      const countBeforeLoad = previousMessageCount.current;
+      try {
+        for (let attempt = 0; attempt < REMOTE_HISTORY_ATTEMPTS; attempt += 1) {
+          const fetchOlder = paging.current.onLoadRemoteHistory;
+          if (!fetchOlder) break;
+          saveScrollPosition();
+          await fetchOlder();
+          // Let React commit the expanded conversation before judging progress.
+          await new Promise<void>((resolve) => { window.setTimeout(resolve, 0); });
+          if (previousMessageCount.current !== countBeforeLoad) break;
+          if (!paging.current.hasRemoteHistory) break;
+        }
+        if (previousMessageCount.current === countBeforeLoad) {
+          exhaustedRemoteHistory.current = true;
+          setRemoteHistoryExhausted(true);
+        }
+      } finally {
+        // Always release the latch. A page that lands in another topic, a relay
+        // error, or a cancelled load must not wedge every later scroll.
+        loadingOlder.current = false;
+        setLoadingOlderHistory(false);
+      }
+    })();
+  }, [conversationKey, saveScrollPosition]);
+
   useLayoutEffect(() => {
     const element = ref.current;
     if (!element) return;
@@ -4288,6 +4931,8 @@ function useChunkedMessageList<T extends { event_id: string }>(
       element.scrollTop = element.scrollHeight;
       positionedConversation.current = conversationKey;
       savedScroll.current = { stuckAtBottom: true };
+      exhaustedRemoteHistory.current = false;
+      setRemoteHistoryExhausted(false);
       setAtBottom(true);
     } else if (savedScroll.current.stuckAtBottom) {
       const bottomDistance = element.scrollHeight - element.scrollTop - element.clientHeight;
@@ -4309,62 +4954,59 @@ function useChunkedMessageList<T extends { event_id: string }>(
       setVisibleCount(renderedCount);
     }
     renderedMessageCounts.set(conversationKey, renderedCount);
+    if (previousMessageCount.current !== messages.length) {
+      // History moved, so the relays are worth asking again.
+      exhaustedRemoteHistory.current = false;
+      setRemoteHistoryExhausted(false);
+    }
     previousMessageCount.current = messages.length;
-    loadingOlder.current = false;
+    pendingLocalPage.current = false;
+    // Keep paging while the reader is parked near the top. Widening the local
+    // window is instant and often only adds a handful of rows, so without this
+    // the first step stalls there instead of continuing into the relay fetch
+    // that actually needs a spinner.
     if (
       canLoadOlder
-      && element.scrollHeight <= element.clientHeight + 1
-      && !loadingOlder.current
-      && !loadingRemoteHistory.current
+      && (element.scrollTop <= OLDER_MESSAGE_TRIGGER_DISTANCE
+        || element.scrollHeight <= element.clientHeight + 1)
     ) {
-      loadingOlder.current = true;
-      if (hasOlder) {
-        setVisibleCount((current) =>
-          Math.min(messages.length, current + MESSAGE_PAGE_SIZE)
-        );
-      } else if (onLoadRemoteHistory) {
-        loadingRemoteHistory.current = true;
-        saveScrollPosition();
-        void onLoadRemoteHistory().finally(() => {
-          loadingRemoteHistory.current = false;
-        });
-      }
+      loadOlder();
     }
   });
+
+  // Watching a sentinel above the oldest row keeps paging working even when the
+  // container swallows scroll events or the new batch lands off screen.
+  useEffect(() => {
+    const element = ref.current;
+    const sentinel = olderSentinel.current;
+    if (!element || !sentinel || !canLoadOlder) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) loadOlder();
+      },
+      { root: element, rootMargin: `${OLDER_MESSAGE_TRIGGER_DISTANCE}px 0px 0px 0px` },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [canLoadOlder, conversationKey, loadOlder, messages.length]);
 
   const onScroll = useCallback(() => {
     const element = ref.current;
     if (!element) return;
     saveScrollPosition();
-    if (
-      !canLoadOlder
-      || loadingOlder.current
-      || loadingRemoteHistory.current
-      || element.scrollTop > element.clientHeight
-    ) return;
-    loadingOlder.current = true;
-    if (hasOlder) {
-      setVisibleCount((current) => {
-        const next = Math.min(messages.length, current + MESSAGE_PAGE_SIZE);
-        renderedMessageCounts.set(conversationKey, next);
-        return next;
-      });
-    } else if (onLoadRemoteHistory) {
-      loadingRemoteHistory.current = true;
-      void onLoadRemoteHistory().finally(() => {
-        loadingRemoteHistory.current = false;
-      });
-    }
-  }, [
-    canLoadOlder,
-    conversationKey,
-    hasOlder,
-    messages.length,
-    onLoadRemoteHistory,
-    saveScrollPosition,
-  ]);
+    if (element.scrollTop <= OLDER_MESSAGE_TRIGGER_DISTANCE) loadOlder();
+  }, [loadOlder, saveScrollPosition]);
 
-  return { ref, onScroll, visibleMessages, renderedCount, atBottom };
+  return {
+    ref,
+    olderSentinel,
+    onScroll,
+    visibleMessages,
+    renderedCount,
+    atBottom,
+    canLoadOlder,
+    loadingOlder: loadingOlderHistory,
+  };
 }
 
 function useAutosizeComposer(
@@ -4592,6 +5234,12 @@ function ConversationPanel({
             ? <MediaLoadStatus prominent />
             : <div className="quiet">{topic ? "this topic is quiet" : "the group is quiet"}</div>
         )}
+        {messageList.canLoadOlder && (
+          <OlderMessagesSentinel
+            loading={messageList.loadingOlder}
+            sentinel={messageList.olderSentinel}
+          />
+        )}
         {messageList.visibleMessages.map((item) => (
           <MessageRow key={item.event_id} message={item} own={item.author_public_key === selfPublicKey} presence={presenceStatuses.get(item.author_public_key) ?? "offline"} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onToggleReaction={(emoji) => void onReaction(item, emoji)} onPerson={onPerson} mediaScopeId={conversation.group.group_id} />
         ))}
@@ -4800,6 +5448,12 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
       </header>
       <div className="messages" ref={messageList.ref} onScroll={messageList.onScroll}>
         {conversation.messages.length === 0 && <div className="quiet">start the conversation</div>}
+        {messageList.canLoadOlder && (
+          <OlderMessagesSentinel
+            loading={messageList.loadingOlder}
+            sentinel={messageList.olderSentinel}
+          />
+        )}
         {messageList.visibleMessages.map((rawItem) => {
           const item = withCurrentDirectProfile(rawItem, self, contact);
           const rawReply = conversation.messages.find(
@@ -4959,7 +5613,18 @@ function MessageRow({
       } : undefined}
     >
       <button onClick={() => onPerson(person)}><PresenceAvatar name={message.username} image={message.avatar} size={34} status={presence ?? "offline"} /></button>
-      <div className="message-body"><div className="message-meta"><button onClick={() => onPerson(person)}>{message.username}</button></div>{forwardedPerson && <div className="message-forwarded"><Forward size={13} /><span>Forwarded from</span><button onClick={() => onPerson(forwardedPerson)}>{forwardedPerson.username}</button></div>}{message.reply_to_message_id && <div className="message-reply-reference">{replyTo ? <>{replyTo.attachment && <ReplyMediaThumbnail message={replyTo as MessageSummary & { attachment: MediaAttachment }} scopeId={mediaScopeId} />}<span className="message-reply-copy"><strong>{replyTo.username}</strong><span>{replyPreview(replyTo)}</span></span></> : <span>original message unavailable</span>}</div>}{message.text && <p className={jumboEmojiCount ? `emoji-only emoji-only-${jumboEmojiCount}` : undefined}>{linkify(message.text)}</p>}{previewUrl && <LinkPreviewCard url={previewUrl} />}{localAttachment ? <LocalMessageMedia attachment={localAttachment} manifest={message.attachment} scopeId={mediaScopeId} uploadProgress={message.upload_progress} uploadError={message.upload_error} /> : message.attachment && <MessageMedia attachment={message.attachment} scopeId={mediaScopeId} />}<time className="message-time">{formatTime(message.created_at_millis)}</time>{message.reactions && message.reactions.length > 0 && <MessageReactions reactions={message.reactions} onToggle={onToggleReaction} />}</div>
+      <div className="message-body">
+        <div className="message-meta"><button onClick={() => onPerson(person)}>{message.username}</button></div>
+        {forwardedPerson && <div className="message-forwarded"><Forward size={13} /><span>Forwarded from</span><button onClick={() => onPerson(forwardedPerson)}>{forwardedPerson.username}</button></div>}
+        {message.reply_to_message_id && <div className="message-reply-reference">{replyTo ? <>{replyTo.attachment && <ReplyMediaThumbnail message={replyTo as MessageSummary & { attachment: MediaAttachment }} scopeId={mediaScopeId} />}<span className="message-reply-copy"><strong>{replyTo.username}</strong><span>{replyPreview(replyTo)}</span></span></> : <span>original message unavailable</span>}</div>}
+        {message.text && <p className={jumboEmojiCount ? `emoji-only emoji-only-${jumboEmojiCount}` : undefined}>{linkify(message.text)}</p>}
+        {previewUrl && <LinkPreviewCard url={previewUrl} />}
+        {localAttachment
+          ? <LocalMessageMedia attachment={localAttachment} manifest={message.attachment} scopeId={mediaScopeId} uploadProgress={message.upload_progress} uploadError={message.upload_error} />
+          : message.attachment && <MessageMedia attachment={message.attachment} scopeId={mediaScopeId} />}
+        <time className="message-time">{formatTime(message.created_at_millis)}</time>
+        {message.reactions && message.reactions.length > 0 && <MessageReactions reactions={message.reactions} onToggle={onToggleReaction} />}
+      </div>
     </article>
   );
 }
@@ -5071,7 +5736,7 @@ function MessageMedia({ attachment, scopeId, autoplayVideo = false }: { attachme
     ) return;
     void prewarmMediaBootstrap(attachment, scopeId, visibility.priority);
   }, [attachment, scopeId, video, videoRequested, visibility.priority]);
-  const { source, failed } = useMediaSource(
+  const { source, failed, retry: retrySource } = useMediaSource(
     attachment,
     scopeId,
     video
@@ -5105,6 +5770,7 @@ function MessageMedia({ attachment, scopeId, autoplayVideo = false }: { attachme
           autoPlay={videoRequested}
           playbackRequested={videoRequested}
           onRequestPlayback={() => setVideoRequested(true)}
+          onSourceError={retrySource}
           failed={failed}
         />
       ) : source ? (
@@ -5291,6 +5957,28 @@ function requestMediaSource(
 }
 
 async function downloadAttachment(attachment: MediaAttachment, scopeId?: string) {
+  if (isTauri) {
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    const destinationPath = await save({
+      defaultPath: attachment.file_name || "noise-media",
+      title: "Save decrypted media",
+    });
+    if (!destinationPath) return false;
+    const data = await noise<AttachmentData>({
+      action: "fetch_attachment",
+      attachment,
+      scope_id: scopeId,
+      relays,
+    });
+    if (!data) throw new Error("media is unavailable");
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke<string>("download_media", {
+      sourcePath: data.file_path,
+      fileName: attachment.file_name,
+      destinationPath,
+    });
+    return true;
+  }
   const data = await noise<AttachmentData>({
     action: "fetch_attachment",
     attachment,
@@ -5298,14 +5986,6 @@ async function downloadAttachment(attachment: MediaAttachment, scopeId?: string)
     relays,
   });
   if (!data) throw new Error("media is unavailable");
-  if (isTauri) {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke<string>("download_media", {
-      sourcePath: data.file_path,
-      fileName: attachment.file_name,
-    });
-    return;
-  }
   const link = document.createElement("a");
   link.href = data.file_path;
   link.download = attachment.file_name || "noise-media";
@@ -5313,6 +5993,7 @@ async function downloadAttachment(attachment: MediaAttachment, scopeId?: string)
   document.body.append(link);
   link.click();
   link.remove();
+  return true;
 }
 
 async function pendingMediaFromAttachment(
@@ -5515,6 +6196,7 @@ function useMediaSource(
     return source ? { cacheKey, source } : null;
   });
   const [failedKey, setFailedKey] = useState<string | null>(null);
+  const retryRequest = useRef<Promise<boolean> | null>(null);
   const source = loaded?.cacheKey === cacheKey
     ? loaded.source
     : mediaCache.get(cacheKey) ?? null;
@@ -5552,7 +6234,27 @@ function useMediaSource(
       if (retryTimer !== undefined) window.clearTimeout(retryTimer);
     };
   }, [attachment, cacheKey, priority, scopeId]);
-  return { source, failed: failedKey === cacheKey };
+  const retry = useCallback(() => {
+    if (retryRequest.current) return retryRequest.current;
+    mediaCache.delete(cacheKey);
+    mediaLoadPromises.delete(cacheKey);
+    setFailedKey(null);
+    const request = requestMediaSource(attachment, scopeId, "visible")
+      .then((next) => {
+        setLoaded({ cacheKey, source: next });
+        return true;
+      })
+      .catch(() => {
+        setFailedKey(cacheKey);
+        return false;
+      })
+      .finally(() => {
+        if (retryRequest.current === request) retryRequest.current = null;
+      });
+    retryRequest.current = request;
+    return request;
+  }, [attachment, cacheKey, scopeId]);
+  return { source, failed: failedKey === cacheKey, retry };
 }
 
 function useMediaPriority<T extends HTMLElement>() {
@@ -5697,14 +6399,47 @@ function ChatImage({
       && (suppliedDimensions || mediaDimensionCache.has(cacheKey))
     ),
   );
+  const [expanded, setExpanded] = useState(false);
   useEffect(() => {
     const knownDimensions = suppliedDimensions ?? mediaDimensionCache.get(cacheKey) ?? null;
     setDimensions(knownDimensions);
     setReady(Boolean(source && decodedImageCache.has(cacheKey) && knownDimensions));
   }, [cacheKey, pixelHeight, pixelWidth, source]);
+  useEffect(() => {
+    if (!expanded) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setExpanded(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [expanded]);
   const style = mediaFrameStyle(dimensions?.width, dimensions?.height);
+  const visibleSource = source ?? preview;
+  const lightboxRoot = document.querySelector<HTMLElement>(".app-shell")
+    ?? document.body;
+  const expandedImageStyle: CSSProperties | undefined =
+    dimensions?.width && dimensions.height
+      ? {
+        width: `min(90vw, ${(90 * dimensions.width) / dimensions.height}vh)`,
+        height: "auto",
+      }
+      : undefined;
   return (
-    <span className="chat-image" style={style}>
+    <span
+      className="chat-image"
+      style={style}
+      role={visibleSource ? "button" : undefined}
+      tabIndex={visibleSource ? 0 : undefined}
+      aria-label={visibleSource ? "view image full size" : undefined}
+      onClick={visibleSource ? () => setExpanded(true) : undefined}
+      onKeyDown={visibleSource ? (event) => {
+        if (event.target !== event.currentTarget) return;
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          setExpanded(true);
+        }
+      } : undefined}
+    >
       {source && (
         <img
           className={ready ? "ready" : ""}
@@ -5725,6 +6460,36 @@ function ChatImage({
       )}
       {!ready && preview && <img className="media-preview-cover" src={preview} alt="" aria-hidden="true" />}
       {!ready && <MediaLoadStatus failed={failed} compact={Boolean(preview)} />}
+      {expanded && visibleSource && createPortal(
+        <div
+          className="image-lightbox"
+          role="dialog"
+          aria-modal="true"
+          aria-label="expanded image"
+          onClick={(event) => {
+            event.stopPropagation();
+            setExpanded(false);
+          }}
+          onKeyDown={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            className="image-lightbox-close"
+            onClick={() => setExpanded(false)}
+            aria-label="close expanded image"
+            autoFocus
+          >
+            <X size={18} />
+          </button>
+          <img
+            src={visibleSource}
+            alt="shared media, expanded"
+            style={expandedImageStyle}
+            onClick={(event) => event.stopPropagation()}
+          />
+        </div>,
+        lightboxRoot,
+      )}
     </span>
   );
 }
@@ -5738,6 +6503,7 @@ function ChatVideo({
   autoPlay = false,
   playbackRequested = false,
   onRequestPlayback,
+  onSourceError,
   failed = false,
 }: {
   source?: string;
@@ -5748,6 +6514,7 @@ function ChatVideo({
   autoPlay?: boolean;
   playbackRequested?: boolean;
   onRequestPlayback?: () => void;
+  onSourceError?: () => Promise<boolean>;
   failed?: boolean;
 }) {
   const [playing, setPlaying] = useState(false);
@@ -5765,7 +6532,11 @@ function ChatVideo({
   const [measuredDimensions, setMeasuredDimensions] = useState(() =>
     posterCacheKey ? mediaDimensionCache.get(posterCacheKey) ?? null : null
   );
+  const [fullscreen, setFullscreen] = useState(false);
   const video = useRef<HTMLVideoElement>(null);
+  const frame = useRef<HTMLDivElement>(null);
+  const automaticRecoveryAttempts = useRef(0);
+  const sourceRecoveryInFlight = useRef(false);
   // Give visible desktop videos their local stream before Play so WebKit can
   // finish metadata/range probes without adding that setup to the click.
   const activeSource = source;
@@ -5779,7 +6550,24 @@ function ChatVideo({
     setDuration(0);
     setBuffering(false);
     setPlaybackFailed(false);
+    sourceRecoveryInFlight.current = false;
   }, [activeSource]);
+  useEffect(() => {
+    automaticRecoveryAttempts.current = 0;
+  }, [posterCacheKey]);
+  useEffect(() => {
+    const syncFullscreen = () => {
+      const active = activeFullscreenElement();
+      setFullscreen(active !== null && (active === frame.current || active === video.current));
+    };
+    syncFullscreen();
+    document.addEventListener("fullscreenchange", syncFullscreen);
+    document.addEventListener("webkitfullscreenchange", syncFullscreen);
+    return () => {
+      document.removeEventListener("fullscreenchange", syncFullscreen);
+      document.removeEventListener("webkitfullscreenchange", syncFullscreen);
+    };
+  }, []);
   useEffect(() => {
     const element = video.current;
     if (!autoPlay || !activeSource || !element) return;
@@ -5867,6 +6655,13 @@ function ChatVideo({
     element.currentTime = nextTime;
     setCurrentTime(nextTime);
   };
+  const toggleFullscreen = () => {
+    if (activeFullscreenElement()) {
+      leaveFullscreen();
+      return;
+    }
+    enterFullscreen(frame.current, video.current);
+  };
   const revealOnRenderedFrame = (element: HTMLVideoElement) => {
     if (playbackFrameReady) return;
     if ("requestVideoFrameCallback" in element) {
@@ -5882,6 +6677,18 @@ function ChatVideo({
     if (!element || !activeSource) return;
     setPlaybackFailed(false);
     setBuffering(true);
+    if (onSourceError) {
+      automaticRecoveryAttempts.current = 0;
+      sourceRecoveryInFlight.current = true;
+      void onSourceError().then((recovered) => {
+        if (!recovered) {
+          sourceRecoveryInFlight.current = false;
+          setBuffering(false);
+          setPlaybackFailed(true);
+        }
+      });
+      return;
+    }
     element.load();
     void element.play().catch(() => setPlaybackFailed(true));
   };
@@ -5895,7 +6702,11 @@ function ChatVideo({
     && (onRequestPlayback
       ? !playbackRequested || Boolean(activeSource)
       : Boolean(activeSource));
-  return <div className={`chat-video ${hasStarted ? "started" : ""} ${loading ? "media-pending" : ""}`} style={frameStyle}>
+  return <div
+    ref={frame}
+    className={`chat-video ${hasStarted ? "started" : ""} ${loading ? "media-pending" : ""} ${fullscreen ? "fullscreen" : ""}`}
+    style={fullscreen ? undefined : frameStyle}
+  >
     <video
       ref={video}
       src={activeSource}
@@ -5944,6 +6755,7 @@ function ChatVideo({
         setPlaybackFailed(false);
       }}
       onPlaying={(event) => {
+        automaticRecoveryAttempts.current = 0;
         setVideoReady(true);
         setBuffering(false);
         revealOnRenderedFrame(event.currentTarget);
@@ -5966,14 +6778,39 @@ function ChatVideo({
       }}
       onError={() => {
         setPlaying(false);
+        if (sourceRecoveryInFlight.current) return;
+        if (
+          onSourceError
+          && playbackRequested
+          && automaticRecoveryAttempts.current < 3
+        ) {
+          automaticRecoveryAttempts.current += 1;
+          sourceRecoveryInFlight.current = true;
+          setPlaybackFailed(false);
+          setBuffering(true);
+          void onSourceError().then((recovered) => {
+            if (!recovered) {
+              sourceRecoveryInFlight.current = false;
+              setBuffering(false);
+              setPlaybackFailed(true);
+            }
+          });
+          return;
+        }
         setBuffering(false);
         setPlaybackFailed(true);
       }}
       onClick={togglePlayback}
+      onDoubleClick={toggleFullscreen}
       onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
           togglePlayback();
+          return;
+        }
+        if (event.key === "f" || event.key === "F") {
+          event.preventDefault();
+          toggleFullscreen();
         }
       }}
       tabIndex={0}
@@ -6048,6 +6885,16 @@ function ChatVideo({
       >
         {muted ? <VolumeX size={17} /> : <Volume2 size={17} />}
       </button>
+      <button
+        type="button"
+        className="noise-video-control-button"
+        disabled={!activeSource}
+        onClick={toggleFullscreen}
+        aria-label={fullscreen ? "exit full screen" : "play video full screen"}
+        title={fullscreen ? "exit full screen" : "full screen"}
+      >
+        {fullscreen ? <Minimize size={16} /> : <Maximize size={16} />}
+      </button>
     </div>
     {playbackFailed && activeSource && (
       <button type="button" className="chat-video-retry" onClick={retryPlayback}>
@@ -6056,6 +6903,43 @@ function ChatVideo({
       </button>
     )}
   </div>;
+}
+
+type FullscreenElement = HTMLElement & { webkitRequestFullscreen?: () => void };
+type FullscreenVideo = HTMLVideoElement & { webkitEnterFullscreen?: () => void };
+type FullscreenDocument = Document & {
+  webkitFullscreenElement?: Element | null;
+  webkitExitFullscreen?: () => void;
+};
+
+function activeFullscreenElement() {
+  const scope = document as FullscreenDocument;
+  return scope.fullscreenElement ?? scope.webkitFullscreenElement ?? null;
+}
+
+function leaveFullscreen() {
+  const scope = document as FullscreenDocument;
+  if (scope.exitFullscreen) {
+    void Promise.resolve(scope.exitFullscreen()).catch(() => undefined);
+    return;
+  }
+  scope.webkitExitFullscreen?.();
+}
+
+function enterFullscreen(frame: HTMLElement | null, video: HTMLVideoElement | null) {
+  const target = frame as FullscreenElement | null;
+  // iOS only ever fullscreens the video itself, so fall back to its native player.
+  const nativeVideoFullscreen = () =>
+    (video as FullscreenVideo | null)?.webkitEnterFullscreen?.();
+  if (target?.requestFullscreen) {
+    void Promise.resolve(target.requestFullscreen()).catch(nativeVideoFullscreen);
+    return;
+  }
+  if (target?.webkitRequestFullscreen) {
+    target.webkitRequestFullscreen();
+    return;
+  }
+  nativeVideoFullscreen();
 }
 
 function formatVideoTime(seconds: number) {
@@ -6084,10 +6968,12 @@ function ForwardMessageDialog({
   onClose: () => void;
   onForward: (
     destination: ForwardDestination,
+    showOriginalAuthor: boolean,
     onProgress: (progress: number) => void,
   ) => Promise<boolean>;
 }) {
   const [query, setQuery] = useState("");
+  const [showOriginalAuthor, setShowOriginalAuthor] = useState(true);
   const [forwardingTo, setForwardingTo] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
   const normalized = query.trim().toLowerCase();
@@ -6119,7 +7005,7 @@ function ForwardMessageDialog({
     if (forwardingTo) return;
     setForwardingTo(destination.label);
     setProgress(0);
-    const sent = await onForward(destination, setProgress);
+    const sent = await onForward(destination, showOriginalAuthor, setProgress);
     if (sent) {
       window.setTimeout(onClose, 450);
     } else {
@@ -6147,6 +7033,19 @@ function ForwardMessageDialog({
         <strong>{attachmentLabel ? `${attachmentLabel}${message.text ? " + message" : ""}` : "message"}</strong>
         <span>{message.text || message.attachment?.file_name || "encrypted media"}</span>
       </div>
+      <label className="settings-toggle-row forward-author-toggle">
+        <span>
+          <strong>show original author</strong>
+          <small>include forwarded from {message.forwarded_from?.username ?? message.username}</small>
+        </span>
+        <input
+          type="checkbox"
+          role="switch"
+          checked={showOriginalAuthor}
+          disabled={Boolean(forwardingTo)}
+          onChange={(event) => setShowOriginalAuthor(event.target.checked)}
+        />
+      </label>
       <input
         className="forward-search"
         value={query}
@@ -6400,7 +7299,10 @@ function ProfileAlbumDialog({
     });
     if (!local) throw new Error("the album could not be updated");
     onSummary(local);
-    await noise({ action: "sync_account", relays });
+    void noise({ action: "sync_account", relays }).catch(() => {
+      // The signed profile update and local album are already durable.
+      // Encrypted cross-device account sync retries in the background.
+    });
     const nextAlbum = local.identity.album;
     if (!nextAlbum) {
       setAlbum(null);
@@ -6485,7 +7387,7 @@ function ProfileAlbumDialog({
   async function uploadQueuedMedia() {
     if (!pendingUploads.length || uploadProgress !== null) return;
     setError(null);
-    setUploadProgress(0);
+    setUploadProgress(1);
     setUploadIndex(0);
     const controller = new AbortController();
     uploadController.current = controller;
@@ -6792,7 +7694,19 @@ function PresenceAvatar({
   );
 }
 
-function Onboarding({ busy, onCreate, onSignIn }: { busy: boolean; onCreate: (username: string, password: string) => Promise<boolean>; onSignIn: (noiseId: string, password: string) => Promise<boolean> }) {
+function Onboarding({
+  busy,
+  addingAccount,
+  onCancelAdd,
+  onCreate,
+  onSignIn,
+}: {
+  busy: boolean;
+  addingAccount: boolean;
+  onCancelAdd: () => void;
+  onCreate: (username: string, password: string) => Promise<boolean>;
+  onSignIn: (noiseId: string, password: string) => Promise<boolean>;
+}) {
   const [mode, setMode] = useState<"create" | "signin">("create");
   const [username, setUsername] = useState("");
   const [noiseId, setNoiseId] = useState("");
@@ -6823,6 +7737,11 @@ function Onboarding({ busy, onCreate, onSignIn }: { busy: boolean; onCreate: (us
   };
   return (
     <div className="onboarding" data-tauri-drag-region>
+      {addingAccount && (
+        <button className="onboarding-cancel-add" disabled={busy} onClick={onCancelAdd}>
+          <ArrowLeft size={14} /> back to my account
+        </button>
+      )}
       <NoiseMark size={54} />
       <h1>noise</h1>
       <p>no phone number. no email. just your noise ID and password.</p>
@@ -6880,12 +7799,13 @@ function NoiseIdDialog({ noiseId, onClose }: { noiseId: string; onClose: () => v
   return <Modal onClose={onClose}><DialogHeading icon={<NoiseMark size={28} />} title="this is your noise ID" detail="you’ll use it with your password to sign in on any device" /><div className="frequency-card">{noiseId}</div><p className="noise-id-warning">Save this somewhere private. noise cannot recover it for you.</p><DialogButtons><CopyButton value={noiseId} label="copy noise ID" /><button className="primary" onClick={onClose}>I saved it</button></DialogButtons></Modal>;
 }
 
-function SettingsDialog({ profile, blockedPeople, busy, onClose, onSave, onUnblock, onSummary, onLogout, onDeleteAccount }: { profile: IdentitySummary; blockedPeople: DirectSummary[]; busy: boolean; onClose: () => void; onSave: (username: string, bio: string, avatar: string | null, remove: boolean, acceptsDirectMessages: boolean) => Promise<boolean>; onUnblock: (person: DirectSummary) => Promise<boolean>; onSummary: (summary: LocalSummary) => void; onLogout: () => void; onDeleteAccount: () => void }) {
+function SettingsDialog({ profile, devices, blockedPeople, busy, onClose, onSave, onUnblock, onRevokeDevice, onSummary, onLogout, onDeleteAccount }: { profile: IdentitySummary; devices: DeviceSummary[]; blockedPeople: DirectSummary[]; busy: boolean; onClose: () => void; onSave: (username: string, bio: string, avatar: string | null, remove: boolean, acceptsDirectMessages: boolean) => Promise<boolean>; onUnblock: (person: DirectSummary) => Promise<boolean>; onRevokeDevice: (device: DeviceSummary) => Promise<boolean>; onSummary: (summary: LocalSummary) => void; onLogout: () => void; onDeleteAccount: () => void }) {
   const [tab, setTab] = useState<"identity" | "album" | "privacy" | "blocks" | "account">("identity");
   const [username, setUsername] = useState(profile.username);
   const [bio, setBio] = useState(profile.bio);
   const [acceptsDirectMessages, setAcceptsDirectMessages] = useState(profile.accepts_direct_messages);
   const [saving, setSaving] = useState(false);
+  const [confirmingDeviceId, setConfirmingDeviceId] = useState<string | null>(null);
   const image = useImageSelection();
   const settingsChanged = username.trim() !== profile.username
     || bio !== profile.bio
@@ -6949,6 +7869,31 @@ function SettingsDialog({ profile, blockedPeople, busy, onClose, onSave, onUnblo
         </section>}
         {tab === "account" && <div className="user-account-settings">
           {profile.noise_id && <section className="settings-section"><h3>noise ID</h3><div className="noise-id-setting"><strong>{profile.noise_id}</strong><CopyButton value={profile.noise_id} label="copy" /></div><p>Use this with your password to sign in on another device.</p></section>}
+          {profile.noise_id && <section className="settings-section">
+            <h3>signed-in devices</h3>
+            <div className="device-session-list">
+              {devices.map((device) => <div className="device-session-row" key={device.device_id}>
+                <Laptop size={18} />
+                <span>
+                  <strong>{device.name}{device.is_current && <i>this device</i>}</strong>
+                  <small>{device.platform} · {formatDeviceActivity(device.last_seen_at_millis)}</small>
+                </span>
+                {!device.is_current && <button
+                  className={confirmingDeviceId === device.device_id ? "danger confirm" : "danger"}
+                  disabled={locked}
+                  onClick={() => {
+                    if (confirmingDeviceId !== device.device_id) {
+                      setConfirmingDeviceId(device.device_id);
+                      return;
+                    }
+                    setConfirmingDeviceId(null);
+                    void onRevokeDevice(device);
+                  }}
+                >{confirmingDeviceId === device.device_id ? "confirm" : "log out"}</button>}
+              </div>)}
+            </div>
+            <p>Logging out a device removes its official Noise session the next time it connects.</p>
+          </section>}
           {profile.noise_id && <section className="settings-section account-session"><span><strong>log out on this device</strong><small>Your encrypted identity remains available on the relay network.</small></span><button disabled={locked} onClick={onLogout}>log out</button></section>}
           <section className="settings-danger"><span><strong>delete account</strong><small>erase this identity and its encrypted account vault</small></span><button className="danger" disabled={locked} onClick={onDeleteAccount}>delete account</button></section>
         </div>}
@@ -7483,10 +8428,11 @@ function Loading() {
   );
 }
 
-async function syncGroupEncryption(): Promise<GroupEncryptionStatus | null> {
+async function syncGroupEncryption(groupId?: string): Promise<GroupEncryptionStatus | null> {
   try {
     return await noise<GroupEncryptionStatus>({
       action: "sync_group_encryption",
+      group_id: groupId ?? null,
       relays,
     });
   } catch (cause) {
@@ -7588,19 +8534,35 @@ function EncryptionPending({ phase }: { phase: GroupEncryptionStatus["phase"] })
   return (
     <div className="encryption-pending">
       <Shield />
-      <strong>restoring this group</strong>
+      <strong>
+        {phase === "waiting_for_admission" ? "joining this group" : "restoring this group"}
+      </strong>
       <span>
-        {phase === "waiting_for_admission"
-          ? "the group founder will admit this identity automatically"
+        {phase === "waiting_for_admission" || phase === "waiting_for_device"
+          ? "any member who is online admits this identity automatically"
           : "restoring encrypted group access from your noise account"}
       </span>
-      <small>no other device is required — this screen updates automatically</small>
+      <small>nothing to approve — this screen updates on its own</small>
     </div>
   );
 }
 
 function formatTime(millis: number) {
   return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(millis));
+}
+
+function formatDeviceActivity(millis: number) {
+  const elapsed = Math.max(0, Date.now() - millis);
+  if (elapsed < 2 * 60_000) return "active now";
+  if (elapsed < 60 * 60_000) return `active ${Math.floor(elapsed / 60_000)}m ago`;
+  if (elapsed < 24 * 60 * 60_000) return `active ${Math.floor(elapsed / (60 * 60_000))}h ago`;
+  return `active ${new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    year: new Date(millis).getFullYear() === new Date().getFullYear()
+      ? undefined
+      : "numeric",
+  }).format(new Date(millis))}`;
 }
 
 function formatGalleryDate(millis: number) {

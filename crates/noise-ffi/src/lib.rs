@@ -41,6 +41,17 @@ enum Request {
         password: String,
         relays: Vec<String>,
     },
+    RegisterDevice {
+        state_path: String,
+        name: String,
+        platform: String,
+        relays: Vec<String>,
+    },
+    RevokeDevice {
+        state_path: String,
+        device_id: String,
+        relays: Vec<String>,
+    },
     SyncAccount {
         state_path: String,
         relays: Vec<String>,
@@ -187,6 +198,15 @@ enum Request {
     SyncGroupEncryption {
         state_path: String,
         cache_path: String,
+        /// Absent for the open group. Present for a background pass that only
+        /// admits the members another group is waiting on.
+        #[serde(default)]
+        group_id: Option<String>,
+        relays: Vec<String>,
+    },
+    GroupHasPendingAdmissions {
+        state_path: String,
+        group_id: String,
         relays: Vec<String>,
     },
     SyncGroupActivity {
@@ -318,6 +338,14 @@ enum Request {
     WatchDirect {
         state_path: String,
         since: Option<u64>,
+        relays: Vec<String>,
+    },
+    RegisterPushSubscription {
+        state_path: String,
+        installation_id: String,
+        device_token: String,
+        environment: String,
+        topic: String,
         relays: Vec<String>,
     },
     SayDirect {
@@ -591,10 +619,14 @@ fn begin_session_end() -> SessionEndGuard {
 
 fn request_loading_ticket(request: &Request) -> Option<LoadingTicket> {
     let class = match request {
-        Request::SyncGroupEncryption { .. }
+        Request::SyncGroupEncryption { group_id: None, .. }
         | Request::Conversation { .. }
         | Request::LoadOlderGroupHistory { .. }
         | Request::LoadOlderTopicHistory { .. } => LoadingClass::Group,
+        Request::SyncGroupEncryption {
+            group_id: Some(_), ..
+        }
+        | Request::GroupHasPendingAdmissions { .. } => LoadingClass::Background,
         Request::SyncAccount {
             interruptible: true,
             ..
@@ -666,8 +698,11 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         Request::DiscoverRelayMasks { .. }
             | Request::WatchGroup { .. }
             | Request::WatchGroupId { .. }
+            | Request::SyncAccount { .. }
+            | Request::SyncReadState { .. }
             | Request::SyncGroupActivity { .. }
             | Request::SyncTopicActivity { .. }
+            | Request::GroupHasPendingAdmissions { .. }
             | Request::CachedConversation { .. }
             | Request::HeartbeatPresence { .. }
             | Request::ReplyNotificationSnapshot { .. }
@@ -677,10 +712,12 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             | Request::FetchAttachment { .. }
             | Request::FetchAttachmentRange { .. }
             | Request::FetchLinkPreview { .. }
+            | Request::FetchProfileAlbum { .. }
             | Request::UploadMediaChunk { .. }
             | Request::UploadMediaChunkToGroup { .. }
             | Request::UploadDirectMediaChunk { .. }
             | Request::UploadDirectMediaChunkTo { .. }
+            | Request::UploadProfileMediaChunk { .. }
     ) {
         None
     } else {
@@ -749,14 +786,35 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
+        Request::RegisterDevice {
+            state_path,
+            name,
+            platform,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.register_device(state_path, &name, &platform, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::RevokeDevice {
+            state_path,
+            device_id,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.revoke_device(state_path, &device_id, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         Request::SyncAccount {
             state_path,
             relays,
             interruptible,
         } => {
             let runtime = runtime()?;
-            let future = client.sync_account(state_path, relays);
-            let result = if interruptible {
+            let future = client.prepare_account_sync(&state_path, relays);
+            let update = if interruptible {
                 runtime.block_on_loading(
                     future,
                     loading_ticket
@@ -764,6 +822,21 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 )
             } else {
                 runtime.block_on(future)
+            }
+            .map_err(|error| error.to_string())?;
+            if session_ending().load(Ordering::Acquire) {
+                return Err("session ended".to_owned());
+            }
+            let _state_guard = state_lock()
+                .lock()
+                .map_err(|_| "local state lock is unavailable".to_owned())?;
+            if session_ending().load(Ordering::Acquire) {
+                return Err("session ended".to_owned());
+            }
+            let result = if let Some(update) = update {
+                client.apply_account_state_update(&state_path, update)
+            } else {
+                client.local_summary(&state_path)
             }
             .map_err(|error| error.to_string())?;
             serde_json::to_value(result).map_err(|error| error.to_string())
@@ -775,8 +848,8 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             interruptible,
         } => {
             let runtime = runtime()?;
-            let future = client.sync_read_state(state_path, cache_path, relays);
-            let result = if interruptible {
+            let future = client.prepare_read_state_sync(&state_path, relays);
+            let update = if interruptible {
                 runtime.block_on_loading(
                     future,
                     loading_ticket
@@ -784,6 +857,21 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 )
             } else {
                 runtime.block_on(future)
+            }
+            .map_err(|error| error.to_string())?;
+            if session_ending().load(Ordering::Acquire) {
+                return Err("session ended".to_owned());
+            }
+            let _state_guard = state_lock()
+                .lock()
+                .map_err(|_| "local state lock is unavailable".to_owned())?;
+            if session_ending().load(Ordering::Acquire) {
+                return Err("session ended".to_owned());
+            }
+            let result = if let Some(update) = update {
+                client.apply_read_state_update(&state_path, &cache_path, update)
+            } else {
+                client.local_summary(&state_path)
             }
             .map_err(|error| error.to_string())?;
             serde_json::to_value(result).map_err(|error| error.to_string())
@@ -1059,14 +1147,34 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
-        Request::SyncGroupEncryption {
+        Request::GroupHasPendingAdmissions {
             state_path,
-            cache_path,
+            group_id,
             relays,
         } => serde_json::to_value(
             runtime()?
                 .block_on_loading(
-                    client.sync_active_group_encryption(state_path, cache_path, relays),
+                    client.group_has_pending_admissions(state_path, &group_id, relays),
+                    loading_ticket
+                        .ok_or_else(|| "background loading ticket is missing".to_owned())?,
+                )
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::SyncGroupEncryption {
+            state_path,
+            cache_path,
+            group_id,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on_loading(
+                    client.sync_group_encryption(
+                        state_path,
+                        cache_path,
+                        group_id.as_deref(),
+                        relays,
+                    ),
                     loading_ticket.ok_or_else(|| "group loading ticket is missing".to_owned())?,
                 )
                 .map_err(|error| error.to_string())?,
@@ -1246,18 +1354,18 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                     .map_err(|error| error.to_string())?
             } else {
                 match attachment {
-                Some(attachment) => runtime()?
-                    .block_on(client.say_with_attachment_reply(
-                        state_path,
-                        text,
-                        attachment,
-                        reply_to_message_id,
-                        relays,
-                    ))
-                    .map_err(|error| error.to_string())?,
-                None => runtime()?
-                    .block_on(client.say_reply(state_path, text, reply_to_message_id, relays))
-                    .map_err(|error| error.to_string())?,
+                    Some(attachment) => runtime()?
+                        .block_on(client.say_with_attachment_reply(
+                            state_path,
+                            text,
+                            attachment,
+                            reply_to_message_id,
+                            relays,
+                        ))
+                        .map_err(|error| error.to_string())?,
+                    None => runtime()?
+                        .block_on(client.say_reply(state_path, text, reply_to_message_id, relays))
+                        .map_err(|error| error.to_string())?,
                 }
             };
             serde_json::to_value(sent).map_err(|error| error.to_string())
@@ -1406,6 +1514,26 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
+        Request::RegisterPushSubscription {
+            state_path,
+            installation_id,
+            device_token,
+            environment,
+            topic,
+            relays,
+        } => {
+            runtime()?
+                .block_on(client.register_push_subscription(
+                    state_path,
+                    installation_id,
+                    device_token,
+                    environment,
+                    topic,
+                    relays,
+                ))
+                .map_err(|error| error.to_string())?;
+            Ok(Value::Bool(true))
+        }
         Request::SayDirect {
             state_path,
             text,

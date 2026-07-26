@@ -1,9 +1,10 @@
 [package]
 name = "noise-relay"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 
 [dependencies]
+a2 = { version = "0.10.0", default-features = false, features = ["ring"] }
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true

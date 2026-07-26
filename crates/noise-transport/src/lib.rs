@@ -19,7 +19,20 @@ pub const OHTTP_KEYS_PATH: &str = "/v1/ohttp-keys";
 pub const OHTTP_RELAY_PATH: &str = "/v1/ohttp/relay";
 pub const RELAY_DIRECTORY_PATH: &str = "/v3/relays";
 pub const SIGNED_RELAY_DESCRIPTOR_PATH: &str = "/v3/relay-descriptor";
+pub const RELAY_CAPABILITIES_PATH: &str = "/v2/relay-capabilities";
 pub const RELAY_PROTOCOL_VERSION: u16 = 4;
+
+/// What a relay accepts beyond the protocol version it advertises.
+///
+/// A relay that predates a capability answers this request with 404, so an
+/// absent or false flag means the client must keep to the older behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayCapabilities {
+    /// Whether membership epochs authored by any group member are accepted.
+    /// Older relays only accept epochs authored by the group founder.
+    #[serde(default)]
+    pub member_admission: bool,
+}
 
 const PAD_BUCKETS: &[usize] = &[
     1024,

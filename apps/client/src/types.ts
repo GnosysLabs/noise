@@ -56,11 +56,21 @@ export type GroupSummary = {
 
 export type LocalSummary = {
   identity: IdentitySummary;
+  devices: DeviceSummary[];
   groups: GroupSummary[];
   directs: DirectSummary[];
   known_people: DirectSummary[];
   blocked_people: DirectSummary[];
   hidden_public_keys: string[];
+};
+
+export type DeviceSummary = {
+  device_id: string;
+  name: string;
+  platform: string;
+  created_at_millis: number;
+  last_seen_at_millis: number;
+  is_current: boolean;
 };
 
 export type DirectSummary = {
@@ -276,6 +286,9 @@ export type GroupWatch = {
   deleted?: boolean;
   online_public_keys: string[];
   recently_active_public_keys: string[];
+  changed_stream_locators?: string[];
+  control_changed?: boolean;
+  change_hints_complete?: boolean;
 };
 
 export type ReplyNotificationSummary = {

@@ -18,6 +18,16 @@ pub struct RelayConfig {
     pub bootstrap_relays: Vec<String>,
     pub discovery_interval_seconds: u64,
     pub storage_limit_bytes: u64,
+    pub push_notifications: Option<PushNotificationConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PushNotificationConfig {
+    pub key_file: PathBuf,
+    pub key_id: String,
+    pub team_id: String,
+    pub topic: String,
 }
 
 impl Default for RelayConfig {
@@ -31,6 +41,7 @@ impl Default for RelayConfig {
             bootstrap_relays: Vec::new(),
             discovery_interval_seconds: 30,
             storage_limit_bytes: 0,
+            push_notifications: None,
         }
     }
 }
@@ -58,6 +69,13 @@ impl RelayConfig {
             .is_some_and(|url| url.trim().is_empty())
         {
             bail!("public_url cannot be empty")
+        }
+        if let Some(push) = self.push_notifications.as_ref()
+            && (push.key_id.trim().is_empty()
+                || push.team_id.trim().is_empty()
+                || push.topic != "xyz.gnosyslabs.noise.ios")
+        {
+            bail!("push notification configuration is invalid")
         }
         Ok(())
     }

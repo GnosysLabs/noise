@@ -10,6 +10,7 @@
     "core:window:allow-unminimize",
     "core:window:allow-set-focus",
     "dialog:allow-open",
+    "dialog:allow-save",
     "notification:default",
     "opener:allow-default-urls",
     "opener:allow-open-url",

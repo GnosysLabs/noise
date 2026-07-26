@@ -618,6 +618,8 @@ pub struct MlsEpochRecord {
     pub version: u32,
     pub record_id: String,
     pub previous_record_id: String,
+    /// The account that authored this epoch. Any account inside the parent
+    /// epoch may author an admission; only the founder may author a removal.
     pub owner_public_key: String,
     pub member_accounts: Vec<String>,
     pub bundle: MlsCommitBundle,
@@ -663,6 +665,23 @@ impl MlsEpochRecord {
         ));
         record.verify()?;
         Ok(record)
+    }
+
+    /// Whether the parent epoch's membership authorizes this epoch transition.
+    ///
+    /// Every account already inside the group may author an epoch that only
+    /// admits accounts, so a join never waits for one specific member to be
+    /// online. Removing an account stays with the founder, whose client is the
+    /// only one that validates signed self-leave and ban requests.
+    #[must_use]
+    pub fn authorizes_from(&self, founder_public_key: &str, parent_members: &[String]) -> bool {
+        if !parent_members.contains(&self.owner_public_key) {
+            return false;
+        }
+        let removes_accounts = parent_members
+            .iter()
+            .any(|member| !self.member_accounts.contains(member));
+        !removes_accounts || self.owner_public_key == founder_public_key
     }
 
     pub fn verify(&self) -> Result<(), NoiseError> {
@@ -718,17 +737,19 @@ impl MlsControlLog {
         self.genesis.verify()?;
         let mut parent_epoch = 0;
         let mut previous_record_id = self.genesis.record_id.as_str();
+        let mut parent_members = self.genesis.member_accounts.as_slice();
         for record in &self.epochs {
             record.verify()?;
             if record.bundle.group_id != self.genesis.group_id
-                || record.owner_public_key != self.genesis.owner_public_key
                 || record.bundle.parent_epoch != parent_epoch
                 || record.previous_record_id != previous_record_id
+                || !record.authorizes_from(&self.genesis.owner_public_key, parent_members)
             {
                 return Err(NoiseError::InvalidMlsState);
             }
             parent_epoch = record.bundle.epoch;
             previous_record_id = &record.record_id;
+            parent_members = record.member_accounts.as_slice();
         }
         Ok(())
     }
@@ -1478,5 +1499,97 @@ mod tests {
             charlie_after.archive_key_base64
         );
         assert_ne!(bob_epoch.archive_key_base64, alice_after.archive_key_base64);
+    }
+
+    #[test]
+    fn any_member_may_admit_and_only_the_founder_may_remove() {
+        let alice_identity = Identity::generate();
+        let bob_identity = Identity::generate();
+        let charlie_identity = Identity::generate();
+        let group =
+            GroupMembership::create_owned("member admission", alice_identity.public_key_base64());
+        let group_id = group.group_id.as_str();
+        let mut alice = MlsAccountState::create(&alice_identity).unwrap();
+        let mut bob = MlsAccountState::create(&bob_identity).unwrap();
+        let mut charlie = MlsAccountState::create(&charlie_identity).unwrap();
+        let bob_request = MlsJoinRequest::create(&bob_identity, &mut bob, group_id).unwrap();
+        let charlie_request =
+            MlsJoinRequest::create(&charlie_identity, &mut charlie, group_id).unwrap();
+        let genesis = alice.create_group_genesis(&alice_identity, &group).unwrap();
+        let add_bob = alice
+            .add_member(group_id, &bob_request.key_package_base64)
+            .unwrap();
+        let add_bob_record = alice
+            .create_epoch_record(&alice_identity, &genesis.record_id, add_bob.clone())
+            .unwrap();
+        bob.join_group(group_id, add_bob.welcome_base64.as_deref().unwrap())
+            .unwrap();
+
+        // A member that did not found the group can admit the next joiner.
+        let add_charlie = bob
+            .add_member(group_id, &charlie_request.key_package_base64)
+            .unwrap();
+        let add_charlie_record = bob
+            .create_epoch_record(&bob_identity, &add_bob_record.record_id, add_charlie.clone())
+            .unwrap();
+        MlsControlLog {
+            genesis: genesis.clone(),
+            epochs: vec![add_bob_record.clone(), add_charlie_record.clone()],
+        }
+        .verify()
+        .unwrap();
+        alice.process_commit(&add_charlie).unwrap();
+        charlie
+            .join_group(group_id, add_charlie.welcome_base64.as_deref().unwrap())
+            .unwrap();
+
+        // An account outside the parent epoch authorizes nothing.
+        assert!(!add_charlie_record.authorizes_from(
+            &alice_identity.public_key_base64(),
+            &[alice_identity.public_key_base64()],
+        ));
+
+        // The same member cannot evict anyone.
+        let bob_removes_charlie = bob
+            .remove_member(group_id, &charlie_identity.public_key_base64())
+            .unwrap();
+        let bob_removal = bob
+            .create_epoch_record(
+                &bob_identity,
+                &add_charlie_record.record_id,
+                bob_removes_charlie,
+            )
+            .unwrap();
+        bob_removal.verify().unwrap();
+        assert!(
+            MlsControlLog {
+                genesis: genesis.clone(),
+                epochs: vec![
+                    add_bob_record.clone(),
+                    add_charlie_record.clone(),
+                    bob_removal,
+                ],
+            }
+            .verify()
+            .is_err()
+        );
+
+        // The founder still can.
+        let alice_removes_charlie = alice
+            .remove_member(group_id, &charlie_identity.public_key_base64())
+            .unwrap();
+        let alice_removal = alice
+            .create_epoch_record(
+                &alice_identity,
+                &add_charlie_record.record_id,
+                alice_removes_charlie,
+            )
+            .unwrap();
+        MlsControlLog {
+            genesis,
+            epochs: vec![add_bob_record, add_charlie_record, alice_removal],
+        }
+        .verify()
+        .unwrap();
     }
 }

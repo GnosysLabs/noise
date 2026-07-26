@@ -3,12 +3,13 @@ mod discovery;
 mod identity;
 mod link_preview;
 mod privacy;
+mod push;
 mod shard_store;
 mod store;
 mod update;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     path::PathBuf,
     sync::{
@@ -30,14 +31,16 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use noise_core::{
-    AccountVault, GroupDeletion, GroupPresence, InviteRecord, InviteRotation, MlsControlLog,
-    MlsEpochRecord, MlsGroupGenesis, MlsJoinRequest, MlsRemovalRequest, SignedEvent, StorageShard,
+    AccountVault, DirectPushRequest, GroupDeletion, GroupPresence, InviteRecord, InviteRotation,
+    MlsControlLog, MlsEpochRecord, MlsGroupGenesis, MlsJoinRequest, MlsRemovalRequest,
+    PushSubscriptionRegistration, SignedEvent, StorageShard,
 };
 use noise_transport::{
     GATEWAY_HEADER, LinkPreview, LinkPreviewRequest, OHTTP_GATEWAY_PATH, OHTTP_KEYS_MEDIA_TYPE,
     OHTTP_KEYS_PATH, OHTTP_RELAY_PATH, OHTTP_REQUEST_MEDIA_TYPE, OHTTP_RESPONSE_MEDIA_TYPE,
-    PlainRequest, RELAY_DIRECTORY_PATH, RELAY_PROTOCOL_VERSION, RelayDescriptor,
-    SIGNED_RELAY_DESCRIPTOR_PATH, SignedRelayDescriptor, encode_response,
+    PlainRequest, RELAY_CAPABILITIES_PATH, RELAY_DIRECTORY_PATH, RELAY_PROTOCOL_VERSION,
+    RelayCapabilities, RelayDescriptor, SIGNED_RELAY_DESCRIPTOR_PATH, SignedRelayDescriptor,
+    encode_response,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -54,6 +57,7 @@ use discovery::{
 };
 use identity::RelayIdentity;
 use privacy::PrivacyGateway;
+use push::PushService;
 use shard_store::ShardStore;
 use store::{DurableStore, ShardMetadata};
 
@@ -63,6 +67,12 @@ const MAX_GROUP_PRESENCE_MILLIS: u64 = 60_000;
 const RECENT_GROUP_PRESENCE_MILLIS: u64 = 5 * 60_000;
 const MAX_GROUP_PRESENCES: usize = 100_000;
 const GROUP_EVENT_PAGE_SIZE: usize = 128;
+// OHTTP mask relays reject encrypted responses above 2.6 MB. Event count
+// alone is not a safe pagination boundary because media posters live inside
+// signed events. Keep history pages comfortably below the transport ceiling
+// so encryption overhead can never turn a healthy topic into an apparent
+// relay outage.
+const GROUP_EVENT_PAGE_MAX_BYTES: usize = 384 * 1024;
 const LINK_PREVIEW_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const MAX_LINK_PREVIEW_CACHE_ENTRIES: usize = 128;
 
@@ -133,6 +143,7 @@ struct ServerSettings {
     bootstrap_relay: Vec<String>,
     discovery_interval_seconds: u64,
     storage_limit_bytes: u64,
+    push_notifications: Option<config::PushNotificationConfig>,
 }
 
 #[derive(Clone)]
@@ -149,7 +160,7 @@ struct AppState {
     shard_bytes: Arc<AtomicU64>,
     storage_limit_bytes: u64,
     deletions: Arc<RwLock<HashMap<String, GroupDeletion>>>,
-    group_changes: Arc<RwLock<HashMap<String, watch::Sender<u64>>>>,
+    group_changes: Arc<RwLock<HashMap<String, watch::Sender<GroupChangeState>>>>,
     group_presences: Arc<RwLock<HashMap<String, HashMap<String, GroupPresence>>>>,
     account_changes: Arc<RwLock<HashMap<String, watch::Sender<u64>>>>,
     link_previews: Arc<RwLock<HashMap<String, CachedLinkPreview>>>,
@@ -168,6 +179,7 @@ struct AppState {
     allow_local_discovery: bool,
     mask_targets: Arc<HashSet<String>>,
     public_url: Option<String>,
+    push: Option<PushService>,
 }
 
 #[derive(Clone)]
@@ -225,6 +237,30 @@ struct GroupWatchResponse {
     changed: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     presences: Vec<GroupPresence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    changed_stream_locators: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    control_changed: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    change_hints_complete: bool,
+}
+
+#[derive(Clone, Debug)]
+struct GroupChange {
+    revision: u64,
+    stream_locator: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GroupChangeState {
+    revision: u64,
+    recent: VecDeque<GroupChange>,
+}
+
+const GROUP_CHANGE_HISTORY_LIMIT: usize = 256;
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,6 +312,7 @@ fn resolve_server_settings(args: &Args) -> anyhow::Result<ServerSettings> {
         bootstrap_relay: config.bootstrap_relays,
         discovery_interval_seconds: config.discovery_interval_seconds,
         storage_limit_bytes: config.storage_limit_bytes,
+        push_notifications: config.push_notifications,
     })
 }
 
@@ -313,6 +350,7 @@ fn print_status(settings: &ServerSettings, json: bool) -> anyhow::Result<()> {
         "bootstrap_relays": settings.bootstrap_relay.len(),
         "storage_limit_bytes": (settings.storage_limit_bytes != 0).then_some(settings.storage_limit_bytes),
         "storage_backend": std::env::var("NOISE_STORAGE_BACKEND").unwrap_or_else(|_| "local".into()),
+        "push_notifications": settings.push_notifications.is_some(),
     });
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
@@ -563,6 +601,11 @@ async fn main() -> anyhow::Result<()> {
         .timeout(Duration::from_secs(40))
         .build()
         .context("could not initialize relay HTTP")?;
+    let push = args
+        .push_notifications
+        .as_ref()
+        .map(|config| PushService::new(config, store.clone()))
+        .transpose()?;
     let state = AppState {
         accounts: Arc::new(RwLock::new(recovered.accounts)),
         invites: Arc::new(RwLock::new(recovered.invites)),
@@ -595,6 +638,7 @@ async fn main() -> anyhow::Result<()> {
         allow_local_discovery,
         mask_targets: Arc::new(mask_targets),
         public_url: public_url.clone(),
+        push,
     };
 
     tokio::spawn(anti_entropy_loop(state.clone()));
@@ -609,6 +653,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/invites/{locator}", get(get_invite))
         .route("/v1/invite-rotations", post(publish_invite_rotation))
         .route("/v1/events", post(publish_event))
+        .route("/v1/push/subscriptions", post(register_push_subscription))
+        .route("/v1/push/direct-events", post(deliver_direct_push))
         .route("/v1/groups/{group_id}/events", get(group_events))
         .route(
             "/v2/groups/{group_id}/events/latest",
@@ -656,6 +702,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v4/shards/{shard_id}", get(get_shard).delete(delete_shard))
         .route("/v1/group-deletions", post(publish_group_deletion))
         .route("/v1/snapshot", get(snapshot))
+        .route(RELAY_CAPABILITIES_PATH, get(relay_capabilities))
         .route(OHTTP_KEYS_PATH, get(ohttp_keys))
         .route("/v1/relay-descriptor", get(relay_descriptor))
         .route(SIGNED_RELAY_DESCRIPTOR_PATH, get(signed_relay_descriptor))
@@ -853,6 +900,73 @@ async fn publish_event(
     Ok(StatusCode::ACCEPTED)
 }
 
+async fn register_push_subscription(
+    State(state): State<AppState>,
+    Json(registration): Json<PushSubscriptionRegistration>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    register_push_subscription_inner(&state, registration).await
+}
+
+async fn register_push_subscription_inner(
+    state: &AppState,
+    registration: PushSubscriptionRegistration,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let push = state.push.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this relay does not provide push notifications".into(),
+        )
+    })?;
+    push.register(registration)
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn deliver_direct_push(
+    State(state): State<AppState>,
+    Json(request): Json<DirectPushRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    deliver_direct_push_inner(&state, request).await
+}
+
+async fn deliver_direct_push_inner(
+    state: &AppState,
+    request: DirectPushRequest,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let trigger = request.trigger;
+    trigger
+        .verify()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    request
+        .event
+        .verify()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let event_matches = request.event.event_id == trigger.event_id
+        && request.event.group_id == trigger.recipient_mailbox_id
+        && request.event.author_public_key == trigger.sender_public_key
+        && request.event.created_at_millis == trigger.created_at_millis;
+    if !event_matches {
+        return Err((
+            StatusCode::CONFLICT,
+            "the referenced direct event is unavailable".into(),
+        ));
+    }
+    let push = state.push.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this relay does not provide push notifications".into(),
+        )
+    })?;
+    let push = push.clone();
+    tokio::spawn(async move {
+        if let Err(error) = push.deliver(&trigger).await {
+            eprintln!("could not deliver direct push notification: {error:#}");
+        }
+    });
+    Ok(StatusCode::ACCEPTED)
+}
+
 async fn group_events(
     State(state): State<AppState>,
     Path(group_id): Path<String>,
@@ -969,11 +1083,7 @@ async fn newer_stream_event_page(
 }
 
 fn validate_stream_locator(stream_locator: &str) -> Result<(), StatusCode> {
-    if stream_locator.len() != 64
-        || !stream_locator
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
+    if stream_locator.len() != 64 || !stream_locator.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok(())
@@ -1025,7 +1135,7 @@ async fn group_event_page(
             .cmp(&right.created_at_millis)
             .then_with(|| left.event_id.cmp(&right.event_id))
     });
-    let has_more = events.len() > GROUP_EVENT_PAGE_SIZE;
+    let mut has_more = events.len() > GROUP_EVENT_PAGE_SIZE;
     if events.len() > GROUP_EVENT_PAGE_SIZE {
         match cursor {
             GroupEventPageCursor::Latest | GroupEventPageCursor::Before(_, _) => {
@@ -1035,6 +1145,20 @@ async fn group_event_page(
                 events.truncate(GROUP_EVENT_PAGE_SIZE);
             }
         }
+    }
+
+    let mut serialized_bytes = events
+        .iter()
+        .map(|event| serde_json::to_vec(event).map_or(0, |body| body.len() + 1))
+        .sum::<usize>();
+    while events.len() > 1 && serialized_bytes > GROUP_EVENT_PAGE_MAX_BYTES {
+        has_more = true;
+        let removed = match cursor {
+            GroupEventPageCursor::Latest | GroupEventPageCursor::Before(_, _) => events.remove(0),
+            GroupEventPageCursor::After(_, _) => events.pop().expect("event page is not empty"),
+        };
+        serialized_bytes = serialized_bytes
+            .saturating_sub(serde_json::to_vec(&removed).map_or(0, |body| body.len() + 1));
     }
     Ok(GroupEventPage { events, has_more })
 }
@@ -1388,6 +1512,18 @@ async fn delete_shard(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Advertise what this relay accepts so clients can hold back a behavior until
+/// every relay they use has been upgraded.
+async fn relay_capabilities() -> Json<RelayCapabilities> {
+    Json(relay_capability_set())
+}
+
+fn relay_capability_set() -> RelayCapabilities {
+    RelayCapabilities {
+        member_admission: true,
+    }
+}
+
 async fn ohttp_keys(State(state): State<AppState>) -> Response {
     (
         [(CONTENT_TYPE, OHTTP_KEYS_MEDIA_TYPE)],
@@ -1694,6 +1830,9 @@ async fn dispatch_private_request(
     }
 
     match (request.method.as_str(), request.path.as_str()) {
+        ("GET", RELAY_CAPABILITIES_PATH) => {
+            private_json(StatusCode::OK, &relay_capability_set())
+        }
         ("POST", "/v1/link-preview") => {
             let Ok(request) = serde_json::from_slice::<LinkPreviewRequest>(&request.body) else {
                 return private_error(StatusCode::BAD_REQUEST, "invalid link preview request");
@@ -1825,6 +1964,27 @@ async fn dispatch_private_request(
                     eprintln!("relay storage error: {error:#}");
                     private_error(StatusCode::INTERNAL_SERVER_ERROR, "storage failed")
                 }
+            }
+        }
+        ("POST", "/v1/push/subscriptions") => {
+            let Ok(registration) =
+                serde_json::from_slice::<PushSubscriptionRegistration>(&request.body)
+            else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid push subscription");
+            };
+            match register_push_subscription_inner(state, registration).await {
+                Ok(status) => (status, Vec::new()),
+                Err((status, message)) => private_error(status, &message),
+            }
+        }
+        ("POST", "/v1/push/direct-events") => {
+            let Ok(push_request) = serde_json::from_slice::<DirectPushRequest>(&request.body)
+            else {
+                return private_error(StatusCode::BAD_REQUEST, "invalid direct push request");
+            };
+            match deliver_direct_push_inner(state, push_request).await {
+                Ok(status) => (status, Vec::new()),
+                Err((status, message)) => private_error(status, &message),
             }
         }
         ("POST", "/v2/mls/join-requests") => {
@@ -2111,9 +2271,7 @@ async fn dispatch_private_request(
                 }
             }
         }
-        ("GET", path)
-            if path.starts_with("/v3/groups/") && path.ends_with("/events/latest") =>
-        {
+        ("GET", path) if path.starts_with("/v3/groups/") && path.ends_with("/events/latest") => {
             let Some((group_id, stream_path)) = path
                 .trim_start_matches("/v3/groups/")
                 .split_once("/streams/")
@@ -2137,9 +2295,7 @@ async fn dispatch_private_request(
                 Err(status) => private_error(status, "could not read topic history"),
             }
         }
-        ("GET", path)
-            if path.starts_with("/v3/groups/") && path.contains("/events/before/") =>
-        {
+        ("GET", path) if path.starts_with("/v3/groups/") && path.contains("/events/before/") => {
             let Some((group_id, stream_path)) = path
                 .trim_start_matches("/v3/groups/")
                 .split_once("/streams/")
@@ -2174,9 +2330,7 @@ async fn dispatch_private_request(
                 Err(status) => private_error(status, "could not read topic history"),
             }
         }
-        ("GET", path)
-            if path.starts_with("/v3/groups/") && path.contains("/events/after/") =>
-        {
+        ("GET", path) if path.starts_with("/v3/groups/") && path.contains("/events/after/") => {
             let Some((group_id, stream_path)) = path
                 .trim_start_matches("/v3/groups/")
                 .split_once("/streams/")
@@ -2365,23 +2519,54 @@ async fn wait_for_group_change(
         if state.deletions.read().await.contains_key(group_id) {
             return Err(StatusCode::GONE);
         }
-        let current = state
+        let mut group_events = state
             .events
             .read()
             .await
             .values()
             .filter(|event| event.group_id == group_id)
-            .count() as u64;
+            .map(|event| {
+                (
+                    event.created_at_millis,
+                    event.event_id.clone(),
+                    event.stream_locator.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        group_events.sort_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+        });
+        let current = group_events.len() as u64;
         if current == 0 {
             return Err(StatusCode::NOT_FOUND);
         }
+        let history_start = group_events.len().saturating_sub(GROUP_CHANGE_HISTORY_LIMIT);
+        let recent = group_events
+            .into_iter()
+            .skip(history_start)
+            .enumerate()
+            .map(|(index, (_, _, stream_locator))| GroupChange {
+                revision: current
+                    .saturating_sub((current as usize - history_start) as u64)
+                    .saturating_add(index as u64)
+                    .saturating_add(1),
+                stream_locator,
+            })
+            .collect();
         let sender = state
             .group_changes
             .write()
             .await
             .entry(group_id.to_owned())
-            .or_insert_with(|| watch::channel(current).0)
+            .or_insert_with(|| {
+                watch::channel(GroupChangeState {
+                    revision: current,
+                    recent,
+                })
+                .0
+            })
             .clone();
+        let current = sender.borrow().revision;
         (current, sender.subscribe())
     };
 
@@ -2390,14 +2575,18 @@ async fn wait_for_group_change(
             revision: current,
             changed: false,
             presences: active_group_presences(state, group_id).await,
+            changed_stream_locators: Vec::new(),
+            control_changed: false,
+            change_hints_complete: false,
         });
     };
     if current != since {
-        return Ok(GroupWatchResponse {
-            revision: current,
-            changed: true,
-            presences: active_group_presences(state, group_id).await,
-        });
+        let change_state = changes.borrow().clone();
+        return Ok(group_watch_response(
+            &change_state,
+            since,
+            active_group_presences(state, group_id).await,
+        ));
     }
 
     if timeout(Duration::from_secs(20), changes.changed())
@@ -2407,19 +2596,54 @@ async fn wait_for_group_change(
         if state.deletions.read().await.contains_key(group_id) {
             return Err(StatusCode::GONE);
         }
-        let revision = *changes.borrow_and_update();
-        return Ok(GroupWatchResponse {
-            revision,
-            changed: revision != since,
-            presences: active_group_presences(state, group_id).await,
-        });
+        let change_state = changes.borrow_and_update().clone();
+        return Ok(group_watch_response(
+            &change_state,
+            since,
+            active_group_presences(state, group_id).await,
+        ));
     }
 
     Ok(GroupWatchResponse {
         revision: since,
         changed: false,
         presences: active_group_presences(state, group_id).await,
+        changed_stream_locators: Vec::new(),
+        control_changed: false,
+        change_hints_complete: true,
     })
+}
+
+fn group_watch_response(
+    state: &GroupChangeState,
+    since: u64,
+    presences: Vec<GroupPresence>,
+) -> GroupWatchResponse {
+    let relevant = state
+        .recent
+        .iter()
+        .filter(|change| change.revision > since)
+        .collect::<Vec<_>>();
+    let change_hints_complete = state.revision == since
+        || relevant.first().is_some_and(|change| {
+            change.revision == since.saturating_add(1)
+        });
+    let mut changed_stream_locators = relevant
+        .iter()
+        .filter_map(|change| change.stream_locator.clone())
+        .collect::<Vec<_>>();
+    changed_stream_locators.sort();
+    changed_stream_locators.dedup();
+    GroupWatchResponse {
+        revision: state.revision,
+        changed: state.revision != since,
+        presences,
+        changed_stream_locators,
+        control_changed: relevant
+            .iter()
+            .any(|change| change.stream_locator.is_none()),
+        change_hints_complete,
+    }
 }
 
 async fn wait_for_account_change(
@@ -2453,6 +2677,9 @@ async fn wait_for_account_change(
             revision: current,
             changed: false,
             presences: Vec::new(),
+            changed_stream_locators: Vec::new(),
+            control_changed: false,
+            change_hints_complete: false,
         });
     };
     if current != since {
@@ -2460,6 +2687,9 @@ async fn wait_for_account_change(
             revision: current,
             changed: true,
             presences: Vec::new(),
+            changed_stream_locators: Vec::new(),
+            control_changed: false,
+            change_hints_complete: false,
         });
     }
 
@@ -2481,6 +2711,9 @@ async fn wait_for_account_change(
             revision,
             changed: revision != since,
             presences: Vec::new(),
+            changed_stream_locators: Vec::new(),
+            control_changed: false,
+            change_hints_complete: false,
         });
     }
 
@@ -2488,6 +2721,9 @@ async fn wait_for_account_change(
         revision: since,
         changed: false,
         presences: Vec::new(),
+        changed_stream_locators: Vec::new(),
+        control_changed: false,
+        change_hints_complete: false,
     })
 }
 
@@ -2681,17 +2917,23 @@ async fn insert_event(state: &AppState, event: SignedEvent) -> anyhow::Result<In
         return Ok(InsertResult::Deleted);
     }
     let group_id = event.group_id.clone();
+    let stream_locator = event.stream_locator.clone();
     let object_id = event.event_id.clone();
     let inserted = state
         .store
         .insert("event", object_id.clone(), &event)
         .await?;
     if inserted {
-        state.events.write().await.insert(object_id, event);
-        if let Some(sender) = state.group_changes.read().await.get(&group_id) {
-            let revision = sender.borrow().saturating_add(1);
-            sender.send_replace(revision);
+        if let Some(push) = state.push.clone() {
+            let push_event = event.clone();
+            tokio::spawn(async move {
+                if let Err(error) = push.deliver_event(&push_event).await {
+                    eprintln!("could not deliver direct event notification: {error:#}");
+                }
+            });
         }
+        state.events.write().await.insert(object_id, event);
+        notify_group_stream_change(state, &group_id, stream_locator).await;
     }
     Ok(if inserted {
         InsertResult::Inserted
@@ -2703,9 +2945,7 @@ async fn insert_event(state: &AppState, event: SignedEvent) -> anyhow::Result<In
 async fn validate_mls_event(state: &AppState, event: &SignedEvent) -> anyhow::Result<()> {
     let has_genesis = state.mls_geneses.read().await.contains_key(&event.group_id);
     if !has_genesis {
-        if event.encryption_version == 1
-            && event.epoch.is_none()
-            && event.stream_locator.is_none()
+        if event.encryption_version == 1 && event.epoch.is_none() && event.stream_locator.is_none()
         {
             return Ok(());
         }
@@ -2873,9 +3113,6 @@ async fn insert_mls_epoch(
         .get(&group_id)
         .cloned()
         .context("group has no MLS genesis")?;
-    if record.owner_public_key != genesis.owner_public_key {
-        bail!("MLS epoch author is not the group founder")
-    }
     let mut epochs = state
         .mls_epochs
         .read()
@@ -2894,6 +3131,13 @@ async fn insert_mls_epoch(
         || record.previous_record_id != head_record_id
     {
         bail!("MLS epoch does not extend the current control head")
+    }
+    let head_members = epochs.last().map_or_else(
+        || genesis.member_accounts.as_slice(),
+        |epoch| epoch.member_accounts.as_slice(),
+    );
+    if !record.authorizes_from(&genesis.owner_public_key, head_members) {
+        bail!("MLS epoch author cannot change this group's membership")
     }
     let object_id = record.record_id.clone();
     let inserted = state
@@ -2925,9 +3169,25 @@ async fn mls_control_log(state: &AppState, group_id: &str) -> Option<MlsControlL
 }
 
 async fn notify_group_change(state: &AppState, group_id: &str) {
+    notify_group_stream_change(state, group_id, None).await;
+}
+
+async fn notify_group_stream_change(
+    state: &AppState,
+    group_id: &str,
+    stream_locator: Option<String>,
+) {
     if let Some(sender) = state.group_changes.read().await.get(group_id) {
-        let revision = sender.borrow().saturating_add(1);
-        sender.send_replace(revision);
+        let mut change_state = sender.borrow().clone();
+        change_state.revision = change_state.revision.saturating_add(1);
+        change_state.recent.push_back(GroupChange {
+            revision: change_state.revision,
+            stream_locator,
+        });
+        while change_state.recent.len() > GROUP_CHANGE_HISTORY_LIMIT {
+            change_state.recent.pop_front();
+        }
+        sender.send_replace(change_state);
     }
 }
 

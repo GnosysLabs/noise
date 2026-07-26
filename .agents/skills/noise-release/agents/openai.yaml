@@ -1,0 +1,4 @@
+interface:
+  display_name: "Noise Release"
+  short_description: "Build, sign, deploy, and verify Noise"
+  default_prompt: "Use $noise-release to build, sign, deploy, and verify the requested Noise platforms."

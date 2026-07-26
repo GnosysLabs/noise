@@ -1,4 +1,5 @@
 type WasmSession = {
+  clear_session(): void;
   restore_session(bytes: Uint8Array): void;
   session_state(): Uint8Array;
 };
@@ -13,7 +14,29 @@ const DATABASE_NAME = "noise-browser";
 const STORE_NAME = "private-vault";
 const DEVICE_KEY = "device-key";
 const STATE_KEY = "encrypted-state";
+const ACCOUNT_REGISTRY_KEY = "account-registry-v1";
 const ADDITIONAL_DATA = new TextEncoder().encode("makenoise.chat browser vault v1");
+
+export type BrowserAccountRecord = {
+  id: string;
+  public_key: string;
+  username: string;
+  bio: string;
+  avatar: unknown | null;
+};
+
+export type BrowserAccountList = {
+  active_account_id: string | null;
+  adding_account: boolean;
+  accounts: BrowserAccountRecord[];
+};
+
+type BrowserAccountRegistry = {
+  version: 1;
+  activeAccountID: string;
+  addingFromAccountID: string | null;
+  accounts: BrowserAccountRecord[];
+};
 
 let databasePromise: Promise<IDBDatabase> | null = null;
 
@@ -83,9 +106,27 @@ async function deviceKey() {
   return created;
 }
 
-export async function restoreBrowserVault(wasm: WasmSession) {
-  const encrypted = await readValue<EncryptedVault>(STATE_KEY);
-  if (!encrypted) return;
+async function accountRegistry(): Promise<BrowserAccountRegistry> {
+  const existing = await readValue<BrowserAccountRegistry>(ACCOUNT_REGISTRY_KEY);
+  if (existing?.version === 1 && existing.activeAccountID) return existing;
+  return {
+    version: 1,
+    activeAccountID: "legacy",
+    addingFromAccountID: null,
+    accounts: [],
+  };
+}
+
+function accountStateKey(accountID: string) {
+  return accountID === "legacy" ? STATE_KEY : `${STATE_KEY}:${accountID}`;
+}
+
+async function restoreAccount(wasm: WasmSession, accountID: string) {
+  const encrypted = await readValue<EncryptedVault>(accountStateKey(accountID));
+  if (!encrypted) {
+    wasm.clear_session();
+    return;
+  }
   if (encrypted.version !== 1 || !(encrypted.iv instanceof Uint8Array)) {
     throw new Error("the encrypted browser vault has an unsupported format");
   }
@@ -108,10 +149,17 @@ export async function restoreBrowserVault(wasm: WasmSession) {
   wasm.restore_session(new Uint8Array(plaintext));
 }
 
+export async function restoreBrowserVault(wasm: WasmSession) {
+  const registry = await accountRegistry();
+  await restoreAccount(wasm, registry.activeAccountID);
+}
+
 export async function persistBrowserVault(wasm: WasmSession) {
+  const registry = await accountRegistry();
+  const stateKey = accountStateKey(registry.activeAccountID);
   const state = wasm.session_state();
   if (!state.byteLength) {
-    await deleteValue(STATE_KEY);
+    await deleteValue(stateKey);
     return;
   }
   const key = await deviceKey();
@@ -121,5 +169,82 @@ export async function persistBrowserVault(wasm: WasmSession) {
     key,
     ownedBuffer(state),
   );
-  await writeValue(STATE_KEY, { version: 1, iv, ciphertext } satisfies EncryptedVault);
+  await writeValue(stateKey, { version: 1, iv, ciphertext } satisfies EncryptedVault);
+}
+
+export async function browserAccountList(): Promise<BrowserAccountList> {
+  const registry = await accountRegistry();
+  return {
+    active_account_id: registry.activeAccountID,
+    adding_account: registry.addingFromAccountID !== null,
+    accounts: registry.accounts,
+  };
+}
+
+export async function updateBrowserAccount(summary: {
+  identity: {
+    public_key: string;
+    username: string;
+    bio: string;
+    avatar: unknown | null;
+  };
+}) {
+  const registry = await accountRegistry();
+  const record: BrowserAccountRecord = {
+    id: registry.activeAccountID,
+    public_key: summary.identity.public_key,
+    username: summary.identity.username,
+    bio: summary.identity.bio,
+    avatar: summary.identity.avatar,
+  };
+  const index = registry.accounts.findIndex((account) => account.id === record.id);
+  if (index >= 0) registry.accounts[index] = record;
+  else registry.accounts.push(record);
+  registry.addingFromAccountID = null;
+  await writeValue(ACCOUNT_REGISTRY_KEY, registry);
+}
+
+export async function startAddingBrowserAccount(wasm: WasmSession) {
+  await persistBrowserVault(wasm);
+  const registry = await accountRegistry();
+  if (registry.addingFromAccountID !== null) return;
+  registry.addingFromAccountID = registry.activeAccountID;
+  registry.activeAccountID = `account-${Date.now().toString(16)}${crypto.randomUUID().replaceAll("-", "")}`;
+  await writeValue(ACCOUNT_REGISTRY_KEY, registry);
+  wasm.clear_session();
+}
+
+export async function cancelAddingBrowserAccount(wasm: WasmSession) {
+  const registry = await accountRegistry();
+  if (!registry.addingFromAccountID) return;
+  const pendingID = registry.activeAccountID;
+  const previousID = registry.addingFromAccountID;
+  await deleteValue(accountStateKey(pendingID));
+  registry.activeAccountID = previousID;
+  registry.addingFromAccountID = null;
+  await writeValue(ACCOUNT_REGISTRY_KEY, registry);
+  await restoreAccount(wasm, previousID);
+}
+
+export async function switchBrowserAccount(wasm: WasmSession, accountID: string) {
+  await persistBrowserVault(wasm);
+  const registry = await accountRegistry();
+  if (!registry.accounts.some((account) => account.id === accountID)) {
+    throw new Error("that account is no longer signed in on this browser");
+  }
+  registry.activeAccountID = accountID;
+  registry.addingFromAccountID = null;
+  await writeValue(ACCOUNT_REGISTRY_KEY, registry);
+  await restoreAccount(wasm, accountID);
+}
+
+export async function removeActiveBrowserAccount(wasm: WasmSession) {
+  const registry = await accountRegistry();
+  const removedID = registry.activeAccountID;
+  await deleteValue(accountStateKey(removedID));
+  registry.accounts = registry.accounts.filter((account) => account.id !== removedID);
+  registry.addingFromAccountID = null;
+  registry.activeAccountID = registry.accounts[0]?.id ?? "legacy";
+  await writeValue(ACCOUNT_REGISTRY_KEY, registry);
+  await restoreAccount(wasm, registry.activeAccountID);
 }

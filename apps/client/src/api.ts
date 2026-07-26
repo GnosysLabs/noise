@@ -1,5 +1,14 @@
-import type { NoiseRequest } from "./types";
-import { persistBrowserVault, restoreBrowserVault } from "./webVault";
+import type { LocalSummary, NoiseRequest, ProfileImage } from "./types";
+import {
+  browserAccountList,
+  cancelAddingBrowserAccount,
+  persistBrowserVault,
+  removeActiveBrowserAccount,
+  restoreBrowserVault,
+  startAddingBrowserAccount,
+  switchBrowserAccount,
+  updateBrowserAccount,
+} from "./webVault";
 
 type Envelope<T> = {
   ok: boolean;
@@ -27,6 +36,7 @@ let maskRelays: string[] = [];
 let maskRelayOffset = 0;
 type BrowserAdapter = {
   default(): Promise<unknown>;
+  clear_session(): void;
   noise_invoke(request: unknown): Promise<unknown>;
   restore_session(bytes: Uint8Array): void;
   session_state(): Uint8Array;
@@ -42,6 +52,7 @@ const browserConcurrentActions = new Set([
   "fetch_attachment_range",
   "fetch_link_preview",
   "fetch_profile_album",
+  "group_has_pending_admissions",
   "heartbeat_presence",
   "reply_notification_snapshot",
   "status",
@@ -81,7 +92,18 @@ async function invokeBrowser<T>(request: NoiseRequest): Promise<T | null> {
     if (!browserConcurrentActions.has(request.action)) {
       await persistBrowserVault(adapter);
     }
-    return response.data ?? null;
+    const data = response.data ?? null;
+    if (
+      data
+      && typeof data === "object"
+      && "identity" in data
+    ) {
+      await updateBrowserAccount(data as unknown as LocalSummary);
+    }
+    if (request.action === "logout" || request.action === "delete_account") {
+      await removeActiveBrowserAccount(adapter);
+    }
+    return data;
   };
 
   if (browserConcurrentActions.has(request.action)) return operation();
@@ -123,6 +145,58 @@ export async function noise<T>(request: NoiseRequest): Promise<T | null> {
   });
   if (!response.ok) throw new Error(response.error ?? "unknown noise core error");
   return response.data ?? null;
+}
+
+export type LocalAccount = {
+  id: string;
+  public_key: string;
+  username: string;
+  bio: string;
+  avatar: ProfileImage | null;
+};
+
+export type LocalAccountList = {
+  active_account_id: string | null;
+  adding_account: boolean;
+  accounts: LocalAccount[];
+};
+
+export async function listLocalAccounts(): Promise<LocalAccountList> {
+  if (!isTauri) {
+    return browserAccountList() as Promise<LocalAccountList>;
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<LocalAccountList>("list_local_accounts");
+}
+
+export async function startAddingLocalAccount() {
+  if (!isTauri) {
+    const adapter = await browserAdapter();
+    await startAddingBrowserAccount(adapter);
+    return;
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("start_adding_local_account");
+}
+
+export async function cancelAddingLocalAccount() {
+  if (!isTauri) {
+    const adapter = await browserAdapter();
+    await cancelAddingBrowserAccount(adapter);
+    return;
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("cancel_adding_local_account");
+}
+
+export async function switchLocalAccount(accountId: string) {
+  if (!isTauri) {
+    const adapter = await browserAdapter();
+    await switchBrowserAccount(adapter, accountId);
+    return;
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("switch_local_account", { accountId });
 }
 
 export async function registerMediaStream(request: NoiseRequest) {

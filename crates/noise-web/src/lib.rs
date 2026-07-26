@@ -81,6 +81,27 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .await
                 .map_err(|error| error.to_string())?,
         ),
+        "register_device" => data(
+            client
+                .register_device(
+                    STATE_PATH,
+                    &required::<String>(&request, "name")?,
+                    &required::<String>(&request, "platform")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "revoke_device" => data(
+            client
+                .revoke_device(
+                    STATE_PATH,
+                    &required::<String>(&request, "device_id")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
         "sync_account" => data(
             client
                 .sync_account(STATE_PATH, relays(&request)?)
@@ -300,9 +321,24 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .await
                 .map_err(|error| error.to_string())?,
         ),
+        "group_has_pending_admissions" => data(
+            client
+                .group_has_pending_admissions(
+                    STATE_PATH,
+                    &required::<String>(&request, "group_id")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
         "sync_group_encryption" => data(
             client
-                .sync_active_group_encryption(STATE_PATH, CACHE_PATH, relays(&request)?)
+                .sync_group_encryption(
+                    STATE_PATH,
+                    CACHE_PATH,
+                    optional::<String>(&request, "group_id")?.as_deref(),
+                    relays(&request)?,
+                )
                 .await
                 .map_err(|error| error.to_string())?,
         ),
@@ -315,12 +351,7 @@ async fn dispatch(request: Value) -> Result<Value, String> {
             let sent = if let Some(topic_id) = topic_id {
                 client
                     .say_topic(
-                        STATE_PATH,
-                        &topic_id,
-                        text,
-                        attachment,
-                        reply_to,
-                        relay_list,
+                        STATE_PATH, &topic_id, text, attachment, reply_to, relay_list,
                     )
                     .await
             } else if let Some(attachment) = attachment {
@@ -750,6 +781,11 @@ pub async fn noise_invoke(request: JsValue) -> JsValue {
 pub fn restore_session(bytes: Vec<u8>) -> Result<(), JsValue> {
     noise_client::import_web_state(STATE_PATH, bytes)
         .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+#[wasm_bindgen]
+pub fn clear_session() {
+    noise_client::clear_web_state(STATE_PATH);
 }
 
 #[wasm_bindgen]

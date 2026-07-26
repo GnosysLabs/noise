@@ -153,6 +153,46 @@ impl Identity {
     pub fn direct_scope_id(&self, peer_public_key: &str) -> Result<String, NoiseError> {
         direct_scope_id(&self.public_key_base64(), peer_public_key)
     }
+
+    pub fn push_subscription_registration(
+        &self,
+        installation_id: impl Into<String>,
+        device_token: impl Into<String>,
+        environment: impl Into<String>,
+        topic: impl Into<String>,
+        issued_at_millis: u64,
+    ) -> Result<PushSubscriptionRegistration, NoiseError> {
+        let mut registration = PushSubscriptionRegistration {
+            public_key: self.public_key_base64(),
+            installation_id: installation_id.into(),
+            device_token: device_token.into(),
+            environment: environment.into(),
+            topic: topic.into(),
+            issued_at_millis,
+            signature_base64: String::new(),
+        };
+        registration.signature_base64 = self.sign(&registration.signing_bytes()?);
+        registration.verify()?;
+        Ok(registration)
+    }
+
+    pub fn direct_push_trigger(
+        &self,
+        event_id: impl Into<String>,
+        recipient_mailbox_id: impl Into<String>,
+        created_at_millis: u64,
+    ) -> Result<DirectPushTrigger, NoiseError> {
+        let mut trigger = DirectPushTrigger {
+            event_id: event_id.into(),
+            recipient_mailbox_id: recipient_mailbox_id.into(),
+            sender_public_key: self.public_key_base64(),
+            created_at_millis,
+            signature_base64: String::new(),
+        };
+        trigger.signature_base64 = self.sign(&trigger.signing_bytes()?);
+        trigger.verify()?;
+        Ok(trigger)
+    }
 }
 
 pub fn direct_mailbox_id(public_key: &str) -> Result<String, NoiseError> {
@@ -189,6 +229,112 @@ pub fn direct_message_id(author_public_key: &str, author_sequence: u64) -> Strin
     hasher.update(author_public_key.as_bytes());
     hasher.update(&author_sequence.to_be_bytes());
     hasher.finalize().to_hex().to_string()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PushSubscriptionRegistration {
+    pub public_key: String,
+    pub installation_id: String,
+    pub device_token: String,
+    pub environment: String,
+    pub topic: String,
+    pub issued_at_millis: u64,
+    pub signature_base64: String,
+}
+
+#[derive(Serialize)]
+struct UnsignedPushSubscriptionRegistration<'a> {
+    public_key: &'a str,
+    installation_id: &'a str,
+    device_token: &'a str,
+    environment: &'a str,
+    topic: &'a str,
+    issued_at_millis: u64,
+}
+
+impl PushSubscriptionRegistration {
+    pub fn mailbox_id(&self) -> Result<String, NoiseError> {
+        direct_mailbox_id(&self.public_key)
+    }
+
+    pub fn verify(&self) -> Result<(), NoiseError> {
+        if self.installation_id.len() > 128
+            || self.installation_id.is_empty()
+            || self.device_token.len() < 32
+            || self.device_token.len() > 512
+            || !self
+                .device_token
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || !matches!(self.environment.as_str(), "sandbox" | "production")
+            || self.topic != "xyz.gnosyslabs.noise.ios"
+        {
+            return Err(NoiseError::InvalidEncoding("push subscription"));
+        }
+        self.mailbox_id()?;
+        verify_signature(
+            &self.public_key,
+            &self.signature_base64,
+            &self.signing_bytes()?,
+        )
+    }
+
+    fn signing_bytes(&self) -> Result<Vec<u8>, NoiseError> {
+        Ok(serde_json::to_vec(&UnsignedPushSubscriptionRegistration {
+            public_key: &self.public_key,
+            installation_id: &self.installation_id,
+            device_token: &self.device_token,
+            environment: &self.environment,
+            topic: &self.topic,
+            issued_at_millis: self.issued_at_millis,
+        })?)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DirectPushTrigger {
+    pub event_id: String,
+    pub recipient_mailbox_id: String,
+    pub sender_public_key: String,
+    pub created_at_millis: u64,
+    pub signature_base64: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DirectPushRequest {
+    pub trigger: DirectPushTrigger,
+    pub event: SignedEvent,
+}
+
+#[derive(Serialize)]
+struct UnsignedDirectPushTrigger<'a> {
+    event_id: &'a str,
+    recipient_mailbox_id: &'a str,
+    sender_public_key: &'a str,
+    created_at_millis: u64,
+}
+
+impl DirectPushTrigger {
+    pub fn verify(&self) -> Result<(), NoiseError> {
+        if !valid_hex_id(&self.event_id) || !valid_hex_id(&self.recipient_mailbox_id) {
+            return Err(NoiseError::InvalidEncoding("direct push trigger"));
+        }
+        direct_mailbox_id(&self.sender_public_key)?;
+        verify_signature(
+            &self.sender_public_key,
+            &self.signature_base64,
+            &self.signing_bytes()?,
+        )
+    }
+
+    fn signing_bytes(&self) -> Result<Vec<u8>, NoiseError> {
+        Ok(serde_json::to_vec(&UnsignedDirectPushTrigger {
+            event_id: &self.event_id,
+            recipient_mailbox_id: &self.recipient_mailbox_id,
+            sender_public_key: &self.sender_public_key,
+            created_at_millis: self.created_at_millis,
+        })?)
+    }
 }
 
 pub fn profile_media_scope_id(public_key: &str) -> Result<String, NoiseError> {
@@ -2238,6 +2384,7 @@ pub struct MemberState {
     pub album: Option<ProfileAlbum>,
     pub accepts_direct_messages: bool,
     pub joined_at_millis: u64,
+    pub profile_sequence: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -2384,6 +2531,7 @@ impl GroupState {
                             album: album.clone(),
                             accepts_direct_messages,
                             joined_at_millis: event.created_at_millis,
+                            profile_sequence: event.author_sequence,
                         },
                     );
                     update_message_profiles(
@@ -2406,6 +2554,7 @@ impl GroupState {
                     member.avatar = profile.avatar.clone();
                     member.album = profile.album.clone();
                     member.accepts_direct_messages = profile.accepts_direct_messages;
+                    member.profile_sequence = event.author_sequence;
                     update_message_profiles(
                         &mut state.messages,
                         &event.author_public_key,
@@ -2497,7 +2646,9 @@ impl GroupState {
                         || topic.archived
                         || event.stream_locator.is_some()
                         || !valid_topic_name(&name)
-                        || icon.as_deref().is_some_and(|icon| !valid_reaction_emoji(icon))
+                        || icon
+                            .as_deref()
+                            .is_some_and(|icon| !valid_reaction_emoji(icon))
                     {
                         state.rejected_events += 1;
                         continue;
@@ -2844,8 +2995,7 @@ impl GroupState {
                         || !is_owner
                             && !is_moderator
                             && ((!text.is_empty() && !state.profile.members_can_send_messages)
-                                || (attachment.is_some()
-                                    && !state.profile.members_can_send_media))
+                                || (attachment.is_some() && !state.profile.members_can_send_media))
                     {
                         state.rejected_events += 1;
                         continue;
@@ -3297,7 +3447,10 @@ mod tests {
         );
         assert_eq!(state.topics[&topic_id].name, "Announcements");
         assert_eq!(state.topics[&topic_id].icon, "📣");
-        assert_eq!(state.messages[0].topic_id.as_deref(), Some(topic_id.as_str()));
+        assert_eq!(
+            state.messages[0].topic_id.as_deref(),
+            Some(topic_id.as_str())
+        );
         assert_eq!(state.messages[0].text, "hello topic");
         assert_eq!(
             state.messages[0]

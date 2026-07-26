@@ -24,3 +24,11 @@ discovery_interval_seconds = 30
 
 # Zero means no application-level quota beyond the disk or bucket limit.
 storage_limit_bytes = 0
+
+# Optional APNs delivery. Relays without this section continue transporting
+# messages normally but don't accept iOS push subscriptions.
+# [push_notifications]
+# key_file = "/etc/noise-relay/apns.p8"
+# key_id = "YOUR_KEY_ID"
+# team_id = "YOUR_TEAM_ID"
+# topic = "xyz.gnosyslabs.noise.ios"

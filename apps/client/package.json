@@ -1,10 +1,11 @@
 {
   "name": "@noise/client",
   "private": true,
-  "version": "0.1.15",
+  "version": "0.1.16",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
+    "dev:desktop": "tauri dev --release",
     "build": "tsc && vite build",
     "build:web": "../../scripts/build-web-client.sh",
     "tauri": "tauri"

@@ -25,7 +25,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use rand::random;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tauri::Manager;
 #[cfg(not(target_os = "macos"))]
@@ -34,6 +34,7 @@ use tauri_plugin_notification::NotificationExt;
 static NOTIFICATION_WATCHERS_STARTED: AtomicBool = AtomicBool::new(false);
 static NEXT_MEDIA_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 static MEDIA_SERVER_BASE_URL: OnceLock<String> = OnceLock::new();
+static ACCOUNT_REGISTRY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Default)]
 struct MediaStreamRegistry(Arc<Mutex<HashMap<String, Value>>>);
@@ -44,6 +45,37 @@ struct OptimizedMediaUpload {
     file_name: String,
     mime_type: String,
     byte_length: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct LocalAccountRegistry {
+    version: u32,
+    active_account_id: Option<String>,
+    adding_from_account_id: Option<String>,
+    accounts: Vec<LocalAccountRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LocalAccountRecord {
+    id: String,
+    public_key: String,
+    username: String,
+    bio: String,
+    avatar: Option<Value>,
+    pending: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct LocalAccountList {
+    active_account_id: Option<String>,
+    adding_account: bool,
+    accounts: Vec<LocalAccountRecord>,
+}
+
+struct ActiveAccountPaths {
+    id: String,
+    state: PathBuf,
+    cache: PathBuf,
 }
 
 fn unix_millis() -> u64 {
@@ -61,14 +93,152 @@ struct PendingNotification {
     created_at_millis: u64,
 }
 
-fn state_path() -> Result<PathBuf, String> {
+fn noise_data_directory() -> Result<PathBuf, String> {
     dirs::data_dir()
-        .map(|directory| directory.join("noise").join("profile.json"))
+        .map(|directory| directory.join("noise"))
         .ok_or_else(|| "this device has no application data directory".to_owned())
 }
 
+fn account_registry_path() -> Result<PathBuf, String> {
+    Ok(noise_data_directory()?.join("accounts.json"))
+}
+
+fn read_account_registry() -> Result<LocalAccountRegistry, String> {
+    let path = account_registry_path()?;
+    if !path.exists() {
+        return Ok(LocalAccountRegistry {
+            version: 1,
+            active_account_id: Some("legacy".to_owned()),
+            adding_from_account_id: None,
+            accounts: Vec::new(),
+        });
+    }
+    let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+    let mut registry = serde_json::from_slice::<LocalAccountRegistry>(&bytes)
+        .map_err(|error| format!("local account list is invalid: {error}"))?;
+    if registry.version == 0 {
+        registry.version = 1;
+    }
+    Ok(registry)
+}
+
+fn write_account_registry(registry: &LocalAccountRegistry) -> Result<(), String> {
+    let path = account_registry_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let bytes = serde_json::to_vec_pretty(registry).map_err(|error| error.to_string())?;
+    fs::write(path, bytes).map_err(|error| error.to_string())
+}
+
+fn active_account_paths(app: &tauri::AppHandle) -> Result<ActiveAccountPaths, String> {
+    let _guard = ACCOUNT_REGISTRY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "local account list is unavailable".to_owned())?;
+    let registry = read_account_registry()?;
+    let id = registry
+        .active_account_id
+        .unwrap_or_else(|| "legacy".to_owned());
+    let data = noise_data_directory()?;
+    let cache_root = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?;
+    if id == "legacy" {
+        Ok(ActiveAccountPaths {
+            id,
+            state: data.join("profile.json"),
+            cache: cache_root,
+        })
+    } else {
+        Ok(ActiveAccountPaths {
+            state: data.join("accounts").join(&id).join("profile.json"),
+            cache: cache_root.join("accounts").join(&id),
+            id,
+        })
+    }
+}
+
+fn update_active_account_metadata(account_id: &str, response: &Value) -> Result<(), String> {
+    let Some(identity) = response
+        .get("data")
+        .and_then(|data| data.get("identity"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    let public_key = identity
+        .get("public_key")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let username = identity
+        .get("username")
+        .and_then(Value::as_str)
+        .unwrap_or("noise user")
+        .to_owned();
+    if public_key.is_empty() {
+        return Ok(());
+    }
+    let _guard = ACCOUNT_REGISTRY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "local account list is unavailable".to_owned())?;
+    let mut registry = read_account_registry()?;
+    registry
+        .accounts
+        .retain(|account| !account.pending || account.id == account_id);
+    let record = LocalAccountRecord {
+        id: account_id.to_owned(),
+        public_key,
+        username,
+        bio: identity
+            .get("bio")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        avatar: identity.get("avatar").cloned().filter(|value| !value.is_null()),
+        pending: false,
+    };
+    if let Some(existing) = registry
+        .accounts
+        .iter_mut()
+        .find(|existing| existing.id == account_id)
+    {
+        *existing = record;
+    } else {
+        registry.accounts.push(record);
+    }
+    registry.active_account_id = Some(account_id.to_owned());
+    registry.adding_from_account_id = None;
+    write_account_registry(&registry)
+}
+
+fn remove_active_account_from_registry(account_id: &str) -> Result<(), String> {
+    let _guard = ACCOUNT_REGISTRY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "local account list is unavailable".to_owned())?;
+    let mut registry = read_account_registry()?;
+    registry.accounts.retain(|account| account.id != account_id);
+    registry.adding_from_account_id = None;
+    registry.active_account_id = registry
+        .accounts
+        .iter()
+        .find(|account| !account.pending)
+        .map(|account| account.id.clone())
+        .or_else(|| Some("legacy".to_owned()));
+    write_account_registry(&registry)
+}
+
 async fn execute_noise_request(app: &tauri::AppHandle, mut request: Value) -> Value {
-    let Ok(path) = state_path() else {
+    let action = request
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let Ok(paths) = active_account_paths(app) else {
         return json!({ "ok": false, "error": "could not locate noise identity storage" });
     };
     let Some(request_object) = request.as_object_mut() else {
@@ -76,17 +246,14 @@ async fn execute_noise_request(app: &tauri::AppHandle, mut request: Value) -> Va
     };
     request_object.insert(
         "state_path".into(),
-        Value::String(path.to_string_lossy().into_owned()),
+        Value::String(paths.state.to_string_lossy().into_owned()),
     );
-    let Ok(cache_path) = app.path().app_cache_dir() else {
-        return json!({ "ok": false, "error": "could not locate noise media cache" });
-    };
     request_object.insert(
         "cache_path".into(),
-        Value::String(cache_path.to_string_lossy().into_owned()),
+        Value::String(paths.cache.to_string_lossy().into_owned()),
     );
 
-    match tauri::async_runtime::spawn_blocking(move || {
+    let response = match tauri::async_runtime::spawn_blocking(move || {
         noise_ffi::response_json(&request.to_string())
     })
     .await
@@ -94,7 +261,15 @@ async fn execute_noise_request(app: &tauri::AppHandle, mut request: Value) -> Va
         Ok(response) => serde_json::from_str(&response)
             .unwrap_or_else(|error| json!({ "ok": false, "error": error.to_string() })),
         Err(error) => json!({ "ok": false, "error": error.to_string() }),
+    };
+    if response.get("ok").and_then(Value::as_bool) == Some(true) {
+        if matches!(action.as_str(), "logout" | "delete_account") {
+            let _ = remove_active_account_from_registry(&paths.id);
+        } else {
+            let _ = update_active_account_metadata(&paths.id, &response);
+        }
     }
+    response
 }
 
 async fn noise_request_data(app: &tauri::AppHandle, request: Value) -> Result<Value, String> {
@@ -113,6 +288,102 @@ async fn noise_request_data(app: &tauri::AppHandle, request: Value) -> Result<Va
 #[tauri::command]
 async fn noise_invoke(app: tauri::AppHandle, request: Value) -> Value {
     execute_noise_request(&app, request).await
+}
+
+#[tauri::command]
+fn list_local_accounts() -> Result<LocalAccountList, String> {
+    let _guard = ACCOUNT_REGISTRY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "local account list is unavailable".to_owned())?;
+    let registry = read_account_registry()?;
+    Ok(LocalAccountList {
+        active_account_id: registry.active_account_id,
+        adding_account: registry.adding_from_account_id.is_some(),
+        accounts: registry
+            .accounts
+            .into_iter()
+            .filter(|account| !account.pending)
+            .collect(),
+    })
+}
+
+#[tauri::command]
+fn start_adding_local_account() -> Result<(), String> {
+    let _guard = ACCOUNT_REGISTRY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "local account list is unavailable".to_owned())?;
+    let mut registry = read_account_registry()?;
+    if registry.adding_from_account_id.is_some() {
+        return Ok(());
+    }
+    registry.accounts.retain(|account| !account.pending);
+    let previous = registry
+        .active_account_id
+        .clone()
+        .unwrap_or_else(|| "legacy".to_owned());
+    let id = format!("account-{:016x}{:016x}", unix_millis(), random::<u64>());
+    registry.adding_from_account_id = Some(previous);
+    registry.active_account_id = Some(id.clone());
+    registry.accounts.push(LocalAccountRecord {
+        id,
+        public_key: String::new(),
+        username: "new account".to_owned(),
+        bio: String::new(),
+        avatar: None,
+        pending: true,
+    });
+    write_account_registry(&registry)
+}
+
+#[tauri::command]
+fn cancel_adding_local_account(app: tauri::AppHandle) -> Result<(), String> {
+    let _guard = ACCOUNT_REGISTRY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "local account list is unavailable".to_owned())?;
+    let mut registry = read_account_registry()?;
+    let Some(previous) = registry.adding_from_account_id.take() else {
+        return Ok(());
+    };
+    let pending_id = registry.active_account_id.clone();
+    if let Some(id) = pending_id.as_deref() {
+        if id != "legacy" {
+            let data = noise_data_directory()?.join("accounts").join(id);
+            if data.exists() {
+                let _ = fs::remove_dir_all(data);
+            }
+            if let Ok(cache) = app.path().app_cache_dir() {
+                let cache = cache.join("accounts").join(id);
+                if cache.exists() {
+                    let _ = fs::remove_dir_all(cache);
+                }
+            }
+        }
+        registry.accounts.retain(|account| account.id != id);
+    }
+    registry.active_account_id = Some(previous);
+    write_account_registry(&registry)
+}
+
+#[tauri::command]
+fn switch_local_account(account_id: String) -> Result<(), String> {
+    let _guard = ACCOUNT_REGISTRY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "local account list is unavailable".to_owned())?;
+    let mut registry = read_account_registry()?;
+    if !registry
+        .accounts
+        .iter()
+        .any(|account| account.id == account_id && !account.pending)
+    {
+        return Err("that account is no longer signed in on this device".to_owned());
+    }
+    registry.active_account_id = Some(account_id);
+    registry.adding_from_account_id = None;
+    write_account_registry(&registry)
 }
 
 #[tauri::command]
@@ -173,7 +444,9 @@ fn register_media_stream(
     let base_url = MEDIA_SERVER_BASE_URL
         .get()
         .ok_or_else(|| "desktop media server is not ready".to_owned())?;
-    Ok(format!("{base_url}/noise-media/{id}/media.{file_extension}"))
+    Ok(format!(
+        "{base_url}/noise-media/{id}/media.{file_extension}"
+    ))
 }
 
 #[tauri::command]
@@ -418,10 +691,7 @@ async fn media_http_response(
             .expect("media HTTP response is valid");
     }
     if method != Method::GET || total == 0 {
-        return media_http_error(
-            StatusCode::BAD_REQUEST,
-            "media stream request is invalid",
-        );
+        return media_http_error(StatusCode::BAD_REQUEST, "media stream request is invalid");
     }
     let (start, end) = requested_media_range(
         headers
@@ -430,10 +700,7 @@ async fn media_http_response(
         total,
     );
     let Some(object) = core_request.as_object_mut() else {
-        return media_http_error(
-            StatusCode::BAD_REQUEST,
-            "media stream request is invalid",
-        );
+        return media_http_error(StatusCode::BAD_REQUEST, "media stream request is invalid");
     };
     object.insert(
         "action".to_owned(),
@@ -530,16 +797,17 @@ async fn download_media(
     app: tauri::AppHandle,
     source_path: String,
     file_name: String,
+    destination_path: Option<String>,
 ) -> Result<String, String> {
     let cache_directory = app
         .path()
         .app_cache_dir()
         .map_err(|error| error.to_string())?
         .join("media");
-    let download_directory = app
-        .path()
-        .download_dir()
-        .map_err(|error| error.to_string())?;
+    let download_directory = destination_path
+        .is_none()
+        .then(|| app.path().download_dir().map_err(|error| error.to_string()))
+        .transpose()?;
     tauri::async_runtime::spawn_blocking(move || {
         let source = fs::canonicalize(source_path).map_err(|error| error.to_string())?;
         let cache = fs::canonicalize(cache_directory).map_err(|error| error.to_string())?;
@@ -548,7 +816,9 @@ async fn download_media(
                 "noise can only download decrypted media from its private cache".to_owned(),
             );
         }
-        fs::create_dir_all(&download_directory).map_err(|error| error.to_string())?;
+        if let Some(download_directory) = download_directory.as_ref() {
+            fs::create_dir_all(download_directory).map_err(|error| error.to_string())?;
+        }
         let raw_name = Path::new(&file_name)
             .file_name()
             .and_then(|value| value.to_str())
@@ -580,16 +850,32 @@ async fn download_media(
             .and_then(|value| value.to_str())
             .unwrap_or("noise-media");
         let extension = requested.extension().and_then(|value| value.to_str());
-        let mut destination = download_directory.join(sanitized);
-        let mut copy_number = 2_u32;
-        while destination.exists() {
-            let candidate = if let Some(extension) = extension {
-                format!("{stem} ({copy_number}).{extension}")
-            } else {
-                format!("{stem} ({copy_number})")
-            };
-            destination = download_directory.join(candidate);
-            copy_number += 1;
+        let mut destination = if let Some(destination_path) = destination_path.as_ref() {
+            let destination = PathBuf::from(destination_path);
+            if !destination.is_absolute() {
+                return Err("the selected download destination is invalid".to_owned());
+            }
+            destination
+        } else {
+            download_directory
+                .as_ref()
+                .expect("the default download directory is available")
+                .join(sanitized)
+        };
+        if destination_path.is_none() {
+            let mut copy_number = 2_u32;
+            while destination.exists() {
+                let candidate = if let Some(extension) = extension {
+                    format!("{stem} ({copy_number}).{extension}")
+                } else {
+                    format!("{stem} ({copy_number})")
+                };
+                destination = download_directory
+                    .as_ref()
+                    .expect("the default download directory is available")
+                    .join(candidate);
+                copy_number += 1;
+            }
         }
         fs::copy(&source, &destination).map_err(|error| error.to_string())?;
         Ok(destination.to_string_lossy().into_owned())
@@ -1026,7 +1312,10 @@ fn main() {
                 token: server_token,
             };
             let router = Router::new()
-                .route("/{token}/noise-media/{id}/{file_name}", any(media_http_response))
+                .route(
+                    "/{token}/noise-media/{id}/{file_name}",
+                    any(media_http_response),
+                )
                 .with_state(state);
             tauri::async_runtime::spawn(async move {
                 let listener = match tokio::net::TcpListener::from_std(media_listener) {
@@ -1049,6 +1338,10 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             noise_invoke,
+            list_local_accounts,
+            start_adding_local_account,
+            cancel_adding_local_account,
+            switch_local_account,
             register_media_stream,
             optimize_video_upload,
             inspect_media_upload,

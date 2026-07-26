@@ -40,12 +40,26 @@ The epoch exporter derives a Noise archive root that only members of that epoch
 can obtain.
 
 Membership commits are serialized by the group control log. Clients must not
-merge two competing commits for the same parent epoch. The first production
-implementation permits only the founder to author an epoch commit. Members
-publish signed self-removal requests and moderators publish signed ban
-requests; a founder client converts valid requests into MLS removal commits.
-This constraint can later be replaced by a quorum control log without changing
-message encryption.
+merge two competing commits for the same parent epoch.
+
+Any account already inside the parent epoch may author a commit that only
+admits accounts, so a join never waits for one specific member to be online.
+Only the founder may author a commit that removes accounts: members publish
+signed self-removal requests, moderators publish signed ban requests, and a
+founder client converts valid requests into MLS removal commits.
+
+Because a relay keeps the first epoch it accepts for a head, members take
+deterministic turns rather than racing. Every member derives the same order from
+the signed head record; the first-ranked member admits immediately and later
+ranks only step in when it stays absent. Competing commits still fail closed,
+and a device that merged a superseded commit discards its local group state and
+asks to be re-admitted instead of holding an archive key nobody else derives.
+
+Relays advertise whether they accept member-authored admissions. A client keeps
+admission with the founder until every relay it uses reports that capability, so
+a partially upgraded relay set cannot leave an epoch stranded on some replicas.
+A replica that missed an earlier epoch is treated as behind rather than forked,
+and clients replay the records it is missing.
 
 ## History plane: backward-readable archive roots
 
@@ -120,9 +134,13 @@ The production join flow is:
 1. the joining client creates an MLS KeyPackage;
 2. the frequency opens an encrypted join capability;
 3. the client publishes a signed join request containing that KeyPackage;
-4. the group controller validates the capability and current ban state;
-5. the controller publishes an MLS add commit and Welcome; and
+4. the member whose turn it is validates the capability and current ban state
+   against the group's own moderation history;
+5. that member publishes an MLS add commit and Welcome; and
 6. the joining client enters the new epoch and receives its archive root.
+
+Members admit in the background for every group they belong to, not only the
+group open on screen, so admission does not depend on where anyone is looking.
 
 Noise automatically revokes and replaces the join capability when a member is
 banned. Otherwise a banned person who retained the old frequency could simply
