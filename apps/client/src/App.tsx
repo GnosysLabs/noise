@@ -1,6 +1,7 @@
 import {
   ArrowLeft,
   ArrowUp,
+  ArrowUpDown,
   AudioWaveform,
   Camera,
   Check,
@@ -3298,6 +3299,47 @@ export default function App() {
     }
   }
 
+  async function reorderGroups(groupIds: string[]) {
+    let previousGroups: GroupSummary[] | null = null;
+    setSummary((current) => {
+      if (!current) return current;
+      previousGroups = current.groups;
+      const byId = new Map(current.groups.map((group) => [group.group_id, group]));
+      const reordered = groupIds
+        .map((groupId) => byId.get(groupId))
+        .filter((group): group is GroupSummary => Boolean(group));
+      if (reordered.length !== current.groups.length) return current;
+      return { ...current, groups: reordered };
+    });
+    try {
+      const result = await noise<LocalSummary>({
+        action: "reorder_groups",
+        group_ids: groupIds,
+      });
+      if (!result) throw new Error("the group order could not be saved");
+      setSummary(result);
+      void noise({
+        action: "sync_account",
+        relays,
+        interruptible: true,
+      }).catch(() => {
+        // The order is already durable locally. Account backup retries
+        // normally and should not undo the visible rearrangement.
+      });
+    } catch (cause) {
+      if (previousGroups) {
+        setSummary((current) => {
+          if (!current) return current;
+          const currentIds = current.groups.map((group) => group.group_id);
+          return currentIds.every((groupId, index) => groupId === groupIds[index])
+            ? { ...current, groups: previousGroups! }
+            : current;
+        });
+      }
+      setError(message(cause));
+    }
+  }
+
   function applySavedIdentity(local: LocalSummary) {
     const identity = local.identity;
     const updateMessage = (item: MessageSummary): MessageSummary =>
@@ -4096,6 +4138,7 @@ export default function App() {
         onSelectTopic={(topic) => void selectTopic(topic)}
         onCreateTopic={(group) => setDialog({ type: "create_topic", group })}
         onManageTopic={(group, topic) => setDialog({ type: "topic", group, topic })}
+        onReorderGroups={reorderGroups}
         onReorderTopics={(group, topicIds) => reorderTopics(group.group_id, topicIds)}
         onSelectDirect={(direct) => void selectDirect(direct)}
       />
@@ -5027,6 +5070,7 @@ function Sidebar({
   onSelectTopic,
   onCreateTopic,
   onManageTopic,
+  onReorderGroups,
   onReorderTopics,
   onSelectDirect,
 }: {
@@ -5057,6 +5101,7 @@ function Sidebar({
   onSelectTopic: (topic: TopicSummary | null) => void;
   onCreateTopic: (group: GroupSummary) => void;
   onManageTopic: (group: GroupSummary, topic: TopicSummary) => void;
+  onReorderGroups: (groupIds: string[]) => Promise<void>;
   onReorderTopics: (group: GroupSummary, topicIds: string[]) => Promise<void>;
   onSelectDirect: (direct: DirectSummary) => void;
 }) {
@@ -5066,13 +5111,22 @@ function Sidebar({
       (member) => member.public_key === summary.identity.public_key && member.is_moderator,
     ) === true;
   const canReorderTopics = conversation?.group.owner_public_key === summary.identity.public_key;
+  const [rearrangingGroups, setRearrangingGroups] = useState(false);
+  const [draggedGroupId, setDraggedGroupId] = useState<string | null>(null);
+  const [groupDropTarget, setGroupDropTarget] = useState<{ groupId: string; after: boolean } | null>(null);
   const [draggedTopicId, setDraggedTopicId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ topicId: string; after: boolean } | null>(null);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const accountMenuRef = useRef<HTMLDivElement | null>(null);
   const topicDrag = useRef<{ pointerId: number; topicId: string; startY: number; moved: boolean } | null>(null);
   const dropTargetRef = useRef<{ topicId: string; after: boolean } | null>(null);
+  const groupDrag = useRef<{ pointerId: number; groupId: string; startY: number; moved: boolean } | null>(null);
+  const groupDropTargetRef = useRef<{ groupId: string; after: boolean } | null>(null);
   const suppressTopicClick = useRef(false);
+  const updateGroupDropTarget = (target: { groupId: string; after: boolean } | null) => {
+    groupDropTargetRef.current = target;
+    setGroupDropTarget(target);
+  };
   const updateDropTarget = (target: { topicId: string; after: boolean } | null) => {
     dropTargetRef.current = target;
     setDropTarget(target);
@@ -5087,6 +5141,11 @@ function Sidebar({
     document.addEventListener("pointerdown", close);
     return () => document.removeEventListener("pointerdown", close);
   }, [accountMenuOpen]);
+  useEffect(() => {
+    if (mode !== "groups") {
+      setRearrangingGroups(false);
+    }
+  }, [mode]);
   return (
     <aside className="sidebar">
       <div className="sidebar-drag" data-tauri-drag-region>
@@ -5096,10 +5155,19 @@ function Sidebar({
         <button className={mode === "groups" ? "active" : ""} onClick={() => onMode("groups")}><UsersRound size={14} /> groups</button>
         <button className={mode === "directs" ? "active" : ""} onClick={() => onMode("directs")}><MessagesSquare size={14} /> dms{hasUnreadDirects && <span className="tab-unread-dot" aria-label="unread direct messages" />}</button>
       </div>
-      {mode === "groups" && <div className="sidebar-actions">
-        <button className="wide-button" onClick={onMake}><Plus size={15} /> create group</button>
+      {mode === "groups" && <div className="sidebar-actions group-actions">
+        <button className="wide-button" onClick={onMake}><Plus size={15} /> new group</button>
         <button className="square-button" onClick={onJoin} title="join group" aria-label="join group"><Radio size={16} /></button>
         <button className="square-button" onClick={onSearch} title="search (⌘K)" aria-label="search"><Search size={16} /></button>
+        <button
+          className={`square-button ${rearrangingGroups ? "active" : ""}`}
+          onClick={() => setRearrangingGroups((current) => !current)}
+          title={rearrangingGroups ? "done rearranging" : "rearrange groups"}
+          aria-label={rearrangingGroups ? "done rearranging groups" : "rearrange groups"}
+          aria-pressed={rearrangingGroups}
+        >
+          {rearrangingGroups ? <Check size={16} /> : <ArrowUpDown size={16} />}
+        </button>
       </div>}
       {mode === "directs" && <div className="sidebar-actions direct-actions">
         <button className="wide-button" onClick={onNewDirect}><Plus size={15} /> direct message</button>
@@ -5122,19 +5190,25 @@ function Sidebar({
           </div>
         )}
         {mode === "groups" ? summary.groups.map((group) => {
-          const groupConversation = group.is_active
+          const groupConversation = !rearrangingGroups && group.is_active
             && conversation?.group.group_id === group.group_id
             ? conversation
             : null;
           const topics = groupConversation?.topics.filter((topic) => !topic.archived) ?? [];
           return (
-            <div className="group-entry" key={group.group_id}>
+            <div
+              className={`group-entry ${rearrangingGroups ? "reorderable" : ""} ${draggedGroupId === group.group_id ? "dragging" : ""} ${groupDropTarget?.groupId === group.group_id ? `drop-target drop-${groupDropTarget.after ? "after" : "before"}` : ""}`}
+              key={group.group_id}
+              data-group-id={group.group_id}
+            >
               <button
                 className={`group-row ${group.is_active ? "active" : ""} ${pendingGroupId === group.group_id ? "pending" : ""} ${group.safety_restriction ? "restricted" : ""}`}
-                onClick={() => onSelect(group)}
+                onClick={() => {
+                  if (!rearrangingGroups) onSelect(group);
+                }}
                 onContextMenu={(event) => {
                   event.preventDefault();
-                  if (group.safety_restriction) return;
+                  if (rearrangingGroups || group.safety_restriction) return;
                   onContextMenu(group, event.clientX, event.clientY);
                 }}
               >
@@ -5151,6 +5225,70 @@ function Sidebar({
                   </span>
                 )}
               </button>
+              {rearrangingGroups && <button
+                className="group-reorder-handle"
+                aria-label={`Rearrange ${group.name}`}
+                title="drag to rearrange"
+                onPointerDown={(event) => {
+                  if (event.button !== 0) return;
+                  event.preventDefault();
+                  groupDrag.current = {
+                    pointerId: event.pointerId,
+                    groupId: group.group_id,
+                    startY: event.clientY,
+                    moved: false,
+                  };
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                }}
+                onPointerMove={(event) => {
+                  const drag = groupDrag.current;
+                  if (!drag || drag.pointerId !== event.pointerId) return;
+                  if (!drag.moved && Math.abs(event.clientY - drag.startY) < 4) return;
+                  if (!drag.moved) {
+                    drag.moved = true;
+                    setDraggedGroupId(drag.groupId);
+                  }
+                  const target = document
+                    .elementFromPoint(event.clientX, event.clientY)
+                    ?.closest<HTMLElement>(".group-entry[data-group-id]");
+                  if (
+                    !target
+                    || !target.dataset.groupId
+                    || target.dataset.groupId === drag.groupId
+                  ) {
+                    updateGroupDropTarget(null);
+                    return;
+                  }
+                  const row = target.querySelector<HTMLElement>(".group-row");
+                  const bounds = (row ?? target).getBoundingClientRect();
+                  updateGroupDropTarget({
+                    groupId: target.dataset.groupId,
+                    after: event.clientY >= bounds.top + bounds.height / 2,
+                  });
+                }}
+                onPointerUp={(event) => {
+                  const drag = groupDrag.current;
+                  if (!drag || drag.pointerId !== event.pointerId) return;
+                  groupDrag.current = null;
+                  setDraggedGroupId(null);
+                  const target = groupDropTargetRef.current;
+                  updateGroupDropTarget(null);
+                  if (!drag.moved || !target) return;
+                  const groupIds = summary.groups
+                    .map((item) => item.group_id)
+                    .filter((groupId) => groupId !== drag.groupId);
+                  const targetIndex = groupIds.indexOf(target.groupId);
+                  groupIds.splice(targetIndex + (target.after ? 1 : 0), 0, drag.groupId);
+                  void onReorderGroups(groupIds);
+                }}
+                onPointerCancel={() => {
+                  groupDrag.current = null;
+                  setDraggedGroupId(null);
+                  updateGroupDropTarget(null);
+                }}
+              >
+                <GripVertical size={14} aria-hidden="true" />
+              </button>}
               {groupConversation && (
                 <div className="group-topics">
                   <button

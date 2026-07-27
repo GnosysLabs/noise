@@ -496,6 +496,11 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .await
                 .map_err(|error| error.to_string())?,
         ),
+        "reorder_groups" => data(
+            client
+                .reorder_groups(STATE_PATH, required::<Vec<String>>(&request, "group_ids")?)
+                .map_err(|error| error.to_string())?,
+        ),
         "reorder_topics" => data(
             client
                 .reorder_topics(

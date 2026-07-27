@@ -857,6 +857,8 @@ struct ClientState {
     direct_event_cache: DirectEventCache,
     groups: Vec<GroupMembership>,
     #[serde(default)]
+    group_order_sequence: u64,
+    #[serde(default)]
     group_memberships: HashMap<String, GroupMembershipRecord>,
     active_group_id: Option<String>,
     #[serde(default)]
@@ -961,6 +963,8 @@ struct AccountVaultContents {
     #[serde(default)]
     group_event_caches: HashMap<String, GroupEventCache>,
     groups: Vec<GroupMembership>,
+    #[serde(default)]
+    group_order_sequence: u64,
     #[serde(default)]
     group_memberships: HashMap<String, GroupMembershipRecord>,
     active_group_id: Option<String>,
@@ -1787,8 +1791,81 @@ impl ClientState {
             *existing = group;
         } else {
             self.groups.push(group);
+            self.group_order_sequence = self.group_order_sequence.max(sequence);
         }
         self.active_group_id = Some(group_id);
+    }
+
+    fn group_is_visible(&self, group: &GroupMembership) -> bool {
+        self.active_group_safety_restriction(&group.group_id)
+            .is_some()
+            || group.content_rating != GroupContentRating::Explicit
+            || self.adult_access.explicit_content_enabled
+    }
+
+    fn apply_group_order(&mut self, group_ids: &[String]) -> bool {
+        let before = self.groups.clone();
+        let requested = group_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+        let by_id = self
+            .groups
+            .iter()
+            .cloned()
+            .map(|group| (group.group_id.clone(), group))
+            .collect::<HashMap<_, _>>();
+        self.groups = group_ids
+            .iter()
+            .filter_map(|group_id| by_id.get(group_id).cloned())
+            .chain(
+                before
+                    .iter()
+                    .filter(|group| !requested.contains(group.group_id.as_str()))
+                    .cloned(),
+            )
+            .collect();
+        before != self.groups
+    }
+
+    fn reorder_visible_groups(&mut self, group_ids: &[String]) -> anyhow::Result<bool> {
+        let visible_group_ids = self
+            .groups
+            .iter()
+            .filter(|group| self.group_is_visible(group))
+            .map(|group| group.group_id.clone())
+            .collect::<Vec<_>>();
+        let requested = group_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+        let visible = visible_group_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        if group_ids.len() != requested.len()
+            || group_ids.len() != visible_group_ids.len()
+            || requested != visible
+        {
+            bail!("group order is out of date")
+        }
+        if group_ids == visible_group_ids {
+            return Ok(false);
+        }
+
+        let visible_ids = visible_group_ids.into_iter().collect::<HashSet<_>>();
+        let by_id = self
+            .groups
+            .iter()
+            .cloned()
+            .map(|group| (group.group_id.clone(), group))
+            .collect::<HashMap<_, _>>();
+        let mut ordered = group_ids
+            .iter()
+            .filter_map(|group_id| by_id.get(group_id).cloned());
+        for group in &mut self.groups {
+            if visible_ids.contains(&group.group_id) {
+                *group = ordered
+                    .next()
+                    .context("group order changed while it was being saved")?;
+            }
+        }
+        self.group_order_sequence = self.take_sequence();
+        Ok(true)
     }
 
     fn apply_resolved_group_profile(
@@ -1962,6 +2039,7 @@ impl ClientState {
             // a new device can render the group before paging relay history.
             group_event_caches: self.portable_group_state_snapshots(),
             groups: self.groups.clone(),
+            group_order_sequence: self.group_order_sequence,
             group_memberships: self.vault_group_memberships(),
             active_group_id: self.active_group_id.clone(),
             direct_contacts: self.direct_contacts.clone(),
@@ -2020,6 +2098,7 @@ impl ClientState {
             safety_cache_purged_directive_ids: HashSet::new(),
             direct_event_cache: DirectEventCache::default(),
             groups: contents.groups,
+            group_order_sequence: contents.group_order_sequence,
             group_memberships: contents.group_memberships,
             active_group_id: contents.active_group_id,
             direct_contacts: contents.direct_contacts,
@@ -2710,34 +2789,9 @@ impl ClientState {
                 devices
             },
             groups: {
-                let mut groups = self
-                    .groups
+                self.groups
                     .iter()
-                    .filter(|group| {
-                        self.active_group_safety_restriction(&group.group_id)
-                            .is_some()
-                            || group.content_rating != GroupContentRating::Explicit
-                            || self.adult_access.explicit_content_enabled
-                    })
-                    .collect::<Vec<_>>();
-                groups.sort_by(|left, right| {
-                    let left_unread = self.group_unread_count(&left.group_id) > 0;
-                    let right_unread = self.group_unread_count(&right.group_id) > 0;
-                    right_unread
-                        .cmp(&left_unread)
-                        .then_with(|| {
-                            let markers = if left_unread && right_unread {
-                                &self.group_latest_incoming
-                            } else {
-                                &self.group_latest_activity
-                            };
-                            markers
-                                .get(&right.group_id)
-                                .cmp(&markers.get(&left.group_id))
-                        })
-                        .then_with(|| left.group_id.cmp(&right.group_id))
-                });
-                groups
+                    .filter(|group| self.group_is_visible(group))
                     .into_iter()
                     .map(|group| {
                         let restriction = self
@@ -2985,6 +3039,7 @@ impl NoiseClient {
             safety_cache_purged_directive_ids: HashSet::new(),
             direct_event_cache: DirectEventCache::default(),
             groups: Vec::new(),
+            group_order_sequence: 0,
             group_memberships: HashMap::new(),
             active_group_id: None,
             direct_contacts: Vec::new(),
@@ -3393,6 +3448,19 @@ impl NoiseClient {
 
     pub fn local_summary(&self, path: impl AsRef<Path>) -> anyhow::Result<LocalSummary> {
         load_state(path.as_ref())?.summary()
+    }
+
+    pub fn reorder_groups(
+        &self,
+        path: impl AsRef<Path>,
+        group_ids: Vec<String>,
+    ) -> anyhow::Result<LocalSummary> {
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        if state.reorder_visible_groups(&group_ids)? {
+            save_state(path, &state)?;
+        }
+        state.summary()
     }
 
     pub async fn sync_safety_directives(
@@ -10301,6 +10369,7 @@ impl NoiseClient {
         state.ensure_group_membership_records();
         let memberships_before = state.group_memberships.clone();
         let groups_before = state.groups.clone();
+        let group_order_sequence_before = state.group_order_sequence;
         let frequencies_before = state.group_frequencies.clone();
         let mut remote_memberships = contents.group_memberships.clone();
         for group in &contents.groups {
@@ -10313,6 +10382,15 @@ impl NoiseClient {
         }
         merge_group_membership_records(&mut state.group_memberships, remote_memberships);
         state.reconcile_group_memberships();
+        if contents.group_order_sequence > state.group_order_sequence {
+            let remote_group_ids = contents
+                .groups
+                .iter()
+                .map(|group| group.group_id.clone())
+                .collect::<Vec<_>>();
+            state.apply_group_order(&remote_group_ids);
+            state.group_order_sequence = contents.group_order_sequence;
+        }
         let present_group_ids = state
             .groups
             .iter()
@@ -10547,6 +10625,7 @@ impl NoiseClient {
         }
         let memberships_changed = memberships_before != state.group_memberships
             || groups_before != state.groups
+            || group_order_sequence_before != state.group_order_sequence
             || frequencies_before != state.group_frequencies;
         let direct_reads_changed = state.merge_direct_read_through(&contents.direct_read_through);
         let direct_policy_rejections_changed = merge_read_markers(
@@ -14383,6 +14462,7 @@ mod tests {
             safety_cache_purged_directive_ids: HashSet::new(),
             direct_event_cache: DirectEventCache::default(),
             groups: Vec::new(),
+            group_order_sequence: 0,
             group_memberships: HashMap::new(),
             active_group_id: None,
             direct_contacts: Vec::new(),
@@ -14641,6 +14721,92 @@ mod tests {
             current
                 .get(&first_id)
                 .is_some_and(|record| record.group.is_some())
+        );
+    }
+
+    #[test]
+    fn group_order_stays_saved_when_a_later_group_has_unread_activity() {
+        let identity = Identity::generate();
+        let credentials = AccountCredentials {
+            noise_id: "123456789012".to_owned(),
+            locator: "ab".repeat(32),
+            vault_key_base64: STANDARD_NO_PAD.encode([7_u8; 32]),
+        };
+        let mut state = account_state(&identity, &credentials, test_profile(None), 1, 1);
+        let first = GroupMembership::create_owned("first", identity.public_key_base64());
+        let second = GroupMembership::create_owned("second", identity.public_key_base64());
+        let first_id = first.group_id.clone();
+        let second_id = second.group_id.clone();
+        state.add_group(first);
+        state.add_group(second);
+        state
+            .group_unread_messages
+            .insert(second_id.clone(), vec![marker(200, "newer")]);
+
+        let summary = state.summary().unwrap();
+        assert_eq!(
+            summary
+                .groups
+                .iter()
+                .map(|group| group.group_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![first_id.as_str(), second_id.as_str()]
+        );
+    }
+
+    #[test]
+    fn group_order_preserves_hidden_explicit_slots_and_syncs_to_other_devices() {
+        let identity = Identity::generate();
+        let credentials = AccountCredentials {
+            noise_id: "123456789012".to_owned(),
+            locator: "ab".repeat(32),
+            vault_key_base64: STANDARD_NO_PAD.encode([7_u8; 32]),
+        };
+        let mut source = account_state(&identity, &credentials, test_profile(None), 1, 1);
+        let first = GroupMembership::create_owned("first", identity.public_key_base64());
+        let mut hidden = GroupMembership::create_owned("hidden", identity.public_key_base64());
+        hidden.content_rating = GroupContentRating::Explicit;
+        let third = GroupMembership::create_owned("third", identity.public_key_base64());
+        let first_id = first.group_id.clone();
+        let hidden_id = hidden.group_id.clone();
+        let third_id = third.group_id.clone();
+        source.add_group(first);
+        source.add_group(hidden);
+        source.add_group(third);
+        let mut destination = source.clone();
+
+        assert!(
+            source
+                .reorder_visible_groups(&[third_id.clone(), first_id.clone()])
+                .unwrap()
+        );
+        assert_eq!(
+            source
+                .groups
+                .iter()
+                .map(|group| group.group_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![third_id.as_str(), hidden_id.as_str(), first_id.as_str()]
+        );
+
+        let remote = AccountVault::seal(
+            &identity,
+            &credentials,
+            2,
+            &serde_json::to_vec(&source.vault_contents()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            NoiseClient::merge_remote_account_state(&mut destination, &credentials, &remote)
+                .unwrap()
+        );
+        assert_eq!(
+            destination
+                .groups
+                .iter()
+                .map(|group| group.group_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![third_id.as_str(), hidden_id.as_str(), first_id.as_str()]
         );
     }
 

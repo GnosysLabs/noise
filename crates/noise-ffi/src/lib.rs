@@ -312,6 +312,10 @@ enum Request {
         group_id: String,
         topic_id: String,
     },
+    ReorderGroups {
+        state_path: String,
+        group_ids: Vec<String>,
+    },
     CreateTopic {
         state_path: String,
         name: String,
@@ -1572,6 +1576,15 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         } => serde_json::to_value(
             client
                 .mark_topic_read(state_path, &group_id, Some(&topic_id))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::ReorderGroups {
+            state_path,
+            group_ids,
+        } => serde_json::to_value(
+            client
+                .reorder_groups(state_path, group_ids)
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
