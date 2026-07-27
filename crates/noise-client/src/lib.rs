@@ -761,6 +761,14 @@ struct ClientState {
     mls_recovery_dirty: bool,
     #[serde(default)]
     mls_join_requests: HashMap<String, MlsJoinRequest>,
+    /// A locally prepared epoch and its post-commit MLS state.
+    ///
+    /// This intent is saved before the relay write. If the desktop process is
+    /// rebuilt or closed after a relay accepts the epoch but before the async
+    /// operation resumes, the next sync can adopt the exact state that authored
+    /// that epoch instead of stranding the author on its previous leaf.
+    #[serde(default)]
+    mls_pending_epochs: HashMap<String, PendingMlsEpoch>,
     #[serde(default)]
     mls_local_geneses: HashMap<String, MlsGroupGenesis>,
     #[serde(default)]
@@ -828,6 +836,12 @@ struct ClientState {
     next_author_sequence: u64,
     #[serde(default)]
     account: Option<AccountSession>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingMlsEpoch {
+    candidate: MlsAccountState,
+    record: MlsEpochRecord,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1546,6 +1560,7 @@ impl ClientState {
         if self.mls_group_states.remove(group_id).is_some() {
             self.mls_recovery_dirty = true;
         }
+        self.mls_pending_epochs.remove(group_id);
         if let Some(mls) = self.mls_device.as_mut() {
             mls.forget_group(group_id)
                 .context("could not erase this group's legacy encryption state")?;
@@ -1914,6 +1929,7 @@ impl ClientState {
             mls_group_states: contents.mls_group_states,
             mls_recovery_dirty: false,
             mls_join_requests: HashMap::new(),
+            mls_pending_epochs: HashMap::new(),
             mls_local_geneses: HashMap::new(),
             mls_control_logs: contents.mls_control_logs,
             group_event_caches: contents.group_event_caches,
@@ -2679,6 +2695,7 @@ impl NoiseClient {
             mls_group_states: HashMap::new(),
             mls_recovery_dirty: false,
             mls_join_requests: HashMap::new(),
+            mls_pending_epochs: HashMap::new(),
             mls_local_geneses: HashMap::new(),
             mls_control_logs: HashMap::new(),
             group_event_caches: HashMap::new(),
@@ -4861,6 +4878,56 @@ impl NoiseClient {
             state.mls_local_geneses.remove(&group.group_id);
             save_state(path, &state)?;
         }
+        if let Some(pending) = state.mls_pending_epochs.get(&group.group_id).cloned() {
+            let valid = pending_mls_epoch_is_valid(
+                &pending,
+                &group.group_id,
+                &self_public_key,
+            );
+            let accepted = valid
+                && control_log.as_ref().is_some_and(|log| {
+                    log.epochs
+                        .iter()
+                        .any(|record| record.record_id == pending.record.record_id)
+                });
+            if accepted {
+                state.set_mls_group_state(&group.group_id, pending.candidate);
+                state.mls_pending_epochs.remove(&group.group_id);
+                save_state_immediately(path, &state)?;
+            } else {
+                let still_extends_head = valid
+                    && control_log.as_ref().is_some_and(|log| {
+                        log.head().1 == pending.record.previous_record_id
+                    });
+                if still_extends_head {
+                    match self.publish_mls_epoch(&relays, &pending.record).await? {
+                        ControlHead::Extended => {
+                            state.set_mls_group_state(
+                                &group.group_id,
+                                pending.candidate,
+                            );
+                            if let Some(log) = control_log.as_mut() {
+                                log.epochs.push(pending.record);
+                                state
+                                    .mls_control_logs
+                                    .insert(group.group_id.clone(), log.clone());
+                            }
+                            state.mls_pending_epochs.remove(&group.group_id);
+                            save_state_immediately(path, &state)?;
+                        }
+                        ControlHead::Changed => {
+                            state.mls_pending_epochs.remove(&group.group_id);
+                            save_state(path, &state)?;
+                            control_log =
+                                self.fetch_mls_control_log(&relays, &group.group_id).await?;
+                        }
+                    }
+                } else {
+                    state.mls_pending_epochs.remove(&group.group_id);
+                    save_state(path, &state)?;
+                }
+            }
+        }
         if let Some(log) = control_log.as_ref()
             && discard_superseded_mls_state(&mut state, log)?
         {
@@ -4906,7 +4973,7 @@ impl NoiseClient {
                 state
                     .mls_join_requests
                     .insert(group.group_id.clone(), request);
-                save_state(path, &state)?;
+                save_state_immediately(path, &state)?;
             }
             let join_request = state
                 .mls_join_requests
@@ -4981,7 +5048,7 @@ impl NoiseClient {
                 state
                     .mls_local_geneses
                     .insert(group.group_id.clone(), genesis);
-                save_state(path, &state)?;
+                save_state_immediately(path, &state)?;
             }
             let genesis = state
                 .mls_local_geneses
@@ -4998,6 +5065,45 @@ impl NoiseClient {
         let mut control_log = control_log.context("MLS control log is missing")?;
         let local_epoch = sync_mls_state_from_log(&mut state, &control_log)?;
         let (head_epoch, _) = control_log.head();
+        if local_epoch.is_none()
+            && local_has_mls_group
+            && active_members.contains(&self_public_key)
+            && !has_pending_membership_proof
+        {
+            // A process can be stopped after a self-authored commit reaches the
+            // relays but before its post-commit state is saved. MLS deliberately
+            // cannot replay a commit from the leaf that authored it. Replace
+            // that stale leaf with a fresh signed device request so any current
+            // member can admit this installation again without deleting the
+            // group or losing its account-level membership.
+            let sequence = state.take_sequence();
+            let membership_proof =
+                SignedEvent::member_joined(&identity, &group, &state.profile, sequence)?;
+            let mut replacement = MlsAccountState::create(&identity)
+                .context("could not create a replacement MLS device")?;
+            let request = MlsJoinRequest::create_with_membership_proof(
+                &identity,
+                &mut replacement,
+                group.group_id.clone(),
+                membership_proof,
+            )
+            .context("could not create this device's recovery join request")?;
+            state.set_mls_group_state(&group.group_id, replacement);
+            state
+                .mls_join_requests
+                .insert(group.group_id.clone(), request.clone());
+            state
+                .mls_control_logs
+                .insert(group.group_id.clone(), control_log);
+            save_state_immediately(path, &state)?;
+            self.publish_mls_join_request(&relays, &request).await?;
+            return Ok(GroupEncryptionStatus {
+                group_id: group.group_id,
+                phase: "waiting_for_admission".into(),
+                epoch: None,
+                missing_member_public_keys: Vec::new(),
+            });
+        }
         // Only a member whose own encryption state sits on the current head can
         // author the next epoch; anything else would build on a stale parent.
         let is_current_member = local_epoch == Some(head_epoch)
@@ -5054,13 +5160,28 @@ impl NoiseClient {
                             .insert(group.group_id.clone(), frequency);
                         save_state(path, &state)?;
                     }
-                    if self.publish_mls_epoch(&relays, &record).await? == ControlHead::Extended {
-                        state.set_mls_group_state(&group.group_id, candidate);
-                        control_log.epochs.push(record);
-                        state
-                            .mls_control_logs
-                            .insert(group.group_id.clone(), control_log.clone());
-                        save_state(path, &state)?;
+                    state.mls_pending_epochs.insert(
+                        group.group_id.clone(),
+                        PendingMlsEpoch {
+                            candidate: candidate.clone(),
+                            record: record.clone(),
+                        },
+                    );
+                    save_state_immediately(path, &state)?;
+                    match self.publish_mls_epoch(&relays, &record).await? {
+                        ControlHead::Extended => {
+                            state.set_mls_group_state(&group.group_id, candidate);
+                            control_log.epochs.push(record);
+                            state.mls_pending_epochs.remove(&group.group_id);
+                            state
+                                .mls_control_logs
+                                .insert(group.group_id.clone(), control_log.clone());
+                            save_state_immediately(path, &state)?;
+                        }
+                        ControlHead::Changed => {
+                            state.mls_pending_epochs.remove(&group.group_id);
+                            save_state(path, &state)?;
+                        }
                     }
                 }
             }
@@ -5132,9 +5253,28 @@ impl NoiseClient {
                         &control_log,
                         &admitted,
                     )?;
-                    if self.publish_mls_epoch(&relays, &record).await? == ControlHead::Extended {
-                        state.set_mls_group_state(&group.group_id, candidate);
-                        control_log.epochs.push(record);
+                    state.mls_pending_epochs.insert(
+                        group.group_id.clone(),
+                        PendingMlsEpoch {
+                            candidate: candidate.clone(),
+                            record: record.clone(),
+                        },
+                    );
+                    save_state_immediately(path, &state)?;
+                    match self.publish_mls_epoch(&relays, &record).await? {
+                        ControlHead::Extended => {
+                            state.set_mls_group_state(&group.group_id, candidate);
+                            control_log.epochs.push(record);
+                            state.mls_pending_epochs.remove(&group.group_id);
+                            state
+                                .mls_control_logs
+                                .insert(group.group_id.clone(), control_log.clone());
+                            save_state_immediately(path, &state)?;
+                        }
+                        ControlHead::Changed => {
+                            state.mls_pending_epochs.remove(&group.group_id);
+                            save_state(path, &state)?;
+                        }
                     }
                 }
             }
@@ -5327,7 +5467,7 @@ impl NoiseClient {
                 .mls_control_logs
                 .insert(group.group_id.clone(), control_log);
         }
-        save_state(path, &state)?;
+        save_state_immediately(path, &state)?;
         self.publish_mls_join_request(&relays, &request).await?;
         if !has_control_log {
             self.publish_event(&relays, &membership_proof).await?;
@@ -11874,6 +12014,26 @@ fn validate_mls_member_accounts(
     Ok(())
 }
 
+fn pending_mls_epoch_is_valid(
+    pending: &PendingMlsEpoch,
+    group_id: &str,
+    self_public_key: &str,
+) -> bool {
+    pending.record.verify().is_ok()
+        && pending.record.bundle.group_id == group_id
+        && pending.record.owner_public_key == self_public_key
+        && pending
+            .candidate
+            .epoch(group_id)
+            .is_ok_and(|epoch| epoch.epoch == pending.record.bundle.epoch)
+        && validate_mls_member_accounts(
+            &pending.candidate,
+            group_id,
+            &pending.record.member_accounts,
+        )
+        .is_ok()
+}
+
 /// Every join request this group can admit from its current control head.
 ///
 /// The filter reads only signed control-plane data, so every member derives the
@@ -13114,6 +13274,52 @@ fn save_state(path: &Path, state: &ClientState) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(all(not(target_arch = "wasm32"), not(test)))]
+fn save_state_immediately(path: &Path, state: &ClientState) -> anyhow::Result<()> {
+    let cache = native_state_cache();
+    let (lock, condition) = &**cache;
+    let generation = {
+        let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.next_generation = guard.next_generation.saturating_add(1);
+        let generation = guard.next_generation;
+        let persisted_generation = guard
+            .entries
+            .get(path)
+            .map_or(0, |entry| entry.persisted_generation);
+        // `None` reserves this generation for the synchronous writer so the
+        // debounce thread cannot race the same temporary file.
+        guard.entries.insert(
+            path.to_path_buf(),
+            NativeStateEntry {
+                state: state.clone(),
+                generation,
+                persisted_generation,
+                write_after: None,
+            },
+        );
+        generation
+    };
+    let bytes = serde_json::to_vec(state)?;
+    if let Err(error) = persist_native_state_generation(cache, path, generation, &bytes) {
+        let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = guard.entries.get_mut(path)
+            && entry.generation == generation
+        {
+            entry.write_after = Some(Instant::now() + Duration::from_secs(1));
+            condition.notify_one();
+        }
+        return Err(error).with_context(|| format!("could not persist {}", path.display()));
+    }
+    let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = guard.entries.get_mut(path)
+        && entry.generation == generation
+    {
+        entry.persisted_generation = generation;
+        entry.write_after = None;
+    }
+    Ok(())
+}
+
 #[cfg(all(not(target_arch = "wasm32"), test))]
 fn save_state(path: &Path, state: &ClientState) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
@@ -13134,6 +13340,11 @@ fn save_state(path: &Path, state: &ClientState) -> anyhow::Result<()> {
     fs::rename(&temporary, path)
         .with_context(|| format!("could not replace {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn save_state_immediately(path: &Path, state: &ClientState) -> anyhow::Result<()> {
+    save_state(path, state)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -13302,6 +13513,7 @@ mod tests {
             mls_group_states: HashMap::new(),
             mls_recovery_dirty: false,
             mls_join_requests: HashMap::new(),
+            mls_pending_epochs: HashMap::new(),
             mls_local_geneses: HashMap::new(),
             mls_control_logs: HashMap::new(),
             group_event_caches: HashMap::new(),
@@ -14072,10 +14284,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pending.len(), 1);
-        let (_, record) =
+        let (candidate, record) =
             prepare_member_add_epoch(&state, &member_identity, &group, &members, &log, &pending)
                 .unwrap();
         assert_eq!(record.owner_public_key, member_identity.public_key_base64());
+        let staged = PendingMlsEpoch {
+            candidate,
+            record: record.clone(),
+        };
+        assert!(pending_mls_epoch_is_valid(
+            &staged,
+            &group_id,
+            &member_identity.public_key_base64(),
+        ));
+        assert!(!pending_mls_epoch_is_valid(
+            &staged,
+            &group_id,
+            &founder_identity.public_key_base64(),
+        ));
         let mut admitted = log.clone();
         admitted.epochs.push(record);
         admitted.verify().unwrap();
