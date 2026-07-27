@@ -49,6 +49,7 @@ type BrowserAdapter = {
 };
 let browserAdapterPromise: Promise<BrowserAdapter> | null = null;
 let browserMutationQueue = Promise.resolve();
+let browserAccountGeneration = 0;
 let localAccountTransitioning = false;
 
 const browserConcurrentActions = new Set([
@@ -92,6 +93,7 @@ async function browserAdapter() {
 }
 
 async function invokeBrowser<T>(request: NoiseRequest): Promise<T | null> {
+  const accountGeneration = browserAccountGeneration;
   const operation = async () => {
     const adapter = await browserAdapter();
     const response = await adapter.noise_invoke({
@@ -99,6 +101,7 @@ async function invokeBrowser<T>(request: NoiseRequest): Promise<T | null> {
       mask_relays: rotateMaskRelays(),
     }) as Envelope<T>;
     if (!response.ok) throw new Error(response.error ?? "unknown noise core error");
+    if (accountGeneration !== browserAccountGeneration) return null;
     if (!browserConcurrentActions.has(request.action)) {
       await persistBrowserVault(adapter);
     }
@@ -108,7 +111,9 @@ async function invokeBrowser<T>(request: NoiseRequest): Promise<T | null> {
       && typeof data === "object"
       && "identity" in data
     ) {
-      await updateBrowserAccount(data as unknown as LocalSummary);
+      const accountId = (await browserAccountList()).active_account_id;
+      if (accountGeneration !== browserAccountGeneration || !accountId) return null;
+      await updateBrowserAccount(data as unknown as LocalSummary, accountId);
     }
     if (request.action === "logout" || request.action === "delete_account") {
       await removeActiveBrowserAccount(adapter);
@@ -190,6 +195,7 @@ export async function startAddingLocalAccount() {
   await runLocalAccountTransition(async () => {
     if (!isTauri) {
       const adapter = await browserAdapter();
+      browserAccountGeneration += 1;
       await enqueueBrowserMutation(() => startAddingBrowserAccount(adapter));
       return;
     }
@@ -202,6 +208,7 @@ export async function cancelAddingLocalAccount() {
   await runLocalAccountTransition(async () => {
     if (!isTauri) {
       const adapter = await browserAdapter();
+      browserAccountGeneration += 1;
       await enqueueBrowserMutation(() => cancelAddingBrowserAccount(adapter));
       return;
     }
@@ -214,6 +221,7 @@ export async function switchLocalAccount(accountId: string) {
   await runLocalAccountTransition(async () => {
     if (!isTauri) {
       const adapter = await browserAdapter();
+      browserAccountGeneration += 1;
       await enqueueBrowserMutation(() => switchBrowserAccount(adapter, accountId));
       return;
     }

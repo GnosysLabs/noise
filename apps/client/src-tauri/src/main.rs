@@ -186,9 +186,23 @@ fn update_active_account_metadata(account_id: &str, response: &Value) -> Result<
         .lock()
         .map_err(|_| "local account list is unavailable".to_owned())?;
     let mut registry = read_account_registry()?;
-    registry
+    let response_is_for_active_account =
+        registry.active_account_id.as_deref() == Some(account_id);
+    let account_is_still_registered = registry
         .accounts
-        .retain(|account| !account.pending || account.id == account_id);
+        .iter()
+        .any(|account| account.id == account_id);
+    // A request started before an account switch may finish afterward. It may
+    // refresh metadata for a still-signed-in account, but it must never restore
+    // a removed account or undo the user's newer active-account selection.
+    if !response_is_for_active_account && !account_is_still_registered {
+        return Ok(());
+    }
+    if response_is_for_active_account {
+        registry
+            .accounts
+            .retain(|account| !account.pending || account.id == account_id);
+    }
     let record = LocalAccountRecord {
         id: account_id.to_owned(),
         public_key,
@@ -213,8 +227,9 @@ fn update_active_account_metadata(account_id: &str, response: &Value) -> Result<
     } else {
         registry.accounts.push(record);
     }
-    registry.active_account_id = Some(account_id.to_owned());
-    registry.adding_from_account_id = None;
+    if response_is_for_active_account {
+        registry.adding_from_account_id = None;
+    }
     write_account_registry(&registry)
 }
 

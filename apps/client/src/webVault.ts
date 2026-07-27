@@ -188,10 +188,11 @@ export async function updateBrowserAccount(summary: {
     bio: string;
     avatar: unknown | null;
   };
-}) {
+}, accountID: string) {
   const registry = await accountRegistry();
+  if (registry.activeAccountID !== accountID) return;
   const record: BrowserAccountRecord = {
-    id: registry.activeAccountID,
+    id: accountID,
     public_key: summary.identity.public_key,
     username: summary.identity.username,
     bio: summary.identity.bio,
@@ -214,7 +215,7 @@ export async function startAddingBrowserAccount(wasm: WasmSession) {
   wasm.clear_session();
 }
 
-export async function cancelAddingBrowserAccount(wasm: WasmSession) {
+export async function cancelAddingBrowserAccount(_wasm: WasmSession) {
   const registry = await accountRegistry();
   if (!registry.addingFromAccountID) return;
   const pendingID = registry.activeAccountID;
@@ -223,7 +224,6 @@ export async function cancelAddingBrowserAccount(wasm: WasmSession) {
   registry.activeAccountID = previousID;
   registry.addingFromAccountID = null;
   await writeValue(ACCOUNT_REGISTRY_KEY, registry);
-  await restoreAccount(wasm, previousID);
 }
 
 export async function switchBrowserAccount(wasm: WasmSession, accountID: string) {
@@ -235,7 +235,6 @@ export async function switchBrowserAccount(wasm: WasmSession, accountID: string)
   registry.activeAccountID = accountID;
   registry.addingFromAccountID = null;
   await writeValue(ACCOUNT_REGISTRY_KEY, registry);
-  await restoreAccount(wasm, accountID);
 }
 
 export async function removeActiveBrowserAccount(wasm: WasmSession) {
