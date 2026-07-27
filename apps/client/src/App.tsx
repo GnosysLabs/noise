@@ -44,11 +44,15 @@ import {
   VolumeX,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
+import { Fragment, useCallback, useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { CSSProperties, RefObject } from "react";
 import { createPortal } from "react-dom";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
+import botAvatar1 from "../../marketing/public/bottts-friend-1.svg";
+import botAvatar2 from "../../marketing/public/bottts-friend-2.svg";
+import botAvatar3 from "../../marketing/public/bottts-friend-3.svg";
+import botAvatar4 from "../../marketing/public/bottts-friend-4.svg";
 import {
   cancelAddingLocalAccount,
   isTauri,
@@ -6080,8 +6084,14 @@ function ConversationPanel({
             sentinel={messageList.olderSentinel}
           />
         )}
-        {messageList.visibleMessages.map((item) => (
-          <MessageRow key={item.event_id} message={item} own={item.author_public_key === selfPublicKey} presence={presenceStatuses.get(item.author_public_key) ?? "offline"} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onToggleReaction={(emoji) => void onReaction(item, emoji)} reactionPeople={reactionPeople} onPerson={onPerson} mediaScopeId={conversation.group.group_id} />
+        {messageList.visibleMessages.map((item, index) => (
+          <Fragment key={item.event_id}>
+            {(index === 0 || !sameLocalDay(
+              messageList.visibleMessages[index - 1].created_at_millis,
+              item.created_at_millis,
+            )) && <MessageDateSeparator millis={item.created_at_millis} />}
+            <MessageRow message={item} own={item.author_public_key === selfPublicKey} presence={presenceStatuses.get(item.author_public_key) ?? "offline"} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onToggleReaction={(emoji) => void onReaction(item, emoji)} reactionPeople={reactionPeople} onPerson={onPerson} mediaScopeId={conversation.group.group_id} />
+          </Fragment>
         ))}
       </div>
       {selfMember && (canSendMessages || canSendMedia) ? <div className="composer">
@@ -6310,13 +6320,22 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
             sentinel={messageList.olderSentinel}
           />
         )}
-        {messageList.visibleMessages.map((rawItem) => {
+        {messageList.visibleMessages.map((rawItem, index) => {
           const item = withCurrentDirectProfile(rawItem, self, contact);
+          const startsDay = index === 0 || !sameLocalDay(
+            messageList.visibleMessages[index - 1].created_at_millis,
+            rawItem.created_at_millis,
+          );
           const rawReply = conversation.messages.find(
             (candidate) => candidate.message_id === item.reply_to_message_id,
           );
           const replyTo = rawReply ? withCurrentDirectProfile(rawReply, self, contact) : undefined;
-          return <MessageRow key={item.event_id} message={item} own={item.author_public_key === self.public_key} presence={item.author_public_key === self.public_key ? selfPresence : contactPresence} replyTo={replyTo} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} mediaScopeId={conversation.media_scope_id} />;
+          return (
+            <Fragment key={item.event_id}>
+              {startsDay && <MessageDateSeparator millis={item.created_at_millis} />}
+              <MessageRow message={item} own={item.author_public_key === self.public_key} presence={item.author_public_key === self.public_key ? selfPresence : contactPresence} replyTo={replyTo} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} mediaScopeId={conversation.media_scope_id} />
+            </Fragment>
+          );
         })}
       </div>
       {contact.accepts_direct_messages ? <div className="composer">
@@ -6495,6 +6514,15 @@ function MessageRow({
         {message.reactions && message.reactions.length > 0 && <MessageReactions reactions={message.reactions} people={reactionPeople} onToggle={onToggleReaction} onPerson={onPerson} />}
       </div>
     </article>
+  );
+}
+
+function MessageDateSeparator({ millis }: { millis: number }) {
+  const label = formatMessageDate(millis);
+  return (
+    <div className="message-date-separator" role="separator" aria-label={label}>
+      <span>{label}</span>
+    </div>
   );
 }
 
@@ -8644,11 +8672,25 @@ function useProfileImageSource(
   return source;
 }
 
+const botAvatarSources = [botAvatar1, botAvatar2, botAvatar3, botAvatar4];
+
+function botAvatarSource(seed: string) {
+  let hash = 2166136261;
+  for (const byte of new TextEncoder().encode(seed)) {
+    hash ^= byte;
+    hash = Math.imul(hash, 16777619);
+  }
+  return botAvatarSources[(hash >>> 0) % botAvatarSources.length];
+}
+
 function Avatar({ name, image, size, square = false }: { name: string; image: ProfileImage | null; size: number; square?: boolean }) {
   const source = useProfileImageSource(image, true);
+  const fallback = square ? null : botAvatarSource(name);
   return (
     <span className={`avatar ${square ? "square" : ""}`} style={{ width: size, height: size }}>
-      {source ? <img src={source} alt="" /> : <b>{name.slice(0, 1).toUpperCase()}</b>}
+      {source || fallback
+        ? <img src={source ?? fallback ?? undefined} alt="" />
+        : <b>{name.slice(0, 1).toUpperCase()}</b>}
     </span>
   );
 }
@@ -9549,18 +9591,24 @@ function ruleItems(value: string) {
 
 function emojiOnlyCount(text: string): 1 | 2 | 3 | null {
   const trimmed = text.trim();
-  if (!trimmed || /[\p{L}\p{N}]/u.test(trimmed)) return null;
+  if (!trimmed) return null;
   const Segmenter = (Intl as { Segmenter?: typeof Intl.Segmenter }).Segmenter;
   if (!Segmenter) return null;
   const segments = new Segmenter(undefined, { granularity: "grapheme" });
   let count = 0;
   for (const { segment } of segments.segment(trimmed)) {
     if (/^\s+$/.test(segment)) continue;
-    if (!/\p{Extended_Pictographic}/u.test(segment)) return null;
+    if (!isEmojiGrapheme(segment)) return null;
     count += 1;
     if (count > 3) return null;
   }
   return count === 1 || count === 2 || count === 3 ? count : null;
+}
+
+function isEmojiGrapheme(segment: string) {
+  return /\p{Extended_Pictographic}/u.test(segment)
+    || /^\p{Regional_Indicator}{2}$/u.test(segment)
+    || /^[#*0-9]\uFE0F?\u20E3$/u.test(segment);
 }
 
 function ReportMessageDialog({
@@ -10240,6 +10288,30 @@ function EncryptionPending({ phase }: { phase: GroupEncryptionStatus["phase"] })
 
 function formatTime(millis: number) {
   return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(millis));
+}
+
+function sameLocalDay(leftMillis: number, rightMillis: number) {
+  const left = new Date(leftMillis);
+  const right = new Date(rightMillis);
+  return left.getFullYear() === right.getFullYear()
+    && left.getMonth() === right.getMonth()
+    && left.getDate() === right.getDate();
+}
+
+function formatMessageDate(millis: number) {
+  const date = new Date(millis);
+  const today = new Date();
+  if (sameLocalDay(millis, today.getTime())) return "Today";
+
+  const yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+  if (sameLocalDay(millis, yesterday.getTime())) return "Yesterday";
+
+  return new Intl.DateTimeFormat(undefined, {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    year: date.getFullYear() === today.getFullYear() ? undefined : "numeric",
+  }).format(date);
 }
 
 function formatDeviceActivity(millis: number) {
