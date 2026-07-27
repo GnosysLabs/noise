@@ -5,6 +5,7 @@ import glass from "@dicebear/styles/glass.json" with { type: "json" };
 const glassStyle = new Style(glass);
 const botttsNeutralStyle = new Style(botttsNeutral);
 const avatarSize = 256;
+const userAvatarCount = 256n;
 const userAvatarSourceCache = new Map<string, string>();
 
 export async function generateGroupAvatar(seed: string): Promise<string> {
@@ -12,19 +13,34 @@ export async function generateGroupAvatar(seed: string): Promise<string> {
 }
 
 export async function generateUserAvatar(seed: string): Promise<string> {
-  return generateAvatar(botttsNeutralStyle, seed, "profile avatar");
+  return generateAvatar(
+    botttsNeutralStyle,
+    canonicalUserAvatarSeed(seed),
+    "profile avatar",
+  );
 }
 
 export function generateUserAvatarSource(seed: string): string {
-  const cached = userAvatarSourceCache.get(seed);
+  const canonicalSeed = canonicalUserAvatarSeed(seed);
+  const cached = userAvatarSourceCache.get(canonicalSeed);
   if (cached) return cached;
   const svg = new Avatar(botttsNeutralStyle, {
-    seed,
+    seed: canonicalSeed,
     size: avatarSize,
   }).toString();
   const source = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
-  userAvatarSourceCache.set(seed, source);
+  userAvatarSourceCache.set(canonicalSeed, source);
   return source;
+}
+
+function canonicalUserAvatarSeed(seed: string): string {
+  let hash = 14_695_981_039_346_656_037n;
+  for (const byte of new TextEncoder().encode(seed)) {
+    hash ^= BigInt(byte);
+    hash = BigInt.asUintN(64, hash * 1_099_511_628_211n);
+  }
+  const index = (hash % userAvatarCount).toString().padStart(3, "0");
+  return `noise-profile-${index}`;
 }
 
 async function generateAvatar(style: Style, seed: string, label: string): Promise<string> {
