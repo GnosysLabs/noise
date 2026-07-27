@@ -138,7 +138,6 @@ try {
 
     Invoke-Checked pnpm --dir $clientDirectory install --frozen-lockfile
 
-    $env:TAURI_SIGNING_PRIVATE_KEY = $UpdaterKeyPath
     $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $updaterPassword
     $env:CARGO_BUILD_JOBS = [string]$CargoBuildJobs
     $env:CARGO_TARGET_DIR = $cargoTarget
@@ -146,17 +145,20 @@ try {
     $preflightFile = Join-Path $env:TEMP "noise-updater-preflight-$PID"
     Set-Content -LiteralPath $preflightFile -Value "noise updater signing preflight"
     try {
+        $env:TAURI_SIGNING_PRIVATE_KEY_PATH = $UpdaterKeyPath
         Invoke-Checked pnpm --dir $clientDirectory tauri signer sign $preflightFile
         if (-not (Test-Path -LiteralPath "$preflightFile.sig" -PathType Leaf)) {
             throw "Updater signing preflight did not produce a signature"
         }
     }
     finally {
+        Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PATH -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $preflightFile -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath "$preflightFile.sig" -Force -ErrorAction SilentlyContinue
     }
 
     Remove-Item -LiteralPath $bundleDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    $env:TAURI_SIGNING_PRIVATE_KEY = Get-Content -LiteralPath $UpdaterKeyPath -Raw
     Invoke-Checked pnpm --dir $clientDirectory tauri build --bundles nsis
 
     $installers = @(
@@ -224,6 +226,7 @@ try {
 }
 finally {
     Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
+    Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PATH -ErrorAction SilentlyContinue
     Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
     $updaterPassword = $null
     $secureUpdaterPassword = $null
