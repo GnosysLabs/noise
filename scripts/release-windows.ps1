@@ -7,6 +7,7 @@ param(
 
     [string]$Repository = (Join-Path $env:USERPROFILE "noise"),
     [string]$UpdaterKeyPath = (Join-Path $env:USERPROFILE ".tauri\noise.key"),
+    [string]$UpdaterPasswordPath = (Join-Path $env:LOCALAPPDATA "noise-release\updater-password.dpapi"),
     [int]$CargoBuildJobs = 4
 )
 
@@ -64,14 +65,22 @@ if (-not (Test-Path -LiteralPath $UpdaterKeyPath -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath "$UpdaterKeyPath.pub" -PathType Leaf)) {
     throw "Updater public key is missing: $UpdaterKeyPath.pub"
 }
-
-$updaterPassword = $env:NOISE_WINDOWS_UPDATER_PASSWORD
-Remove-Item Env:NOISE_WINDOWS_UPDATER_PASSWORD -ErrorAction SilentlyContinue
-if ([string]::IsNullOrWhiteSpace($updaterPassword)) {
-    $updaterPassword = [Console]::In.ReadToEnd()
+if (-not (Test-Path -LiteralPath $UpdaterPasswordPath -PathType Leaf)) {
+    throw "DPAPI-protected updater password is missing: $UpdaterPasswordPath"
 }
-if ([string]::IsNullOrWhiteSpace($updaterPassword)) {
-    throw "Updater signing password was not supplied on standard input"
+
+$secureUpdaterPassword = Get-Content -LiteralPath $UpdaterPasswordPath -Raw |
+    ConvertTo-SecureString
+$passwordPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR(
+    $secureUpdaterPassword
+)
+try {
+    $updaterPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
+        $passwordPointer
+    )
+}
+finally {
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordPointer)
 }
 
 Set-Location $Repository
@@ -213,6 +222,7 @@ finally {
     Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
     Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
     $updaterPassword = $null
+    $secureUpdaterPassword = $null
 
     if ($worktreeAdded) {
         Set-Location $Repository

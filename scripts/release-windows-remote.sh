@@ -13,6 +13,7 @@ local_assets="$repo_root/target/release/windows-assets"
 temporary_dir=$(mktemp -d /tmp/noise-windows-release.XXXXXX)
 remote_script="C:/Users/cmcel/AppData/Local/Temp/noise-release-windows-$short_revision.ps1"
 remote_stamp=$(date -u +%Y%m%dT%H%M%SZ)
+remote_password='C:\Users\cmcel\AppData\Local\noise-release\updater-password.dpapi'
 
 cleanup() {
   rm -rf "$temporary_dir"
@@ -46,19 +47,49 @@ version=$(
 )
 remote_output="C:\\Users\\cmcel\\AppData\\Local\\noise-release-assets\\$version-$short_revision-$remote_stamp"
 
-updater_password=${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}
-if [[ -z "$updater_password" ]]; then
-  updater_password=$(security find-generic-password -a "$keychain_account" -s "$keychain_service" -w)
-fi
-
 ssh -o BatchMode=yes -o ConnectTimeout=8 "$windows_host" \
   'powershell -NoProfile -NonInteractive -Command "$env:USERNAME; $env:COMPUTERNAME"' \
   >/dev/null
+
+password_present=$(
+  ssh -o BatchMode=yes "$windows_host" \
+    "powershell -NoProfile -NonInteractive -Command \"Test-Path -LiteralPath '$remote_password' -PathType Leaf\""
+)
+password_present=$(printf '%s' "$password_present" | tr -d '\r')
+if [[ "$password_present" != "True" ]]; then
+  updater_password=${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}
+  if [[ -z "$updater_password" ]]; then
+    updater_password=$(security find-generic-password -a "$keychain_account" -s "$keychain_service" -w)
+  fi
+  provision_command=$(
+    printf '$passwordValues = @($input); if ($passwordValues.Count -ne 1) { throw "Updater password input is invalid" }; $passwordPath = "%s"; $passwordDirectory = Split-Path -Parent $passwordPath; New-Item -ItemType Directory -Force -Path $passwordDirectory | Out-Null; $securePassword = ConvertTo-SecureString -String ([string]$passwordValues[0]) -AsPlainText -Force; $securePassword | ConvertFrom-SecureString | Set-Content -LiteralPath $passwordPath -NoNewline; Write-Output "WINDOWS_UPDATER_PASSWORD_STORED"' \
+      "$remote_password"
+  )
+  provision_encoded=$(
+    printf '%s' "$provision_command" |
+      iconv -f UTF-8 -t UTF-16LE |
+      base64 |
+      tr -d '\r\n'
+  )
+  provision_result=$(
+    printf '%s' "$updater_password" |
+      ssh -o BatchMode=yes "$windows_host" \
+        "powershell -NoProfile -NonInteractive -EncodedCommand $provision_encoded"
+  )
+  updater_password=
+  if ! printf '%s' "$provision_result" | tr -d '\r' |
+    grep -Fx 'WINDOWS_UPDATER_PASSWORD_STORED' >/dev/null; then
+    echo "Could not provision the DPAPI-protected Windows updater password" >&2
+    exit 1
+  fi
+fi
+
 scp -q "$repo_root/scripts/release-windows.ps1" "$windows_host:$remote_script"
 
 remote_command=$(
-  printf '$passwordValues = @($input); if ($passwordValues.Count -ne 1) { throw "Updater password input is invalid" }; $env:NOISE_WINDOWS_UPDATER_PASSWORD = [string]$passwordValues[0]; & '\''%s'\'' -Repository '\''%s'\'' -Revision '\''%s'\'' -OutputDirectory '\''%s'\''' \
-    "$remote_script" "$windows_repo" "$revision" "$remote_output"
+  printf "& '%s' -Repository '%s' -Revision '%s' -OutputDirectory '%s' -UpdaterPasswordPath '%s'" \
+    "$remote_script" "$windows_repo" "$revision" "$remote_output" \
+    "$remote_password"
 )
 remote_encoded=$(
   printf '%s' "$remote_command" |
@@ -67,14 +98,12 @@ remote_encoded=$(
     tr -d '\r\n'
 )
 remote_result=$(
-  printf '%s' "$updater_password" |
-    ssh -o BatchMode=yes \
-      -o ServerAliveInterval=20 \
-      -o ServerAliveCountMax=30 \
-      "$windows_host" \
-      "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $remote_encoded"
+  ssh -o BatchMode=yes \
+    -o ServerAliveInterval=20 \
+    -o ServerAliveCountMax=30 \
+    "$windows_host" \
+    "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $remote_encoded"
 )
-updater_password=
 
 remote_result=$(printf '%s' "$remote_result" | tr -d '\r')
 result_revision=$(printf '%s\n' "$remote_result" | awk -F= '/^RESULT_REVISION=/{sub(/^[^=]*=/, ""); print; exit}')

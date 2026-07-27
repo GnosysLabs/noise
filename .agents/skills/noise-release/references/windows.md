@@ -12,8 +12,9 @@ The Mac-side script:
 
 1. Requires the exact commit to be present on `origin/main`.
 2. Connects through the `noise-windows` SSH alias.
-3. Sends the updater password from the existing macOS Keychain entry without
-   printing it.
+3. Uses the updater password stored for the Windows account with DPAPI. If it
+   is missing, the Mac provisions it once from the existing macOS Keychain
+   entry without printing it.
 4. Runs `scripts/release-windows.ps1` in a temporary detached worktree on the
    PC, leaving the PC's main checkout untouched.
 5. Builds the NSIS installer with Tauri updater signing enabled.
