@@ -194,10 +194,23 @@ try {
         throw "Could not verify the Windows release worktree"
     }
     if ($worktreeStatus.Count -ne 0) {
-        $changedPaths = ($worktreeStatus | ForEach-Object {
-            if ($_.Length -gt 3) { $_.Substring(3) } else { $_ }
-        }) -join ", "
-        throw "The Windows release build changed tracked source files: $changedPaths"
+        # Tauri can rewrite a restored Cargo manifest with Windows line endings.
+        # Permit that byte-level normalization, but reject semantic or untracked
+        # source changes.
+        & git -C $worktree diff --quiet --ignore-space-at-eol
+        $semanticDiffExit = $LASTEXITCODE
+        if ($semanticDiffExit -gt 1) {
+            throw "Could not compare the Windows release worktree"
+        }
+        $untrackedPaths = @($worktreeStatus | Where-Object {
+            $_.StartsWith("??")
+        })
+        if ($semanticDiffExit -eq 1 -or $untrackedPaths.Count -ne 0) {
+            $changedPaths = ($worktreeStatus | ForEach-Object {
+                if ($_.Length -gt 3) { $_.Substring(3) } else { $_ }
+            }) -join ", "
+            throw "The Windows release build changed tracked source files: $changedPaths"
+        }
     }
 
     if (Test-Path -LiteralPath $OutputDirectory) {
