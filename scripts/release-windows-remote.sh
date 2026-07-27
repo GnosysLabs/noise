@@ -60,7 +60,12 @@ remote_command=$(
   printf "& '%s' -Repository '%s' -Revision '%s' -OutputDirectory '%s'" \
     "$remote_script" "$windows_repo" "$revision" "$remote_output"
 )
-remote_encoded=$(printf '%s' "$remote_command" | iconv -f UTF-8 -t UTF-16LE | base64)
+remote_encoded=$(
+  printf '%s' "$remote_command" |
+    iconv -f UTF-8 -t UTF-16LE |
+    base64 |
+    tr -d '\r\n'
+)
 remote_result=$(
   printf '%s' "$updater_password" |
     ssh -o BatchMode=yes \
