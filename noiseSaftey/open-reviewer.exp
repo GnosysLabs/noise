@@ -1,0 +1,20 @@
+#!/usr/bin/expect -f
+
+set timeout -1
+set reviewer_opened 0
+
+cd "/Users/christopher/Dev/noise"
+spawn -noecho cargo run -q -p noise-safety-intake -- review \
+    --secret-key-file noiseSaftey/dev-data/recipient-secret.json \
+    --spool-dir noiseSaftey/dev-data/inbox
+
+expect {
+    -re {open this private URL: (http://127\.0\.0\.1:4311/[^\r\n ]+)} {
+        if {$reviewer_opened == 0} {
+            set reviewer_opened 1
+            exec open $expect_out(1,string) &
+        }
+        exp_continue
+    }
+    eof
+}

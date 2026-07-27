@@ -32,6 +32,11 @@ cargo run -p noise-safety-intake -- review \
   --spool-dir noiseSaftey/dev-data/inbox
 ```
 
+On the reviewer Mac, the generated **noise safety reviewer** launcher runs
+`noiseSaftey/open-reviewer.exp` in Terminal and opens the private one-time URL
+automatically. Keep that Terminal window open while reviewing; closing it stops
+the reviewer.
+
 The reviewer prints a random, single-session localhost URL. It decrypts and
 cryptographically verifies reports only inside that private service. New
 reports include encrypted human context: names displayed at report time, noise
