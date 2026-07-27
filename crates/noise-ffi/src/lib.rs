@@ -22,10 +22,6 @@ fn default_search_limit() -> usize {
     60
 }
 
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum Request {
@@ -477,8 +473,6 @@ enum Request {
         message_event_id: String,
         category: SafetyReportCategoryV1,
         details: Option<String>,
-        #[serde(default = "default_true")]
-        follow_up_allowed: bool,
         safety_url: String,
         recipient_public_key_base64: Option<String>,
     },
@@ -1920,7 +1914,6 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             message_event_id,
             category,
             details,
-            follow_up_allowed,
             safety_url,
             recipient_public_key_base64,
         } => serde_json::to_value(
@@ -1930,7 +1923,6 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                     &message_event_id,
                     category,
                     details,
-                    follow_up_allowed,
                     &safety_url,
                     recipient_public_key_base64,
                 ))

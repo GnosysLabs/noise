@@ -7551,10 +7551,18 @@ impl NoiseClient {
         message_event_id: &str,
         category: SafetyReportCategoryV1,
         details: Option<String>,
-        follow_up_allowed: bool,
         safety_url: &str,
         recipient_public_key_base64: Option<String>,
     ) -> anyhow::Result<SafetyReportReceipt> {
+        if !matches!(
+            category,
+            SafetyReportCategoryV1::ThreatsOrImmediateDanger
+                | SafetyReportCategoryV1::SexualExploitationOrNonConsensualSexualContent
+                | SafetyReportCategoryV1::ChildSafety
+                | SafetyReportCategoryV1::ExplicitContentNotProperlyLabeled
+        ) {
+            bail!("this report category belongs with group staff")
+        }
         let path = path.as_ref();
         let mut state = load_state(path)?;
         let group = state.active_group()?.clone();
@@ -7629,7 +7637,7 @@ impl NoiseClient {
                     username: state.profile.username.clone(),
                     direct_message_policy: state.profile.effective_direct_message_policy(),
                 },
-                follow_up_allowed,
+                follow_up_allowed: None,
             }),
             reported_author: Some(SafetyProfileSnapshotV1 {
                 public_key: target.author_public_key.clone(),

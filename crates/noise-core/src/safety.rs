@@ -30,10 +30,10 @@ const MAX_RELAY_URL_BYTES: usize = 2_048;
 const MAX_GROUP_QUARANTINE_MILLIS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const MAX_SAFETY_GROUP_STAFF: usize = 64;
 
-/// The user-facing reason selected before a report is routed to noise safety.
+/// The user-facing reason selected for a report or safety directive.
 ///
-/// Categories that normally belong to group staff remain valid here because a
-/// user may escalate when group staff are involved or have not acted.
+/// Official clients route routine community moderation categories to group
+/// staff and reserve noise safety intake for app-level safety categories.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SafetyReportCategoryV1 {
@@ -77,7 +77,8 @@ pub struct SafetyProfileSnapshotV1 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SafetyReporterContextV1 {
     pub profile: SafetyProfileSnapshotV1,
-    pub follow_up_allowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up_allowed: Option<bool>,
 }
 
 /// Human-readable group context encrypted to noise safety.
@@ -883,7 +884,7 @@ mod tests {
                         username: "reporter".into(),
                         direct_message_policy: DirectMessagePolicy::Everyone,
                     },
-                    follow_up_allowed: true,
+                    follow_up_allowed: Some(true),
                 }),
                 reported_author: Some(SafetyProfileSnapshotV1 {
                     public_key: author.public_key_base64(),

@@ -834,11 +834,7 @@ fn render_report(html: &mut String, state: &ReviewState, item: &ReviewItem) {
             html,
             "reporter",
             &reporter.profile,
-            if reporter.follow_up_allowed {
-                "follow-up from noise safety allowed"
-            } else {
-                "reporter asked not to be contacted"
-            },
+            "profile shown in the group at report time",
         );
     } else {
         render_identity_key_card(
