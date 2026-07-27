@@ -11,7 +11,7 @@ use anyhow::{Context, bail};
 use axum::{
     Router,
     body::Body,
-    extract::{DefaultBodyLimit, Path as RoutePath, State},
+    extract::{DefaultBodyLimit, Path as RoutePath, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -53,6 +53,38 @@ struct ReviewItem {
     decision: Option<ReviewDecisionRecord>,
     legacy_reviewed: bool,
     report: Result<SafetyReportV1, &'static str>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ReviewQueue {
+    #[default]
+    Open,
+    Closed,
+}
+
+impl ReviewQueue {
+    fn from_query(value: Option<&str>) -> Self {
+        match value {
+            Some("closed") => Self::Closed,
+            _ => Self::Open,
+        }
+    }
+
+    fn includes(self, item: &ReviewItem) -> bool {
+        item.is_decided() == matches!(self, Self::Closed)
+    }
+
+    fn query_value(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct ReviewIndexQuery {
+    queue: Option<String>,
 }
 
 impl ReviewItem {
@@ -183,14 +215,16 @@ pub(crate) async fn serve(
 
 async fn review_index(
     RoutePath(token): RoutePath<String>,
+    Query(query): Query<ReviewIndexQuery>,
     State(state): State<ReviewState>,
     headers: HeaderMap,
 ) -> Response {
     if !authorized(&state, &token, &headers) {
         return reviewer_error(StatusCode::NOT_FOUND, "reviewer not found");
     }
+    let queue = ReviewQueue::from_query(query.queue.as_deref());
     match load_reports(&state).await {
-        Ok(reports) => secure_html(StatusCode::OK, render_index(&state, &reports)),
+        Ok(reports) => secure_html(StatusCode::OK, render_index(&state, &reports, queue)),
         Err(_) => reviewer_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "the private report inbox could not be read",
@@ -727,8 +761,9 @@ fn decision_path(decisions_dir: &Path, receipt_id: &str) -> PathBuf {
     decisions_dir.join(format!("{receipt_id}.json"))
 }
 
-fn render_index(state: &ReviewState, reports: &[ReviewItem]) -> String {
-    let new_count = reports.iter().filter(|report| !report.is_decided()).count();
+fn render_index(state: &ReviewState, reports: &[ReviewItem], queue: ReviewQueue) -> String {
+    let open_count = reports.iter().filter(|report| !report.is_decided()).count();
+    let closed_count = reports.len().saturating_sub(open_count);
     let mut html = String::with_capacity(16_384);
     html.push_str(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -742,10 +777,10 @@ header{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;
 h1{margin:0;font-size:clamp(34px,6vw,62px);line-height:.95;letter-spacing:-.055em}
 .lede{max-width:660px;margin:13px 0 0;color:#aaa2ad;font-size:14px;line-height:1.55}
 .refresh{flex:none;padding:10px 14px;border:1px solid #ffffff18;border-radius:10px;background:#ffffff0a;color:#e8e1ea;text-decoration:none;font-size:12px;font-weight:700}
-.summary{display:flex;gap:8px;margin:0 0 18px}.summary span,.badge{padding:5px 8px;border-radius:999px;background:#ffffff0b;color:#bfb6c2;font-size:10px;font-weight:750;text-transform:uppercase;letter-spacing:.06em}
-.summary .new,.badge.verified{background:#b8ff3818;color:#c8ff6b}.empty{padding:46px;border:1px dashed #ffffff20;border-radius:18px;color:#9e95a1;text-align:center}
+.queue-bar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:0 0 18px}.tabs{display:flex;gap:5px;padding:4px;border:1px solid #ffffff10;border-radius:12px;background:#111013}.tab{display:flex;align-items:center;gap:8px;padding:9px 12px;border-radius:8px;color:#9f96a2;text-decoration:none;font-size:11px;font-weight:800}.tab span{min-width:20px;padding:3px 6px;border-radius:999px;background:#ffffff0a;text-align:center;font-size:9px}.tab.active{background:#302d33;color:#f5eff7}.tab.active span{background:#b8ff3820;color:#c8ff6b}.summary{display:flex;gap:8px}.summary span,.badge{padding:5px 8px;border-radius:999px;background:#ffffff0b;color:#bfb6c2;font-size:10px;font-weight:750;text-transform:uppercase;letter-spacing:.06em}
+.badge.verified{background:#b8ff3818;color:#c8ff6b}.empty{padding:46px;border:1px dashed #ffffff20;border-radius:18px;color:#9e95a1;text-align:center}
 .reports{display:grid;gap:14px}.report{overflow:hidden;border:1px solid #ffffff12;border-radius:18px;background:#201e22cc;box-shadow:0 18px 55px #0000002b}
-.report.decided{opacity:.7}.report.invalid{border-color:#ff718555}.report-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:18px 20px;border-bottom:1px solid #ffffff0d}
+.report.decided{border-color:#ffffff18}.report.invalid{border-color:#ff718555}.report-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:18px 20px;border-bottom:1px solid #ffffff0d}
 .report-head h2{margin:4px 0 0;font-size:17px;letter-spacing:-.02em}.report-head p{margin:6px 0 0;color:#958c98;font-size:11px}
 .report-body{display:grid;gap:14px;padding:20px}.content{padding:15px;border-radius:12px;background:#121114}.content h3,.facts dt{margin:0 0 7px;color:#8f8692;font-size:9px;font-weight:800;letter-spacing:.13em;text-transform:uppercase}
 pre{margin:0;color:#f5eff7;font:13px/1.58 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
@@ -755,25 +790,50 @@ pre{margin:0;color:#f5eff7;font:13px/1.58 ui-monospace,SFMono-Regular,Menlo,mono
 details.technical{border:1px solid #ffffff0c;border-radius:10px;background:#151417}details.technical summary{padding:11px 12px;color:#a9a0ac;font-size:10px;font-weight:750;cursor:pointer}details.technical .facts{padding:0 12px 12px}.download{color:#c8ff6b;text-decoration:none;font-size:10px;font-weight:800}
 .report-foot{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 20px;border-top:1px solid #ffffff0d;background:#17161980}
 .report-foot>span{color:#958c98;font-size:10px}.actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:7px}.actions button{padding:9px 11px;border:1px solid #ffffff14;border-radius:9px;background:#302d33;color:#eee7f0;font-size:10px;font-weight:850;cursor:pointer}.actions .hide{background:#b8ff38;color:#192000}.actions .pause{border-color:#ff9a5b55;background:#ff9a5b18;color:#ffc49f}.actions .block{border-color:#ff718566;background:#ff71851a;color:#ff9aaa}
-@media(max-width:680px){main{width:min(100% - 20px,980px);padding-top:30px}header{align-items:flex-start;flex-direction:column}.facts,.people{grid-template-columns:1fr}.report-head{flex-direction:column}.report-foot{align-items:flex-start;flex-direction:column}.actions{justify-content:flex-start}}
+@media(max-width:680px){main{width:min(100% - 20px,980px);padding-top:30px}header{align-items:flex-start;flex-direction:column}.queue-bar{align-items:flex-start;flex-direction:column}.facts,.people{grid-template-columns:1fr}.report-head{flex-direction:column}.report-foot{align-items:flex-start;flex-direction:column}.actions{justify-content:flex-start}}
 </style></head><body><main><header><div><p class="eyebrow">LOCAL / PRIVATE / VERIFIED</p><h1>noise safety</h1>
 <p class="lede">This reviewer reads encrypted envelope files from the local inbox. It never accepts internet connections and never renders or downloads reported media.</p></div>"#,
     );
     let _ = write!(
         html,
-        r#"<a class="refresh" href="/{}">refresh inbox</a></header><div class="summary"><span class="new">{} new</span><span>{} total</span><span>key {}</span></div>"#,
+        r#"<a class="refresh" href="/{}?queue={}">refresh inbox</a></header>"#,
         state.token,
-        new_count,
-        reports.len(),
-        short_identifier(&state.recipient_key_id)
+        queue.query_value(),
     );
-    if reports.is_empty() {
-        html.push_str(
-            r#"<div class="empty">No encrypted reports are waiting in this local inbox.</div>"#,
-        );
+    let _ = write!(
+        html,
+        r#"<div class="queue-bar"><nav class="tabs" aria-label="report queue"><a class="tab{}" href="/{}?queue=open">open <span>{}</span></a><a class="tab{}" href="/{}?queue=closed">closed <span>{}</span></a></nav><div class="summary"><span>{} total</span><span>key {}</span></div></div>"#,
+        if queue == ReviewQueue::Open {
+            " active"
+        } else {
+            ""
+        },
+        state.token,
+        open_count,
+        if queue == ReviewQueue::Closed {
+            " active"
+        } else {
+            ""
+        },
+        state.token,
+        closed_count,
+        reports.len(),
+        short_identifier(&state.recipient_key_id),
+    );
+    let visible_reports = reports
+        .iter()
+        .filter(|report| queue.includes(report))
+        .collect::<Vec<_>>();
+    if visible_reports.is_empty() {
+        html.push_str(match queue {
+            ReviewQueue::Open => {
+                r#"<div class="empty">No open reports are waiting in this local inbox.</div>"#
+            }
+            ReviewQueue::Closed => r#"<div class="empty">No reports have been closed yet.</div>"#,
+        });
     } else {
         html.push_str(r#"<section class="reports">"#);
-        for item in reports {
+        for item in visible_reports {
             render_report(&mut html, state, item);
         }
         html.push_str("</section>");
