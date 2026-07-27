@@ -422,6 +422,8 @@ function withCurrentGroupProfile(
 const PRESENCE_IDLE_MILLIS = 5 * 60_000;
 const PRESENCE_HEARTBEAT_MILLIS = 20_000;
 const PRESENCE_OBSERVATION_STALE_MILLIS = 70_000;
+const ADMISSION_RETRY_MILLIS = 4_250;
+const ADMISSION_RETRY_LIMIT = 8;
 const DEFAULT_ACCENT_COLOR = "#7758ED";
 const MAX_DISPLAY_NAME_LENGTH = 16;
 const ACCENT_PRESETS = ["#7758ED", "#E84D8A", "#F06A3C", "#E0A82E", "#43B581", "#24A6A6", "#4D82F0", "#A45EE5"];
@@ -1601,6 +1603,12 @@ export default function App() {
   const directConversationCache = useRef(new Map<string, DirectConversation>());
   const groupReadInFlight = useRef(new Set<string>());
   const admissionQueue = useRef(Promise.resolve());
+  const admissionPasses = useRef(new Map<string, {
+    attempts: number;
+    queued: boolean;
+    timer: number | null;
+  }>());
+  const queueAdmissionPassRef = useRef<(groupId: string) => void>(() => undefined);
   const accountCacheSyncTimer = useRef<number | null>(null);
   const groupSelectionInFlight = useRef(false);
   const topicSelectionGeneration = useRef(0);
@@ -2677,24 +2685,57 @@ export default function App() {
         group_id: groupId,
         relays,
       });
-      if (!waiting) return;
+      if (!waiting) return false;
       // An admission-only pass, even for the group on screen: it reads the
       // signed control log instead of the group's history, and the phase this
       // identity is in keeps coming from opening and recovering the group.
-      await syncGroupEncryption(groupId);
+      const encryption = await syncGroupEncryption(groupId);
+      // Active members may need to wait briefly for an earlier-ranked online
+      // member to take the admission turn. Keep checking during that bounded
+      // handoff window; identities still waiting to join must not poll here.
+      return encryption?.phase === "active";
     } catch {
       // Admission retries on the next control change or when the group opens.
+      return false;
     }
   }, []);
 
   const queueAdmissionPass = useCallback((groupId: string) => {
+    const existing = admissionPasses.current.get(groupId);
+    if (existing && (existing.queued || existing.timer !== null)) return;
+    const pass = existing ?? { attempts: 0, queued: false, timer: null };
+    pass.queued = true;
+    admissionPasses.current.set(groupId, pass);
     // One group at a time: signing in to a long member list must not fire a
     // burst of relay round trips at the conversation the user is opening.
     admissionQueue.current = admissionQueue.current
       .then(() => new Promise<void>((resolve) => window.setTimeout(resolve, 250)))
       .then(() => admitPendingGroupMembers(groupId))
-      .catch(() => undefined);
+      .then((shouldRetry) => {
+        pass.queued = false;
+        if (!shouldRetry || pass.attempts >= ADMISSION_RETRY_LIMIT) {
+          admissionPasses.current.delete(groupId);
+          return;
+        }
+        pass.attempts += 1;
+        pass.timer = window.setTimeout(() => {
+          pass.timer = null;
+          queueAdmissionPassRef.current(groupId);
+        }, ADMISSION_RETRY_MILLIS);
+      })
+      .catch(() => {
+        pass.queued = false;
+        admissionPasses.current.delete(groupId);
+      });
   }, [admitPendingGroupMembers]);
+  queueAdmissionPassRef.current = queueAdmissionPass;
+
+  useEffect(() => () => {
+    for (const pass of admissionPasses.current.values()) {
+      if (pass.timer !== null) window.clearTimeout(pass.timer);
+    }
+    admissionPasses.current.clear();
+  }, []);
 
   const syncChangedGroupStreams = useCallback(async (
     groupId: string,
