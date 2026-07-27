@@ -49,10 +49,6 @@ import type { CSSProperties, RefObject } from "react";
 import { createPortal } from "react-dom";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
-import botAvatar1 from "../../marketing/public/bottts-friend-1.svg";
-import botAvatar2 from "../../marketing/public/bottts-friend-2.svg";
-import botAvatar3 from "../../marketing/public/bottts-friend-3.svg";
-import botAvatar4 from "../../marketing/public/bottts-friend-4.svg";
 import {
   cancelAddingLocalAccount,
   isTauri,
@@ -8672,25 +8668,11 @@ function useProfileImageSource(
   return source;
 }
 
-const botAvatarSources = [botAvatar1, botAvatar2, botAvatar3, botAvatar4];
-
-function botAvatarSource(seed: string) {
-  let hash = 2166136261;
-  for (const byte of new TextEncoder().encode(seed)) {
-    hash ^= byte;
-    hash = Math.imul(hash, 16777619);
-  }
-  return botAvatarSources[(hash >>> 0) % botAvatarSources.length];
-}
-
 function Avatar({ name, image, size, square = false }: { name: string; image: ProfileImage | null; size: number; square?: boolean }) {
   const source = useProfileImageSource(image, true);
-  const fallback = square ? null : botAvatarSource(name);
   return (
     <span className={`avatar ${square ? "square" : ""}`} style={{ width: size, height: size }}>
-      {source || fallback
-        ? <img src={source ?? fallback ?? undefined} alt="" />
-        : <b>{name.slice(0, 1).toUpperCase()}</b>}
+      {source ? <img src={source} alt="" /> : <b>{name.slice(0, 1).toUpperCase()}</b>}
     </span>
   );
 }
