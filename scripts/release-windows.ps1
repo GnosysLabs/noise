@@ -194,7 +194,10 @@ try {
         throw "Could not verify the Windows release worktree"
     }
     if ($worktreeStatus.Count -ne 0) {
-        throw "The Windows release build changed tracked source files"
+        $changedPaths = ($worktreeStatus | ForEach-Object {
+            if ($_.Length -gt 3) { $_.Substring(3) } else { $_ }
+        }) -join ", "
+        throw "The Windows release build changed tracked source files: $changedPaths"
     }
 
     if (Test-Path -LiteralPath $OutputDirectory) {
