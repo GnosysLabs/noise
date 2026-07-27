@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 use tokio::{fs, io::AsyncWriteExt, net::TcpListener};
 use tower_http::cors::CorsLayer;
 
+mod review;
+
 const DEFAULT_BIND: &str = "127.0.0.1:4310";
+const DEFAULT_REVIEW_BIND: &str = "127.0.0.1:4311";
 const MAX_REPORT_BODY_BYTES: usize = 384 * 1024;
 const MAX_CIPHERTEXT_BYTES: usize = 256 * 1024;
 const RATE_LIMIT_REPORTS: u32 = 30;
@@ -53,6 +56,17 @@ enum Command {
         #[arg(long, default_value = DEFAULT_BIND)]
         bind: SocketAddr,
     },
+    /// Review and mark reports from a private, localhost-only interface.
+    Review {
+        #[arg(long)]
+        secret_key_file: PathBuf,
+        #[arg(long)]
+        spool_dir: PathBuf,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long, default_value = DEFAULT_REVIEW_BIND)]
+        bind: SocketAddr,
+    },
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -62,7 +76,7 @@ struct PublicRecipientKey {
     public_key_base64: String,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct PrivateRecipientKey {
     version: u32,
     recipient_key_id: String,
@@ -110,6 +124,12 @@ async fn main() -> anyhow::Result<()> {
             spool_dir,
             bind,
         } => serve(&public_key_file, &spool_dir, bind).await,
+        Command::Review {
+            secret_key_file,
+            spool_dir,
+            state_dir,
+            bind,
+        } => review::serve(&secret_key_file, &spool_dir, state_dir.as_deref(), bind).await,
     }
 }
 
@@ -288,9 +308,12 @@ async fn write_new_bytes(path: &Path, bytes: &[u8], private: bool) -> std::io::R
     }
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(if private { 0o600 } else { 0o644 });
     let mut file = options.open(path).await?;
-    if private {
-        secure_file(path).await?;
+    if private && let Err(error) = secure_file(path).await {
+        let _ = fs::remove_file(path).await;
+        return Err(error);
     }
     if let Err(error) = file.write_all(bytes).await {
         let _ = fs::remove_file(path).await;

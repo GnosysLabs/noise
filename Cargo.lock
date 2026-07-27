@@ -4384,10 +4384,13 @@ dependencies = [
  "blake3",
  "clap",
  "noise-core",
+ "rand 0.9.5",
  "serde",
  "serde_json",
+ "time",
  "tokio",
  "tower-http",
+ "zeroize",
 ]
 
 [[package]]

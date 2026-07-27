@@ -136,9 +136,19 @@ The development intake under `noiseSaftey/` accepts only the sealed envelope,
 enforces a strict size limit and per-address rate limit, and writes the
 ciphertext to a private spool without decrypting it. It runs with a public
 recipient-key file; the recipient secret is generated into a separate file and
-is not required by the intake. The private case store must not create media
-previews, accept manual uploads, place reports in email, or copy report contents
-into general application logs.
+is not required by the intake.
+
+The separate development reviewer binds only to loopback, requires an ephemeral
+unguessable URL token, reads the private recipient key with restrictive file
+permissions, and decrypts and cryptographically verifies envelopes from a local
+inbox. It renders reported text and metadata but never media bytes, previews, or
+keys. Reviewed state is stored separately from the immutable envelope. In
+production, this reviewer must obtain still-encrypted envelopes through an
+outbound pull or another authenticated private transfer; it must not expose an
+internet listener.
+
+The private case store must not create media previews, accept manual uploads,
+place reports in email, or copy report contents into general application logs.
 
 Opening a report verifies cryptographic facts, not the legal character of
 unknown media. Temporary suppression and quarantine decisions must be recorded
@@ -150,7 +160,7 @@ process.
 This foundation intentionally does not yet implement:
 
 - deployment of the write-only intake endpoint;
-- the private review worker or management console;
+- production transfer between the public intake and private reviewer;
 - signed official-client suppression or group-quarantine decisions;
 - trusted hash integrations; or
 - legal evidence and external reporting procedures.
