@@ -240,9 +240,11 @@ No production service change should begin until these gaps are closed:
   and
 - establish the final write freeze or accepted-write journal.
 
-The private production Cloudflare R2 bucket baseline was provisioned on
-2026-07-27. Its bucket-scoped runtime credential will be created only when the
-production service has a protected secret destination. The next architecture
-decision is selecting the initial PostgreSQL, queue, and deployment providers.
-The importer should be built only after the verifier can reproduce every
-aggregate and digest in this document from copied data.
+The private production Cloudflare R2 bucket baseline and the empty PostgreSQL
+foundation on Cyphers VPS were provisioned on 2026-07-27. Durable jobs will
+initially use PostgreSQL rather than a separate queue service. The R2
+bucket-scoped runtime credential will be created only when the production
+service can consume it from the protected server environment. The next design
+work is the signed device-session contract and canonical PostgreSQL schema. The
+importer should be built only after the verifier can reproduce every aggregate
+and digest in this document from copied data.

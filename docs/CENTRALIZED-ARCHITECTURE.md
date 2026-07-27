@@ -702,7 +702,9 @@ Before implementation:
    bucket-scoped runtime credential only when the production service has a
    protected secret destination. Local development uses an isolated adapter;
    there is no staging deployment.
-3. Choose the initial PostgreSQL, queue, and deployment providers.
+3. Selected and provisioned 2026-07-27: PostgreSQL 16, the API, realtime
+   gateway, and PostgreSQL-backed durable jobs initially run on Cyphers VPS
+   under systemd and nginx. See `docs/CENTRAL-SERVICE-DEPLOYMENT.md`.
 4. Define the signed device-session protocol and minimum server-visible
    membership record.
 5. Specify the canonical event and cursor schema.
