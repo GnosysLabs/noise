@@ -85,7 +85,11 @@ finally {
 
 Set-Location $Repository
 Invoke-Checked git fetch --prune origin
-Invoke-Checked git cat-file -e "$Revision^{commit}"
+Invoke-Checked -Command git -Arguments @(
+    "cat-file",
+    "-e",
+    "$Revision^{commit}"
+)
 $resolvedRevision = (git rev-parse "$Revision^{commit}").Trim()
 if ($LASTEXITCODE -ne 0 -or -not $resolvedRevision) {
     throw "Could not resolve Windows build revision: $Revision"

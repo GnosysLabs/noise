@@ -17,7 +17,7 @@ remote_password='C:\Users\cmcel\AppData\Local\noise-release\updater-password.dpa
 
 cleanup() {
   rm -rf "$temporary_dir"
-  ssh -o BatchMode=yes "$windows_host" \
+  ssh -n -o BatchMode=yes "$windows_host" \
     "powershell -NoProfile -NonInteractive -Command \"Remove-Item -LiteralPath '$remote_script' -Force -ErrorAction SilentlyContinue\"" \
     >/dev/null 2>&1 || true
 }
@@ -47,12 +47,12 @@ version=$(
 )
 remote_output="C:\\Users\\cmcel\\AppData\\Local\\noise-release-assets\\$version-$short_revision-$remote_stamp"
 
-ssh -o BatchMode=yes -o ConnectTimeout=8 "$windows_host" \
+ssh -n -o BatchMode=yes -o ConnectTimeout=8 "$windows_host" \
   'powershell -NoProfile -NonInteractive -Command "$env:USERNAME; $env:COMPUTERNAME"' \
   >/dev/null
 
 password_present=$(
-  ssh -o BatchMode=yes "$windows_host" \
+  ssh -n -o BatchMode=yes "$windows_host" \
     "powershell -NoProfile -NonInteractive -Command \"Test-Path -LiteralPath '$remote_password' -PathType Leaf\""
 )
 password_present=$(printf '%s' "$password_present" | tr -d '\r')
@@ -98,7 +98,7 @@ remote_encoded=$(
     tr -d '\r\n'
 )
 remote_result=$(
-  ssh -o BatchMode=yes \
+  ssh -n -o BatchMode=yes \
     -o ServerAliveInterval=20 \
     -o ServerAliveCountMax=30 \
     "$windows_host" \
