@@ -9,6 +9,7 @@ import {
   Copy,
   Crown,
   Download,
+  EyeOff,
   Forward,
   GripVertical,
   Images,
@@ -2917,6 +2918,18 @@ export default function App() {
     }
   }
 
+  async function changeExplicitContentPreference(enabled: boolean) {
+    return perform(async () => {
+      const local = await noise<LocalSummary>({
+        action: "set_explicit_content_enabled",
+        enabled,
+        relays,
+      });
+      if (!local) throw new Error("the content preference was not updated");
+      setSummary(local);
+    }, false);
+  }
+
   async function performConcurrent(operation: () => Promise<void>) {
     setError(null);
     try {
@@ -3845,6 +3858,7 @@ export default function App() {
         onJoin={() => setDialog({ type: "join" })}
         onSearch={() => setDialog({ type: "search" })}
         onNewDirect={() => setDialog({ type: "new_direct" })}
+        onEnableExplicitContent={() => void changeExplicitContentPreference(true)}
         onSettings={() => setDialog({ type: "profile", profile: summary.identity })}
         onAddAccount={() => void beginAddingAccount()}
         onSwitchAccount={(account) => void selectLocalAccount(account)}
@@ -4208,17 +4222,7 @@ export default function App() {
             setDialog({ type: "profile", profile: local.identity });
           }}
           onUnblock={(person) => updateBlock(person, false)}
-          onExplicitContentChange={(enabled) =>
-            perform(async () => {
-              const local = await noise<LocalSummary>({
-                action: "set_explicit_content_enabled",
-                enabled,
-                relays,
-              });
-              if (!local) throw new Error("the content preference was not updated");
-              setSummary(local);
-            }, false)
-          }
+          onExplicitContentChange={changeExplicitContentPreference}
           onRevokeDevice={(device) =>
             perform(async () => {
               const local = await noise<LocalSummary>({
@@ -4729,6 +4733,7 @@ function Sidebar({
   onJoin,
   onSearch,
   onNewDirect,
+  onEnableExplicitContent,
   onSettings,
   onAddAccount,
   onSwitchAccount,
@@ -4758,6 +4763,7 @@ function Sidebar({
   onJoin: () => void;
   onSearch: () => void;
   onNewDirect: () => void;
+  onEnableExplicitContent: () => void;
   onSettings: () => void;
   onAddAccount: () => void;
   onSwitchAccount: (account: LocalAccount) => void;
@@ -4817,6 +4823,21 @@ function Sidebar({
         <button className="square-button" onClick={onSearch} title="search (⌘K)" aria-label="search"><Search size={16} /></button>
       </div>}
       <div className="group-list">
+        {mode === "groups" && summary.adult_access.hidden_explicit_group_count > 0 && (
+          <div className="hidden-explicit-groups">
+            <EyeOff size={16} aria-hidden="true" />
+            <span>
+              <strong>
+                {summary.adult_access.hidden_explicit_group_count} explicit{" "}
+                {summary.adult_access.hidden_explicit_group_count === 1 ? "group" : "groups"} hidden
+              </strong>
+              <small>names, artwork, previews, and unread counts are hidden</small>
+            </span>
+            <button disabled={accountBusy} onClick={onEnableExplicitContent}>
+              {accountBusy ? "enabling…" : "enable"}
+            </button>
+          </div>
+        )}
         {mode === "groups" ? summary.groups.map((group) => {
           const groupConversation = group.is_active
             && conversation?.group.group_id === group.group_id

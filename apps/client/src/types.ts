@@ -62,6 +62,7 @@ export type GroupSummary = {
 export type AdultAccessSummary = {
   age_attested: boolean;
   explicit_content_enabled: boolean;
+  hidden_explicit_group_count: number;
 };
 
 export type LocalSummary = {

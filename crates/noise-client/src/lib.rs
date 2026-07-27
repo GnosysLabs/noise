@@ -331,6 +331,8 @@ pub struct AdultAccessSummary {
     pub age_attested: bool,
     #[serde(default, alias = "adult_content_enabled")]
     pub explicit_content_enabled: bool,
+    #[serde(default)]
+    pub hidden_explicit_group_count: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2406,6 +2408,14 @@ impl ClientState {
             adult_access: AdultAccessSummary {
                 age_attested: self.adult_access.age_attested,
                 explicit_content_enabled: self.adult_access.explicit_content_enabled,
+                hidden_explicit_group_count: if self.adult_access.explicit_content_enabled {
+                    0
+                } else {
+                    self.groups
+                        .iter()
+                        .filter(|group| group.content_rating == GroupContentRating::Explicit)
+                        .count()
+                },
             },
             devices: {
                 let mut devices = self
