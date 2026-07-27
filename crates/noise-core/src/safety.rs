@@ -10,8 +10,8 @@ use rand::random;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Identity, MAX_STORAGE_SHARDS, NoiseError, SignedEvent, decode, decode_array, now_millis,
-    valid_hex_id, verify_signature,
+    DirectMessagePolicy, Identity, MAX_STORAGE_SHARDS, NoiseError, SignedEvent,
+    authoritative_group_id, decode, decode_array, now_millis, valid_hex_id, verify_signature,
 };
 
 const SAFETY_REPORT_VERSION: u32 = 1;
@@ -19,10 +19,16 @@ const SAFETY_ENVELOPE_VERSION: u32 = 1;
 const SAFETY_REPORT_CONTEXT: &str = "xyz.gnosyslabs.noise.safety-report.v1";
 const SAFETY_HPKE_INFO: &[u8] = b"xyz.gnosyslabs.noise.safety-envelope.v1";
 const SAFETY_KEY_ID_CONTEXT: &str = "xyz.gnosyslabs.noise.safety-key-id.v1";
+const SAFETY_DIRECTIVE_VERSION: u32 = 1;
+const SAFETY_DIRECTIVE_CONTEXT: &str = "xyz.gnosyslabs.noise.safety-directive.v1";
+const SAFETY_DIRECTIVE_SIGNING_KEY_CONTEXT: &str =
+    "xyz.gnosyslabs.noise.safety-directive-signing-key.v1";
 const MAX_REPORT_DETAILS_CHARS: usize = 1_000;
 const MAX_REPORTED_TEXT_CHARS: usize = 10_000;
 const MAX_ENCRYPTED_OBJECTS: usize = 256;
 const MAX_RELAY_URL_BYTES: usize = 2_048;
+const MAX_GROUP_QUARANTINE_MILLIS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const MAX_SAFETY_GROUP_STAFF: usize = 64;
 
 /// The user-facing reason selected before a report is routed to noise safety.
 ///
@@ -54,6 +60,360 @@ pub struct SafetyMediaFingerprintV1 {
 #[serde(rename_all = "snake_case")]
 pub enum SafetyMediaHashAlgorithmV1 {
     Sha256,
+}
+
+/// A human-readable profile snapshot carried inside the encrypted report.
+///
+/// The public key remains the cryptographic identity. A snapshot for the
+/// reporter is self-attested by the report signature; other snapshots describe
+/// what the reporting client displayed at report time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafetyProfileSnapshotV1 {
+    pub public_key: String,
+    pub username: String,
+    pub direct_message_policy: DirectMessagePolicy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafetyReporterContextV1 {
+    pub profile: SafetyProfileSnapshotV1,
+    pub follow_up_allowed: bool,
+}
+
+/// Human-readable group context encrypted to noise safety.
+///
+/// The founder relationship is verified from the authoritative group id.
+/// Moderator entries are a reporter-signed snapshot of the group state and are
+/// deliberately named `reported_moderators` so they are not mistaken for
+/// independently published role attestations.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafetyGroupContextV1 {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub founder: Option<SafetyProfileSnapshotV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_nonce_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reported_moderators: Vec<SafetyProfileSnapshotV1>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafetyReportHumanContextV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reporter: Option<SafetyReporterContextV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_author: Option<SafetyProfileSnapshotV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<SafetyGroupContextV1>,
+}
+
+pub fn noise_signature_for_public_key(public_key: &str) -> Result<String, NoiseError> {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let bytes = decode_array::<32>(public_key, "noise signature public key")?;
+    let mut signature = String::with_capacity(13);
+    for character_index in 0..12 {
+        let mut value = 0usize;
+        for bit_index in 0..5 {
+            let source_bit = character_index * 5 + bit_index;
+            value =
+                (value << 1) | usize::from((bytes[source_bit / 8] >> (7 - (source_bit % 8))) & 1);
+        }
+        signature.push(ALPHABET[value] as char);
+        if character_index == 5 {
+            signature.push('-');
+        }
+    }
+    Ok(signature)
+}
+
+/// A content-free action that official noise clients can enforce after
+/// verifying the pinned safety signing key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafetyDirectiveActionV1 {
+    SuppressEvent,
+    RestrictGroup,
+    RestrictIdentity,
+    RestoreGroup,
+    RestoreIdentity,
+}
+
+/// A signed, content-free safety decision intended for a future public feed.
+///
+/// It contains identifiers and policy metadata only. Report text, profile
+/// snapshots, media bytes, fingerprints, and object locations stay private.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafetyDirectiveV1 {
+    pub version: u32,
+    pub directive_id: String,
+    pub action: SafetyDirectiveActionV1,
+    pub reason: SafetyReportCategoryV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_public_key: Option<String>,
+    pub issued_at_millis: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_millis: Option<u64>,
+    pub signing_public_key: String,
+    pub signature_base64: String,
+}
+
+#[derive(Serialize)]
+struct UnsignedSafetyDirectiveV1<'a> {
+    context: &'static str,
+    version: u32,
+    directive_id: &'a str,
+    action: SafetyDirectiveActionV1,
+    reason: SafetyReportCategoryV1,
+    group_id: Option<&'a str>,
+    event_id: Option<&'a str>,
+    identity_public_key: Option<&'a str>,
+    issued_at_millis: u64,
+    expires_at_millis: Option<u64>,
+    signing_public_key: &'a str,
+}
+
+/// The private Ed25519 signer derived from the safety recipient secret with a
+/// role-specific KDF context.
+#[derive(Clone)]
+pub struct SafetyDirectiveSigningKeyPair {
+    identity: Identity,
+}
+
+impl SafetyDirectiveSigningKeyPair {
+    pub fn public_key_base64(&self) -> String {
+        self.identity.public_key_base64()
+    }
+}
+
+impl SafetyDirectiveV1 {
+    pub fn suppress_event(
+        signer: &SafetyDirectiveSigningKeyPair,
+        reason: SafetyReportCategoryV1,
+        group_id: String,
+        event_id: String,
+    ) -> Result<Self, NoiseError> {
+        Self::create(
+            signer,
+            SafetyDirectiveActionV1::SuppressEvent,
+            reason,
+            Some(group_id),
+            Some(event_id),
+            None,
+            None,
+        )
+    }
+
+    pub fn restrict_group(
+        signer: &SafetyDirectiveSigningKeyPair,
+        reason: SafetyReportCategoryV1,
+        group_id: String,
+        expires_at_millis: Option<u64>,
+    ) -> Result<Self, NoiseError> {
+        Self::create(
+            signer,
+            SafetyDirectiveActionV1::RestrictGroup,
+            reason,
+            Some(group_id),
+            None,
+            None,
+            expires_at_millis,
+        )
+    }
+
+    pub fn restrict_identity(
+        signer: &SafetyDirectiveSigningKeyPair,
+        reason: SafetyReportCategoryV1,
+        identity_public_key: String,
+        expires_at_millis: Option<u64>,
+    ) -> Result<Self, NoiseError> {
+        Self::create(
+            signer,
+            SafetyDirectiveActionV1::RestrictIdentity,
+            reason,
+            None,
+            None,
+            Some(identity_public_key),
+            expires_at_millis,
+        )
+    }
+
+    pub fn restore_group(
+        signer: &SafetyDirectiveSigningKeyPair,
+        reason: SafetyReportCategoryV1,
+        group_id: String,
+    ) -> Result<Self, NoiseError> {
+        Self::create(
+            signer,
+            SafetyDirectiveActionV1::RestoreGroup,
+            reason,
+            Some(group_id),
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub fn restore_identity(
+        signer: &SafetyDirectiveSigningKeyPair,
+        reason: SafetyReportCategoryV1,
+        identity_public_key: String,
+    ) -> Result<Self, NoiseError> {
+        Self::create(
+            signer,
+            SafetyDirectiveActionV1::RestoreIdentity,
+            reason,
+            None,
+            None,
+            Some(identity_public_key),
+            None,
+        )
+    }
+
+    pub fn verify_with_signing_public_key(
+        &self,
+        expected_public_key: &str,
+    ) -> Result<(), NoiseError> {
+        if self.version != SAFETY_DIRECTIVE_VERSION
+            || !valid_hex_id(&self.directive_id)
+            || self.issued_at_millis == 0
+            || self.signing_public_key != expected_public_key
+        {
+            return Err(NoiseError::InvalidEncoding("safety directive"));
+        }
+        decode_array::<32>(
+            &self.signing_public_key,
+            "safety directive signing public key",
+        )?;
+        match self.action {
+            SafetyDirectiveActionV1::SuppressEvent => {
+                if !self.group_id.as_deref().is_some_and(valid_hex_id)
+                    || !self.event_id.as_deref().is_some_and(valid_hex_id)
+                    || self.identity_public_key.is_some()
+                    || self.expires_at_millis.is_some()
+                {
+                    return Err(NoiseError::InvalidEncoding("safety directive"));
+                }
+            }
+            SafetyDirectiveActionV1::RestrictGroup => {
+                if !self.group_id.as_deref().is_some_and(valid_hex_id)
+                    || self.event_id.is_some()
+                    || self.identity_public_key.is_some()
+                    || !valid_optional_restriction_expiry(
+                        self.issued_at_millis,
+                        self.expires_at_millis,
+                    )
+                {
+                    return Err(NoiseError::InvalidEncoding("safety directive"));
+                }
+            }
+            SafetyDirectiveActionV1::RestrictIdentity => {
+                if self.group_id.is_some()
+                    || self.event_id.is_some()
+                    || self
+                        .identity_public_key
+                        .as_deref()
+                        .is_none_or(|public_key| {
+                            decode_array::<32>(public_key, "restricted identity public key")
+                                .is_err()
+                        })
+                    || !valid_optional_restriction_expiry(
+                        self.issued_at_millis,
+                        self.expires_at_millis,
+                    )
+                {
+                    return Err(NoiseError::InvalidEncoding("safety directive"));
+                }
+            }
+            SafetyDirectiveActionV1::RestoreGroup => {
+                if !self.group_id.as_deref().is_some_and(valid_hex_id)
+                    || self.event_id.is_some()
+                    || self.identity_public_key.is_some()
+                    || self.expires_at_millis.is_some()
+                {
+                    return Err(NoiseError::InvalidEncoding("safety directive"));
+                }
+            }
+            SafetyDirectiveActionV1::RestoreIdentity => {
+                if self.group_id.is_some()
+                    || self.event_id.is_some()
+                    || self
+                        .identity_public_key
+                        .as_deref()
+                        .is_none_or(|public_key| {
+                            decode_array::<32>(public_key, "restored identity public key").is_err()
+                        })
+                    || self.expires_at_millis.is_some()
+                {
+                    return Err(NoiseError::InvalidEncoding("safety directive"));
+                }
+            }
+        }
+        verify_signature(
+            &self.signing_public_key,
+            &self.signature_base64,
+            &self.signing_bytes()?,
+        )
+    }
+
+    fn create(
+        signer: &SafetyDirectiveSigningKeyPair,
+        action: SafetyDirectiveActionV1,
+        reason: SafetyReportCategoryV1,
+        group_id: Option<String>,
+        event_id: Option<String>,
+        identity_public_key: Option<String>,
+        expires_at_millis: Option<u64>,
+    ) -> Result<Self, NoiseError> {
+        let random_id: [u8; 32] = random();
+        let mut directive = Self {
+            version: SAFETY_DIRECTIVE_VERSION,
+            directive_id: blake3::hash(&random_id).to_hex().to_string(),
+            action,
+            reason,
+            group_id,
+            event_id,
+            identity_public_key,
+            issued_at_millis: now_millis(),
+            expires_at_millis,
+            signing_public_key: signer.public_key_base64(),
+            signature_base64: String::new(),
+        };
+        directive.signature_base64 = signer.identity.sign(&directive.signing_bytes()?);
+        directive.verify_with_signing_public_key(&signer.public_key_base64())?;
+        Ok(directive)
+    }
+
+    fn signing_bytes(&self) -> Result<Vec<u8>, NoiseError> {
+        Ok(serde_json::to_vec(&UnsignedSafetyDirectiveV1 {
+            context: SAFETY_DIRECTIVE_CONTEXT,
+            version: self.version,
+            directive_id: &self.directive_id,
+            action: self.action,
+            reason: self.reason,
+            group_id: self.group_id.as_deref(),
+            event_id: self.event_id.as_deref(),
+            identity_public_key: self.identity_public_key.as_deref(),
+            issued_at_millis: self.issued_at_millis,
+            expires_at_millis: self.expires_at_millis,
+            signing_public_key: &self.signing_public_key,
+        })?)
+    }
+}
+
+fn valid_optional_restriction_expiry(
+    issued_at_millis: u64,
+    expires_at_millis: Option<u64>,
+) -> bool {
+    let Some(expires_at_millis) = expires_at_millis else {
+        return true;
+    };
+    expires_at_millis
+        .checked_sub(issued_at_millis)
+        .is_some_and(|duration| duration > 0 && duration <= MAX_GROUP_QUARANTINE_MILLIS)
 }
 
 /// An opaque encrypted storage location associated with the reported event.
@@ -95,6 +455,8 @@ pub struct SafetyReportV1 {
     pub reported_text_excerpt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_context: Option<SafetyReportHumanContextV1>,
     pub created_at_millis: u64,
     pub signature_base64: String,
 }
@@ -113,6 +475,8 @@ struct UnsignedSafetyReportV1<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     reported_text_excerpt: Option<&'a str>,
     details: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    human_context: Option<&'a SafetyReportHumanContextV1>,
     created_at_millis: u64,
 }
 
@@ -127,6 +491,31 @@ impl SafetyReportV1 {
         encrypted_objects: Vec<SafetyEncryptedObjectV1>,
         reported_text_excerpt: Option<String>,
         details: Option<String>,
+    ) -> Result<Self, NoiseError> {
+        Self::create_with_human_context(
+            reporter,
+            category,
+            reported_event,
+            group_context_proof,
+            media_fingerprint,
+            encrypted_objects,
+            reported_text_excerpt,
+            details,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_human_context(
+        reporter: &Identity,
+        category: SafetyReportCategoryV1,
+        reported_event: SignedEvent,
+        group_context_proof: Option<SignedEvent>,
+        media_fingerprint: Option<SafetyMediaFingerprintV1>,
+        encrypted_objects: Vec<SafetyEncryptedObjectV1>,
+        reported_text_excerpt: Option<String>,
+        details: Option<String>,
+        human_context: Option<SafetyReportHumanContextV1>,
     ) -> Result<Self, NoiseError> {
         let reported_text_excerpt = reported_text_excerpt.filter(|value| !value.trim().is_empty());
         let details = details
@@ -144,6 +533,7 @@ impl SafetyReportV1 {
             encrypted_objects,
             reported_text_excerpt,
             details,
+            human_context,
             created_at_millis: now_millis(),
             signature_base64: String::new(),
         };
@@ -178,6 +568,10 @@ impl SafetyReportV1 {
             {
                 return Err(NoiseError::GroupMismatch);
             }
+        }
+
+        if let Some(context) = &self.human_context {
+            self.verify_human_context(context)?;
         }
 
         if let Some(fingerprint) = &self.media_fingerprint {
@@ -261,9 +655,69 @@ impl SafetyReportV1 {
             encrypted_objects: &self.encrypted_objects,
             reported_text_excerpt: self.reported_text_excerpt.as_deref(),
             details: self.details.as_deref(),
+            human_context: self.human_context.as_ref(),
             created_at_millis: self.created_at_millis,
         })?)
     }
+
+    fn verify_human_context(&self, context: &SafetyReportHumanContextV1) -> Result<(), NoiseError> {
+        if let Some(reporter) = &context.reporter {
+            verify_profile_snapshot(&reporter.profile)?;
+            if reporter.profile.public_key != self.reporter_public_key {
+                return Err(NoiseError::IdentityMismatch);
+            }
+        }
+        if let Some(author) = &context.reported_author {
+            verify_profile_snapshot(author)?;
+            if author.public_key != self.reported_event.author_public_key {
+                return Err(NoiseError::IdentityMismatch);
+            }
+        }
+        if let Some(group) = &context.group {
+            let name_length = group.name.trim().chars().count();
+            if !(1..=80).contains(&name_length)
+                || group.name.chars().any(char::is_control)
+                || group.reported_moderators.len() > MAX_SAFETY_GROUP_STAFF
+                || group.founder.is_some() != group.authority_nonce_base64.is_some()
+            {
+                return Err(NoiseError::InvalidEncoding("safety group context"));
+            }
+            if let (Some(founder), Some(authority_nonce_base64)) =
+                (&group.founder, &group.authority_nonce_base64)
+            {
+                verify_profile_snapshot(founder)?;
+                let authority_nonce =
+                    decode_array::<32>(authority_nonce_base64, "group authority nonce")?;
+                if authoritative_group_id(&founder.public_key, &authority_nonce)
+                    != self.reported_event.group_id
+                {
+                    return Err(NoiseError::InvalidGroupAuthority);
+                }
+            }
+            let mut moderator_keys = HashSet::with_capacity(group.reported_moderators.len());
+            for moderator in &group.reported_moderators {
+                verify_profile_snapshot(moderator)?;
+                if !moderator_keys.insert(moderator.public_key.as_str())
+                    || group
+                        .founder
+                        .as_ref()
+                        .is_some_and(|founder| founder.public_key == moderator.public_key)
+                {
+                    return Err(NoiseError::InvalidEncoding("safety group context"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn verify_profile_snapshot(profile: &SafetyProfileSnapshotV1) -> Result<(), NoiseError> {
+    decode_array::<32>(&profile.public_key, "safety profile public key")?;
+    let username_length = profile.username.trim().chars().count();
+    if !(1..=32).contains(&username_length) || profile.username.chars().any(char::is_control) {
+        return Err(NoiseError::InvalidEncoding("safety profile snapshot"));
+    }
+    Ok(())
 }
 
 /// The only report shape accepted by the future public intake endpoint.
@@ -307,6 +761,13 @@ impl SafetyEncryptionKeyPair {
 
     pub fn key_id(&self) -> String {
         safety_key_id(&self.key_pair.public)
+    }
+
+    pub fn directive_signing_key_pair(&self) -> Result<SafetyDirectiveSigningKeyPair, NoiseError> {
+        let signing_secret = blake3::derive_key(SAFETY_DIRECTIVE_SIGNING_KEY_CONTEXT, &self.secret);
+        Ok(SafetyDirectiveSigningKeyPair {
+            identity: Identity::from_secret_base64(&STANDARD_NO_PAD.encode(signing_secret))?,
+        })
     }
 
     pub fn open(&self, envelope: &SealedSafetyReportV1) -> Result<SafetyReportV1, NoiseError> {
@@ -396,7 +857,7 @@ mod tests {
         .unwrap();
         let reported_event =
             SignedEvent::chat(&author, &group, "encrypted report target", 1).unwrap();
-        let report = SafetyReportV1::create(
+        let report = SafetyReportV1::create_with_human_context(
             &reporter,
             SafetyReportCategoryV1::HarassmentOrHatefulBehavior,
             reported_event,
@@ -415,6 +876,31 @@ mod tests {
             }],
             Some("The exact text of the reported message.".into()),
             Some("Group staff may be involved.".into()),
+            Some(SafetyReportHumanContextV1 {
+                reporter: Some(SafetyReporterContextV1 {
+                    profile: SafetyProfileSnapshotV1 {
+                        public_key: reporter.public_key_base64(),
+                        username: "reporter".into(),
+                        direct_message_policy: DirectMessagePolicy::Everyone,
+                    },
+                    follow_up_allowed: true,
+                }),
+                reported_author: Some(SafetyProfileSnapshotV1 {
+                    public_key: author.public_key_base64(),
+                    username: "reported author".into(),
+                    direct_message_policy: DirectMessagePolicy::Nobody,
+                }),
+                group: Some(SafetyGroupContextV1 {
+                    name: group.name.clone(),
+                    founder: Some(SafetyProfileSnapshotV1 {
+                        public_key: author.public_key_base64(),
+                        username: "reported author".into(),
+                        direct_message_policy: DirectMessagePolicy::Nobody,
+                    }),
+                    authority_nonce_base64: Some(group.authority_nonce_base64.clone()),
+                    reported_moderators: Vec::new(),
+                }),
+            }),
         )
         .unwrap();
 
@@ -431,11 +917,70 @@ mod tests {
             opened.reported_text_excerpt.as_deref(),
             Some("The exact text of the reported message.")
         );
+        assert_eq!(
+            opened
+                .human_context
+                .as_ref()
+                .and_then(|context| context.reported_author.as_ref())
+                .map(|profile| profile.username.as_str()),
+            Some("reported author")
+        );
         assert_eq!(decoded.recipient_key_id, restored_key.key_id());
         assert!(
             SafetyEncryptionKeyPair::generate()
                 .unwrap()
                 .open(&decoded)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn signed_safety_directives_cover_restrictions_and_restores() {
+        let safety_key = SafetyEncryptionKeyPair::generate().unwrap();
+        let signer = safety_key.directive_signing_key_pair().unwrap();
+        let signing_public_key = signer.public_key_base64();
+        let identity = Identity::generate();
+        let group_id = "a".repeat(64);
+
+        let pause = SafetyDirectiveV1::restrict_group(
+            &signer,
+            SafetyReportCategoryV1::ChildSafety,
+            group_id.clone(),
+            Some(now_millis() + 24 * 60 * 60 * 1_000),
+        )
+        .unwrap();
+        let block = SafetyDirectiveV1::restrict_identity(
+            &signer,
+            SafetyReportCategoryV1::ChildSafety,
+            identity.public_key_base64(),
+            None,
+        )
+        .unwrap();
+        let restore =
+            SafetyDirectiveV1::restore_group(&signer, SafetyReportCategoryV1::Other, group_id)
+                .unwrap();
+
+        pause
+            .verify_with_signing_public_key(&signing_public_key)
+            .unwrap();
+        block
+            .verify_with_signing_public_key(&signing_public_key)
+            .unwrap();
+        restore
+            .verify_with_signing_public_key(&signing_public_key)
+            .unwrap();
+        assert_eq!(
+            noise_signature_for_public_key(&identity.public_key_base64())
+                .unwrap()
+                .len(),
+            13
+        );
+
+        let mut tampered = block;
+        tampered.identity_public_key = Some(Identity::generate().public_key_base64());
+        assert!(
+            tampered
+                .verify_with_signing_public_key(&signing_public_key)
                 .is_err()
         );
     }

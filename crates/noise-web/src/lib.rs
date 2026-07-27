@@ -732,6 +732,7 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                     &required::<String>(&request, "message_event_id")?,
                     required(&request, "category")?,
                     optional::<String>(&request, "details")?,
+                    optional::<bool>(&request, "follow_up_allowed")?.unwrap_or(true),
                     &required::<String>(&request, "safety_url")?,
                     optional::<String>(&request, "recipient_public_key_base64")?,
                 )

@@ -17,7 +17,10 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use clap::{Parser, Subcommand};
-use noise_core::{SafetyEncryptionKeyPair, SealedSafetyReportV1, safety_recipient_key_id};
+use noise_core::{
+    SafetyEncryptionKeyPair, SealedSafetyReportV1, noise_signature_for_public_key,
+    safety_recipient_key_id,
+};
 use serde::{Deserialize, Serialize};
 use tokio::{fs, io::AsyncWriteExt, net::TcpListener};
 use tower_http::cors::CorsLayer;
@@ -74,6 +77,8 @@ struct PublicRecipientKey {
     version: u32,
     recipient_key_id: String,
     public_key_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    directive_signing_public_key_base64: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -143,6 +148,9 @@ async fn generate_keys(public_output: &Path, secret_output: &Path) -> anyhow::Re
         version: 1,
         recipient_key_id: recipient_key_id.clone(),
         public_key_base64: pair.public_key_base64(),
+        directive_signing_public_key_base64: Some(
+            pair.directive_signing_key_pair()?.public_key_base64(),
+        ),
     };
     let private = PrivateRecipientKey {
         version: 1,
@@ -288,7 +296,13 @@ async fn read_public_key(path: &Path) -> anyhow::Result<PublicRecipientKey> {
         serde_json::from_slice(&bytes).context("recipient public-key file is invalid")?;
     let expected = safety_recipient_key_id(&recipient.public_key_base64)
         .context("recipient public key is invalid")?;
-    if recipient.version != 1 || recipient.recipient_key_id != expected {
+    if recipient.version != 1
+        || recipient.recipient_key_id != expected
+        || recipient
+            .directive_signing_public_key_base64
+            .as_deref()
+            .is_some_and(|public_key| noise_signature_for_public_key(public_key).is_err())
+    {
         bail!("recipient public-key file does not match its identifier")
     }
     Ok(recipient)
@@ -408,6 +422,12 @@ mod tests {
             version: 1,
             recipient_key_id: recipient.key_id(),
             public_key_base64: recipient.public_key_base64(),
+            directive_signing_public_key_base64: Some(
+                recipient
+                    .directive_signing_key_pair()
+                    .unwrap()
+                    .public_key_base64(),
+            ),
         };
 
         assert!(validate_envelope(&public, &envelope).is_ok());

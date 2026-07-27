@@ -498,6 +498,11 @@ button:disabled { cursor: default; opacity: 0.48; }
 .report-route-note, .report-data-note { margin: 0; border-radius: 8px; color: var(--muted); font-size: 10px; line-height: 1.45; }
 .report-route-note { display: flex; align-items: center; gap: 7px; padding: 8px 9px; background: rgba(var(--accent-rgb),.1); }
 .report-data-note { padding: 8px 9px; background: rgba(0,0,0,.14); }
+.report-follow-up { display: flex; align-items: flex-start; gap: 9px; padding: 9px; border: 1px solid var(--line); border-radius: 8px; background: rgba(255,255,255,.025); }
+.report-follow-up input { margin-top: 2px; accent-color: var(--accent); }
+.report-follow-up span { display: grid; gap: 2px; }
+.report-follow-up strong { color: var(--text); font-size: 11px; }
+.report-follow-up small { color: var(--muted); font-size: 9px; line-height: 1.4; }
 .report-sent-state { display: grid; gap: 5px; padding: 12px; border-radius: 10px; background: rgba(255,255,255,.045); }
 .report-sent-state strong { color: #ece8ef; font-size: 12px; }
 .report-sent-state span { color: var(--muted); font-size: 10.5px; }

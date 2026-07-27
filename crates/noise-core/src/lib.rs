@@ -23,9 +23,11 @@ pub use production_e2ee::{
     MlsRemovalReason, MlsRemovalRequest,
 };
 pub use safety::{
-    SafetyEncryptedObjectV1, SafetyEncryptedShardV1, SafetyEncryptionKeyPair,
-    SafetyMediaFingerprintV1, SafetyMediaHashAlgorithmV1, SafetyReportCategoryV1, SafetyReportV1,
-    SealedSafetyReportV1, safety_recipient_key_id,
+    SafetyDirectiveActionV1, SafetyDirectiveSigningKeyPair, SafetyDirectiveV1,
+    SafetyEncryptedObjectV1, SafetyEncryptedShardV1, SafetyEncryptionKeyPair, SafetyGroupContextV1,
+    SafetyMediaFingerprintV1, SafetyMediaHashAlgorithmV1, SafetyProfileSnapshotV1,
+    SafetyReportCategoryV1, SafetyReportHumanContextV1, SafetyReportV1, SafetyReporterContextV1,
+    SealedSafetyReportV1, noise_signature_for_public_key, safety_recipient_key_id,
 };
 
 const FREQUENCY_SPACE: u64 = 1_000_000_000_000;

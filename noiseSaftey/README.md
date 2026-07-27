@@ -31,9 +31,39 @@ cargo run -p noise-safety-intake -- review \
 ```
 
 The reviewer prints a random, single-session localhost URL. It decrypts and
-cryptographically verifies reports only when rendering that private page. It
-does not render or download reported media, and reviewed state is stored as
-private sidecar files under the ignored development inbox.
+cryptographically verifies reports only inside that private service. New
+reports include encrypted human context: names displayed at report time, noise
+signatures, the reporter's follow-up preference, the cryptographically
+verifiable founder, and a reporter-signed moderator snapshot. Reports created
+before that context was added still show noise signatures, but their names
+remain unavailable.
+
+The reviewer never renders or retrieves reported media. A reviewer may
+deliberately download the complete decrypted and verified report as JSON; that
+file can contain reported message text and private metadata, but never media
+bytes or decryption keys.
+
+Each report can be closed with no action or produce one of these signed,
+content-free directives:
+
+- suppress the reported event;
+- restrict the group for 24 hours;
+- restrict the group indefinitely;
+- restrict the reported identity indefinitely.
+
+The directive protocol also supports signed group and identity restores.
+Temporary and indefinite group restrictions use the same client enforcement
+mechanism; only the optional expiry differs.
+
+Local decisions are stored under `.review-state/decisions`. Enforcement
+directives are reconciled into `.review-state/directive-outbox` so a crash
+between the decision and outbox write cannot lose an action. The directive
+signer is deterministically derived from the existing recipient secret with a
+separate KDF context, preserving compatibility with existing encrypted inbox
+files.
+
+The outbox is not a public directive feed yet, and official noise apps do not
+consume or enforce these files yet.
 
 During development, the intake and reviewer can share this local directory. A
 production reviewer must remain unreachable from the internet and obtain only

@@ -18,9 +18,12 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use noise_core::{
-    SafetyEncryptionKeyPair, SafetyReportCategoryV1, SafetyReportV1, SealedSafetyReportV1,
+    SafetyDirectiveActionV1, SafetyDirectiveSigningKeyPair, SafetyDirectiveV1,
+    SafetyEncryptionKeyPair, SafetyProfileSnapshotV1, SafetyReportCategoryV1, SafetyReportV1,
+    SealedSafetyReportV1, noise_signature_for_public_key,
 };
 use rand::random;
+use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{fs, io::AsyncWriteExt, net::TcpListener};
 use zeroize::Zeroize;
@@ -29,20 +32,26 @@ use super::{PrivateRecipientKey, secure_directory, secure_file};
 
 const MAX_ENVELOPE_FILE_BYTES: usize = 384 * 1024;
 const MAX_SECRET_FILE_BYTES: usize = 8 * 1024;
+const MAX_DECISION_FILE_BYTES: usize = 64 * 1024;
+const GROUP_QUARANTINE_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Clone)]
 struct ReviewState {
     recipient: Arc<SafetyEncryptionKeyPair>,
+    directive_signer: Arc<SafetyDirectiveSigningKeyPair>,
     recipient_key_id: String,
     spool_dir: PathBuf,
     state_dir: PathBuf,
+    decisions_dir: PathBuf,
+    outbox_dir: PathBuf,
     token: String,
     expected_host: String,
 }
 
 struct ReviewItem {
     receipt_id: String,
-    reviewed: bool,
+    decision: Option<ReviewDecisionRecord>,
+    legacy_reviewed: bool,
     report: Result<SafetyReportV1, &'static str>,
 }
 
@@ -52,6 +61,31 @@ impl ReviewItem {
             .as_ref()
             .map_or(0, |report| report.created_at_millis)
     }
+
+    fn is_decided(&self) -> bool {
+        self.decision.is_some() || self.legacy_reviewed
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReviewOutcome {
+    NoAction,
+    SuppressEvent,
+    PauseGroup,
+    BlockGroup,
+    BlockIdentity,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReviewDecisionRecord {
+    version: u32,
+    receipt_id: String,
+    report_id: String,
+    outcome: ReviewOutcome,
+    decided_at_millis: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    directive: Option<SafetyDirectiveV1>,
 }
 
 pub(crate) async fn serve(
@@ -77,21 +111,55 @@ pub(crate) async fn serve(
         .await
         .with_context(|| format!("could not create {}", state_dir.display()))?;
     secure_directory(&state_dir).await?;
+    let decisions_dir = state_dir.join("decisions");
+    let outbox_dir = state_dir.join("directive-outbox");
+    for directory in [&decisions_dir, &outbox_dir] {
+        fs::create_dir_all(directory)
+            .await
+            .with_context(|| format!("could not create {}", directory.display()))?;
+        secure_directory(directory).await?;
+    }
 
     let token = URL_SAFE_NO_PAD.encode(random::<[u8; 32]>());
+    let directive_signer = recipient
+        .directive_signing_key_pair()
+        .context("could not derive safety directive signing key")?;
     let state = ReviewState {
         recipient_key_id: recipient.key_id(),
         recipient: Arc::new(recipient),
+        directive_signer: Arc::new(directive_signer),
         spool_dir: spool_dir.to_owned(),
         state_dir,
+        decisions_dir,
+        outbox_dir,
         token,
         expected_host: bind.to_string(),
     };
     let router = Router::new()
         .route("/{token}", get(review_index))
         .route(
-            "/{token}/reports/{receipt_id}/reviewed",
-            post(mark_reviewed),
+            "/{token}/reports/{receipt_id}/decisions/no-action",
+            post(decide_no_action),
+        )
+        .route(
+            "/{token}/reports/{receipt_id}/decisions/suppress-event",
+            post(decide_suppress_event),
+        )
+        .route(
+            "/{token}/reports/{receipt_id}/decisions/pause-group",
+            post(decide_pause_group),
+        )
+        .route(
+            "/{token}/reports/{receipt_id}/decisions/block-group",
+            post(decide_block_group),
+        )
+        .route(
+            "/{token}/reports/{receipt_id}/decisions/block-identity",
+            post(decide_block_identity),
+        )
+        .route(
+            "/{token}/reports/{receipt_id}/download",
+            get(download_report),
         )
         .layer(DefaultBodyLimit::max(1_024))
         .with_state(state.clone());
@@ -102,6 +170,11 @@ pub(crate) async fn serve(
     println!("noise safety reviewer listening locally");
     println!("open this private URL: {review_url}");
     println!("recipient key id: {}", state.recipient_key_id);
+    println!(
+        "directive signing public key: {}",
+        state.directive_signer.public_key_base64()
+    );
+    println!("directive outbox: {}", state.outbox_dir.display());
     std::io::Write::flush(&mut std::io::stdout())?;
     axum::serve(listener, router)
         .await
@@ -125,7 +198,7 @@ async fn review_index(
     }
 }
 
-async fn mark_reviewed(
+async fn download_report(
     RoutePath((token, receipt_id)): RoutePath<(String, String)>,
     State(state): State<ReviewState>,
     headers: HeaderMap,
@@ -133,23 +206,191 @@ async fn mark_reviewed(
     if !authorized(&state, &token, &headers) || !valid_receipt_id(&receipt_id) {
         return reviewer_error(StatusCode::NOT_FOUND, "reviewer not found");
     }
-    if verify_report_file(&state, &receipt_id).await.is_err() {
-        return reviewer_error(StatusCode::BAD_REQUEST, "this report could not be verified");
-    }
-    let marker_path = reviewed_marker_path(&state.state_dir, &receipt_id);
-    let reviewed_at_millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis());
-    let marker = format!("reviewed_at_unix_millis={reviewed_at_millis}\n");
-    match write_private_marker(&marker_path, marker.as_bytes()).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+    let report = match verify_report_file(&state, &receipt_id).await {
+        Ok(report) => report,
+        Err(_) => {
+            return reviewer_error(StatusCode::BAD_REQUEST, "this report could not be verified");
+        }
+    };
+    let mut bytes = match serde_json::to_vec_pretty(&report) {
+        Ok(bytes) => bytes,
         Err(_) => {
             return reviewer_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "the reviewed state could not be saved",
+                "the verified report could not be encoded",
             );
         }
+    };
+    bytes.push(b'\n');
+    let mut response = (StatusCode::OK, bytes).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&format!(
+        "attachment; filename=\"noise-safety-report-{}.json\"",
+        report.report_id
+    )) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
+    }
+    apply_security_headers(&mut response);
+    response
+}
+
+async fn decide_no_action(
+    RoutePath((token, receipt_id)): RoutePath<(String, String)>,
+    State(state): State<ReviewState>,
+    headers: HeaderMap,
+) -> Response {
+    decide(token, receipt_id, state, headers, ReviewOutcome::NoAction).await
+}
+
+async fn decide_suppress_event(
+    RoutePath((token, receipt_id)): RoutePath<(String, String)>,
+    State(state): State<ReviewState>,
+    headers: HeaderMap,
+) -> Response {
+    decide(
+        token,
+        receipt_id,
+        state,
+        headers,
+        ReviewOutcome::SuppressEvent,
+    )
+    .await
+}
+
+async fn decide_pause_group(
+    RoutePath((token, receipt_id)): RoutePath<(String, String)>,
+    State(state): State<ReviewState>,
+    headers: HeaderMap,
+) -> Response {
+    decide(token, receipt_id, state, headers, ReviewOutcome::PauseGroup).await
+}
+
+async fn decide_block_group(
+    RoutePath((token, receipt_id)): RoutePath<(String, String)>,
+    State(state): State<ReviewState>,
+    headers: HeaderMap,
+) -> Response {
+    decide(token, receipt_id, state, headers, ReviewOutcome::BlockGroup).await
+}
+
+async fn decide_block_identity(
+    RoutePath((token, receipt_id)): RoutePath<(String, String)>,
+    State(state): State<ReviewState>,
+    headers: HeaderMap,
+) -> Response {
+    decide(
+        token,
+        receipt_id,
+        state,
+        headers,
+        ReviewOutcome::BlockIdentity,
+    )
+    .await
+}
+
+async fn decide(
+    token: String,
+    receipt_id: String,
+    state: ReviewState,
+    headers: HeaderMap,
+    outcome: ReviewOutcome,
+) -> Response {
+    if !authorized(&state, &token, &headers) || !valid_receipt_id(&receipt_id) {
+        return reviewer_error(StatusCode::NOT_FOUND, "reviewer not found");
+    }
+    let report = match verify_report_file(&state, &receipt_id).await {
+        Ok(report) => report,
+        Err(_) => {
+            return reviewer_error(StatusCode::BAD_REQUEST, "this report could not be verified");
+        }
+    };
+    let decision_path = decision_path(&state.decisions_dir, &receipt_id);
+    if let Ok(existing) = read_decision(&decision_path).await {
+        if validate_decision(&state, &existing, &receipt_id, &report).is_err() {
+            return reviewer_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the saved decision could not be verified",
+            );
+        }
+        if existing.outcome != outcome {
+            return reviewer_error(
+                StatusCode::CONFLICT,
+                "this report already has a different final decision",
+            );
+        }
+        if materialize_directive(&state, &existing).await.is_err() {
+            return reviewer_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the signed directive could not be placed in the outbox",
+            );
+        }
+        return secure_redirect(&format!("/{token}"));
+    }
+    let decided_at_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64);
+    let directive = match create_directive(&state, &report, outcome, decided_at_millis) {
+        Ok(directive) => directive,
+        Err(_) => {
+            return reviewer_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the signed directive could not be created",
+            );
+        }
+    };
+    let decision = ReviewDecisionRecord {
+        version: 1,
+        receipt_id: receipt_id.clone(),
+        report_id: report.report_id.clone(),
+        outcome,
+        decided_at_millis,
+        directive,
+    };
+    let mut bytes = match serde_json::to_vec_pretty(&decision) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return reviewer_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the decision could not be encoded",
+            );
+        }
+    };
+    bytes.push(b'\n');
+    match write_private_file(&decision_path, &bytes).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let Ok(existing) = read_decision(&decision_path).await else {
+                return reviewer_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the saved decision could not be read",
+                );
+            };
+            if existing.outcome != outcome
+                || validate_decision(&state, &existing, &receipt_id, &report).is_err()
+            {
+                return reviewer_error(
+                    StatusCode::CONFLICT,
+                    "this report already has a different final decision",
+                );
+            }
+        }
+        Err(_) => {
+            return reviewer_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the decision could not be saved",
+            );
+        }
+    }
+    if materialize_directive(&state, &decision).await.is_err() {
+        return reviewer_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the signed directive could not be placed in the outbox",
+        );
     }
     secure_redirect(&format!("/{token}"))
 }
@@ -170,9 +411,6 @@ async fn load_reports(state: &ReviewState) -> anyhow::Result<Vec<ReviewItem>> {
         if !valid_receipt_id(&receipt_id) {
             continue;
         }
-        let reviewed = fs::metadata(reviewed_marker_path(&state.state_dir, &receipt_id))
-            .await
-            .is_ok();
         let report = match read_and_verify_report(
             state.recipient.as_ref(),
             &entry.path(),
@@ -183,18 +421,190 @@ async fn load_reports(state: &ReviewState) -> anyhow::Result<Vec<ReviewItem>> {
             Ok(report) => Ok(report),
             Err(_) => Err("could not decrypt or cryptographically verify this envelope"),
         };
+        let decision = match read_decision(&decision_path(&state.decisions_dir, &receipt_id)).await
+        {
+            Ok(decision) => {
+                let verified_report = report
+                    .as_ref()
+                    .map_err(|_| anyhow::anyhow!("decision belongs to an invalid report"))?;
+                validate_decision(state, &decision, &receipt_id, verified_report)?;
+                materialize_directive(state, &decision).await?;
+                Some(decision)
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let legacy_reviewed = fs::metadata(reviewed_marker_path(&state.state_dir, &receipt_id))
+            .await
+            .is_ok();
         reports.push(ReviewItem {
             receipt_id,
-            reviewed,
+            decision,
+            legacy_reviewed,
             report,
         });
     }
     reports.sort_by(|left, right| {
-        left.reviewed
-            .cmp(&right.reviewed)
+        left.is_decided()
+            .cmp(&right.is_decided())
             .then_with(|| right.created_at_millis().cmp(&left.created_at_millis()))
     });
     Ok(reports)
+}
+
+fn create_directive(
+    state: &ReviewState,
+    report: &SafetyReportV1,
+    outcome: ReviewOutcome,
+    decided_at_millis: u64,
+) -> anyhow::Result<Option<SafetyDirectiveV1>> {
+    let group_id = report.reported_event.group_id.clone();
+    let directive = match outcome {
+        ReviewOutcome::NoAction => None,
+        ReviewOutcome::SuppressEvent => Some(SafetyDirectiveV1::suppress_event(
+            state.directive_signer.as_ref(),
+            report.category,
+            group_id,
+            report.reported_event.event_id.clone(),
+        )?),
+        ReviewOutcome::PauseGroup => {
+            let expires_at_millis = decided_at_millis
+                .checked_add(GROUP_QUARANTINE_MILLIS)
+                .context("group quarantine expiry overflowed")?;
+            Some(SafetyDirectiveV1::restrict_group(
+                state.directive_signer.as_ref(),
+                report.category,
+                group_id,
+                Some(expires_at_millis),
+            )?)
+        }
+        ReviewOutcome::BlockGroup => Some(SafetyDirectiveV1::restrict_group(
+            state.directive_signer.as_ref(),
+            report.category,
+            group_id,
+            None,
+        )?),
+        ReviewOutcome::BlockIdentity => Some(SafetyDirectiveV1::restrict_identity(
+            state.directive_signer.as_ref(),
+            report.category,
+            report.reported_event.author_public_key.clone(),
+            None,
+        )?),
+    };
+    Ok(directive)
+}
+
+fn validate_decision(
+    state: &ReviewState,
+    decision: &ReviewDecisionRecord,
+    receipt_id: &str,
+    report: &SafetyReportV1,
+) -> anyhow::Result<()> {
+    if decision.version != 1
+        || decision.receipt_id != receipt_id
+        || decision.report_id != report.report_id
+        || decision.decided_at_millis == 0
+    {
+        bail!("invalid saved safety decision")
+    }
+    let signing_public_key = state.directive_signer.public_key_base64();
+    match (decision.outcome, decision.directive.as_ref()) {
+        (ReviewOutcome::NoAction, None) => Ok(()),
+        (ReviewOutcome::SuppressEvent, Some(directive))
+            if directive.action == SafetyDirectiveActionV1::SuppressEvent
+                && directive.reason == report.category
+                && directive.group_id.as_deref()
+                    == Some(report.reported_event.group_id.as_str())
+                && directive.event_id.as_deref()
+                    == Some(report.reported_event.event_id.as_str()) =>
+        {
+            directive
+                .verify_with_signing_public_key(&signing_public_key)
+                .context("invalid event suppression directive")
+        }
+        (ReviewOutcome::PauseGroup, Some(directive))
+            if directive.action == SafetyDirectiveActionV1::RestrictGroup
+                && directive.reason == report.category
+                && directive.group_id.as_deref()
+                    == Some(report.reported_event.group_id.as_str())
+                && directive.event_id.is_none()
+                && directive.identity_public_key.is_none()
+                && directive.expires_at_millis
+                    == decision
+                        .decided_at_millis
+                        .checked_add(GROUP_QUARANTINE_MILLIS) =>
+        {
+            directive
+                .verify_with_signing_public_key(&signing_public_key)
+                .context("invalid group quarantine directive")
+        }
+        (ReviewOutcome::BlockGroup, Some(directive))
+            if directive.action == SafetyDirectiveActionV1::RestrictGroup
+                && directive.reason == report.category
+                && directive.group_id.as_deref()
+                    == Some(report.reported_event.group_id.as_str())
+                && directive.event_id.is_none()
+                && directive.identity_public_key.is_none()
+                && directive.expires_at_millis.is_none() =>
+        {
+            directive
+                .verify_with_signing_public_key(&signing_public_key)
+                .context("invalid indefinite group restriction directive")
+        }
+        (ReviewOutcome::BlockIdentity, Some(directive))
+            if directive.action == SafetyDirectiveActionV1::RestrictIdentity
+                && directive.reason == report.category
+                && directive.group_id.is_none()
+                && directive.event_id.is_none()
+                && directive.identity_public_key.as_deref()
+                    == Some(report.reported_event.author_public_key.as_str())
+                && directive.expires_at_millis.is_none() =>
+        {
+            directive
+                .verify_with_signing_public_key(&signing_public_key)
+                .context("invalid identity restriction directive")
+        }
+        _ => bail!("saved safety decision does not match its report"),
+    }
+}
+
+async fn read_decision(path: &Path) -> Result<ReviewDecisionRecord, std::io::Error> {
+    let metadata = fs::symlink_metadata(path).await?;
+    if !metadata.file_type().is_file() || metadata.len() as usize > MAX_DECISION_FILE_BYTES {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid safety decision file",
+        ));
+    }
+    let bytes = fs::read(path).await?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))
+}
+
+async fn materialize_directive(
+    state: &ReviewState,
+    decision: &ReviewDecisionRecord,
+) -> anyhow::Result<()> {
+    let Some(directive) = &decision.directive else {
+        return Ok(());
+    };
+    let mut bytes = serde_json::to_vec_pretty(directive)?;
+    bytes.push(b'\n');
+    let path = state
+        .outbox_dir
+        .join(format!("{}.json", directive.directive_id));
+    match write_private_file(&path, &bytes).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let existing = fs::read(&path).await?;
+            if existing == bytes {
+                Ok(())
+            } else {
+                bail!("directive outbox file does not match the signed decision")
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn verify_report_file(
@@ -268,7 +678,7 @@ fn ensure_private_file_permissions(_metadata: &std::fs::Metadata) -> anyhow::Res
     Ok(())
 }
 
-async fn write_private_marker(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+async fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -313,8 +723,12 @@ fn reviewed_marker_path(state_dir: &Path, receipt_id: &str) -> PathBuf {
     state_dir.join(format!("{receipt_id}.reviewed"))
 }
 
+fn decision_path(decisions_dir: &Path, receipt_id: &str) -> PathBuf {
+    decisions_dir.join(format!("{receipt_id}.json"))
+}
+
 fn render_index(state: &ReviewState, reports: &[ReviewItem]) -> String {
-    let new_count = reports.iter().filter(|report| !report.reviewed).count();
+    let new_count = reports.iter().filter(|report| !report.is_decided()).count();
     let mut html = String::with_capacity(16_384);
     html.push_str(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -331,15 +745,17 @@ h1{margin:0;font-size:clamp(34px,6vw,62px);line-height:.95;letter-spacing:-.055e
 .summary{display:flex;gap:8px;margin:0 0 18px}.summary span,.badge{padding:5px 8px;border-radius:999px;background:#ffffff0b;color:#bfb6c2;font-size:10px;font-weight:750;text-transform:uppercase;letter-spacing:.06em}
 .summary .new,.badge.verified{background:#b8ff3818;color:#c8ff6b}.empty{padding:46px;border:1px dashed #ffffff20;border-radius:18px;color:#9e95a1;text-align:center}
 .reports{display:grid;gap:14px}.report{overflow:hidden;border:1px solid #ffffff12;border-radius:18px;background:#201e22cc;box-shadow:0 18px 55px #0000002b}
-.report.reviewed{opacity:.7}.report.invalid{border-color:#ff718555}.report-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:18px 20px;border-bottom:1px solid #ffffff0d}
-.report-head h2{margin:4px 0 0;font-size:17px;letter-spacing:-.02em}.report-head p{margin:6px 0 0;color:#958c98;font:11px ui-monospace,SFMono-Regular,Menlo,monospace}
+.report.decided{opacity:.7}.report.invalid{border-color:#ff718555}.report-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:18px 20px;border-bottom:1px solid #ffffff0d}
+.report-head h2{margin:4px 0 0;font-size:17px;letter-spacing:-.02em}.report-head p{margin:6px 0 0;color:#958c98;font-size:11px}
 .report-body{display:grid;gap:14px;padding:20px}.content{padding:15px;border-radius:12px;background:#121114}.content h3,.facts dt{margin:0 0 7px;color:#8f8692;font-size:9px;font-weight:800;letter-spacing:.13em;text-transform:uppercase}
 pre{margin:0;color:#f5eff7;font:13px/1.58 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
 .muted{color:#938a96}.facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:0}.facts div{min-width:0;padding:12px;border:1px solid #ffffff0c;border-radius:10px}
 .facts dd{margin:0;color:#d5ced7;font-size:11px;line-height:1.5;overflow-wrap:anywhere}.facts code{font:10px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
+.people{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.person{min-width:0;padding:13px;border:1px solid #ffffff0d;border-radius:12px;background:#ffffff04}.person>small{display:block;margin-bottom:7px;color:#8f8692;font-size:9px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}.person strong{display:block;font-size:14px}.person code{display:inline-block;margin:6px 0 4px;padding:4px 6px;border-radius:6px;background:#0004;color:#c8ff6b;font:11px ui-monospace,SFMono-Regular,Menlo,monospace}.person span{display:block;color:#9b929e;font-size:10px;line-height:1.4}.staff{display:grid;gap:8px}.staff h3{margin:0;color:#8f8692;font-size:9px;letter-spacing:.12em;text-transform:uppercase}.staff-list{display:flex;flex-wrap:wrap;gap:7px}.staff-list .person{flex:1 1 210px}
+details.technical{border:1px solid #ffffff0c;border-radius:10px;background:#151417}details.technical summary{padding:11px 12px;color:#a9a0ac;font-size:10px;font-weight:750;cursor:pointer}details.technical .facts{padding:0 12px 12px}.download{color:#c8ff6b;text-decoration:none;font-size:10px;font-weight:800}
 .report-foot{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 20px;border-top:1px solid #ffffff0d;background:#17161980}
-.report-foot span{color:#958c98;font-size:10px}.report-foot button{padding:9px 12px;border:0;border-radius:9px;background:#b8ff38;color:#192000;font-size:11px;font-weight:850;cursor:pointer}
-@media(max-width:680px){main{width:min(100% - 20px,980px);padding-top:30px}header{align-items:flex-start;flex-direction:column}.facts{grid-template-columns:1fr}.report-head{flex-direction:column}}
+.report-foot>span{color:#958c98;font-size:10px}.actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:7px}.actions button{padding:9px 11px;border:1px solid #ffffff14;border-radius:9px;background:#302d33;color:#eee7f0;font-size:10px;font-weight:850;cursor:pointer}.actions .hide{background:#b8ff38;color:#192000}.actions .pause{border-color:#ff9a5b55;background:#ff9a5b18;color:#ffc49f}.actions .block{border-color:#ff718566;background:#ff71851a;color:#ff9aaa}
+@media(max-width:680px){main{width:min(100% - 20px,980px);padding-top:30px}header{align-items:flex-start;flex-direction:column}.facts,.people{grid-template-columns:1fr}.report-head{flex-direction:column}.report-foot{align-items:flex-start;flex-direction:column}.actions{justify-content:flex-start}}
 </style></head><body><main><header><div><p class="eyebrow">LOCAL / PRIVATE / VERIFIED</p><h1>noise safety</h1>
 <p class="lede">This reviewer reads encrypted envelope files from the local inbox. It never accepts internet connections and never renders or downloads reported media.</p></div>"#,
     );
@@ -367,7 +783,7 @@ pre{margin:0;color:#f5eff7;font:13px/1.58 ui-monospace,SFMono-Regular,Menlo,mono
 }
 
 fn render_report(html: &mut String, state: &ReviewState, item: &ReviewItem) {
-    let reviewed_class = if item.reviewed { " reviewed" } else { "" };
+    let decided_class = if item.is_decided() { " decided" } else { "" };
     let Ok(report) = &item.report else {
         let _ = write!(
             html,
@@ -384,14 +800,75 @@ fn render_report(html: &mut String, state: &ReviewState, item: &ReviewItem) {
         .iter()
         .map(|object| object.shards.len())
         .sum::<usize>();
+    let human_context = report.human_context.as_ref();
+    let group_context = human_context.and_then(|context| context.group.as_ref());
+    let group_name = group_context
+        .map(|group| group.name.as_str())
+        .unwrap_or("group name not included");
     let _ = write!(
         html,
         r#"<article class="report{}"><div class="report-head"><div><span class="badge verified">signatures verified</span><h2>{}</h2><p>{}</p></div><span class="badge">{}</span></div><div class="report-body">"#,
-        reviewed_class,
+        decided_class,
+        escape_html(group_name),
         category_label(report.category),
-        escape_html(&item.receipt_id),
-        if item.reviewed { "reviewed" } else { "new" }
+        if item.is_decided() { "decided" } else { "new" }
     );
+    html.push_str(r#"<div class="people">"#);
+    if let Some(author) = human_context.and_then(|context| context.reported_author.as_ref()) {
+        render_identity_card(
+            html,
+            "reported author",
+            author,
+            "profile shown in the group at report time",
+        );
+    } else {
+        render_identity_key_card(
+            html,
+            "reported author",
+            &report.reported_event.author_public_key,
+            "name not included in this older report",
+        );
+    }
+    if let Some(reporter) = human_context.and_then(|context| context.reporter.as_ref()) {
+        render_identity_card(
+            html,
+            "reporter",
+            &reporter.profile,
+            if reporter.follow_up_allowed {
+                "follow-up from noise safety allowed"
+            } else {
+                "reporter asked not to be contacted"
+            },
+        );
+    } else {
+        render_identity_key_card(
+            html,
+            "reporter",
+            &report.reporter_public_key,
+            "name and follow-up preference not included",
+        );
+    }
+    html.push_str("</div>");
+    if let Some(group) = group_context {
+        if let Some(founder) = &group.founder {
+            html.push_str(r#"<div class="staff"><h3>group staff</h3><div class="staff-list">"#);
+            render_identity_card(
+                html,
+                "founder · authority verified",
+                founder,
+                "contact profile shown by the reporting client",
+            );
+            for moderator in &group.reported_moderators {
+                render_identity_card(
+                    html,
+                    "reported moderator",
+                    moderator,
+                    "role reported by the client; no standalone role attestation",
+                );
+            }
+            html.push_str("</div></div>");
+        }
+    }
     if let Some(text) = text {
         let _ = write!(
             html,
@@ -421,11 +898,13 @@ fn render_report(html: &mut String, state: &ReviewState, item: &ReviewItem) {
     };
     let _ = write!(
         html,
-        r#"<dl class="facts"><div><dt>reported author</dt><dd><code>{}</code></dd></div><div><dt>reporter</dt><dd><code>{}</code></dd></div><div><dt>group / event</dt><dd><code>{}<br>{}</code></dd></div><div><dt>time</dt><dd>reported {}<br>event signed {}</dd></div><div><dt>group context</dt><dd>{}</dd></div><div><dt>media boundary</dt><dd>{}</dd></div></dl></div><div class="report-foot"><span>Cryptographic validity does not itself determine whether content violates policy.</span>"#,
+        r#"<details class="technical"><summary>technical details</summary><dl class="facts"><div><dt>reported author key</dt><dd><code>{}</code></dd></div><div><dt>reporter key</dt><dd><code>{}</code></dd></div><div><dt>group / event</dt><dd><code>{}<br>{}</code></dd></div><div><dt>report / receipt</dt><dd><code>{}<br>{}</code></dd></div><div><dt>time</dt><dd>reported {}<br>event signed {}</dd></div><div><dt>group context proof</dt><dd>{}</dd></div><div><dt>media boundary</dt><dd>{}</dd></div><div><dt>full report</dt><dd><a class="download" href="/{}/reports/{}/download">download verified JSON</a><br>contains no media bytes</dd></div></dl></details></div><div class="report-foot"><span>Cryptographic validity does not itself determine whether content violates policy.</span>"#,
         escape_html(&report.reported_event.author_public_key),
         escape_html(&report.reporter_public_key),
         escape_html(&report.reported_event.group_id),
         escape_html(&report.reported_event.event_id),
+        escape_html(&report.report_id),
+        escape_html(&item.receipt_id),
         format_timestamp(report.created_at_millis),
         format_timestamp(report.reported_event.created_at_millis),
         if report.group_context_proof.is_some() {
@@ -433,18 +912,76 @@ fn render_report(html: &mut String, state: &ReviewState, item: &ReviewItem) {
         } else {
             "no additional reporter-authored group event included"
         },
-        escape_html(&media_summary)
+        escape_html(&media_summary),
+        state.token,
+        item.receipt_id
     );
-    if item.reviewed {
-        html.push_str(r#"<span class="badge verified">reviewed</span>"#);
+    if let Some(decision) = &item.decision {
+        let _ = write!(
+            html,
+            r#"<span class="badge verified">{}</span>"#,
+            outcome_label(decision.outcome)
+        );
+    } else if item.legacy_reviewed {
+        html.push_str(r#"<span class="badge verified">reviewed (legacy)</span>"#);
     } else {
         let _ = write!(
             html,
-            r#"<form method="post" action="/{}/reports/{}/reviewed"><button type="submit">mark reviewed</button></form>"#,
-            state.token, item.receipt_id
+            r#"<div class="actions"><form method="post" action="/{token}/reports/{receipt}/decisions/no-action"><button type="submit">no action</button></form><form method="post" action="/{token}/reports/{receipt}/decisions/suppress-event"><button class="hide" type="submit">hide message</button></form><form method="post" action="/{token}/reports/{receipt}/decisions/pause-group"><button class="pause" type="submit">pause group 24h</button></form><form method="post" action="/{token}/reports/{receipt}/decisions/block-group"><button class="block" type="submit">block group</button></form><form method="post" action="/{token}/reports/{receipt}/decisions/block-identity"><button class="block" type="submit">block author</button></form></div>"#,
+            token = state.token,
+            receipt = item.receipt_id,
         );
     }
     html.push_str("</div></article>");
+}
+
+fn outcome_label(outcome: ReviewOutcome) -> &'static str {
+    match outcome {
+        ReviewOutcome::NoAction => "no action",
+        ReviewOutcome::SuppressEvent => "message hidden",
+        ReviewOutcome::PauseGroup => "group paused for 24 hours",
+        ReviewOutcome::BlockGroup => "group blocked",
+        ReviewOutcome::BlockIdentity => "author blocked",
+    }
+}
+
+fn render_identity_card(
+    html: &mut String,
+    role: &str,
+    profile: &SafetyProfileSnapshotV1,
+    note: &str,
+) {
+    let signature = noise_signature_for_public_key(&profile.public_key)
+        .unwrap_or_else(|_| "unavailable".to_owned());
+    let _ = write!(
+        html,
+        r#"<div class="person"><small>{}</small><strong>{}</strong><code>{}</code><span>{} · {}</span></div>"#,
+        escape_html(role),
+        escape_html(&profile.username),
+        escape_html(&signature),
+        direct_message_policy_label(profile.direct_message_policy),
+        escape_html(note)
+    );
+}
+
+fn render_identity_key_card(html: &mut String, role: &str, public_key: &str, note: &str) {
+    let signature =
+        noise_signature_for_public_key(public_key).unwrap_or_else(|_| "unavailable".to_owned());
+    let _ = write!(
+        html,
+        r#"<div class="person"><small>{}</small><strong>name unavailable</strong><code>{}</code><span>{}</span></div>"#,
+        escape_html(role),
+        escape_html(&signature),
+        escape_html(note)
+    );
+}
+
+fn direct_message_policy_label(policy: noise_core::DirectMessagePolicy) -> &'static str {
+    match policy {
+        noise_core::DirectMessagePolicy::Everyone => "accepts DMs",
+        noise_core::DirectMessagePolicy::SharedGroups => "shared-group DMs only",
+        noise_core::DirectMessagePolicy::Nobody => "DMs closed",
+    }
 }
 
 fn category_label(category: SafetyReportCategoryV1) -> &'static str {

@@ -4530,7 +4530,7 @@ export default function App() {
           groupContentRating={selectedConversationState?.group.content_rating ?? "general"}
           busy={busy}
           onClose={() => setDialog(null)}
-          onReport={(category, destination, details) => perform(async () => {
+          onReport={(category, destination, details, followUpAllowed) => perform(async () => {
             if (destination === "noise" && !noiseSafetyUrl) {
               throw new Error("noise safety reporting is not available in this build");
             }
@@ -4553,6 +4553,7 @@ export default function App() {
                 message_event_id: dialog.message.event_id,
                 category,
                 details: details || null,
+                follow_up_allowed: followUpAllowed,
                 safety_url: noiseSafetyUrl,
                 recipient_public_key_base64: noiseSafetyPublicKey,
               });
@@ -9314,6 +9315,7 @@ function ReportMessageDialog({
     category: SafetyReportCategory,
     destination: ReportDestination,
     details: string,
+    followUpAllowed: boolean,
   ) => Promise<boolean>;
   onBlock: () => void;
   onLeave: () => void;
@@ -9321,6 +9323,7 @@ function ReportMessageDialog({
   const [category, setCategory] = useState<SafetyReportCategory | null>(null);
   const [destination, setDestination] = useState<ReportDestination>("group_staff");
   const [details, setDetails] = useState("");
+  const [followUpAllowed, setFollowUpAllowed] = useState(true);
   const [submittedTo, setSubmittedTo] = useState<ReportDestination | null>(null);
   const categories = REPORT_CATEGORIES.filter(
     (item) =>
@@ -9354,7 +9357,7 @@ function ReportMessageDialog({
   };
   const submit = async () => {
     if (!category || busy) return;
-    if (await onReport(category, destination, details.trim())) {
+    if (await onReport(category, destination, details.trim(), followUpAllowed)) {
       setSubmittedTo(destination);
     }
   };
@@ -9405,11 +9408,22 @@ function ReportMessageDialog({
           <p className="report-route-note"><Shield size={14} /> this category goes privately to noise safety</p>
         )}
         {destination === "noise" && (
-          <p className="report-data-note">
-            {message.text.trim()
-              ? "The exact text of this message will be included in the encrypted report. Surrounding messages and media bytes are not sent."
-              : "This message has no text. Media bytes are not sent; noise receives signed event metadata and encrypted object locations."}
-          </p>
+          <>
+            <p className="report-data-note">
+              {message.text.trim()
+                ? "The exact text of this message will be included in the encrypted report. Surrounding messages and media bytes are not sent."
+                : "This message has no text. Media bytes are not sent; noise receives signed event metadata and encrypted object locations."}
+            </p>
+            <label className="report-follow-up">
+              <input
+                type="checkbox"
+                checked={followUpAllowed}
+                disabled={busy}
+                onChange={(event) => setFollowUpAllowed(event.target.checked)}
+              />
+              <span><strong>allow follow-up from noise safety</strong><small>noise safety may contact you about this report through an official account</small></span>
+            </label>
+          </>
         )}
         <LabeledArea label="details (optional)" count={`${details.length}/180`}>
           <textarea

@@ -56,11 +56,12 @@ use noise_core::{
     GroupPresence, GroupProfile, GroupState, HistoryKeyLink, Identity, InviteRecord,
     InviteRotation, MlsAccountState, MlsControlLog, MlsEpochRecord, MlsGroupGenesis,
     MlsJoinRequest, MlsRemovalReason, MlsRemovalRequest, Profile, PushSubscriptionRegistration,
-    SafetyEncryptedObjectV1, SafetyEncryptedShardV1, SafetyReportV1, SignedEvent, StorageManifest,
-    derive_account_credentials, direct_mailbox_id, direct_message_id, display_frequency,
-    display_noise_id, encode_blob_for_storage, frequency_locator, generate_frequency,
-    generate_noise_id, media_preview_is_valid, normalize_frequency, profile_media_scope_id,
-    reconstruct_blob_from_storage_payloads, valid_reaction_emoji,
+    SafetyEncryptedObjectV1, SafetyEncryptedShardV1, SafetyGroupContextV1, SafetyProfileSnapshotV1,
+    SafetyReportHumanContextV1, SafetyReportV1, SafetyReporterContextV1, SignedEvent,
+    StorageManifest, derive_account_credentials, direct_mailbox_id, direct_message_id,
+    display_frequency, display_noise_id, encode_blob_for_storage, frequency_locator,
+    generate_frequency, generate_noise_id, media_preview_is_valid, normalize_frequency,
+    profile_media_scope_id, reconstruct_blob_from_storage_payloads, valid_reaction_emoji,
 };
 pub use noise_core::{
     DirectMessagePolicy, ForwardedFrom, GroupContentRating, MediaAttachment, MediaChunk,
@@ -7202,6 +7203,7 @@ impl NoiseClient {
         message_event_id: &str,
         category: SafetyReportCategoryV1,
         details: Option<String>,
+        follow_up_allowed: bool,
         safety_url: &str,
         recipient_public_key_base64: Option<String>,
     ) -> anyhow::Result<SafetyReportReceipt> {
@@ -7249,7 +7251,53 @@ impl NoiseClient {
             .cloned();
         let reported_text_excerpt =
             (!target.text.trim().is_empty()).then(|| target.text.trim().to_owned());
-        let report = SafetyReportV1::create(
+        let founder = (!group.authority_nonce_base64.is_empty())
+            .then_some(())
+            .and_then(|()| view.owner_public_key.as_ref())
+            .and_then(|public_key| {
+                view.members
+                    .get(public_key)
+                    .map(|member| SafetyProfileSnapshotV1 {
+                        public_key: member.public_key.clone(),
+                        username: member.username.clone(),
+                        direct_message_policy: member.direct_message_policy,
+                    })
+            });
+        let mut reported_moderators = view
+            .moderators
+            .iter()
+            .filter_map(|public_key| view.members.get(public_key))
+            .map(|member| SafetyProfileSnapshotV1 {
+                public_key: member.public_key.clone(),
+                username: member.username.clone(),
+                direct_message_policy: member.direct_message_policy,
+            })
+            .collect::<Vec<_>>();
+        reported_moderators.sort_by(|left, right| left.public_key.cmp(&right.public_key));
+        let human_context = SafetyReportHumanContextV1 {
+            reporter: Some(SafetyReporterContextV1 {
+                profile: SafetyProfileSnapshotV1 {
+                    public_key: actor_public_key.clone(),
+                    username: state.profile.username.clone(),
+                    direct_message_policy: state.profile.effective_direct_message_policy(),
+                },
+                follow_up_allowed,
+            }),
+            reported_author: Some(SafetyProfileSnapshotV1 {
+                public_key: target.author_public_key.clone(),
+                username: target.username.clone(),
+                direct_message_policy: target.direct_message_policy,
+            }),
+            group: Some(SafetyGroupContextV1 {
+                name: view.profile.name.clone(),
+                authority_nonce_base64: founder
+                    .as_ref()
+                    .map(|_| group.authority_nonce_base64.clone()),
+                founder,
+                reported_moderators,
+            }),
+        };
+        let report = SafetyReportV1::create_with_human_context(
             &identity,
             category,
             reported_event,
@@ -7258,6 +7306,7 @@ impl NoiseClient {
             safety_encrypted_objects(target.attachment.as_ref()),
             reported_text_excerpt,
             details,
+            Some(human_context),
         )
         .context("could not prepare the noise safety report")?;
 
