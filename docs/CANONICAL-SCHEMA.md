@@ -1,6 +1,7 @@
 # noise canonical PostgreSQL schema
 
-Status: initial schema contract for the central compatibility service
+Status: initial schema contract consumed by the authentication,
+encrypted-account-vault, and canonical group-event service layers
 
 Updated: 2026-07-27
 
@@ -142,5 +143,10 @@ service startup. Production application traffic remains on the relays until:
 4. the central service can consume the schema; and
 5. the compatibility importer verifies the production object union.
 
-The empty production `noise` database is intentionally left unchanged by the
-design-validation step.
+The service now consumes the account, device, session, account-vault, group,
+membership, stream, event, restriction, cursor, and outbox portions of this
+contract in isolated validation. MLS control ingestion, direct events, media,
+push, safety-directive ingestion, and workers remain to be implemented.
+
+The empty production `noise` database is intentionally left unchanged by these
+design and service-validation steps.

@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    http::StatusCode,
+    http::{StatusCode, header::CACHE_CONTROL},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -40,6 +40,34 @@ impl ApiError {
         }
     }
 
+    pub const fn not_found(code: &'static str) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code,
+        }
+    }
+
+    pub const fn gone(code: &'static str) -> Self {
+        Self {
+            status: StatusCode::GONE,
+            code,
+        }
+    }
+
+    pub const fn precondition_required() -> Self {
+        Self {
+            status: StatusCode::PRECONDITION_REQUIRED,
+            code: "if_match_required",
+        }
+    }
+
+    pub const fn precondition_failed(code: &'static str) -> Self {
+        Self {
+            status: StatusCode::PRECONDITION_FAILED,
+            code,
+        }
+    }
+
     pub const fn too_many_requests() -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -65,6 +93,11 @@ struct ErrorBody {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(ErrorBody { error: self.code })).into_response()
+        (
+            self.status,
+            [(CACHE_CONTROL, "no-store")],
+            Json(ErrorBody { error: self.code }),
+        )
+            .into_response()
     }
 }

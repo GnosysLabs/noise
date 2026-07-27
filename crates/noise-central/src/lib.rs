@@ -1,6 +1,8 @@
 mod config;
 mod database;
 mod error;
+mod events;
+mod vaults;
 
 use std::sync::Arc;
 
@@ -9,7 +11,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
-        header::{AUTHORIZATION, CONTENT_TYPE},
+        header::{AUTHORIZATION, CONTENT_TYPE, ETAG, IF_MATCH},
     },
     response::IntoResponse,
     routing::{delete, get, post},
@@ -31,12 +33,17 @@ use error::ApiError;
 const CHALLENGE_LIFETIME_SECONDS: i64 = 120;
 const SESSION_LIFETIME_SECONDS: i64 = 60 * 60;
 const MAX_ACTIVE_CHALLENGES: i64 = 5;
-const MAX_BODY_BYTES: usize = 64 * 1024;
+const MAX_BODY_BYTES: usize = 3_000_000;
 
 #[derive(Clone)]
 struct AppState {
     database: Database,
     token_hash_key: [u8; 32],
+}
+
+struct AuthenticatedSession {
+    account_id: i64,
+    identity_public_key: [u8; 32],
 }
 
 #[derive(Deserialize)]
@@ -93,6 +100,19 @@ pub async fn build_app(config: &CentralConfig) -> anyhow::Result<Router> {
         .route("/v1/auth/sessions", post(open_session))
         .route("/v1/auth/sessions/current", delete(close_current_session))
         .route(
+            "/v1/account-vaults/{locator}",
+            get(vaults::get_account_vault).put(vaults::put_account_vault),
+        )
+        .route("/v1/events", post(events::publish_group_event))
+        .route(
+            "/v1/groups/{group_id}/events",
+            get(events::group_events_after),
+        )
+        .route(
+            "/v1/groups/{group_id}/events/latest",
+            get(events::latest_group_events),
+        )
+        .route(
             "/v1/devices/{installation_id}/revoke",
             post(revoke_installation),
         )
@@ -103,8 +123,9 @@ pub async fn build_app(config: &CentralConfig) -> anyhow::Result<Router> {
         app = app.layer(
             CorsLayer::new()
                 .allow_origin(HeaderValue::from_str(origin)?)
-                .allow_methods([Method::GET, Method::POST, Method::DELETE])
-                .allow_headers([CONTENT_TYPE, AUTHORIZATION]),
+                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+                .allow_headers([CONTENT_TYPE, AUTHORIZATION, IF_MATCH])
+                .expose_headers([ETAG]),
         );
     }
 
@@ -835,6 +856,83 @@ fn bearer_token(headers: &HeaderMap) -> Result<[u8; 32], ApiError> {
         .strip_prefix("Bearer ")
         .ok_or_else(ApiError::unauthorized)?;
     decode_canonical_array::<32>(token, "unauthorized").map_err(|_| ApiError::unauthorized())
+}
+
+async fn authenticate_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedSession, ApiError> {
+    let token = bearer_token(headers)?;
+    let token_hash = blake3::keyed_hash(&state.token_hash_key, &token);
+    let client = state
+        .database
+        .pool
+        .get()
+        .await
+        .map_err(ApiError::database)?;
+    let row = client
+        .query_opt(
+            "SELECT s.account_id, a.identity_public_key
+             FROM noise.sessions s
+             JOIN noise.accounts a ON a.account_id = s.account_id
+             JOIN noise.devices d
+               ON d.device_pk = s.device_pk AND d.account_id = s.account_id
+             LEFT JOIN noise.account_restrictions ar
+               ON ar.account_id = a.account_id
+              AND (ar.expires_at IS NULL OR ar.expires_at > clock_timestamp())
+             WHERE s.token_hash = $1
+               AND s.revoked_at IS NULL
+               AND s.expires_at > clock_timestamp()
+               AND a.status = 'active'
+               AND d.revoked_at IS NULL
+               AND ar.account_id IS NULL",
+            &[&token_hash.as_bytes().as_slice()],
+        )
+        .await
+        .map_err(ApiError::database)?
+        .ok_or_else(ApiError::unauthorized)?;
+    let identity: Vec<u8> = row.get(1);
+    let identity_public_key: [u8; 32] = identity
+        .try_into()
+        .map_err(|_| ApiError::database("stored identity key has an invalid length"))?;
+    Ok(AuthenticatedSession {
+        account_id: row.get(0),
+        identity_public_key,
+    })
+}
+
+fn decode_hex_32(value: &str, error_code: &'static str) -> Result<[u8; 32], ApiError> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ApiError::bad_request(error_code));
+    }
+    let mut decoded = [0u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(pair[0]).ok_or_else(|| ApiError::bad_request(error_code))?;
+        let low = hex_nibble(pair[1]).ok_or_else(|| ApiError::bad_request(error_code))?;
+        decoded[index] = (high << 4) | low;
+    }
+    if encode_hex(&decoded) != value {
+        return Err(ApiError::bad_request(error_code));
+    }
+    Ok(decoded)
+}
+
+fn encode_hex(value: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+const fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
 }
 
 fn parse_u64(value: &str) -> Result<u64, ApiError> {

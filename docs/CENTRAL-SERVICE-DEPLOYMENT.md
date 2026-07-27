@@ -1,6 +1,7 @@
 # noise central service deployment
 
-Status: production foundation provisioned; initial protocol and schema specified
+Status: production foundation provisioned; authentication, encrypted-vault,
+and canonical group-event service built but not deployed
 
 Updated: 2026-07-27
 
@@ -68,10 +69,12 @@ are documented in `DEVICE-SESSIONS.md` and implemented in `noise-core`.
 Authentication and renewal are invisible operations performed by the same
 installation; another device is never required.
 
-The first runnable authentication API is implemented in `crates/noise-central`
-and documented in `CENTRAL-API.md`. Its complete registration, session, logout,
-and revocation flow passed against a disposable PostgreSQL database on Cyphers
-VPS. It has not been installed, routed through nginx, or connected to clients.
+The first runnable API is implemented in `crates/noise-central` and documented
+in `CENTRAL-API.md`. Its registration, silent session, encrypted account-vault
+compare-and-swap, active-membership group-event publication, canonical event
+pagination, logout, and revocation flows pass against a disposable PostgreSQL
+database on Cyphers VPS. It has not been installed, routed through nginx, or
+connected to clients.
 
 The initial canonical database contract is documented in
 `CANONICAL-SCHEMA.md` and implemented by
@@ -100,8 +103,8 @@ backup and cannot be hidden inside an ordinary application deployment.
 
 ## Work still required before traffic
 
-- extend the central API from authentication into account-vault, membership,
-  encrypted-event, MLS, realtime, media, and safety operations;
+- extend the central API into MLS control records, canonical direct events,
+  realtime, media, and safety-directive operations;
 - apply the canonical migration as part of the first reversible service
   deployment, not as an isolated production mutation;
 - implement the transactional outbox/job claim contract;

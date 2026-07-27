@@ -1,7 +1,7 @@
 # noise central API
 
-Status: authentication service implemented and disposable-database validated;
-not deployed
+Status: authentication, encrypted account-vault, and canonical group-event
+service implemented; not deployed
 
 Updated: 2026-07-27
 
@@ -20,12 +20,33 @@ The first runnable central-service layer implements:
 | `POST /v1/auth/sessions` | Verify the same installation's proof and return a one-hour opaque bearer token |
 | `DELETE /v1/auth/sessions/current` | Revoke the current bearer token |
 | `POST /v1/devices/{installation_id}/revoke` | Verify an account-signed revocation and invalidate every installation token |
+| `GET /v1/account-vaults/{locator}` | Bootstrap-fetch the current signed encrypted vault and revision ETag by its opaque locator |
+| `PUT /v1/account-vaults/{locator}` | Compare-and-swap the authenticated account's next signed encrypted vault revision |
+| `POST /v1/events` | Verify and canonically order a signed encrypted group or topic event |
+| `GET /v1/groups/{group_id}/events` | Fetch visible events after a canonical cursor |
+| `GET /v1/groups/{group_id}/events/latest` | Fetch the latest visible canonical event page |
 
 The `installation_id` path value is the canonical unpadded base64 value and
 must be URL-encoded by a client when it contains reserved URL characters.
 
 This service does not change the user-facing sign-in flow. Session challenges
 and renewal are background operations performed by the same installation.
+
+## Account restore bootstrap
+
+A new installation starts with only the user's noise ID and password. Those
+values derive a 256-bit account locator and vault key locally. The installation
+must download the encrypted vault before it can recover the identity key needed
+to register itself, so vault `GET` cannot require an already-existing bearer
+session.
+
+The locator is the capability for this read, as in the existing relay protocol.
+The response is still identity-signed ciphertext; the server never receives
+the password or vault key, and only the client can decrypt it. Vault creation,
+updates, and deletion remain bearer-authenticated and identity-signed. The
+response is marked `Cache-Control: no-store`. The public edge must rate-limit
+bootstrap reads and return the same compact not-found response without
+revealing account metadata.
 
 ## Transactional guarantees
 
@@ -44,6 +65,21 @@ and renewal are background operations performed by the same installation.
 - Client wall-clock correctness is not an authentication dependency. Challenge
   expiry uses the database clock, and revocation replay protection uses its
   signed monotonic sequence.
+- Vault writes require `If-Match`, advance exactly one signed revision, retain
+  every accepted encrypted version, and update the head atomically. Exact
+  retries are idempotent.
+- A signed vault locator and identity are bound to one authenticated account.
+  A signed tombstone marks the account deleted and revokes all of its sessions
+  in the same transaction.
+- Event publication verifies the envelope signature and authenticated author,
+  requires active group membership, enforces active account/group/event safety
+  restrictions, assigns one commit-ordered canonical cursor, and creates its
+  outbox record in the same transaction.
+- Exact event retries return the original cursor. A different event claiming
+  the same protocol scope, author, and sequence is rejected.
+- Event reads require active membership and omit hidden or restricted events.
+  The returned high-water cursor lets a client advance safely past moderated
+  gaps without seeing the hidden envelopes.
 
 ## Stored secrets
 
@@ -58,6 +94,10 @@ only:
 `NOISE_TOKEN_HASH_KEY` must contain 32 random bytes encoded as canonical
 unpadded base64. It is a server secret, never a client setting, database value,
 or committed file.
+
+Account-vault and event records contain signed ciphertext envelopes. The
+service stores no account-vault key, message plaintext, media plaintext, group
+name, or profile plaintext.
 
 Request bodies, passwords, vault keys, identity secrets, installation private
 keys, raw challenge nonces, and raw bearer tokens are not logged.
@@ -86,13 +126,20 @@ not apply migrations automatically.
 ## HTTP boundary
 
 - The server refuses to listen publicly and must remain behind nginx/TLS.
-- Request bodies are limited to 64 KiB.
+- Request bodies are limited to 3,000,000 bytes so the existing encrypted
+  account-vault and event envelope limits fit without accepting unbounded
+  uploads. Media bytes use a separate capability flow and never pass through
+  these JSON routes.
 - Browser CORS is disabled unless one exact HTTPS origin is configured.
+- Browser CORS permits `GET`, `POST`, `PUT`, and `DELETE`, accepts
+  `Authorization`, `Content-Type`, and `If-Match`, and exposes only the vault
+  `ETag` response header.
 - Error responses contain stable codes, not database or cryptographic details.
 - Registration and session challenge issuance are bounded to five concurrently
   active challenges per pseudonymous account/installation.
 - nginx or another edge must add source-based abuse limits before the
-  unauthenticated registration-challenge endpoint is public.
+  unauthenticated registration-challenge and encrypted-vault bootstrap
+  endpoints are public.
 
 ## Validation evidence
 
@@ -100,17 +147,18 @@ On 2026-07-27 the Linux service and canonical migration were exercised against
 a disposable PostgreSQL database on Cyphers VPS. The test covered:
 
 1. startup schema verification and health;
-2. identity-authorized installation registration;
-3. idempotent registration replay;
-4. same-installation session creation;
-5. rejection of one-time challenge reuse;
-6. current-session logout;
-7. a new invisible session;
-8. account-signed installation revocation;
-9. revocation idempotency;
-10. rejection of the revoked bearer token and new session challenges; and
-11. confirmation that raw bearer tokens and raw challenge nonces were not
-    stored.
+2. identity-authorized installation registration and idempotent replay;
+3. same-installation session creation and rejection of challenge reuse;
+4. encrypted vault create, exact retry, unauthenticated bootstrap
+   fetch/local-decrypt, stale compare-and-swap rejection, and next-revision
+   update;
+5. active-membership group-event publication, exact retry, sequence-conflict
+   rejection, canonical pagination, latest-page fetch, and outbox creation;
+6. current-session logout and a new invisible session;
+7. account-signed installation revocation and idempotent replay;
+8. rejection of the revoked bearer token and new session challenges; and
+9. confirmation that raw bearer tokens and raw challenge nonces were not
+   stored.
 
 The disposable database and source/build directories were removed afterward.
 The production `noise` schema remained empty.
@@ -120,13 +168,11 @@ The production `noise` schema remained empty.
 The service is not production-ready and has no public nginx route. Remaining
 central API layers include:
 
-- encrypted account-vault compare-and-swap;
-- group and membership authorization;
-- canonical encrypted event publication and pagination;
 - MLS control records;
+- canonical direct-thread authorization and encrypted direct events;
 - realtime WebSocket catch-up;
 - media upload/download capabilities and R2 runtime credentials;
-- safety restriction enforcement;
+- safety directive ingestion and restriction maintenance;
 - transactional outbox workers and cleanup jobs;
 - production migrations, backups, systemd, nginx, monitoring, and rollback;
   and
