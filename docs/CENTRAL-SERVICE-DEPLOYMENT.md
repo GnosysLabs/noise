@@ -1,6 +1,6 @@
 # noise central service deployment
 
-Status: production foundation selected and provisioned
+Status: production foundation provisioned; initial protocol and schema specified
 
 Updated: 2026-07-27
 
@@ -63,6 +63,18 @@ The PostgreSQL foundation contains:
 The database password exists only in the protected server environment file. It
 must not be printed, copied into Git, or embedded in a client build.
 
+The signed installation-session contract is documented in
+`DEVICE-SESSIONS.md`. Authentication and renewal are invisible operations
+performed by the same installation; another device is never required.
+
+The initial canonical database contract is documented in
+`CANONICAL-SCHEMA.md` and implemented by
+`deploy/central/migrations/0001_canonical_schema.sql`. On 2026-07-27 that
+migration and a representative constraint smoke test passed in a disposable
+PostgreSQL database on this host. The disposable database was removed and the
+production `noise` schema remained empty. The migration is not applied to
+production until a central-service release can consume it.
+
 ## Deployment and rollback boundary
 
 The production service should be installed into a versioned release directory.
@@ -82,9 +94,11 @@ backup and cannot be hidden inside an ordinary application deployment.
 
 ## Work still required before traffic
 
-- define the signed device-session protocol and minimum server-visible
-  membership record;
-- specify and review the canonical PostgreSQL schema;
+- implement the signed installation-session statements and test vectors in
+  `noise-core`;
+- implement the central API and transactional schema access layer;
+- apply the canonical migration as part of the first reversible service
+  deployment, not as an isolated production mutation;
 - implement the transactional outbox/job claim contract;
 - choose and configure the canonical API hostname;
 - create a bucket-scoped R2 runtime credential directly in the protected

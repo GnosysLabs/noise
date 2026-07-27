@@ -2,7 +2,7 @@
 
 - Status: accepted direction for implementation planning
 - Decision date: 2026-07-27
-- Implementation status: not started
+- Implementation status: production foundation and protocol design in progress
 - Media storage: Cloudflare R2 selected
 - Deployment model: local development followed by production; no staging environment
 
@@ -178,9 +178,12 @@ The API service:
 - enforces active safety restrictions.
 
 The API must not receive an account password. After restoring and decrypting an
-account vault locally, a client proves control by signing a server nonce with
-the restored identity or registered device key. The server returns a
-short-lived, device-bound session.
+account vault locally, the same installation proves control by signing a server
+nonce with the restored identity or its registered local authentication key.
+The server returns a short-lived, device-bound session and the installation
+renews it silently. No other device, approval prompt, code, or additional
+sign-in step is required. The complete UX and signing contract is documented in
+`DEVICE-SESSIONS.md`.
 
 ### 3. Realtime gateway
 
@@ -197,7 +200,8 @@ moderation events, safety actions, and account-vault revisions are durable.
 ### 4. PostgreSQL
 
 PostgreSQL is the authoritative metadata and ordered-event store. The initial
-logical schema should include:
+logical schema is specified in `CANONICAL-SCHEMA.md` and
+`deploy/central/migrations/0001_canonical_schema.sql`. It includes:
 
 | Area | Stored state |
 |---|---|

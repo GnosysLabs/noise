@@ -244,7 +244,10 @@ The private production Cloudflare R2 bucket baseline and the empty PostgreSQL
 foundation on Cyphers VPS were provisioned on 2026-07-27. Durable jobs will
 initially use PostgreSQL rather than a separate queue service. The R2
 bucket-scoped runtime credential will be created only when the production
-service can consume it from the protected server environment. The next design
-work is the signed device-session contract and canonical PostgreSQL schema. The
-importer should be built only after the verifier can reproduce every aggregate
-and digest in this document from copied data.
+service can consume it from the protected server environment. The invisible
+same-installation session contract and canonical PostgreSQL schema were
+specified and the migration was validated in a disposable database without
+changing production. The next implementation work is the signed protocol
+primitives and central API. The importer should be built only after the
+verifier can reproduce every aggregate and digest in this document from copied
+data.
