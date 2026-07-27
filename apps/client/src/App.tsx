@@ -9515,13 +9515,6 @@ function ReportMessageDialog({
             ) : (
               <p className="report-route-note"><Shield size={14} /> this category goes to the group founder and moderators</p>
             )}
-            {destination === "noise" && (
-              <p className="report-data-note">
-                {message.text.trim()
-                  ? "The exact text of this message will be included in the encrypted report. Surrounding messages and media bytes are not sent."
-                  : "This message has no text. Media bytes are not sent; noise receives signed event metadata and encrypted object locations."}
-              </p>
-            )}
             <LabeledArea label="details (optional)" count={`${details.length}/180`}>
               <textarea
                 autoFocus

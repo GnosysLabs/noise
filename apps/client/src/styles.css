@@ -509,9 +509,8 @@ button:disabled { cursor: default; opacity: 0.48; }
 .report-category-list strong { color: #ede9f0; font-size: 11px; font-weight: 630; }
 .report-category-list small { color: var(--faint); font-size: 9.5px; line-height: 1.35; }
 .report-category-list i { display: grid; width: 18px; height: 18px; flex: none; place-items: center; border: 1px solid rgba(255,255,255,.12); border-radius: 50%; color: var(--accent-light); font-style: normal; }
-.report-route-note, .report-data-note { margin: 0; border-radius: 8px; color: var(--muted); font-size: 10px; line-height: 1.45; }
+.report-route-note { margin: 0; border-radius: 8px; color: var(--muted); font-size: 10px; line-height: 1.45; }
 .report-route-note { display: flex; align-items: center; gap: 7px; padding: 8px 9px; background: rgba(var(--accent-rgb),.1); }
-.report-data-note { padding: 8px 9px; background: rgba(0,0,0,.14); }
 @media (max-width: 760px) {
   .modal.report-message-modal { width: min(430px, 100%); }
   .report-message-modal .dialog-heading { display: block; }
