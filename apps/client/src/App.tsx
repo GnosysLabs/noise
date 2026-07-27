@@ -9490,79 +9490,91 @@ function ReportMessageDialog({
     }
   };
   return (
-    <Modal onClose={onClose}>
+    <Modal onClose={onClose} wide className="report-message-modal">
       <DialogHeading icon={<TriangleAlert />} title="report message" detail="choose what is wrong" />
-      <div className="report-target-preview"><strong>{message.username}</strong><p>{reportMessagePreview(message)}</p></div>
-      <div className="report-category-list" role="radiogroup" aria-label="report category">
-        {categories.map((item) => (
-          <button
-            type="button"
-            role="radio"
-            aria-checked={category === item.value}
-            className={category === item.value ? "selected" : ""}
-            disabled={busy}
-            key={item.value}
-            onClick={() => selectCategory(item)}
-          >
-            <span><strong>{item.label}</strong><small>{item.detail}</small></span>
-            <i>{category === item.value && <Check size={13} />}</i>
-          </button>
-        ))}
-      </div>
-      {selectedCategory && <>
-        {selectedCategory.destination === "group_staff" ? (
-          <div className="report-destination">
-            <small>who should receive this?</small>
-            <div>
+      <div className="report-dialog-layout">
+        <section className="report-dialog-categories">
+          <div className="report-target-preview"><strong>{message.username}</strong><p>{reportMessagePreview(message)}</p></div>
+          <div className="report-category-list" role="radiogroup" aria-label="report category">
+            {categories.map((item) => (
               <button
-                className={destination === "group_staff" ? "selected" : ""}
+                type="button"
+                role="radio"
+                aria-checked={category === item.value}
+                className={category === item.value ? "selected" : ""}
                 disabled={busy}
-                onClick={() => setDestination("group_staff")}
+                key={item.value}
+                onClick={() => selectCategory(item)}
               >
-                <strong>group staff</strong>
-                <span>the founder and moderators</span>
+                <span><strong>{item.label}</strong><small>{item.detail}</small></span>
+                <i>{category === item.value && <Check size={13} />}</i>
               </button>
-              <button
-                className={destination === "noise" ? "selected" : ""}
-                disabled={busy}
-                onClick={() => setDestination("noise")}
-              >
-                <strong>noise safety instead</strong>
-                <span>use when staff are involved or unsafe to contact</span>
-              </button>
-            </div>
+            ))}
           </div>
-        ) : (
-          <p className="report-route-note"><Shield size={14} /> this category goes privately to noise safety</p>
-        )}
-        {destination === "noise" && (
-          <>
-            <p className="report-data-note">
-              {message.text.trim()
-                ? "The exact text of this message will be included in the encrypted report. Surrounding messages and media bytes are not sent."
-                : "This message has no text. Media bytes are not sent; noise receives signed event metadata and encrypted object locations."}
-            </p>
-            <label className="report-follow-up">
-              <input
-                type="checkbox"
-                checked={followUpAllowed}
-                disabled={busy}
-                onChange={(event) => setFollowUpAllowed(event.target.checked)}
+        </section>
+        <section className="report-dialog-details">
+          {selectedCategory ? <>
+            {selectedCategory.destination === "group_staff" ? (
+              <div className="report-destination">
+                <small>who should receive this?</small>
+                <div>
+                  <button
+                    className={destination === "group_staff" ? "selected" : ""}
+                    disabled={busy}
+                    onClick={() => setDestination("group_staff")}
+                  >
+                    <strong>group staff</strong>
+                    <span>the founder and moderators</span>
+                  </button>
+                  <button
+                    className={destination === "noise" ? "selected" : ""}
+                    disabled={busy}
+                    onClick={() => setDestination("noise")}
+                  >
+                    <strong>noise safety instead</strong>
+                    <span>use when staff are involved or unsafe to contact</span>
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <p className="report-route-note"><Shield size={14} /> this category goes privately to noise safety</p>
+            )}
+            {destination === "noise" && (
+              <>
+                <p className="report-data-note">
+                  {message.text.trim()
+                    ? "The exact text of this message will be included in the encrypted report. Surrounding messages and media bytes are not sent."
+                    : "This message has no text. Media bytes are not sent; noise receives signed event metadata and encrypted object locations."}
+                </p>
+                <label className="report-follow-up">
+                  <input
+                    type="checkbox"
+                    checked={followUpAllowed}
+                    disabled={busy}
+                    onChange={(event) => setFollowUpAllowed(event.target.checked)}
+                  />
+                  <span><strong>allow follow-up from noise safety</strong><small>noise safety may contact you about this report through an official account</small></span>
+                </label>
+              </>
+            )}
+            <LabeledArea label="details (optional)" count={`${details.length}/180`}>
+              <textarea
+                autoFocus
+                maxLength={180}
+                value={details}
+                placeholder={destination === "noise" ? "what should noise safety know?" : "what should group staff know?"}
+                onChange={(event) => setDetails(event.target.value)}
               />
-              <span><strong>allow follow-up from noise safety</strong><small>noise safety may contact you about this report through an official account</small></span>
-            </label>
-          </>
-        )}
-        <LabeledArea label="details (optional)" count={`${details.length}/180`}>
-          <textarea
-            autoFocus
-            maxLength={180}
-            value={details}
-            placeholder={destination === "noise" ? "what should noise safety know?" : "what should group staff know?"}
-            onChange={(event) => setDetails(event.target.value)}
-          />
-        </LabeledArea>
-      </>}
+            </LabeledArea>
+          </> : (
+            <div className="report-selection-prompt">
+              <TriangleAlert size={20} />
+              <strong>choose a reason</strong>
+              <span>we’ll show where the report goes and exactly what information is included.</span>
+            </div>
+          )}
+        </section>
+      </div>
       <DialogButtons onClose={onClose}>
         <button className="report-confirm" disabled={busy || !category} onClick={() => void submit()}>
           {busy && <LoaderCircle className="spinner" size={13} />}
