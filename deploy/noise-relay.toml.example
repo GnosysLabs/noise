@@ -1,4 +1,4 @@
-# Noise listens on localhost. Put a normal HTTPS reverse proxy in front of it.
+# noise listens on localhost. Put a normal HTTPS reverse proxy in front of it.
 listen = "127.0.0.1:4301"
 data = "/var/lib/noise-relay"
 public_url = "https://relay.example"

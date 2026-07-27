@@ -2042,7 +2042,7 @@ fn owned_c_string(value: String) -> *mut c_char {
     }
 }
 
-/// Invoke one Noise client operation.
+/// Invoke one noise client operation.
 ///
 /// The returned string belongs to the caller and must be released with
 /// `noise_free_string`.

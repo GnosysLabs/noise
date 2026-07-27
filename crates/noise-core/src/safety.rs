@@ -24,7 +24,7 @@ const MAX_REPORTED_TEXT_CHARS: usize = 4_000;
 const MAX_ENCRYPTED_OBJECTS: usize = 256;
 const MAX_RELAY_URL_BYTES: usize = 2_048;
 
-/// The user-facing reason selected before a report is routed to Noise Safety.
+/// The user-facing reason selected before a report is routed to noise safety.
 ///
 /// Categories that normally belong to group staff remain valid here because a
 /// user may escalate when group staff are involved or have not acted.
@@ -71,7 +71,7 @@ pub struct SafetyEncryptedShardV1 {
     pub shard_id: String,
 }
 
-/// A content-minimized report intended for Noise Safety rather than group staff.
+/// A content-minimized report intended for noise safety rather than group staff.
 ///
 /// `reported_event` remains encrypted. Including the complete signed event
 /// lets the safety service verify its author, group, event id, and timestamp
@@ -222,7 +222,7 @@ impl SafetyReportV1 {
         )
     }
 
-    /// Encrypt the complete signed report to the current Noise Safety key.
+    /// Encrypt the complete signed report to the current noise safety key.
     pub fn seal(
         &self,
         recipient_public_key_base64: &str,

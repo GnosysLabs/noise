@@ -1,6 +1,6 @@
-# Noise Safety intake
+# noise safety intake
 
-This is the separate, write-only intake boundary for reports sent to Noise
+This is the separate, write-only intake boundary for reports sent to noise
 Safety. It accepts only HPKE-sealed `SealedSafetyReportV1` envelopes and stores
 them without decrypting, previewing, emailing, or logging report contents.
 

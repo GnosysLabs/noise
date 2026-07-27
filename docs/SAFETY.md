@@ -1,17 +1,17 @@
-# Noise safety reporting foundation
+# noise safety reporting foundation
 
 This document defines the protocol boundary for escalating a report from an
-official Noise client to Noise Safety. The category-first client flow and the
+official noise client to noise safety. The category-first client flow and the
 separate write-only development intake now exist, but the intake is not yet
 deployed as a public production service.
 
 ## Authority boundary
 
-Noise keeps three different responsibilities separate:
+noise keeps three different responsibilities separate:
 
 1. Group founders and moderators handle ordinary community rules.
 2. Members can hide, block, leave, and report without moderator permission.
-3. Noise Safety handles severe platform-wide concerns and reports where group
+3. noise safety handles severe platform-wide concerns and reports where group
    staff are involved, unsafe to contact, or have not acted.
 
 Independent relays remain availability infrastructure. They do not receive
@@ -31,7 +31,7 @@ Official clients expose one **Report** action followed by a category:
 - something else.
 
 Consensual sexually explicit material and groups labeled for it are allowed.
-They are not a Noise-level violation merely because they contain intimate or
+They are not a noise-level violation merely because they contain intimate or
 explicit content. The sexual-safety category is deliberately limited to
 exploitation and non-consensual content. Correctly labeled consensual explicit
 content is not reportable merely for being explicit. Sexually explicit content
@@ -40,7 +40,7 @@ choice.
 
 ## Adult access at launch
 
-Noise launches for adults aged 18 and older. New official-client accounts
+noise launches for adults aged 18 and older. New official-client accounts
 enter a birth date before identity keys are generated or any relay request is
 made. The client computes only whether the person is at least 18 and discards
 the exact date. The encrypted account vault stores the successful attestation
@@ -69,11 +69,11 @@ This is an official-client policy gate, not a claim that a self-declared date
 or open-source client is cryptographic proof of age.
 
 Ordinary group-rule, harassment, and spam reports route to group staff by
-default. Severe categories route to Noise Safety. Every group-staff route must
-offer **Report to Noise instead** when group staff are involved or the member
+default. Severe categories route to noise safety. Every group-staff route must
+offer **Report to noise instead** when group staff are involved or the member
 feels unsafe reporting to them.
 
-A report to Noise is never published into the group's moderation history and
+A report to noise is never published into the group's moderation history and
 does not notify its founder or moderators.
 
 ## `SafetyReportV1`
@@ -112,7 +112,7 @@ that the reported content is illegal.
 ## Sealed transport
 
 Before leaving the device, the complete signed report is encrypted to a
-dedicated, rotatable Noise Safety HPKE key using:
+dedicated, rotatable noise safety HPKE key using:
 
 - DHKEM(X25519);
 - HKDF-SHA-256; and

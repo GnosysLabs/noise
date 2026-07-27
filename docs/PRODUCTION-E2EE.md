@@ -1,11 +1,11 @@
-# Noise production encryption
+# noise production encryption
 
 Status: implementation in progress. This document is a release gate, not a
 claim that the current client already provides these properties.
 
 ## Product requirements
 
-Noise groups are persistent rooms. The encryption design must preserve all of
+noise groups are persistent rooms. The encryption design must preserve all of
 the following:
 
 1. Relays never receive plaintext message or media content.
@@ -15,7 +15,7 @@ the following:
 4. Adding or removing a member must not require encrypting one copy of every
    message for every member.
 5. Offline members can catch up from replaceable relays.
-6. The same account can be restored with its Noise ID and password.
+6. The same account can be restored with its noise ID and password.
 7. A relay cannot forge membership, messages, or epoch changes.
 
 Released clients do not yet meet requirement 3. The implementation in this
@@ -24,7 +24,7 @@ behind the relay/client upgrade and release gates below.
 
 ## Control plane: RFC 9420 MLS
 
-Noise uses Messaging Layer Security (MLS) for group membership and epoch key
+noise uses Messaging Layer Security (MLS) for group membership and epoch key
 agreement. The selected implementation is OpenMLS 0.8.1 or newer within the
 compatible 0.8 security line, using:
 
@@ -32,11 +32,11 @@ compatible 0.8 security line, using:
 - X25519 HPKE;
 - ChaCha20-Poly1305;
 - SHA-256; and
-- Ed25519 credentials bound to a Noise identity.
+- Ed25519 credentials bound to a noise identity.
 
 Every accepted membership commit advances the MLS epoch. An add commit admits
 the new identity. A remove commit excludes the old identity from the new epoch.
-The epoch exporter derives a Noise archive root that only members of that epoch
+The epoch exporter derives a noise archive root that only members of that epoch
 can obtain.
 
 Membership commits are serialized by the group control log. Clients must not
@@ -64,7 +64,7 @@ and clients replay the records it is missing.
 ## History plane: backward-readable archive roots
 
 MLS intentionally prevents a new member from decrypting messages from epochs
-before they joined. Noise intentionally grants full history, so archived
+before they joined. noise intentionally grants full history, so archived
 content uses a second layer.
 
 For MLS epoch `N`, every member derives:
@@ -92,7 +92,7 @@ A member who has `archive_root_N` can open the link to `N-1`, then continue
 backward through the history. Someone removed in `N-1` knows the old root but
 cannot reverse the AEAD link to obtain `archive_root_N`.
 
-This provides the Noise product semantics:
+This provides the noise product semantics:
 
 - a new member receives the newest root and can walk backward through the room;
 - a removed member cannot walk forward into new epochs; and
@@ -108,12 +108,12 @@ plane.
 
 Each message or group event is:
 
-1. serialized as a versioned Noise event payload;
+1. serialized as a versioned noise event payload;
 2. encrypted with XChaCha20-Poly1305 under the archive root for its epoch using
    a fresh 192-bit nonce;
 3. bound through AEAD additional data to the group ID, MLS epoch, author public
    key, author sequence, and event type; and
-4. signed by the author's Noise identity.
+4. signed by the author's noise identity.
 
 Clients accept an event only when:
 
@@ -142,7 +142,7 @@ The production join flow is:
 Members admit in the background for every group they belong to, not only the
 group open on screen, so admission does not depend on where anyone is looking.
 
-Noise automatically revokes and replaces the join capability when a member is
+noise automatically revokes and replaces the join capability when a member is
 banned. Otherwise a banned person who retained the old frequency could simply
 create another identity and request admission again.
 
@@ -155,8 +155,8 @@ space.
 
 Migration is a coordinated hard cut because the initial network is small:
 
-1. upgraded clients publish MLS KeyPackages for their Noise identities;
-2. the founder creates the MLS group with the existing Noise group ID;
+1. upgraded clients publish MLS KeyPackages for their noise identities;
+2. the founder creates the MLS group with the existing noise group ID;
 3. the founder adds every upgraded active member;
 4. the signed epoch-zero genesis wraps the legacy group secret under the first
    MLS-derived archive root;
@@ -167,24 +167,24 @@ The legacy secret remains able to open legacy history by design. It cannot
 decrypt any event authored after cutover.
 
 If an active member has not upgraded, the UI must name that member and block
-the cutover or require the founder to explicitly remove them. Noise must never
+the cutover or require the founder to explicitly remove them. noise must never
 silently create a secure subgroup while showing the old membership list.
 
 ## Direct messages
 
 The current static Diffie-Hellman DM secret is also a migration blocker. DMs
 will use a two-member MLS group with the same epoch and archive-link structure.
-This gives Noise one multi-device-capable key-management engine for groups and
+This gives noise one multi-device-capable key-management engine for groups and
 DMs. DM history remains available to newly restored authorized devices, while
 thread deletion and account removal continue to use signed deletion events.
 
 ## Persistence and devices
 
-MLS state contains secret key material. Noise keeps one recoverable MLS state
+MLS state contains secret key material. noise keeps one recoverable MLS state
 per account and group rather than requiring every installation to be admitted
 as a new leaf. Each current per-group state is included in the synchronized
 account vault, which is encrypted by the high-entropy key derived from the
-Noise ID and password and signed by the long-lived account identity.
+noise ID and password and signed by the long-lived account identity.
 
 A newly signed-in installation restores those per-group states, verifies the
 signed MLS control log, advances through any later commits, and immediately
@@ -204,7 +204,7 @@ must also disappear from the next encrypted local snapshot.
 
 ## Release gates
 
-Noise must not call this production encryption until all of these are true:
+noise must not call this production encryption until all of these are true:
 
 - current members can exchange events after an MLS cutover;
 - a new member can decrypt pre-join history;

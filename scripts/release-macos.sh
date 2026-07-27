@@ -12,9 +12,9 @@ keychain_service=xyz.gnosyslabs.noise.updater
 notary_profile=${APPLE_KEYCHAIN_PROFILE:-AC_NOTARY}
 assets_dir="$repo_root/target/release/release-assets"
 bundle_dir="$repo_root/target/release/bundle/macos"
-app_bundle="$bundle_dir/Noise.app"
-human_zip="$assets_dir/Noise-$version-macOS-arm64.zip"
-updater_archive="$assets_dir/Noise-$version-macOS-arm64.app.tar.gz"
+app_bundle="$bundle_dir/noise.app"
+human_zip="$assets_dir/noise-$version-macOS-arm64.zip"
+updater_archive="$assets_dir/noise-$version-macOS-arm64.app.tar.gz"
 latest_json="$assets_dir/latest.json"
 temporary_dir=$(mktemp -d /tmp/noise-release.XXXXXX)
 
@@ -64,7 +64,7 @@ security find-identity -v -p codesigning | grep -F "$APPLE_SIGNING_IDENTITY" >/d
 xcrun notarytool history --keychain-profile "$notary_profile" --output-format json >/dev/null
 
 preflight_file="$temporary_dir/updater-signing-preflight"
-printf 'Noise updater signing preflight\n' > "$preflight_file"
+printf 'noise updater signing preflight\n' > "$preflight_file"
 export TAURI_SIGNING_PRIVATE_KEY_PATH="$updater_key"
 pnpm --dir "$client_dir" tauri signer sign "$preflight_file" >/dev/null
 unset TAURI_SIGNING_PRIVATE_KEY_PATH
@@ -85,14 +85,14 @@ if [[ ! -d "$app_bundle" ]]; then
   exit 1
 fi
 
-notary_zip="$temporary_dir/Noise-$version-notarization.zip"
+notary_zip="$temporary_dir/noise-$version-notarization.zip"
 ditto -c -k --sequesterRsrc --keepParent "$app_bundle" "$notary_zip"
 xcrun notarytool submit "$notary_zip" --keychain-profile "$notary_profile" --wait
 xcrun stapler staple "$app_bundle"
 xcrun stapler validate "$app_bundle"
 
 ditto -c -k --sequesterRsrc --keepParent "$app_bundle" "$human_zip"
-COPYFILE_DISABLE=1 tar -C "$bundle_dir" -czf "$updater_archive" "Noise.app"
+COPYFILE_DISABLE=1 tar -C "$bundle_dir" -czf "$updater_archive" "noise.app"
 export TAURI_SIGNING_PRIVATE_KEY_PATH="$updater_key"
 pnpm --dir "$client_dir" tauri signer sign "$updater_archive"
 unset TAURI_SIGNING_PRIVATE_KEY_PATH
@@ -102,7 +102,7 @@ if [[ ! -s "$updater_archive.sig" ]]; then
 fi
 
 release_url="https://github.com/GnosysLabs/noise/releases/download/$release_tag/$(basename "$updater_archive")"
-release_notes=${NOISE_RELEASE_NOTES:-"First public alpha of Noise."}
+release_notes=${NOISE_RELEASE_NOTES:-"First public alpha of noise."}
 pub_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 node - "$latest_json" "$version" "$release_url" "$updater_archive.sig" "$release_notes" "$pub_date" <<'NODE'
 const fs = require("fs");
@@ -122,8 +122,8 @@ NODE
 codesign --verify --deep --strict --verbose=2 "$app_bundle"
 spctl --assess --type execute --verbose=4 "$app_bundle"
 unzip -tq "$human_zip"
-unzip -Z1 "$human_zip" | grep '^Noise.app/' >/dev/null
-tar -tzf "$updater_archive" | grep '^Noise.app/' >/dev/null
+unzip -Z1 "$human_zip" | grep '^noise.app/' >/dev/null
+tar -tzf "$updater_archive" | grep '^noise.app/' >/dev/null
 node - "$latest_json" "$version" "$release_url" <<'NODE'
 const fs = require("fs");
 const [manifestPath, version, url] = process.argv.slice(2);
@@ -132,6 +132,6 @@ const platform = manifest.platforms?.["darwin-aarch64"];
 if (manifest.version !== version || platform?.url !== url || !platform.signature) process.exit(1);
 NODE
 
-rm -f "$bundle_dir/Noise.app.tar.gz" "$bundle_dir/Noise.app.tar.gz.sig"
+rm -f "$bundle_dir/noise.app.tar.gz" "$bundle_dir/noise.app.tar.gz.sig"
 
 printf 'Release assets ready in %s\n' "$assets_dir"

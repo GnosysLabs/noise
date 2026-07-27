@@ -116,9 +116,9 @@ impl MlsStorageSnapshot {
     }
 }
 
-/// Persisted MLS material for one Noise identity.
+/// Persisted MLS material for one noise identity.
 ///
-/// It contains signature keys, HPKE private keys, and MLS ratchet state. Noise
+/// It contains signature keys, HPKE private keys, and MLS ratchet state. noise
 /// keeps current states isolated per group and stores them only in encrypted
 /// local storage or the password-encrypted account recovery vault.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,7 +130,7 @@ pub struct MlsAccountState {
     storage: MlsStorageSnapshot,
 }
 
-/// An MLS leaf authorized by the long-lived Noise account identity.
+/// An MLS leaf authorized by the long-lived noise account identity.
 ///
 /// The wire name remains device-oriented for compatibility, but recoverable
 /// per-group state allows authenticated installations to resume this leaf.

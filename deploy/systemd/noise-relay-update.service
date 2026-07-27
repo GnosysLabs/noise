@@ -1,5 +1,5 @@
 [Unit]
-Description=Install a signed Noise relay update
+Description=Install a signed noise relay update
 After=network-online.target
 Wants=network-online.target
 

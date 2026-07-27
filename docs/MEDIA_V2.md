@@ -1,6 +1,6 @@
-# Noise media v2
+# noise media v2
 
-Media v2 is the only media byte format produced or fetched by current Noise
+Media v2 is the only media byte format produced or fetched by current noise
 clients. The event model still carries a `MediaAttachment`, but every storage
 manifest produced for an attachment has `v = 2`.
 
@@ -36,7 +36,7 @@ XChaCha20 nonce         24 bytes
 ciphertext              remaining bytes, including the AEAD tag
 ```
 
-The manifest's object ID remains the authenticated Noise blob ID derived from
+The manifest's object ID remains the authenticated noise blob ID derived from
 the group ID, nonce, and ciphertext. Reconstruction must verify that ID before
 decryption.
 

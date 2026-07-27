@@ -1,5 +1,5 @@
 [Unit]
-Description=Noise untrusted relay
+Description=noise untrusted relay
 After=network-online.target
 Wants=network-online.target
 

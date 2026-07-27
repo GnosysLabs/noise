@@ -1,5 +1,5 @@
 [Unit]
-Description=Periodically check for signed Noise relay updates
+Description=Periodically check for signed noise relay updates
 
 [Timer]
 OnBootSec=15m

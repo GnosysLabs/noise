@@ -80,7 +80,7 @@ const MAX_LINK_PREVIEW_CACHE_ENTRIES: usize = 128;
 #[command(
     name = "noise-relay",
     version,
-    about = "An untrusted Noise protocol relay"
+    about = "An untrusted noise protocol relay"
 )]
 struct Args {
     #[arg(long, global = true, env = "NOISE_RELAY_CONFIG")]

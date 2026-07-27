@@ -1,11 +1,11 @@
-# Noise protocol invariants
+# noise protocol invariants
 
 These are product constraints, not implementation details.
 
 1. **No identity PII is retained.** An identity is a locally generated key plus
    a self-authored profile. The protocol never requires a phone number, email,
    legal name, address book, or location. Official clients transiently check a
-   self-declared birth date at account creation because Noise launches as an
+   self-declared birth date at account creation because noise launches as an
    18+ service; only the pass result is retained in the encrypted account
    vault, never the birth date.
 2. **Groups are entered by frequency.** There is no group directory, search,

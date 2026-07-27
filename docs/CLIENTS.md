@@ -1,6 +1,6 @@
-# Noise clients
+# noise clients
 
-Noise now has one shared React interface in `apps/client` and a deliberately
+noise now has one shared React interface in `apps/client` and a deliberately
 small runtime boundary in `src/api.ts`.
 
 ## Desktop today

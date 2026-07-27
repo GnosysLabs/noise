@@ -61,10 +61,10 @@ Priority: optional
 Architecture: $package_arch
 Maintainer: Gnosys Labs <noise@gnosyslabs.xyz>
 Depends: ca-certificates, systemd
-Description: private group messaging relay for Noise
+Description: private group messaging relay for noise
  A single untrusted relay binary that masks requests, replicates signed
  encrypted metadata, and contributes bounded local or S3-compatible shard
- storage to the Noise network.
+ storage to the noise network.
 EOF
 
 cat >"$package_root/DEBIAN/conffiles" <<'EOF'

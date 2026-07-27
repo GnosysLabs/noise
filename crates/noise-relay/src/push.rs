@@ -158,7 +158,7 @@ impl PushService {
                         )
                         .await?;
                     eprintln!(
-                        "could not deliver Noise push to {}: {error}",
+                        "could not deliver noise push to {}: {error}",
                         subscription.installation_id
                     );
                 }

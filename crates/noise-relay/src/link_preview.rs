@@ -234,7 +234,7 @@ async fn public_client_for(url: &Url) -> anyhow::Result<reqwest::Client> {
         .redirect(Policy::none())
         .connect_timeout(Duration::from_secs(4))
         .timeout(Duration::from_secs(10))
-        .user_agent("Noise-Link-Preview/1.0");
+        .user_agent("noise-Link-Preview/1.0");
 
     match url.host().context("link preview URL has no host")? {
         url::Host::Ipv4(address) => require_public_ip(IpAddr::V4(address))?,

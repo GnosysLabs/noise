@@ -606,7 +606,7 @@ fn prepare_media_upload_blocking(
         }
         let _ = fs::remove_file(&output);
         return Err(
-            "this video could not be converted to Noise's streamable MP4 format".to_owned(),
+            "this video could not be converted to noise's streamable MP4 format".to_owned(),
         );
     }
 

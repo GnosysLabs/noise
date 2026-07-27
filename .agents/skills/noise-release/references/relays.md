@@ -1,4 +1,4 @@
-# Noise relays
+# noise relays
 
 ## Managed signed release
 

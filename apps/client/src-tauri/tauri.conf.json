@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Noise",
+  "productName": "noise",
   "version": "0.1.19",
   "identifier": "xyz.gnosyslabs.noise",
   "build": {

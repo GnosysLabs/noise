@@ -134,7 +134,7 @@ async fn generate_keys(public_output: &Path, secret_output: &Path) -> anyhow::Re
         let _ = fs::remove_file(public_output).await;
         return Err(error);
     }
-    println!("generated separate Noise Safety public and private key files");
+    println!("generated separate noise safety public and private key files");
     println!("public key: {}", public_output.display());
     println!("private key: {}", secret_output.display());
     Ok(())
@@ -167,15 +167,15 @@ async fn serve(public_key_file: &Path, spool_dir: &Path, bind: SocketAddr) -> an
         .with_state(state.clone());
     let listener = TcpListener::bind(bind)
         .await
-        .with_context(|| format!("could not bind Noise Safety intake to {bind}"))?;
-    println!("Noise Safety intake listening on http://{bind}");
+        .with_context(|| format!("could not bind noise safety intake to {bind}"))?;
+    println!("noise safety intake listening on http://{bind}");
     println!("recipient key id: {}", state.recipient.recipient_key_id);
     axum::serve(
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
-    .context("Noise Safety intake stopped")
+    .context("noise safety intake stopped")
 }
 
 async fn ready(State(state): State<AppState>) -> Json<ReadyResponse> {

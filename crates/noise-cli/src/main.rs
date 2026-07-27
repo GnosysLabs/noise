@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use noise_client::{GroupContentRating, NoiseClient};
 
 #[derive(Debug, Parser)]
-#[command(name = "noise", about = "The Noise protocol laboratory client")]
+#[command(name = "noise", about = "The noise protocol laboratory client")]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -19,7 +19,7 @@ enum Command {
         #[arg(long)]
         relay: Vec<String>,
     },
-    /// Create a Noise ID and encrypted account vault.
+    /// Create a noise ID and encrypted account vault.
     Init {
         #[arg(long)]
         state: PathBuf,
@@ -32,7 +32,7 @@ enum Command {
         #[arg(long)]
         relay: Vec<String>,
     },
-    /// Restore an identity with its Noise ID and password.
+    /// Restore an identity with its noise ID and password.
     Login {
         #[arg(long)]
         state: PathBuf,
@@ -154,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             println!("identity ready: {}", summary.identity.username);
             println!(
-                "Noise ID: {}",
+                "noise ID: {}",
                 summary
                     .identity
                     .noise_id

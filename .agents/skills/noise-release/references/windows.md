@@ -21,7 +21,7 @@ Do not claim Windows is signed or updater-ready merely because the workflow pass
 
 1. An accessible code-signing certificate without exposing its private key or password.
 2. A timestamp server and Tauri Windows signing configuration.
-3. A Tauri updater artifact signed by the existing Noise updater key.
+3. A Tauri updater artifact signed by the existing noise updater key.
 4. A Windows platform entry in the same final `latest.json` used by the desktop release.
 
 Do not invent certificate thumbprints, passwords, remote Windows hosts, or signing commands. Resolve them from the authorized machine/secret store at release time and add them to repository automation rather than a one-off shell history.

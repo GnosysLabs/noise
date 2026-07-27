@@ -1,9 +1,9 @@
 ---
 name: noise-release
-description: Build, sign, package, deploy, release, or verify Noise across the React/Tauri macOS and Windows desktop clients, the web client, the native SwiftUI iOS app, and Noise relays. Use for development builds, production releases, notarization, updater artifacts, TestFlight/App Store archives, Windows installers, web deployment, relay deployment, rollback, or release troubleshooting in /Users/christopher/Dev/noise and /Users/christopher/Dev/noise-ios.
+description: Build, sign, package, deploy, release, or verify noise across the React/Tauri macOS and Windows desktop clients, the web client, the native SwiftUI iOS app, and noise relays. Use for development builds, production releases, notarization, updater artifacts, TestFlight/App Store archives, Windows installers, web deployment, relay deployment, rollback, or release troubleshooting in /Users/christopher/Dev/noise and /Users/christopher/Dev/noise-ios.
 ---
 
-# Noise Release
+# noise release
 
 Treat source state, build output, signature, published artifact, deployed state, and live behavior as separate evidence. Never report a release as complete until every requested layer has been verified.
 

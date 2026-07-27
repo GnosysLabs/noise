@@ -7,7 +7,7 @@ use noise_core::{GroupMembership, GroupState, Identity, Profile, SignedEvent};
 #[derive(Debug, Parser)]
 #[command(
     name = "noise-sim",
-    about = "Generate and reduce a real Noise membership log"
+    about = "Generate and reduce a real noise membership log"
 )]
 struct Args {
     #[arg(long, default_value_t = 50_000)]

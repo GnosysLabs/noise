@@ -6,11 +6,11 @@
   <strong>A private, group-first messenger built around the people you actually choose.</strong>
 </p>
 
-![Noise desktop app](docs/assets/noise-desktop.png)
+![noise desktop app](docs/assets/noise-desktop.png)
 
 <p align="center">
-  <strong>Join the official Noise group</strong><br>
-  Open Noise and tune to <code>8402 6053 0554</code>
+  <strong>Join the official noise group</strong><br>
+  Open noise and tune to <code>8402 6053 0554</code>
 </p>
 
 There is no public directory, algorithmic feed, phone number, or email signup.
@@ -20,13 +20,13 @@ to personally identifying information.
 
 [Download the latest alpha for macOS or Windows](https://github.com/GnosysLabs/noise/releases/latest)
 
-## What makes Noise different
+## What makes noise different
 
 - **Groups are the center.** Large private communities are the product, not an
   afterthought bolted onto direct messages.
 - **Joining feels intentional.** Groups are found through people, not search or
   recommendations. You join with a frequency shared by someone you trust.
-- **No phone number or email.** Your account uses a random Noise ID and a
+- **No phone number or email.** Your account uses a random noise ID and a
   password. Your display name can change without changing your identity.
 - **Private messages and media.** Message and media payloads are encrypted on
   your device before replaceable relays carry them.
@@ -34,20 +34,20 @@ to personally identifying information.
   rules, replies, reactions, media galleries, moderation, and roles are built
   into the experience.
 
-Noise is currently an early alpha. It is ready for experimentation and real
+noise is currently an early alpha. It is ready for experimentation and real
 communities, but it should not yet be treated as a life-safety tool or a
 guarantee of high-risk anonymity.
 
 ## How it works
 
-Noise does not have one central server that owns every community.
+noise does not have one central server that owns every community.
 
 Clients encrypt content and send signed, padded objects through a network of
 replaceable relays. A relay can help mask where a request is going, carry
 encrypted group and account state, and store only the opaque media shards
 assigned to it. A storage relay sees a request arriving from a mask relay
 instead of directly from the client; the mask can forward the request without
-reading the encrypted Noise payload.
+reading the encrypted noise payload.
 
 There is only **one relay program**. “Mask,” “metadata,” and “media storage” are
 jobs the same binary can perform for a request, not separate node types an
@@ -55,7 +55,7 @@ operator has to understand or maintain.
 
 ## Strength in numbers
 
-Every independently operated relay makes Noise harder to erase and less
+Every independently operated relay makes noise harder to erase and less
 dependent on any one company or machine.
 
 More relays provide:
@@ -86,7 +86,7 @@ Linux servers such as AWS Graviton, Ampere, and many Oracle Cloud machines—not
 just Macs.
 
 You do **not** need Docker, Node.js, Rust, a source checkout, or an installer
-script hosted by Noise. The package contains one binary and systemd units.
+script hosted by noise. The package contains one binary and systemd units.
 After installation, the relay checks a detached Ed25519-signed release manifest
 on a randomized timer. It only installs a package whose exact byte length and
 SHA-256 hash were covered by that signature. A failed restart restores the
@@ -97,7 +97,7 @@ previous binary and service units, and temporary update files are removed.
 Copy this, replace the bracketed values, and give it to an agent with SSH access:
 
 ```text
-Set up an official Noise relay on my Ubuntu VPS.
+Set up an official noise relay on my Ubuntu VPS.
 
 SSH host: [HOST OR TAILSCALE IP]
 SSH user: [USER]
@@ -186,7 +186,7 @@ noise-relay update
 journalctl -u noise-relay.service -f
 ```
 
-Operators remain in control of their machines. Noise can offer signed updates,
+Operators remain in control of their machines. noise can offer signed updates,
 but no central authority can force an independently operated relay to install
 one.
 
@@ -237,11 +237,11 @@ process is documented in
 
 ## License
 
-Noise-authored code in this repository is licensed under the
+noise-authored code in this repository is licensed under the
 [GNU Affero General Public License, version 3 only](LICENSE)
 (`AGPL-3.0-only`), copyright © 2026 Gnosys Labs LLC.
 
-If you modify Noise and make that modified version available for people to use
+If you modify noise and make that modified version available for people to use
 over a network, you must offer those users the corresponding source code as
 required by section 13 of the AGPL. Third-party dependencies and assets remain
 under their respective licenses.

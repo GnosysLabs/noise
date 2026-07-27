@@ -1,4 +1,4 @@
-# Noise production servers
+# noise production servers
 
 This topology was verified on 2026-07-25. Treat it as a starting map, not timeless truth: run the read-only discovery commands before every deployment.
 

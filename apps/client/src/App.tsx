@@ -432,7 +432,7 @@ function currentDeviceDescriptor() {
   const isLinux = /Linux/i.test(userAgent) && !/Android/i.test(userAgent);
   if (isTauri) {
     const platform = isMac ? "macOS" : isWindows ? "Windows" : isLinux ? "Linux" : "Desktop";
-    return { name: `${platform} desktop`, platform: `${platform} · Noise desktop` };
+    return { name: `${platform} desktop`, platform: `${platform} · noise desktop` };
   }
   const platform = /iPhone|iPad/i.test(userAgent)
     ? "iOS"
@@ -445,7 +445,7 @@ function currentDeviceDescriptor() {
           : isLinux
             ? "Linux"
             : "Web";
-  return { name: `${platform} browser`, platform: `${platform} · Noise web` };
+  return { name: `${platform} browser`, platform: `${platform} · noise web` };
 }
 
 function presenceStatusesFromWatch(change: GroupWatch) {
@@ -4532,7 +4532,7 @@ export default function App() {
           onClose={() => setDialog(null)}
           onReport={(category, destination, details) => perform(async () => {
             if (destination === "noise" && !noiseSafetyUrl) {
-              throw new Error("Noise Safety reporting is not available in this build");
+              throw new Error("noise safety reporting is not available in this build");
             }
             const groupId = selectedConversationState?.group.group_id ?? activeGroupId;
             if (groupId) {
@@ -5181,7 +5181,7 @@ function Sidebar({
                     <Avatar name={account.username} image={account.avatar} size={34} />
                     <span>
                       <strong>{account.username}</strong>
-                      <small>{account.bio || "Noise account"}</small>
+                      <small>{account.bio || "noise account"}</small>
                     </span>
                     {active && <Check size={15} />}
                   </button>
@@ -8469,7 +8469,7 @@ function Onboarding({
       {mode === "create" ? <>
         <input autoFocus value={username} maxLength={MAX_DISPLAY_NAME_LENGTH} aria-invalid={createAttempted && !usernameReady} onChange={(event) => setUsername(event.target.value)} placeholder="display name" />
         <label className="onboarding-birth-date">
-          <span>birth date · Noise is 18+</span>
+          <span>birth date · noise is 18+</span>
           <input type="text" inputMode="numeric" autoComplete="bday" value={birthDate} maxLength={10} aria-invalid={createAttempted && !birthDateReady} onChange={(event) => setBirthDate(formatBirthdayInput(event.target.value))} placeholder="MM-DD-YYYY" />
           <small>type your date · checked for 18+ eligibility, then discarded</small>
         </label>
@@ -8620,7 +8620,7 @@ function NewDirectDialog({
         </button>
       </div>
       <p className="new-direct-privacy">
-        Enter the signature exactly as shown in the other person’s settings. It does not reveal the private Noise ID used to sign in.
+        Enter the signature exactly as shown in the other person’s settings. It does not reveal the private noise ID used to sign in.
       </p>
     </Modal>
   );
@@ -9061,7 +9061,7 @@ function SettingsDialog({ profile, adultAccess, devices, blockedPeople, busy, on
               <strong>{noiseSignature(profile.public_key)}</strong>
               <ContactSignalCopyButton publicKey={profile.public_key} />
             </div>
-            <p>Share this signature so someone can start an encrypted DM with you. Noise keeps it discoverable automatically, and it does not reveal your private Noise ID.</p>
+            <p>Share this signature so someone can start an encrypted DM with you. noise keeps it discoverable automatically, and it does not reveal your private noise ID.</p>
           </section>
         </div>}
         {tab === "album" && <ProfileAlbumDialog
@@ -9121,7 +9121,7 @@ function SettingsDialog({ profile, adultAccess, devices, blockedPeople, busy, on
               }}
             />
           </label>
-          <p>Your birth date is not stored. Noise is already 18+; this separate preference controls whether sexually explicit groups appear.</p>
+          <p>Your birth date is not stored. noise is already 18+; this separate preference controls whether sexually explicit groups appear.</p>
         </section>}
         {tab === "blocks" && <section className="settings-section user-block-settings">
           <h3>blocked users</h3>
@@ -9152,7 +9152,7 @@ function SettingsDialog({ profile, adultAccess, devices, blockedPeople, busy, on
                 >{confirmingDeviceId === device.device_id ? "confirm" : "log out"}</button>}
               </div>)}
             </div>
-            <p>Logging out a device removes its official Noise session the next time it connects.</p>
+            <p>Logging out a device removes its official noise session the next time it connects.</p>
           </section>}
           {profile.noise_id && <section className="settings-section account-session"><span><strong>log out on this device</strong><small>Your encrypted identity remains available on the relay network.</small></span><button disabled={locked} onClick={onLogout}>log out</button></section>}
           <section className="settings-danger"><span><strong>delete account</strong><small>erase this identity and its encrypted account vault</small></span><button className="danger" disabled={locked} onClick={onDeleteAccount}>delete account</button></section>
@@ -9333,7 +9333,7 @@ function ReportMessageDialog({
         <DialogHeading
           icon={<Check />}
           title="report sent"
-          detail={submittedTo === "noise" ? "sent privately to Noise Safety" : "sent to group staff"}
+          detail={submittedTo === "noise" ? "sent privately to noise safety" : "sent to group staff"}
         />
         <div className="report-sent-state">
           <strong>the message is now hidden from your view</strong>
@@ -9396,19 +9396,19 @@ function ReportMessageDialog({
                 disabled={busy}
                 onClick={() => setDestination("noise")}
               >
-                <strong>Noise Safety instead</strong>
+                <strong>noise safety instead</strong>
                 <span>use when staff are involved or unsafe to contact</span>
               </button>
             </div>
           </div>
         ) : (
-          <p className="report-route-note"><Shield size={14} /> this category goes privately to Noise Safety</p>
+          <p className="report-route-note"><Shield size={14} /> this category goes privately to noise safety</p>
         )}
         {destination === "noise" && (
           <p className="report-data-note">
             {category === "threats_or_immediate_danger" && message.text.trim()
               ? "The text of this message will be included so the threat can be assessed. Surrounding messages and media bytes are not sent."
-              : "Message text and media bytes are not sent. Noise receives signed event metadata and encrypted object locations."}
+              : "Message text and media bytes are not sent. noise receives signed event metadata and encrypted object locations."}
           </p>
         )}
         <LabeledArea label="details (optional)" count={`${details.length}/180`}>
@@ -9416,7 +9416,7 @@ function ReportMessageDialog({
             autoFocus
             maxLength={180}
             value={details}
-            placeholder={destination === "noise" ? "what should Noise Safety know?" : "what should group staff know?"}
+            placeholder={destination === "noise" ? "what should noise safety know?" : "what should group staff know?"}
             onChange={(event) => setDetails(event.target.value)}
           />
         </LabeledArea>
@@ -9424,7 +9424,7 @@ function ReportMessageDialog({
       <DialogButtons onClose={onClose}>
         <button className="report-confirm" disabled={busy || !category} onClick={() => void submit()}>
           {busy && <LoaderCircle className="spinner" size={13} />}
-          {destination === "noise" ? "report to Noise" : "report to group staff"}
+          {destination === "noise" ? "report to noise" : "report to group staff"}
         </button>
       </DialogButtons>
     </Modal>

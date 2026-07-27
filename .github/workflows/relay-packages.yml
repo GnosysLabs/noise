@@ -106,7 +106,7 @@ jobs:
               --draft \
               --latest=false \
               --verify-tag \
-              --title "Noise relay ${GITHUB_REF_NAME#relay-v}" \
-              --notes "Signed, self-updating Noise relay packages for Ubuntu x86-64 and ARM64." \
+              --title "noise relay ${GITHUB_REF_NAME#relay-v}" \
+              --notes "Signed, self-updating noise relay packages for Ubuntu x86-64 and ARM64." \
               --repo "${GITHUB_REPOSITORY}"
           fi

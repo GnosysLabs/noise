@@ -358,7 +358,7 @@ struct AdultAccessSettings {
 
 impl Default for AdultAccessSettings {
     fn default() -> Self {
-        // Noise had a handful of known-adult accounts before this setting
+        // noise had a handful of known-adult accounts before this setting
         // existed. Missing legacy data is deliberately migrated once as
         // attested, while sexually explicit groups remain hidden by default.
         Self {
@@ -1758,7 +1758,7 @@ impl ClientState {
     }
 
     fn take_sequence(&mut self) -> u64 {
-        // One Noise identity can be active on several devices. A purely local
+        // One noise identity can be active on several devices. A purely local
         // counter can therefore fall behind another device and make otherwise
         // valid events look like replays. Use wall-clock nanoseconds as a
         // shared ordering floor while preserving monotonicity on this device.
@@ -7120,7 +7120,7 @@ impl NoiseClient {
             reported_text_excerpt,
             details,
         )
-        .context("could not prepare the Noise Safety report")?;
+        .context("could not prepare the noise safety report")?;
 
         let safety_url = normalize_safety_intake_url(safety_url)?;
         let recipient_public_key_base64 = if let Some(public_key) =
@@ -7129,61 +7129,61 @@ impl NoiseClient {
             public_key
         } else {
             if !is_local_safety_intake_url(&safety_url) {
-                bail!("this Noise Safety build is missing its pinned recipient key")
+                bail!("this noise safety build is missing its pinned recipient key")
             }
             let response = self
                 .http
                 .get(format!("{safety_url}/v1/key"))
                 .send()
                 .await
-                .context("could not reach the Noise Safety intake")?;
+                .context("could not reach the noise safety intake")?;
             if !response.status().is_success() {
-                bail!("the Noise Safety intake is unavailable")
+                bail!("the noise safety intake is unavailable")
             }
             let bytes = response
                 .bytes()
                 .await
-                .context("could not read the Noise Safety recipient key")?;
+                .context("could not read the noise safety recipient key")?;
             if bytes.len() > 8_192 {
-                bail!("the Noise Safety recipient key response is invalid")
+                bail!("the noise safety recipient key response is invalid")
             }
             let key: SafetyIntakeKey = serde_json::from_slice(&bytes)
-                .context("the Noise Safety recipient key is invalid")?;
+                .context("the noise safety recipient key is invalid")?;
             if key.version != 1 {
-                bail!("the Noise Safety recipient key version is unsupported")
+                bail!("the noise safety recipient key version is unsupported")
             }
             let envelope = report
                 .seal(&key.public_key_base64)
-                .context("could not encrypt the Noise Safety report")?;
+                .context("could not encrypt the noise safety report")?;
             if envelope.recipient_key_id != key.recipient_key_id {
-                bail!("the Noise Safety recipient key does not match its identifier")
+                bail!("the noise safety recipient key does not match its identifier")
             }
             key.public_key_base64
         };
         let envelope = report
             .seal(&recipient_public_key_base64)
-            .context("could not encrypt the Noise Safety report")?;
+            .context("could not encrypt the noise safety report")?;
         let response = self
             .http
             .post(format!("{safety_url}/v1/reports"))
             .json(&envelope)
             .send()
             .await
-            .context("could not submit the Noise Safety report")?;
+            .context("could not submit the noise safety report")?;
         if !response.status().is_success() {
-            bail!("the Noise Safety intake did not accept the report")
+            bail!("the noise safety intake did not accept the report")
         }
         let bytes = response
             .bytes()
             .await
-            .context("could not read the Noise Safety receipt")?;
+            .context("could not read the noise safety receipt")?;
         if bytes.len() > 8_192 {
-            bail!("the Noise Safety receipt is invalid")
+            bail!("the noise safety receipt is invalid")
         }
         let receipt: SafetyReportReceipt =
-            serde_json::from_slice(&bytes).context("the Noise Safety receipt is invalid")?;
+            serde_json::from_slice(&bytes).context("the noise safety receipt is invalid")?;
         if !is_valid_hex_id(&receipt.receipt_id) {
-            bail!("the Noise Safety receipt identifier is invalid")
+            bail!("the noise safety receipt identifier is invalid")
         }
 
         state
@@ -12478,14 +12478,14 @@ fn is_local_relay(base_url: &str) -> bool {
 
 fn normalize_safety_intake_url(value: &str) -> anyhow::Result<String> {
     let value = value.trim().trim_end_matches('/');
-    let url = reqwest::Url::parse(value).context("the Noise Safety intake address is invalid")?;
+    let url = reqwest::Url::parse(value).context("the noise safety intake address is invalid")?;
     if !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
         || (url.scheme() != "https" && !is_local_safety_intake_url(value))
     {
-        bail!("the Noise Safety intake address is invalid")
+        bail!("the noise safety intake address is invalid")
     }
     Ok(value.to_owned())
 }
@@ -12632,7 +12632,7 @@ fn validate_adult_birth_date_on(birth_date: &str, today: Date) -> anyhow::Result
         age -= 1;
     }
     if age < 18 {
-        bail!("Noise is for adults 18 and older")
+        bail!("noise is for adults 18 and older")
     }
     Ok(())
 }
@@ -13369,7 +13369,7 @@ mod tests {
         let active = DeviceRecord {
             device_id: device_id.clone(),
             name: "Mac desktop".to_owned(),
-            platform: "macOS · Noise desktop".to_owned(),
+            platform: "macOS · noise desktop".to_owned(),
             created_at_millis: 100,
             last_seen_at_millis: 200,
             revoked_at_millis: None,
