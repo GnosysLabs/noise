@@ -770,7 +770,7 @@ fn render_index(state: &ReviewState, reports: &[ReviewItem], queue: ReviewQueue)
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>noise safety</title><style>
 :root{color-scheme:dark;font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#171619;color:#f4f0f5}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0,#302538 0,transparent 34rem),#171619}
+*{box-sizing:border-box}body{margin:0;background:#171619}
 main{width:min(980px,calc(100% - 32px));margin:0 auto;padding:52px 0 80px}
 header{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:28px}
 .eyebrow{margin:0 0 7px;color:#b8ff38;font-size:11px;font-weight:800;letter-spacing:.16em}
