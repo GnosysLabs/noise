@@ -201,7 +201,7 @@ const REPORT_CATEGORIES: Array<{
     value: "explicit_content_not_properly_labeled",
     label: "unlabeled sexually explicit content",
     detail: "sexually explicit content posted in a general group",
-    destination: "noise",
+    destination: "group_staff",
   },
   {
     value: "other",

@@ -7559,7 +7559,6 @@ impl NoiseClient {
             SafetyReportCategoryV1::ThreatsOrImmediateDanger
                 | SafetyReportCategoryV1::SexualExploitationOrNonConsensualSexualContent
                 | SafetyReportCategoryV1::ChildSafety
-                | SafetyReportCategoryV1::ExplicitContentNotProperlyLabeled
         ) {
             bail!("this report category belongs with group staff")
         }
