@@ -49,10 +49,6 @@ import type { CSSProperties, RefObject } from "react";
 import { createPortal } from "react-dom";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
-import botAvatar1 from "../../marketing/public/bottts-friend-1.svg";
-import botAvatar2 from "../../marketing/public/bottts-friend-2.svg";
-import botAvatar3 from "../../marketing/public/bottts-friend-3.svg";
-import botAvatar4 from "../../marketing/public/bottts-friend-4.svg";
 import {
   cancelAddingLocalAccount,
   isTauri,
@@ -70,7 +66,7 @@ import {
 } from "./api";
 import type { LocalAccount, LocalAccountList } from "./api";
 import { registerWebMediaStream, webMediaStreamReady } from "./mediaStream";
-import { generateGroupAvatar, generateUserAvatar } from "./groupAvatar";
+import { generateGroupAvatar, generateUserAvatar, generateUserAvatarSource } from "./groupAvatar";
 import { firstLink, linkify, openExternalLink } from "./linkify";
 import { ReactionPicker } from "./ReactionPicker";
 import { useLinkPreview } from "./useLinkPreview";
@@ -8672,20 +8668,9 @@ function useProfileImageSource(
   return source;
 }
 
-const botAvatarSources = [botAvatar1, botAvatar2, botAvatar3, botAvatar4];
-
-function botAvatarSource(seed: string) {
-  let hash = 2166136261;
-  for (const byte of new TextEncoder().encode(seed)) {
-    hash ^= byte;
-    hash = Math.imul(hash, 16777619);
-  }
-  return botAvatarSources[(hash >>> 0) % botAvatarSources.length];
-}
-
 function Avatar({ name, image, size, square = false }: { name: string; image: ProfileImage | null; size: number; square?: boolean }) {
   const source = useProfileImageSource(image, true);
-  const fallback = square ? null : botAvatarSource(name);
+  const fallback = square ? null : generateUserAvatarSource(image?.blob_id ?? name);
   return (
     <span className={`avatar ${square ? "square" : ""}`} style={{ width: size, height: size }}>
       {source || fallback

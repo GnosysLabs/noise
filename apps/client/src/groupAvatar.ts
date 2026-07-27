@@ -5,6 +5,7 @@ import glass from "@dicebear/styles/glass.json" with { type: "json" };
 const glassStyle = new Style(glass);
 const botttsNeutralStyle = new Style(botttsNeutral);
 const avatarSize = 256;
+const userAvatarSourceCache = new Map<string, string>();
 
 export async function generateGroupAvatar(seed: string): Promise<string> {
   return generateAvatar(glassStyle, seed, "group icon");
@@ -12,6 +13,18 @@ export async function generateGroupAvatar(seed: string): Promise<string> {
 
 export async function generateUserAvatar(seed: string): Promise<string> {
   return generateAvatar(botttsNeutralStyle, seed, "profile avatar");
+}
+
+export function generateUserAvatarSource(seed: string): string {
+  const cached = userAvatarSourceCache.get(seed);
+  if (cached) return cached;
+  const svg = new Avatar(botttsNeutralStyle, {
+    seed,
+    size: avatarSize,
+  }).toString();
+  const source = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+  userAvatarSourceCache.set(seed, source);
+  return source;
 }
 
 async function generateAvatar(style: Style, seed: string, label: string): Promise<string> {
