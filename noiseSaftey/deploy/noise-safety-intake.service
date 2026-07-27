@@ -1,0 +1,30 @@
+[Unit]
+Description=noise public safety intake and directive feed
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=noise-safety
+Group=noise-safety
+ExecStart=/usr/local/bin/noise-safety-intake serve --public-key-file /etc/noise-safety/recipient-public.json --spool-dir /var/lib/noise-safety/inbox --directive-dir /var/lib/noise-safety/directives --bind 127.0.0.1:4310
+Restart=on-failure
+RestartSec=2
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6
+ReadWritePaths=/var/lib/noise-safety/inbox
+
+[Install]
+WantedBy=multi-user.target

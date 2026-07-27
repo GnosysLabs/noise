@@ -82,3 +82,20 @@ must configure both `VITE_NOISE_SAFETY_URL` and the pinned
 `VITE_NOISE_SAFETY_PUBLIC_KEY` for reports, plus
 `VITE_NOISE_SAFETY_DIRECTIVE_SIGNING_PUBLIC_KEY` for enforcement. It will not
 trust keys fetched from a remote intake.
+
+## Production boundary
+
+The public service at `safety.makenoise.chat` runs only the `serve` command as
+the unprivileged `noise-safety` user. Its deployment uses:
+
+- `/etc/noise-safety/recipient-public.json` — public encryption and directive
+  verification keys;
+- `/var/lib/noise-safety/inbox` — encrypted report envelopes;
+- `/var/lib/noise-safety/directives` — signed, content-free public decisions;
+- `noiseSaftey/deploy/noise-safety-intake.service` — the sandboxed systemd unit;
+- `noiseSaftey/deploy/safety.makenoise.chat.nginx` — the HTTPS proxy source.
+
+The production recipient secret remains on the reviewer Mac. Encrypted inbox
+files are pulled over SSH for local review, and signed directive JSON files are
+uploaded after a decision. The public VPS does not receive the reviewer secret
+or a reviewer dashboard.
