@@ -4,6 +4,7 @@
 - Decision date: 2026-07-27
 - Implementation status: not started
 - Media storage: Cloudflare R2 selected
+- Deployment model: local development followed by production; no staging environment
 
 ## Decision
 
@@ -525,8 +526,9 @@ compatibility boundary without duplicate or missing events.
 ### Phase 3: central media
 
 - Use the private Cloudflare R2 media bucket for all new encrypted media.
-- Provision separate production, staging, and local-test bucket names so test
-  cleanup can never target production objects.
+- Provision one production media bucket. Local development and automated tests
+  use an isolated local object-store adapter and never receive production R2
+  credentials.
 - Configure the exact web CORS origin, temporary-object lifecycle, and
   least-privilege runtime/admin credentials.
 - Validate direct encrypted-block PUT, HEAD, GET, deletion, interrupted upload,
@@ -693,8 +695,9 @@ Before implementation:
 
 1. Produce a read-only inventory of both official relay stores and current
    client endpoint behavior.
-2. Provision private Cloudflare R2 staging and production media buckets with
-   documented CORS, lifecycle, credential, and recovery boundaries.
+2. Provision the private production Cloudflare R2 media bucket with documented
+   CORS, lifecycle, credential, and recovery boundaries. Local development
+   uses an isolated adapter; there is no staging deployment.
 3. Choose the initial PostgreSQL, queue, and deployment providers.
 4. Define the signed device-session protocol and minimum server-visible
    membership record.
