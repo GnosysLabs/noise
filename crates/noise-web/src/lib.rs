@@ -725,6 +725,20 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?;
             Ok(Value::Null)
         }
+        "report_message_to_noise" => serde_json::to_value(
+            client
+                .report_message_to_noise(
+                    STATE_PATH,
+                    &required::<String>(&request, "message_event_id")?,
+                    required(&request, "category")?,
+                    optional::<String>(&request, "details")?,
+                    &required::<String>(&request, "safety_url")?,
+                    optional::<String>(&request, "recipient_public_key_base64")?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         "resolve_report" => {
             client
                 .resolve_report(

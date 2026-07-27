@@ -53,6 +53,8 @@ import {
   isTauri,
   listLocalAccounts,
   noise,
+  noiseSafetyPublicKey,
+  noiseSafetyUrl,
   prepareGroupBackground,
   prepareImage,
   registerMediaStream,
@@ -101,6 +103,7 @@ import type {
   SearchMessageResult,
   SearchPersonResult,
   SearchResults,
+  SafetyReportCategory,
   SentMessageResult,
   TopicSummary,
 } from "./types";
@@ -137,6 +140,7 @@ type PersonSummary = Pick<MemberSummary, "public_key" | "username" | "bio" | "av
 };
 type SidebarMode = "groups" | "directs";
 type PresenceStatus = "online" | "recently-active" | "offline";
+type ReportDestination = "group_staff" | "noise";
 type ForwardDestination =
   | {
       type: "group";
@@ -149,6 +153,71 @@ type ForwardDestination =
       publicKey: string;
       label: string;
     };
+
+const REPORT_CATEGORIES: Array<{
+  value: SafetyReportCategory;
+  label: string;
+  detail: string;
+  destination: ReportDestination;
+}> = [
+  {
+    value: "group_rules",
+    label: "group rules",
+    detail: "something that breaks this group’s own rules",
+    destination: "group_staff",
+  },
+  {
+    value: "harassment_or_hateful_behavior",
+    label: "harassment or hateful behavior",
+    detail: "targeted abuse, intimidation, or hateful conduct",
+    destination: "group_staff",
+  },
+  {
+    value: "spam_scam_or_impersonation",
+    label: "spam, scam, or impersonation",
+    detail: "unwanted promotion, fraud, or pretending to be someone else",
+    destination: "group_staff",
+  },
+  {
+    value: "threats_or_immediate_danger",
+    label: "threats or immediate danger",
+    detail: "a credible threat, emergency, or risk of imminent harm",
+    destination: "noise",
+  },
+  {
+    value: "sexual_exploitation_or_non_consensual_sexual_content",
+    label: "sexual exploitation or non-consensual content",
+    detail: "sexual material shared without consent or involving exploitation",
+    destination: "noise",
+  },
+  {
+    value: "child_safety",
+    label: "child safety",
+    detail: "sexualization, grooming, exploitation, or danger involving a minor",
+    destination: "noise",
+  },
+  {
+    value: "explicit_content_not_properly_labeled",
+    label: "unlabeled sexually explicit content",
+    detail: "sexually explicit content posted in a general group",
+    destination: "noise",
+  },
+  {
+    value: "other",
+    label: "something else",
+    detail: "a concern that does not fit another category",
+    destination: "group_staff",
+  },
+];
+
+function reportCategory(category: SafetyReportCategory) {
+  return REPORT_CATEGORIES.find((item) => item.value === category)!;
+}
+
+function groupReportReason(category: SafetyReportCategory, details: string) {
+  const label = reportCategory(category).label;
+  return details ? `${label}: ${details}` : label;
+}
 
 function albumButtonLabel(
   album: { item_count: number } | null | undefined,
@@ -231,6 +300,19 @@ function withoutMessage(conversation: Conversation, messageEventId: string): Con
     reported_message_event_ids: conversation.reported_message_event_ids.filter(
       (eventId) => eventId !== messageEventId,
     ),
+  };
+}
+
+function withReportedMessageHidden(
+  conversation: Conversation,
+  messageEventId: string,
+): Conversation {
+  return {
+    ...conversation,
+    messages: conversation.messages.filter((message) => message.event_id !== messageEventId),
+    reported_message_event_ids: conversation.reported_message_event_ids.includes(messageEventId)
+      ? conversation.reported_message_event_ids
+      : [...conversation.reported_message_event_ids, messageEventId],
   };
 }
 
@@ -4422,13 +4504,66 @@ export default function App() {
       {dialog?.type === "report_message" && (
         <ReportMessageDialog
           message={dialog.message}
+          groupContentRating={selectedConversationState?.group.content_rating ?? "general"}
           busy={busy}
           onClose={() => setDialog(null)}
-          onReport={(reason) => perform(async () => {
-            await noise({ action: "report_message", message_event_id: dialog.message.event_id, reason, relays });
-            if (activeGroupId) await refreshCachedGroup(activeGroupId);
-            setDialog(null);
+          onReport={(category, destination, details) => perform(async () => {
+            if (destination === "noise" && !noiseSafetyUrl) {
+              throw new Error("Noise Safety reporting is not available in this build");
+            }
+            const groupId = selectedConversationState?.group.group_id ?? activeGroupId;
+            if (groupId) {
+              const cached = groupConversationCache.current.get(groupId);
+              if (cached) {
+                const hidden = withReportedMessageHidden(cached, dialog.message.event_id);
+                groupConversationCache.current.set(groupId, hidden);
+                setConversation((current) =>
+                  current?.group.group_id === groupId
+                    ? withReportedMessageHidden(current, dialog.message.event_id)
+                    : current
+                );
+              }
+            }
+            if (destination === "noise") {
+              await noise({
+                action: "report_message_to_noise",
+                message_event_id: dialog.message.event_id,
+                category,
+                details: details || null,
+                safety_url: noiseSafetyUrl,
+                recipient_public_key_base64: noiseSafetyPublicKey,
+              });
+            } else {
+              await noise({
+                action: "report_message",
+                message_event_id: dialog.message.event_id,
+                reason: groupReportReason(category, details),
+                relays,
+              });
+            }
+            if (!groupId) return;
+            await refreshCachedGroup(groupId);
+          }, false)}
+          onBlock={() => setDialog({
+            type: "block_person",
+            person: {
+              public_key: dialog.message.author_public_key,
+              username: dialog.message.username,
+              bio: dialog.message.bio,
+              avatar: dialog.message.avatar,
+              album: dialog.message.album,
+              accepts_direct_messages: dialog.message.accepts_direct_messages,
+              direct_message_policy: dialog.message.direct_message_policy,
+              presence_status: presenceStatuses.get(dialog.message.author_public_key) ?? "offline",
+            },
           })}
+          onLeave={() => {
+            if (selectedConversationState) {
+              setDialog({ type: "leave_group", group: selectedConversationState.group });
+            } else {
+              setDialog(null);
+            }
+          }}
         />
       )}
       {dialog?.type === "delete_message" && (
@@ -9136,14 +9271,136 @@ function emojiOnlyCount(text: string): 1 | 2 | 3 | null {
   return count === 1 || count === 2 || count === 3 ? count : null;
 }
 
-function ReportMessageDialog({ message, busy, onClose, onReport }: { message: MessageSummary; busy: boolean; onClose: () => void; onReport: (reason: string) => Promise<boolean> }) {
-  const [reason, setReason] = useState("");
+function ReportMessageDialog({
+  message,
+  groupContentRating,
+  busy,
+  onClose,
+  onReport,
+  onBlock,
+  onLeave,
+}: {
+  message: MessageSummary;
+  groupContentRating: GroupContentRating;
+  busy: boolean;
+  onClose: () => void;
+  onReport: (
+    category: SafetyReportCategory,
+    destination: ReportDestination,
+    details: string,
+  ) => Promise<boolean>;
+  onBlock: () => void;
+  onLeave: () => void;
+}) {
+  const [category, setCategory] = useState<SafetyReportCategory | null>(null);
+  const [destination, setDestination] = useState<ReportDestination>("group_staff");
+  const [details, setDetails] = useState("");
+  const [submittedTo, setSubmittedTo] = useState<ReportDestination | null>(null);
+  const categories = REPORT_CATEGORIES.filter(
+    (item) =>
+      item.value !== "explicit_content_not_properly_labeled"
+      || groupContentRating === "general",
+  );
+  if (submittedTo) {
+    return (
+      <Modal onClose={onClose} compact>
+        <DialogHeading
+          icon={<Check />}
+          title="report sent"
+          detail={submittedTo === "noise" ? "sent privately to Noise Safety" : "sent to group staff"}
+        />
+        <div className="report-sent-state">
+          <strong>the message is now hidden from your view</strong>
+          <span>You can also block the account or leave the group.</span>
+        </div>
+        <div className="report-protection-actions">
+          <button onClick={onBlock}><ShieldOff size={14} /> block account</button>
+          <button onClick={onLeave}><LogOut size={14} /> leave group</button>
+        </div>
+        <DialogButtons><button className="primary" onClick={onClose}>done</button></DialogButtons>
+      </Modal>
+    );
+  }
+  const selectedCategory = category ? reportCategory(category) : null;
+  const selectCategory = (item: (typeof REPORT_CATEGORIES)[number]) => {
+    setCategory(item.value);
+    setDestination(item.destination);
+  };
+  const submit = async () => {
+    if (!category || busy) return;
+    if (await onReport(category, destination, details.trim())) {
+      setSubmittedTo(destination);
+    }
+  };
   return (
-    <Modal onClose={onClose} compact>
-      <DialogHeading icon={<TriangleAlert />} title="report message?" detail="send this to the group’s moderation queue" />
+    <Modal onClose={onClose}>
+      <DialogHeading icon={<TriangleAlert />} title="report message" detail="choose what is wrong" />
       <div className="report-target-preview"><strong>{message.username}</strong><p>{reportMessagePreview(message)}</p></div>
-      <LabeledArea label="details (optional)" count={`${reason.length}/280`}><textarea autoFocus maxLength={280} value={reason} placeholder="what should moderators know?" onChange={(event) => setReason(event.target.value)} /></LabeledArea>
-      <DialogButtons onClose={onClose}><button className="report-confirm" disabled={busy} onClick={() => void onReport(reason.trim())}>{busy && <LoaderCircle className="spinner" size={13} />} report message</button></DialogButtons>
+      <div className="report-category-list" role="radiogroup" aria-label="report category">
+        {categories.map((item) => (
+          <button
+            type="button"
+            role="radio"
+            aria-checked={category === item.value}
+            className={category === item.value ? "selected" : ""}
+            disabled={busy}
+            key={item.value}
+            onClick={() => selectCategory(item)}
+          >
+            <span><strong>{item.label}</strong><small>{item.detail}</small></span>
+            <i>{category === item.value && <Check size={13} />}</i>
+          </button>
+        ))}
+      </div>
+      {selectedCategory && <>
+        {selectedCategory.destination === "group_staff" ? (
+          <div className="report-destination">
+            <small>who should receive this?</small>
+            <div>
+              <button
+                className={destination === "group_staff" ? "selected" : ""}
+                disabled={busy}
+                onClick={() => setDestination("group_staff")}
+              >
+                <strong>group staff</strong>
+                <span>the founder and moderators</span>
+              </button>
+              <button
+                className={destination === "noise" ? "selected" : ""}
+                disabled={busy}
+                onClick={() => setDestination("noise")}
+              >
+                <strong>Noise Safety instead</strong>
+                <span>use when staff are involved or unsafe to contact</span>
+              </button>
+            </div>
+          </div>
+        ) : (
+          <p className="report-route-note"><Shield size={14} /> this category goes privately to Noise Safety</p>
+        )}
+        {destination === "noise" && (
+          <p className="report-data-note">
+            {category === "threats_or_immediate_danger" && message.text.trim()
+              ? "The text of this message will be included so the threat can be assessed. Surrounding messages and media bytes are not sent."
+              : "Message text and media bytes are not sent. Noise receives signed event metadata and encrypted object locations."}
+          </p>
+        )}
+        <LabeledArea label="details (optional)" count={`${details.length}/180`}>
+          <textarea
+            autoFocus
+            maxLength={180}
+            value={details}
+            placeholder={destination === "noise" ? "what should Noise Safety know?" : "what should group staff know?"}
+            onChange={(event) => setDetails(event.target.value)}
+          />
+        </LabeledArea>
+      </>}
+      <DialogButtons onClose={onClose}>
+        <button className="report-confirm" disabled={busy || !category} onClick={() => void submit()}>
+          {busy && <LoaderCircle className="spinner" size={13} />}
+          {destination === "noise" ? "report to Noise" : "report to group staff"}
+        </button>
+      </DialogButtons>
     </Modal>
   );
 }

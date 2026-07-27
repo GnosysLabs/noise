@@ -9,6 +9,7 @@ members = [
     "crates/noise-relay",
     "crates/noise-cli",
     "crates/noise-sim",
+    "noiseSaftey",
 ]
 resolver = "2"
 

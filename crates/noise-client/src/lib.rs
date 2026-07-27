@@ -56,14 +56,15 @@ use noise_core::{
     GroupPresence, GroupProfile, GroupState, HistoryKeyLink, Identity, InviteRecord,
     InviteRotation, MlsAccountState, MlsControlLog, MlsEpochRecord, MlsGroupGenesis,
     MlsJoinRequest, MlsRemovalReason, MlsRemovalRequest, Profile, PushSubscriptionRegistration,
-    SignedEvent, StorageManifest, derive_account_credentials, direct_mailbox_id, direct_message_id,
-    display_frequency, display_noise_id, encode_blob_for_storage, frequency_locator,
-    generate_frequency, generate_noise_id, media_preview_is_valid, normalize_frequency,
-    profile_media_scope_id, reconstruct_blob_from_storage_payloads, valid_reaction_emoji,
+    SafetyEncryptedObjectV1, SafetyEncryptedShardV1, SafetyReportV1, SignedEvent, StorageManifest,
+    derive_account_credentials, direct_mailbox_id, direct_message_id, display_frequency,
+    display_noise_id, encode_blob_for_storage, frequency_locator, generate_frequency,
+    generate_noise_id, media_preview_is_valid, normalize_frequency, profile_media_scope_id,
+    reconstruct_blob_from_storage_payloads, valid_reaction_emoji,
 };
 pub use noise_core::{
     DirectMessagePolicy, ForwardedFrom, GroupContentRating, MediaAttachment, MediaChunk,
-    ProfileAlbum, ProfileAlbumItem, ProfileImage,
+    ProfileAlbum, ProfileAlbumItem, ProfileImage, SafetyReportCategoryV1,
 };
 pub use noise_transport::LinkPreview;
 use noise_transport::{
@@ -600,6 +601,18 @@ pub struct SearchPersonResult {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SafetyReportReceipt {
+    pub receipt_id: String,
+}
+
+#[derive(Deserialize)]
+struct SafetyIntakeKey {
+    version: u32,
+    recipient_key_id: String,
+    public_key_base64: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProfileAlbumData {
     pub scope_id: String,
     pub items: Vec<ProfileAlbumItem>,
@@ -754,6 +767,8 @@ struct ClientState {
     mls_control_logs: HashMap<String, MlsControlLog>,
     #[serde(default)]
     group_event_caches: HashMap<String, GroupEventCache>,
+    #[serde(default)]
+    noise_reported_message_event_ids: HashMap<String, HashSet<String>>,
     #[serde(default)]
     direct_event_cache: DirectEventCache,
     groups: Vec<GroupMembership>,
@@ -1641,6 +1656,7 @@ impl ClientState {
             self.forget_group_activity(&group_id);
             self.group_conversation_cache.remove(&group_id);
             self.group_event_caches.remove(&group_id);
+            self.noise_reported_message_event_ids.remove(&group_id);
             self.mls_join_requests.remove(&group_id);
             self.mls_local_geneses.remove(&group_id);
             self.mls_control_logs.remove(&group_id);
@@ -1901,6 +1917,7 @@ impl ClientState {
             mls_local_geneses: HashMap::new(),
             mls_control_logs: contents.mls_control_logs,
             group_event_caches: contents.group_event_caches,
+            noise_reported_message_event_ids: HashMap::new(),
             direct_event_cache: DirectEventCache::default(),
             groups: contents.groups,
             group_memberships: contents.group_memberships,
@@ -2665,6 +2682,7 @@ impl NoiseClient {
             mls_local_geneses: HashMap::new(),
             mls_control_logs: HashMap::new(),
             group_event_caches: HashMap::new(),
+            noise_reported_message_event_ids: HashMap::new(),
             direct_event_cache: DirectEventCache::default(),
             groups: Vec::new(),
             group_memberships: HashMap::new(),
@@ -3112,6 +3130,10 @@ impl NoiseClient {
         if let Some(conversation) = cached.as_mut() {
             let identity_public_key = state.identity()?.public_key_base64();
             apply_current_group_profiles(conversation, &state, &identity_public_key);
+            hide_privately_reported_messages(
+                conversation,
+                state.noise_reported_message_event_ids.get(group_id),
+            );
             let blocked = state.active_hidden_keys();
             filter_conversation_for_blocks(conversation, &blocked);
             conversation.group.is_active = state.active_group_id.as_deref() == Some(group_id);
@@ -4924,6 +4946,9 @@ impl NoiseClient {
             state.forget_group_activity(&group.group_id);
             state.group_conversation_cache.remove(&group.group_id);
             state.group_event_caches.remove(&group.group_id);
+            state
+                .noise_reported_message_event_ids
+                .remove(&group.group_id);
             state.tombstone_group(&group.group_id);
             save_state(path, &state)?;
             return Ok(GroupEncryptionStatus {
@@ -7031,6 +7056,155 @@ impl NoiseClient {
         Ok(())
     }
 
+    pub async fn report_message_to_noise(
+        &self,
+        path: impl AsRef<Path>,
+        message_event_id: &str,
+        category: SafetyReportCategoryV1,
+        details: Option<String>,
+        safety_url: &str,
+        recipient_public_key_base64: Option<String>,
+    ) -> anyhow::Result<SafetyReportReceipt> {
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        let group = state.active_group()?.clone();
+        let identity = state.identity()?;
+        let actor_public_key = identity.public_key_base64();
+        let cache = state
+            .group_event_caches
+            .get(&group.group_id)
+            .context("open this group and try reporting the message again")?;
+        let view = rebuild_group_state(&state, &group, &cache.events)?;
+        if !view.members.contains_key(&actor_public_key) {
+            bail!("you are no longer a member of this group")
+        }
+        let target = view
+            .messages
+            .iter()
+            .find(|message| message.event_id == message_event_id)
+            .cloned()
+            .context("that message no longer exists")?;
+        if target.author_public_key == actor_public_key {
+            bail!("you cannot report your own message")
+        }
+        if view.reports.iter().any(|report| {
+            report.message_event_id == message_event_id
+                && report.reporter_public_key == actor_public_key
+        }) {
+            bail!("you already reported this message")
+        }
+        let reported_event = cache
+            .events
+            .iter()
+            .find(|event| event.event_id == message_event_id)
+            .cloned()
+            .context("the signed message event is not available; reload the group and try again")?;
+        let group_context_proof = cache
+            .events
+            .iter()
+            .filter(|event| {
+                event.author_public_key == actor_public_key && event.event_id != message_event_id
+            })
+            .max_by_key(|event| (event.created_at_millis, event.author_sequence))
+            .cloned();
+        let reported_text_excerpt = (category == SafetyReportCategoryV1::ThreatsOrImmediateDanger)
+            .then(|| target.text.trim().to_owned())
+            .filter(|text| !text.is_empty());
+        let report = SafetyReportV1::create(
+            &identity,
+            category,
+            reported_event,
+            group_context_proof,
+            None,
+            safety_encrypted_objects(target.attachment.as_ref()),
+            reported_text_excerpt,
+            details,
+        )
+        .context("could not prepare the Noise Safety report")?;
+
+        let safety_url = normalize_safety_intake_url(safety_url)?;
+        let recipient_public_key_base64 = if let Some(public_key) =
+            recipient_public_key_base64.filter(|value| !value.trim().is_empty())
+        {
+            public_key
+        } else {
+            if !is_local_safety_intake_url(&safety_url) {
+                bail!("this Noise Safety build is missing its pinned recipient key")
+            }
+            let response = self
+                .http
+                .get(format!("{safety_url}/v1/key"))
+                .send()
+                .await
+                .context("could not reach the Noise Safety intake")?;
+            if !response.status().is_success() {
+                bail!("the Noise Safety intake is unavailable")
+            }
+            let bytes = response
+                .bytes()
+                .await
+                .context("could not read the Noise Safety recipient key")?;
+            if bytes.len() > 8_192 {
+                bail!("the Noise Safety recipient key response is invalid")
+            }
+            let key: SafetyIntakeKey = serde_json::from_slice(&bytes)
+                .context("the Noise Safety recipient key is invalid")?;
+            if key.version != 1 {
+                bail!("the Noise Safety recipient key version is unsupported")
+            }
+            let envelope = report
+                .seal(&key.public_key_base64)
+                .context("could not encrypt the Noise Safety report")?;
+            if envelope.recipient_key_id != key.recipient_key_id {
+                bail!("the Noise Safety recipient key does not match its identifier")
+            }
+            key.public_key_base64
+        };
+        let envelope = report
+            .seal(&recipient_public_key_base64)
+            .context("could not encrypt the Noise Safety report")?;
+        let response = self
+            .http
+            .post(format!("{safety_url}/v1/reports"))
+            .json(&envelope)
+            .send()
+            .await
+            .context("could not submit the Noise Safety report")?;
+        if !response.status().is_success() {
+            bail!("the Noise Safety intake did not accept the report")
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .context("could not read the Noise Safety receipt")?;
+        if bytes.len() > 8_192 {
+            bail!("the Noise Safety receipt is invalid")
+        }
+        let receipt: SafetyReportReceipt =
+            serde_json::from_slice(&bytes).context("the Noise Safety receipt is invalid")?;
+        if !is_valid_hex_id(&receipt.receipt_id) {
+            bail!("the Noise Safety receipt identifier is invalid")
+        }
+
+        state
+            .noise_reported_message_event_ids
+            .entry(group.group_id.clone())
+            .or_default()
+            .insert(message_event_id.to_owned());
+        if let Some(conversation) = state.group_conversation_cache.get_mut(&group.group_id) {
+            hide_privately_reported_message(conversation, message_event_id);
+        }
+        if let Some(conversation) = state
+            .group_event_caches
+            .get_mut(&group.group_id)
+            .and_then(|cache| cache.portable_conversation.as_mut())
+        {
+            hide_privately_reported_message(conversation, message_event_id);
+        }
+        save_state(path, &state)?;
+        Ok(receipt)
+    }
+
     pub async fn resolve_report(
         &self,
         path: impl AsRef<Path>,
@@ -7224,6 +7398,9 @@ impl NoiseClient {
         state.forget_group_activity(&group.group_id);
         state.group_conversation_cache.remove(&group.group_id);
         state.group_event_caches.remove(&group.group_id);
+        state
+            .noise_reported_message_event_ids
+            .remove(&group.group_id);
         state.tombstone_group(&group.group_id);
         save_state(path, &state)?;
         state.summary()
@@ -7284,6 +7461,7 @@ impl NoiseClient {
         state.forget_group_activity(group_id);
         state.group_conversation_cache.remove(group_id);
         state.group_event_caches.remove(group_id);
+        state.noise_reported_message_event_ids.remove(group_id);
         state.mls_join_requests.remove(group_id);
         state.mls_local_geneses.remove(group_id);
         state.mls_control_logs.remove(group_id);
@@ -8476,12 +8654,22 @@ impl NoiseClient {
                 });
             }
         }
-        let reported_message_event_ids = view
+        let mut reported_message_event_ids = view
             .reports
             .iter()
             .filter(|report| report.reporter_public_key == identity_public_key)
             .map(|report| report.message_event_id.clone())
-            .collect::<Vec<_>>();
+            .collect::<HashSet<_>>();
+        if let Some(private_reports) = state.noise_reported_message_event_ids.get(&group.group_id) {
+            reported_message_event_ids.extend(private_reports.iter().cloned());
+        }
+        let mut reported_message_event_ids =
+            reported_message_event_ids.into_iter().collect::<Vec<_>>();
+        reported_message_event_ids.sort();
+        let hidden_reported_message_event_ids = reported_message_event_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
         let reports = view
             .reports
             .iter()
@@ -8568,6 +8756,7 @@ impl NoiseClient {
             messages: view
                 .messages
                 .into_iter()
+                .filter(|message| !hidden_reported_message_event_ids.contains(&message.event_id))
                 .map(|message| {
                     let reactions = reactions_by_message
                         .remove(&message.event_id)
@@ -10895,6 +11084,43 @@ fn remove_message_from_conversation(conversation: &mut Conversation, message_eve
         .retain(|event_id| event_id != message_event_id);
 }
 
+fn hide_privately_reported_message(conversation: &mut Conversation, message_event_id: &str) {
+    conversation
+        .messages
+        .retain(|message| message.event_id != message_event_id);
+    if !conversation
+        .reported_message_event_ids
+        .iter()
+        .any(|event_id| event_id == message_event_id)
+    {
+        conversation
+            .reported_message_event_ids
+            .push(message_event_id.to_owned());
+    }
+}
+
+fn hide_privately_reported_messages(
+    conversation: &mut Conversation,
+    message_event_ids: Option<&HashSet<String>>,
+) {
+    let Some(message_event_ids) = message_event_ids else {
+        return;
+    };
+    conversation
+        .messages
+        .retain(|message| !message_event_ids.contains(&message.event_id));
+    for message_event_id in message_event_ids {
+        if !conversation
+            .reported_message_event_ids
+            .contains(message_event_id)
+        {
+            conversation
+                .reported_message_event_ids
+                .push(message_event_id.clone());
+        }
+    }
+}
+
 fn strip_conversation_media_previews(conversation: &mut Conversation) {
     for attachment in conversation
         .messages
@@ -11075,12 +11301,21 @@ fn cached_conversation_from_view(
         }
     }
 
-    let reported_message_event_ids = view
+    let mut reported_message_event_ids = view
         .reports
         .iter()
         .filter(|report| report.reporter_public_key == identity_public_key)
         .map(|report| report.message_event_id.clone())
-        .collect::<Vec<_>>();
+        .collect::<HashSet<_>>();
+    if let Some(private_reports) = state.noise_reported_message_event_ids.get(&group.group_id) {
+        reported_message_event_ids.extend(private_reports.iter().cloned());
+    }
+    let mut reported_message_event_ids = reported_message_event_ids.into_iter().collect::<Vec<_>>();
+    reported_message_event_ids.sort();
+    let hidden_reported_message_event_ids = reported_message_event_ids
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
     let reports = view
         .reports
         .iter()
@@ -11169,6 +11404,7 @@ fn cached_conversation_from_view(
         messages: view
             .messages
             .into_iter()
+            .filter(|message| !hidden_reported_message_event_ids.contains(&message.event_id))
             .map(|message| {
                 let reactions = reactions_by_message
                     .remove(&message.event_id)
@@ -12240,6 +12476,59 @@ fn is_local_relay(base_url: &str) -> bool {
         || base_url.starts_with("http://[::1]")
 }
 
+fn normalize_safety_intake_url(value: &str) -> anyhow::Result<String> {
+    let value = value.trim().trim_end_matches('/');
+    let url = reqwest::Url::parse(value).context("the Noise Safety intake address is invalid")?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || (url.scheme() != "https" && !is_local_safety_intake_url(value))
+    {
+        bail!("the Noise Safety intake address is invalid")
+    }
+    Ok(value.to_owned())
+}
+
+fn is_local_safety_intake_url(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url
+                .host_str()
+                .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]"))
+    })
+}
+
+fn is_valid_hex_id(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn safety_encrypted_objects(attachment: Option<&MediaAttachment>) -> Vec<SafetyEncryptedObjectV1> {
+    let mut objects = HashMap::<String, SafetyEncryptedObjectV1>::new();
+    for manifest in attachment
+        .into_iter()
+        .flat_map(|attachment| &attachment.chunks)
+        .filter_map(|chunk| chunk.storage.as_ref())
+    {
+        objects
+            .entry(manifest.object_id.clone())
+            .or_insert_with(|| SafetyEncryptedObjectV1 {
+                object_id: manifest.object_id.clone(),
+                shards: manifest
+                    .placements
+                    .iter()
+                    .map(|placement| SafetyEncryptedShardV1 {
+                        relay: placement.relay.clone(),
+                        shard_id: placement.shard_id.clone(),
+                    })
+                    .collect(),
+            });
+    }
+    let mut objects = objects.into_values().collect::<Vec<_>>();
+    objects.sort_by(|left, right| left.object_id.cmp(&right.object_id));
+    objects
+}
+
 fn validate_username(username: &str) -> anyhow::Result<()> {
     if username.trim().is_empty() || username.chars().count() > 32 {
         bail!("display names must contain between 1 and 32 characters")
@@ -13017,6 +13306,7 @@ mod tests {
             mls_local_geneses: HashMap::new(),
             mls_control_logs: HashMap::new(),
             group_event_caches: HashMap::new(),
+            noise_reported_message_event_ids: HashMap::new(),
             direct_event_cache: DirectEventCache::default(),
             groups: Vec::new(),
             group_memberships: HashMap::new(),
@@ -14028,5 +14318,17 @@ mod tests {
             conversation.messages[0].direct_message_policy,
             DirectMessagePolicy::Nobody
         );
+    }
+
+    #[test]
+    fn safety_intake_only_trusts_exact_loopback_hosts_without_a_pinned_key() {
+        assert!(is_local_safety_intake_url("http://127.0.0.1:4310"));
+        assert!(is_local_safety_intake_url("http://localhost:4310"));
+        assert!(is_local_safety_intake_url("http://[::1]:4310"));
+        assert!(!is_local_safety_intake_url(
+            "http://127.0.0.1.attacker.example"
+        ));
+        assert!(normalize_safety_intake_url("http://safety.example").is_err());
+        assert!(normalize_safety_intake_url("https://safety.example").is_ok());
     }
 }

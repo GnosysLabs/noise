@@ -12,7 +12,7 @@ use std::{
 use futures_util::future::{AbortHandle, Abortable};
 use noise_client::{
     DirectMessagePolicy, ForwardedFrom, GroupContentRating, MediaAttachment, NoiseClient,
-    ProfileAlbum, ProfileAlbumItem, ProfileImage,
+    ProfileAlbum, ProfileAlbumItem, ProfileImage, SafetyReportCategoryV1,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -459,6 +459,14 @@ enum Request {
         message_event_id: String,
         reason: String,
         relays: Vec<String>,
+    },
+    ReportMessageToNoise {
+        state_path: String,
+        message_event_id: String,
+        category: SafetyReportCategoryV1,
+        details: Option<String>,
+        safety_url: String,
+        recipient_public_key_base64: Option<String>,
     },
     ResolveReport {
         state_path: String,
@@ -1855,6 +1863,26 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?;
             Ok(Value::Null)
         }
+        Request::ReportMessageToNoise {
+            state_path,
+            message_event_id,
+            category,
+            details,
+            safety_url,
+            recipient_public_key_base64,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.report_message_to_noise(
+                    state_path,
+                    &message_event_id,
+                    category,
+                    details,
+                    &safety_url,
+                    recipient_public_key_base64,
+                ))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         Request::ResolveReport {
             state_path,
             report_event_id,

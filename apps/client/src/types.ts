@@ -8,6 +8,15 @@ export type ProfileImage = {
 
 export type DirectMessagePolicy = "everyone" | "shared_groups" | "nobody";
 export type GroupContentRating = "general" | "explicit";
+export type SafetyReportCategory =
+  | "group_rules"
+  | "harassment_or_hateful_behavior"
+  | "spam_scam_or_impersonation"
+  | "threats_or_immediate_danger"
+  | "sexual_exploitation_or_non_consensual_sexual_content"
+  | "child_safety"
+  | "explicit_content_not_properly_labeled"
+  | "other";
 
 export type ProfileAlbum = {
   blob_id: string;

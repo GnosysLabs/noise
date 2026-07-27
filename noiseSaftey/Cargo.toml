@@ -1,0 +1,18 @@
+[package]
+name = "noise-safety-intake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+blake3.workspace = true
+clap.workspace = true
+noise-core = { path = "../crates/noise-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true

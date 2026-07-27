@@ -362,6 +362,12 @@ fn safety_key_id(public_key: &[u8]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+pub fn safety_recipient_key_id(recipient_public_key_base64: &str) -> Result<String, NoiseError> {
+    let recipient_public_key =
+        decode_array::<32>(recipient_public_key_base64, "safety recipient public key")?;
+    Ok(safety_key_id(&recipient_public_key))
+}
+
 fn safety_envelope_aad(version: u32, recipient_key_id: &str) -> Vec<u8> {
     format!("xyz.gnosyslabs.noise.safety-envelope:{version}:{recipient_key_id}").into_bytes()
 }

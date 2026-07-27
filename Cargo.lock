@@ -4375,6 +4375,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "noise-safety-intake"
+version = "0.1.19"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "blake3",
+ "clap",
+ "noise-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-http",
+]
+
+[[package]]
 name = "noise-sim"
 version = "0.1.19"
 dependencies = [

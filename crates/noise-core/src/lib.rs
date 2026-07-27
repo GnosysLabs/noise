@@ -25,7 +25,7 @@ pub use production_e2ee::{
 pub use safety::{
     SafetyEncryptedObjectV1, SafetyEncryptedShardV1, SafetyEncryptionKeyPair,
     SafetyMediaFingerprintV1, SafetyMediaHashAlgorithmV1, SafetyReportCategoryV1, SafetyReportV1,
-    SealedSafetyReportV1,
+    SealedSafetyReportV1, safety_recipient_key_id,
 };
 
 const FREQUENCY_SPACE: u64 = 1_000_000_000_000;

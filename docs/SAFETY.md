@@ -1,8 +1,9 @@
 # Noise safety reporting foundation
 
 This document defines the protocol boundary for escalating a report from an
-official Noise client to Noise Safety. The private write-only intake service
-exists separately; it is not deployed or wired into a user-visible control yet.
+official Noise client to Noise Safety. The category-first client flow and the
+separate write-only development intake now exist, but the intake is not yet
+deployed as a public production service.
 
 ## Authority boundary
 
@@ -18,8 +19,7 @@ plaintext, decide whether a report is valid, or gain authority over a group.
 
 ## Routing
 
-Official clients will eventually expose one **Report** action followed by a
-category:
+Official clients expose one **Report** action followed by a category:
 
 - group rules;
 - harassment or hateful behavior;
@@ -132,10 +132,13 @@ that key belongs in a separate private review worker.
 
 ## Data handling
 
-The intake service accepts only the sealed envelope and enforces a strict size
-limit without decrypting it. The private case store must not create media
-previews, accept manual uploads, place reports in email, or copy report
-contents into general application logs.
+The development intake under `noiseSaftey/` accepts only the sealed envelope,
+enforces a strict size limit and per-address rate limit, and writes the
+ciphertext to a private spool without decrypting it. It runs with a public
+recipient-key file; the recipient secret is generated into a separate file and
+is not required by the intake. The private case store must not create media
+previews, accept manual uploads, place reports in email, or copy report contents
+into general application logs.
 
 Opening a report verifies cryptographic facts, not the legal character of
 unknown media. Temporary suppression and quarantine decisions must be recorded
@@ -148,7 +151,6 @@ This foundation intentionally does not yet implement:
 
 - deployment of the write-only intake endpoint;
 - the private review worker or management console;
-- user-interface routing and confirmation;
 - signed official-client suppression or group-quarantine decisions;
 - trusted hash integrations; or
 - legal evidence and external reporting procedures.
