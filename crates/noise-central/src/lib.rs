@@ -2,6 +2,7 @@ mod config;
 mod database;
 mod error;
 mod events;
+mod mls;
 mod vaults;
 
 use std::sync::Arc;
@@ -111,6 +112,22 @@ pub async fn build_app(config: &CentralConfig) -> anyhow::Result<Router> {
         .route(
             "/v1/groups/{group_id}/events/latest",
             get(events::latest_group_events),
+        )
+        .route("/v2/mls/genesis", post(mls::publish_genesis))
+        .route("/v2/mls/epochs", post(mls::publish_epoch))
+        .route("/v2/mls/join-requests", post(mls::publish_join_request))
+        .route(
+            "/v2/mls/removal-requests",
+            post(mls::publish_removal_request),
+        )
+        .route("/v2/mls/groups/{group_id}", get(mls::control_log))
+        .route(
+            "/v2/mls/groups/{group_id}/join-requests",
+            get(mls::join_requests),
+        )
+        .route(
+            "/v2/mls/groups/{group_id}/removal-requests",
+            get(mls::removal_requests),
         )
         .route(
             "/v1/devices/{installation_id}/revoke",

@@ -1,7 +1,7 @@
 # noise central service deployment
 
 Status: production foundation provisioned; authentication, encrypted-vault,
-and canonical group-event service built but not deployed
+canonical group-event, and MLS control service built but not deployed
 
 Updated: 2026-07-27
 
@@ -72,9 +72,10 @@ installation; another device is never required.
 The first runnable API is implemented in `crates/noise-central` and documented
 in `CENTRAL-API.md`. Its registration, silent session, encrypted account-vault
 compare-and-swap, active-membership group-event publication, canonical event
-pagination, logout, and revocation flows pass against a disposable PostgreSQL
-database on Cyphers VPS. It has not been installed, routed through nginx, or
-connected to clients.
+pagination, MLS genesis/admission/removal transitions, materialized membership,
+logout, and revocation flows pass against a disposable PostgreSQL database on
+Cyphers VPS. It has not been installed, routed through nginx, or connected to
+clients.
 
 The initial canonical database contract is documented in
 `CANONICAL-SCHEMA.md` and implemented by
@@ -103,8 +104,8 @@ backup and cannot be hidden inside an ordinary application deployment.
 
 ## Work still required before traffic
 
-- extend the central API into MLS control records, canonical direct events,
-  realtime, media, and safety-directive operations;
+- extend the central API into canonical direct events, realtime, media, and
+  safety-directive operations;
 - apply the canonical migration as part of the first reversible service
   deployment, not as an isolated production mutation;
 - implement the transactional outbox/job claim contract;

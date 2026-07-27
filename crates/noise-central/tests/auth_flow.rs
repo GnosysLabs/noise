@@ -4,7 +4,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use clap::Parser;
 use noise_central::{CentralConfig, build_app};
 use noise_core::{
-    AccountVault, CentralInstallationAuthKey, GroupMembership, Identity, SignedEvent,
+    AccountVault, CentralInstallationAuthKey, GroupEventPayload, GroupMembership, Identity,
+    MlsAccountState, MlsControlLog, MlsJoinRequest, MlsRemovalRequest, SignedEvent,
     derive_account_credentials,
 };
 use reqwest::StatusCode;
@@ -156,6 +157,14 @@ async fn complete_installation_session_and_revocation_flow() {
 
     verify_account_vault_flow(&http, &base, &identity, &first_session.access_token).await;
     verify_group_event_flow(
+        &http,
+        &base,
+        &database,
+        &identity,
+        &first_session.access_token,
+    )
+    .await;
+    verify_mls_control_flow(
         &http,
         &base,
         &database,
@@ -485,6 +494,362 @@ async fn verify_group_event_flow(
         .await
         .unwrap();
     assert_eq!(outbox.get::<_, i64>(0), 2);
+}
+
+async fn verify_mls_control_flow(
+    http: &reqwest::Client,
+    base: &str,
+    database: &tokio_postgres::Client,
+    founder: &Identity,
+    founder_access_token: &str,
+) {
+    let joiner = Identity::from_secret_base64(&STANDARD_NO_PAD.encode([0x55; 32])).unwrap();
+    let joiner_installation_key =
+        CentralInstallationAuthKey::from_secret_base64(&STANDARD_NO_PAD.encode([0x66; 32]))
+            .unwrap();
+    let joiner_installation_id = STANDARD_NO_PAD.encode([0x77; 32]);
+    let joiner_session = register_test_installation(
+        http,
+        base,
+        &joiner,
+        &joiner_installation_key,
+        &joiner_installation_id,
+    )
+    .await;
+
+    let group =
+        GroupMembership::create_owned("MLS central integration", founder.public_key_base64());
+    let mut founder_mls = MlsAccountState::create(founder).unwrap();
+    let mut joiner_mls = MlsAccountState::create(&joiner).unwrap();
+    let genesis = founder_mls.create_group_genesis(founder, &group).unwrap();
+
+    assert_status(
+        http.post(format!("{base}/v2/mls/genesis"))
+            .bearer_auth(founder_access_token)
+            .json(&genesis)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::ACCEPTED,
+    );
+    assert_status(
+        http.post(format!("{base}/v2/mls/genesis"))
+            .bearer_auth(founder_access_token)
+            .json(&genesis)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::OK,
+    );
+
+    let initial_log: MlsControlLog = http
+        .get(format!("{base}/v2/mls/groups/{}", group.group_id))
+        .bearer_auth(&joiner_session.access_token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    initial_log.verify().unwrap();
+    assert_eq!(initial_log.genesis, genesis);
+    assert!(initial_log.epochs.is_empty());
+
+    let join_request =
+        MlsJoinRequest::create(&joiner, &mut joiner_mls, group.group_id.clone()).unwrap();
+    assert_status(
+        http.post(format!("{base}/v2/mls/join-requests"))
+            .bearer_auth(&joiner_session.access_token)
+            .json(&join_request)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::ACCEPTED,
+    );
+    assert_status(
+        http.post(format!("{base}/v2/mls/join-requests"))
+            .bearer_auth(&joiner_session.access_token)
+            .json(&join_request)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::OK,
+    );
+
+    let pending_joins: Vec<MlsJoinRequest> = http
+        .get(format!(
+            "{base}/v2/mls/groups/{}/join-requests",
+            group.group_id
+        ))
+        .bearer_auth(founder_access_token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pending_joins, vec![join_request.clone()]);
+
+    let admission = founder_mls
+        .add_member(&group.group_id, &join_request.key_package_base64)
+        .unwrap();
+    let welcome = admission.welcome_base64.clone().unwrap();
+    let first_epoch = founder_mls
+        .create_epoch_record(founder, genesis.record_id.clone(), admission)
+        .unwrap();
+    assert_status(
+        http.post(format!("{base}/v2/mls/epochs"))
+            .bearer_auth(founder_access_token)
+            .json(&first_epoch)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::ACCEPTED,
+    );
+    assert_status(
+        http.post(format!("{base}/v2/mls/epochs"))
+            .bearer_auth(founder_access_token)
+            .json(&first_epoch)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::OK,
+    );
+
+    let joiner_epoch = joiner_mls.join_group(&group.group_id, &welcome).unwrap();
+    assert_eq!(joiner_epoch.epoch, 1);
+    let joiner_event = SignedEvent::create_for_epoch(
+        &joiner,
+        group.group_id.clone(),
+        &joiner_epoch.archive_key_base64,
+        joiner_epoch.epoch,
+        text_payload("joined through canonical MLS"),
+        1,
+    )
+    .unwrap();
+    let accepted = publish_event(
+        http,
+        base,
+        &joiner_session.access_token,
+        &joiner_event,
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(accepted.canonical_cursor, 3);
+
+    let removal_request = MlsRemovalRequest::self_left(&joiner, group.group_id.clone()).unwrap();
+    assert_status(
+        http.post(format!("{base}/v2/mls/removal-requests"))
+            .bearer_auth(&joiner_session.access_token)
+            .json(&removal_request)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::ACCEPTED,
+    );
+    let pending_removals: Vec<MlsRemovalRequest> = http
+        .get(format!(
+            "{base}/v2/mls/groups/{}/removal-requests",
+            group.group_id
+        ))
+        .bearer_auth(founder_access_token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pending_removals, vec![removal_request.clone()]);
+
+    let removal = founder_mls
+        .remove_member(&group.group_id, &joiner.public_key_base64())
+        .unwrap();
+    let second_epoch = founder_mls
+        .create_epoch_record(founder, first_epoch.record_id.clone(), removal)
+        .unwrap();
+    assert_status(
+        http.post(format!("{base}/v2/mls/epochs"))
+            .bearer_auth(founder_access_token)
+            .json(&second_epoch)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::ACCEPTED,
+    );
+
+    let retry_after_removal = http
+        .post(format!("{base}/v2/mls/removal-requests"))
+        .bearer_auth(&joiner_session.access_token)
+        .json(&removal_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retry_after_removal.status(), StatusCode::OK);
+
+    let final_log: MlsControlLog = http
+        .get(format!("{base}/v2/mls/groups/{}", group.group_id))
+        .bearer_auth(&joiner_session.access_token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    final_log.verify().unwrap();
+    assert_eq!(
+        final_log.epochs,
+        vec![first_epoch.clone(), second_epoch.clone()]
+    );
+
+    let rejected_event = SignedEvent::create_for_epoch(
+        &joiner,
+        group.group_id.clone(),
+        &joiner_epoch.archive_key_base64,
+        joiner_epoch.epoch,
+        text_payload("must not publish after removal"),
+        2,
+    )
+    .unwrap();
+    let rejected = http
+        .post(format!("{base}/v1/events"))
+        .bearer_auth(&joiner_session.access_token)
+        .json(&rejected_event)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
+
+    let founder_epoch = founder_mls.epoch(&group.group_id).unwrap();
+    let founder_event = SignedEvent::create_for_epoch(
+        founder,
+        group.group_id.clone(),
+        &founder_epoch.archive_key_base64,
+        founder_epoch.epoch,
+        text_payload("founder remains after removal"),
+        1,
+    )
+    .unwrap();
+    let accepted = publish_event(
+        http,
+        base,
+        founder_access_token,
+        &founder_event,
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(accepted.canonical_cursor, 4);
+
+    let group_id = decode_hex(&group.group_id);
+    let membership_counts = database
+        .query_one(
+            "SELECT
+                count(*) FILTER (WHERE gm.active_until_cursor IS NULL),
+                count(*) FILTER (WHERE gm.active_until_cursor IS NOT NULL)
+             FROM noise.group_memberships gm
+             JOIN noise.groups g ON g.group_pk = gm.group_pk
+             WHERE g.protocol_group_id = $1",
+            &[&group_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(membership_counts.get::<_, i64>(0), 1);
+    assert_eq!(membership_counts.get::<_, i64>(1), 1);
+    let epoch_members = database
+        .query(
+            "SELECT e.epoch::text, count(m.account_id)
+             FROM noise.mls_epochs e
+             JOIN noise.mls_epoch_members m ON m.epoch_record_id = e.record_id
+             JOIN noise.groups g ON g.group_pk = e.group_pk
+             WHERE g.protocol_group_id = $1
+             GROUP BY e.epoch
+             ORDER BY e.epoch",
+            &[&group_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(epoch_members.len(), 2);
+    assert_eq!(epoch_members[0].get::<_, &str>(0), "1");
+    assert_eq!(epoch_members[0].get::<_, i64>(1), 2);
+    assert_eq!(epoch_members[1].get::<_, &str>(0), "2");
+    assert_eq!(epoch_members[1].get::<_, i64>(1), 1);
+
+    let mls_outbox = database
+        .query_one(
+            "SELECT count(*)
+             FROM noise.outbox_events
+             WHERE topic LIKE 'mls.%'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(mls_outbox.get::<_, i64>(0), 5);
+}
+
+async fn register_test_installation(
+    http: &reqwest::Client,
+    base: &str,
+    identity: &Identity,
+    installation_key: &CentralInstallationAuthKey,
+    installation_id: &str,
+) -> SessionResponse {
+    let registration_challenge = challenge(
+        http,
+        &format!("{base}/v1/auth/challenges/registration"),
+        serde_json::json!({
+            "account_public_key": identity.public_key_base64(),
+        }),
+    )
+    .await;
+    let registration = identity
+        .central_installation_registration(
+            installation_id,
+            installation_key.public_key_base64(),
+            &registration_challenge.challenge_id_base64,
+            &registration_challenge.challenge_nonce_base64,
+            now_millis(),
+            1,
+        )
+        .unwrap();
+    assert_status(
+        http.post(format!("{base}/v1/devices/register"))
+            .json(&registration)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::CREATED,
+    );
+    let session_challenge = session_challenge(http, base, identity, installation_id).await;
+    let proof = installation_key
+        .session_proof(
+            identity.public_key_base64(),
+            installation_id,
+            &session_challenge.challenge_id_base64,
+            &session_challenge.challenge_nonce_base64,
+            now_millis(),
+        )
+        .unwrap();
+    open_session(http, base, &proof).await
+}
+
+fn text_payload(text: &str) -> GroupEventPayload {
+    GroupEventPayload::Message {
+        text: text.to_owned(),
+        attachment: None,
+        reply_to_message_id: None,
+        forwarded_from: None,
+    }
+}
+
+fn assert_status(response: reqwest::Response, expected: StatusCode) {
+    assert_eq!(response.status(), expected);
 }
 
 async fn publish_event(

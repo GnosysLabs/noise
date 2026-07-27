@@ -1,7 +1,7 @@
 # noise central API
 
-Status: authentication, encrypted account-vault, and canonical group-event
-service implemented; not deployed
+Status: authentication, encrypted account-vault, canonical group-event, and
+MLS control service implemented; not deployed
 
 Updated: 2026-07-27
 
@@ -25,6 +25,13 @@ The first runnable central-service layer implements:
 | `POST /v1/events` | Verify and canonically order a signed encrypted group or topic event |
 | `GET /v1/groups/{group_id}/events` | Fetch visible events after a canonical cursor |
 | `GET /v1/groups/{group_id}/events/latest` | Fetch the latest visible canonical event page |
+| `POST /v2/mls/genesis` | Verify and establish one founder-signed MLS epoch-zero control record |
+| `POST /v2/mls/epochs` | Verify and append one authorized MLS epoch transition to the current head |
+| `POST /v2/mls/join-requests` | Store an authenticated account's signed group-scoped KeyPackage request |
+| `POST /v2/mls/removal-requests` | Store a current member's signed self-leave or founder-reviewed ban request |
+| `GET /v2/mls/groups/{group_id}` | Fetch and reverify the complete canonical MLS control log |
+| `GET /v2/mls/groups/{group_id}/join-requests` | Fetch signed join requests as an active member |
+| `GET /v2/mls/groups/{group_id}/removal-requests` | Fetch signed removal requests as an active member |
 
 The `installation_id` path value is the canonical unpadded base64 value and
 must be URL-encoded by a client when it contains reserved URL characters.
@@ -80,6 +87,20 @@ revealing account metadata.
 - Event reads require active membership and omit hidden or restricted events.
   The returned high-water cursor lets a client advance safely past moderated
   gaps without seeing the hidden envelopes.
+- MLS genesis creates or binds the canonical group and founder, records epoch
+  zero, and materializes the founder membership in one transaction.
+- Epoch writes lock the group control head, require an exact parent record and
+  epoch, verify that the author belonged to the parent snapshot, and permit
+  removals only from the founder. An exact accepted retry is idempotent.
+- Every accepted epoch stores its complete signed account-membership snapshot
+  and atomically opens or closes current membership intervals before the
+  transaction commits.
+- Join and removal requests never change membership by themselves. Any current
+  member may author an admission epoch; only the founder may author an epoch
+  that removes an account, matching the existing MLS protocol.
+- Each accepted MLS object creates a durable outbox record in the same
+  transaction. Control-log and request reads reverify stored signed objects
+  before returning them.
 
 ## Stored secrets
 
@@ -95,9 +116,11 @@ only:
 unpadded base64. It is a server secret, never a client setting, database value,
 or committed file.
 
-Account-vault and event records contain signed ciphertext envelopes. The
-service stores no account-vault key, message plaintext, media plaintext, group
-name, or profile plaintext.
+Account-vault, event, and MLS records contain signed ciphertext or public
+control envelopes. The service stores the pseudonymous account keys and
+membership snapshots already present in the signed MLS protocol, but no MLS
+private state, archive key, account-vault key, message plaintext, media
+plaintext, group name, or profile plaintext.
 
 Request bodies, passwords, vault keys, identity secrets, installation private
 keys, raw challenge nonces, and raw bearer tokens are not logged.
@@ -154,10 +177,16 @@ a disposable PostgreSQL database on Cyphers VPS. The test covered:
    update;
 5. active-membership group-event publication, exact retry, sequence-conflict
    rejection, canonical pagination, latest-page fetch, and outbox creation;
-6. current-session logout and a new invisible session;
-7. account-signed installation revocation and idempotent replay;
-8. rejection of the revoked bearer token and new session challenges; and
-9. confirmation that raw bearer tokens and raw challenge nonces were not
+6. a second authenticated account, founder-signed MLS genesis, signed join
+   request, real OpenMLS admission commit, epoch-one membership
+   materialization, and epoch-encrypted event publication;
+7. signed self-removal request, founder-authored removal commit, epoch-two
+   membership materialization, rejection of the removed member's next event,
+   retained control-log access, and successful founder publication;
+8. current-session logout and a new invisible session;
+9. account-signed installation revocation and idempotent replay;
+10. rejection of the revoked bearer token and new session challenges; and
+11. confirmation that raw bearer tokens and raw challenge nonces were not
    stored.
 
 The disposable database and source/build directories were removed afterward.
@@ -168,7 +197,6 @@ The production `noise` schema remained empty.
 The service is not production-ready and has no public nginx route. Remaining
 central API layers include:
 
-- MLS control records;
 - canonical direct-thread authorization and encrypted direct events;
 - realtime WebSocket catch-up;
 - media upload/download capabilities and R2 runtime credentials;
