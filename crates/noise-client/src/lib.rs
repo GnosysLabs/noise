@@ -6228,6 +6228,16 @@ impl NoiseClient {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<SearchResults> {
+        self.search_local_until(path, query, limit, || false)
+    }
+
+    pub fn search_local_until(
+        &self,
+        path: impl AsRef<Path>,
+        query: &str,
+        limit: usize,
+        should_stop: impl Fn() -> bool,
+    ) -> anyhow::Result<SearchResults> {
         let path = path.as_ref();
         let state = load_state(path)?;
         let query = query.trim();
@@ -6251,6 +6261,9 @@ impl NoiseClient {
         if query.chars().count() > 128 {
             bail!("search queries can contain at most 128 characters")
         }
+        if should_stop() {
+            bail!("search superseded")
+        }
         let limit = limit.clamp(1, 100);
         let hidden = state.active_content_hidden_keys();
         let identity_public_key = state.identity()?.public_key_base64();
@@ -6265,6 +6278,9 @@ impl NoiseClient {
         let mut location_matches = Vec::<(u32, SearchLocationResult)>::new();
 
         for group in &state.groups {
+            if should_stop() {
+                bail!("search superseded")
+            }
             let Some(group_summary) = group_summaries.get(&group.group_id) else {
                 continue;
             };
@@ -6310,6 +6326,9 @@ impl NoiseClient {
             else {
                 continue;
             };
+            if should_stop() {
+                bail!("search superseded")
+            }
             if !conversation_was_cached
                 && let Some(event_cache) = state.group_event_caches.get(&group.group_id)
             {
@@ -6377,6 +6396,9 @@ impl NoiseClient {
             }
         }
 
+        if should_stop() {
+            bail!("search superseded")
+        }
         let direct_contacts = state
             .direct_contacts
             .iter()
@@ -6517,9 +6539,20 @@ impl NoiseClient {
     }
 
     pub fn prepare_local_search(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        self.prepare_local_search_until(path, || false)
+    }
+
+    pub fn prepare_local_search_until(
+        &self,
+        path: impl AsRef<Path>,
+        should_stop: impl Fn() -> bool,
+    ) -> anyhow::Result<()> {
         let path = path.as_ref();
         let state = load_state(path)?;
         for group in &state.groups {
+            if should_stop() {
+                bail!("search superseded")
+            }
             if state
                 .active_group_safety_restriction(&group.group_id)
                 .is_some()
@@ -6533,6 +6566,9 @@ impl NoiseClient {
             else {
                 continue;
             };
+            if should_stop() {
+                bail!("search superseded")
+            }
             if let Some(event_cache) = state.group_event_caches.get(&group.group_id) {
                 cache_materialized_group_conversation(
                     path,

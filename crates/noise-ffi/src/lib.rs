@@ -645,6 +645,11 @@ fn search_lock() -> &'static Mutex<()> {
     SEARCH_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn search_generation() -> &'static AtomicU64 {
+    static SEARCH_GENERATION: AtomicU64 = AtomicU64::new(0);
+    &SEARCH_GENERATION
+}
+
 fn session_ending() -> &'static AtomicBool {
     static SESSION_ENDING: AtomicBool = AtomicBool::new(false);
     &SESSION_ENDING
@@ -790,6 +795,14 @@ fn invoke(request_json: &str) -> Result<Value, String> {
     if !is_logout && session_ending().load(Ordering::Acquire) {
         return Err("session ended".to_owned());
     }
+    let requested_search_generation = matches!(&request, Request::SearchLocal { .. }).then(|| {
+        search_generation()
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1)
+    });
+    let preparation_search_generation =
+        matches!(&request, Request::PrepareLocalSearch { .. })
+            .then(|| search_generation().load(Ordering::Acquire));
     let _search_guard = if matches!(
         &request,
         Request::PrepareLocalSearch { .. } | Request::SearchLocal { .. }
@@ -802,6 +815,11 @@ fn invoke(request_json: &str) -> Result<Value, String> {
     } else {
         None
     };
+    if requested_search_generation.is_some_and(|generation| {
+        search_generation().load(Ordering::Acquire) != generation
+    }) {
+        return Err("search superseded".to_owned());
+    }
     // The watch holds a network request for up to 20 seconds and never writes
     // local state. Everything else is serialized so a refresh cannot save an
     // older state snapshot over a message or profile update in progress.
@@ -891,7 +909,11 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         .map_err(|error| error.to_string()),
         Request::PrepareLocalSearch { state_path } => {
             client
-                .prepare_local_search(state_path)
+                .prepare_local_search_until(state_path, || {
+                    preparation_search_generation.is_some_and(|generation| {
+                        search_generation().load(Ordering::Acquire) != generation
+                    })
+                })
                 .map_err(|error| error.to_string())?;
             Ok(Value::Null)
         }
@@ -901,7 +923,11 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             limit,
         } => serde_json::to_value(
             client
-                .search_local(state_path, &query, limit)
+                .search_local_until(state_path, &query, limit, || {
+                    requested_search_generation.is_some_and(|generation| {
+                        search_generation().load(Ordering::Acquire) != generation
+                    })
+                })
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
