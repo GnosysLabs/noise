@@ -46,6 +46,11 @@ export type IdentitySummary = {
   album: ProfileAlbum | null;
   accepts_direct_messages: boolean;
   direct_message_policy: DirectMessagePolicy;
+  safety_restriction?: SafetyRestrictionSummary | null;
+};
+
+export type SafetyRestrictionSummary = {
+  expires_at_millis: number | null;
 };
 
 export type GroupSummary = {
@@ -66,6 +71,7 @@ export type GroupSummary = {
   is_active: boolean;
   unread_count: number;
   read_state_initialized: boolean;
+  safety_restriction?: SafetyRestrictionSummary | null;
 };
 
 export type AdultAccessSummary = {

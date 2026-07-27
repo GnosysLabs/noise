@@ -56,12 +56,13 @@ use noise_core::{
     GroupPresence, GroupProfile, GroupState, HistoryKeyLink, Identity, InviteRecord,
     InviteRotation, MlsAccountState, MlsControlLog, MlsEpochRecord, MlsGroupGenesis,
     MlsJoinRequest, MlsRemovalReason, MlsRemovalRequest, Profile, PushSubscriptionRegistration,
-    SafetyEncryptedObjectV1, SafetyEncryptedShardV1, SafetyGroupContextV1, SafetyProfileSnapshotV1,
-    SafetyReportHumanContextV1, SafetyReportV1, SafetyReporterContextV1, SignedEvent,
-    StorageManifest, derive_account_credentials, direct_mailbox_id, direct_message_id,
-    display_frequency, display_noise_id, encode_blob_for_storage, frequency_locator,
-    generate_frequency, generate_noise_id, media_preview_is_valid, normalize_frequency,
-    profile_media_scope_id, reconstruct_blob_from_storage_payloads, valid_reaction_emoji,
+    SafetyDirectiveActionV1, SafetyDirectiveV1, SafetyEncryptedObjectV1, SafetyEncryptedShardV1,
+    SafetyGroupContextV1, SafetyProfileSnapshotV1, SafetyReportHumanContextV1, SafetyReportV1,
+    SafetyReporterContextV1, SignedEvent, StorageManifest, derive_account_credentials,
+    direct_mailbox_id, direct_message_id, display_frequency, display_noise_id,
+    encode_blob_for_storage, frequency_locator, generate_frequency, generate_noise_id,
+    media_preview_is_valid, normalize_frequency, profile_media_scope_id,
+    reconstruct_blob_from_storage_payloads, valid_reaction_emoji,
 };
 pub use noise_core::{
     DirectMessagePolicy, ForwardedFrom, GroupContentRating, MediaAttachment, MediaChunk,
@@ -96,6 +97,8 @@ const WEB_MEDIA_CHUNK_CACHE_BYTES: usize = 96 * 1024 * 1024;
 const INITIAL_GROUP_MESSAGE_WINDOW: usize = 30;
 const GROUP_EVENT_PAGE_SIZE: usize = 128;
 const DIRECT_EVENT_CACHE_LIMIT: usize = 1024;
+const MAX_SAFETY_DIRECTIVES: usize = 10_000;
+const MAX_SAFETY_DIRECTIVE_FEED_BYTES: usize = 4 * 1024 * 1024;
 const TOPIC_RECOVERY_CONCURRENCY: usize = 4;
 /// How long a member waits for the member ranked ahead of it to publish a
 /// pending admission before taking the turn itself.
@@ -304,6 +307,13 @@ pub struct IdentitySummary {
     pub album: Option<ProfileAlbum>,
     pub accepts_direct_messages: bool,
     pub direct_message_policy: DirectMessagePolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety_restriction: Option<SafetyRestrictionSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafetyRestrictionSummary {
+    pub expires_at_millis: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +336,8 @@ pub struct GroupSummary {
     pub is_active: bool,
     pub unread_count: usize,
     pub read_state_initialized: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety_restriction: Option<SafetyRestrictionSummary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -611,6 +623,14 @@ struct SafetyIntakeKey {
     version: u32,
     recipient_key_id: String,
     public_key_base64: String,
+    #[serde(default)]
+    directive_signing_public_key_base64: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SafetyDirectiveFeed {
+    version: u32,
+    directives: Vec<SafetyDirectiveV1>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -778,6 +798,10 @@ struct ClientState {
     group_event_caches: HashMap<String, GroupEventCache>,
     #[serde(default)]
     noise_reported_message_event_ids: HashMap<String, HashSet<String>>,
+    /// Last-known signed safety decisions are local enforcement state. They are
+    /// deliberately excluded from the cross-device account vault.
+    #[serde(default)]
+    safety_directives: Vec<SafetyDirectiveV1>,
     #[serde(default)]
     direct_event_cache: DirectEventCache,
     groups: Vec<GroupMembership>,
@@ -1500,6 +1524,9 @@ impl ClientState {
     }
 
     fn ensure_group_access(&self, group: &GroupMembership) -> anyhow::Result<()> {
+        if self.active_group_safety_restriction(&group.group_id).is_some() {
+            bail!("this group is unavailable in official noise apps")
+        }
         if group.content_rating == GroupContentRating::Explicit
             && !self.adult_access.explicit_content_enabled
         {
@@ -1935,6 +1962,7 @@ impl ClientState {
             mls_control_logs: contents.mls_control_logs,
             group_event_caches: contents.group_event_caches,
             noise_reported_message_event_ids: HashMap::new(),
+            safety_directives: Vec::new(),
             direct_event_cache: DirectEventCache::default(),
             groups: contents.groups,
             group_memberships: contents.group_memberships,
@@ -2136,7 +2164,8 @@ impl ClientState {
         );
         let mut activity = messages
             .iter()
-            .filter(|message| !self.is_hidden(&message.author_public_key))
+            .filter(|message| !self.is_content_hidden(&message.author_public_key))
+            .filter(|message| !self.suppressed_event_ids(group_id).contains(&message.event_id))
             .map(|message| MessageMarker {
                 created_at_millis: message.created_at_millis,
                 event_id: message.event_id.clone(),
@@ -2147,7 +2176,8 @@ impl ClientState {
         let incoming = messages
             .iter()
             .filter(|message| message.author_public_key != self_public_key)
-            .filter(|message| !self.is_hidden(&message.author_public_key))
+            .filter(|message| !self.is_content_hidden(&message.author_public_key))
+            .filter(|message| !self.suppressed_event_ids(group_id).contains(&message.event_id))
             .map(|message| MessageMarker {
                 created_at_millis: message.created_at_millis,
                 event_id: message.event_id.clone(),
@@ -2187,7 +2217,8 @@ impl ClientState {
         for message in messages
             .iter()
             .filter(|message| message.author_public_key != self_public_key)
-            .filter(|message| !self.is_hidden(&message.author_public_key))
+            .filter(|message| !self.is_content_hidden(&message.author_public_key))
+            .filter(|message| !self.suppressed_event_ids(group_id).contains(&message.event_id))
         {
             incoming_by_topic
                 .entry(topic_activity_key(group_id, message.topic_id.as_deref()))
@@ -2293,6 +2324,136 @@ impl ClientState {
         hidden
     }
 
+    fn active_group_safety_restriction(&self, group_id: &str) -> Option<&SafetyDirectiveV1> {
+        self.safety_directives
+            .iter()
+            .filter(|directive| {
+                matches!(
+                    directive.action,
+                    SafetyDirectiveActionV1::RestrictGroup
+                        | SafetyDirectiveActionV1::RestoreGroup
+                ) && directive.group_id.as_deref() == Some(group_id)
+            })
+            .max_by(|left, right| safety_directive_order(left).cmp(&safety_directive_order(right)))
+            .filter(|directive| {
+                directive.action == SafetyDirectiveActionV1::RestrictGroup
+                    && safety_restriction_is_active(directive)
+            })
+    }
+
+    fn active_identity_safety_restriction(
+        &self,
+        public_key: &str,
+    ) -> Option<&SafetyDirectiveV1> {
+        self.safety_directives
+            .iter()
+            .filter(|directive| {
+                matches!(
+                    directive.action,
+                    SafetyDirectiveActionV1::RestrictIdentity
+                        | SafetyDirectiveActionV1::RestoreIdentity
+                ) && directive.identity_public_key.as_deref() == Some(public_key)
+            })
+            .max_by(|left, right| safety_directive_order(left).cmp(&safety_directive_order(right)))
+            .filter(|directive| {
+                directive.action == SafetyDirectiveActionV1::RestrictIdentity
+                    && safety_restriction_is_active(directive)
+            })
+    }
+
+    fn active_safety_restricted_identity_keys(&self) -> HashSet<String> {
+        let mut latest = HashMap::<&str, &SafetyDirectiveV1>::new();
+        for directive in &self.safety_directives {
+            let Some(public_key) = directive.identity_public_key.as_deref() else {
+                continue;
+            };
+            if !matches!(
+                directive.action,
+                SafetyDirectiveActionV1::RestrictIdentity
+                    | SafetyDirectiveActionV1::RestoreIdentity
+            ) {
+                continue;
+            }
+            let replace = latest.get(public_key).is_none_or(|current| {
+                safety_directive_order(directive) > safety_directive_order(current)
+            });
+            if replace {
+                latest.insert(public_key, directive);
+            }
+        }
+        latest
+            .into_iter()
+            .filter(|(_, directive)| {
+                directive.action == SafetyDirectiveActionV1::RestrictIdentity
+                    && safety_restriction_is_active(directive)
+            })
+            .map(|(public_key, _)| public_key.to_owned())
+            .collect()
+    }
+
+    fn is_content_hidden(&self, public_key: &str) -> bool {
+        self.is_hidden(public_key)
+            || self
+                .active_identity_safety_restriction(public_key)
+                .is_some()
+    }
+
+    fn active_content_hidden_keys(&self) -> HashSet<String> {
+        let mut hidden = self.active_hidden_keys();
+        hidden.extend(self.active_safety_restricted_identity_keys());
+        hidden
+    }
+
+    fn suppressed_event_ids(&self, group_id: &str) -> HashSet<String> {
+        self.safety_directives
+            .iter()
+            .filter(|directive| {
+                directive.action == SafetyDirectiveActionV1::SuppressEvent
+                    && directive.group_id.as_deref() == Some(group_id)
+            })
+            .filter_map(|directive| directive.event_id.clone())
+            .collect()
+    }
+
+    fn apply_safety_marker_filters(&mut self) {
+        let restricted_identities = self.active_safety_restricted_identity_keys();
+        let suppressed_events = self
+            .safety_directives
+            .iter()
+            .filter(|directive| directive.action == SafetyDirectiveActionV1::SuppressEvent)
+            .filter_map(|directive| directive.event_id.clone())
+            .collect::<HashSet<_>>();
+        let filtered_event_ids = self
+            .group_event_caches
+            .values()
+            .flat_map(|cache| &cache.events)
+            .filter(|event| {
+                suppressed_events.contains(&event.event_id)
+                    || restricted_identities.contains(&event.author_public_key)
+            })
+            .map(|event| event.event_id.clone())
+            .collect::<HashSet<_>>();
+        if filtered_event_ids.is_empty() {
+            return;
+        }
+        for unread in self.group_unread_messages.values_mut() {
+            unread.retain(|marker| !filtered_event_ids.contains(&marker.event_id));
+        }
+        self.group_unread_messages
+            .retain(|_, unread| !unread.is_empty());
+        for unread in self.topic_unread_messages.values_mut() {
+            unread.retain(|marker| !filtered_event_ids.contains(&marker.event_id));
+        }
+        self.topic_unread_messages
+            .retain(|_, unread| !unread.is_empty());
+        self.group_latest_incoming
+            .retain(|_, marker| !filtered_event_ids.contains(&marker.event_id));
+        self.group_latest_activity
+            .retain(|_, marker| !filtered_event_ids.contains(&marker.event_id));
+        self.topic_latest_incoming
+            .retain(|_, marker| !filtered_event_ids.contains(&marker.event_id));
+    }
+
     fn apply_block_filters(&mut self) {
         let block_cutoffs = self
             .block_states
@@ -2366,7 +2527,7 @@ impl ClientState {
         {
             return;
         }
-        if self.is_hidden(&contact.public_key) {
+        if self.is_content_hidden(&contact.public_key) {
             return;
         }
         if let Some(existing) = self
@@ -2424,10 +2585,15 @@ impl ClientState {
 
     fn summary(&self) -> anyhow::Result<LocalSummary> {
         let public_key = self.identity()?.public_key_base64();
+        let identity_safety_restriction = self
+            .active_identity_safety_restriction(&public_key)
+            .map(|directive| SafetyRestrictionSummary {
+                expires_at_millis: directive.expires_at_millis,
+            });
         Ok(LocalSummary {
             identity: IdentitySummary {
                 username: self.profile.username.clone(),
-                public_key,
+                public_key: public_key.clone(),
                 noise_id: self
                     .account
                     .as_ref()
@@ -2438,6 +2604,7 @@ impl ClientState {
                 accepts_direct_messages: self.profile.effective_direct_message_policy()
                     != DirectMessagePolicy::Nobody,
                 direct_message_policy: self.profile.effective_direct_message_policy(),
+                safety_restriction: identity_safety_restriction,
             },
             adult_access: AdultAccessSummary {
                 age_attested: self.adult_access.age_attested,
@@ -2447,7 +2614,12 @@ impl ClientState {
                 } else {
                     self.groups
                         .iter()
-                        .filter(|group| group.content_rating == GroupContentRating::Explicit)
+                        .filter(|group| {
+                            group.content_rating == GroupContentRating::Explicit
+                                && self
+                                    .active_group_safety_restriction(&group.group_id)
+                                    .is_none()
+                        })
                         .count()
                 },
             },
@@ -2479,7 +2651,9 @@ impl ClientState {
                     .groups
                     .iter()
                     .filter(|group| {
-                        group.content_rating != GroupContentRating::Explicit
+                        self.active_group_safety_restriction(&group.group_id)
+                            .is_some()
+                            || group.content_rating != GroupContentRating::Explicit
                             || self.adult_access.explicit_content_enabled
                     })
                     .collect::<Vec<_>>();
@@ -2502,29 +2676,74 @@ impl ClientState {
                 });
                 groups
                     .into_iter()
-                    .map(|group| GroupSummary {
-                        group_id: group.group_id.clone(),
-                        name: group.name.clone(),
-                        description: group.description.clone(),
-                        rules: group.rules.clone(),
-                        content_rating: group.content_rating,
-                        avatar: group.avatar.clone(),
-                        background: group.background.clone(),
-                        mobile_background: group.mobile_background.clone(),
-                        accent_color: group.accent_color.clone(),
-                        members_can_send_messages: group.members_can_send_messages,
-                        members_can_send_media: group.members_can_send_media,
-                        frequency: self
-                            .group_frequencies
-                            .get(&group.group_id)
-                            .and_then(|frequency| display_frequency(frequency).ok()),
-                        owner_public_key: group.owner_public_key.clone(),
-                        remote_deletion_supported: !group.authority_nonce_base64.is_empty(),
-                        is_active: self.active_group_id.as_deref() == Some(&group.group_id),
-                        unread_count: self.group_unread_count(&group.group_id),
-                        read_state_initialized: self
-                            .group_activity_initialized
-                            .contains(&group.group_id),
+                    .map(|group| {
+                        let restriction = self
+                            .active_group_safety_restriction(&group.group_id)
+                            .map(|directive| SafetyRestrictionSummary {
+                                expires_at_millis: directive.expires_at_millis,
+                            });
+                        let unavailable = restriction.is_some();
+                        GroupSummary {
+                            group_id: group.group_id.clone(),
+                            name: if unavailable {
+                                "unavailable group".to_owned()
+                            } else {
+                                group.name.clone()
+                            },
+                            description: if unavailable {
+                                String::new()
+                            } else {
+                                group.description.clone()
+                            },
+                            rules: if unavailable {
+                                String::new()
+                            } else {
+                                group.rules.clone()
+                            },
+                            content_rating: if unavailable {
+                                GroupContentRating::General
+                            } else {
+                                group.content_rating
+                            },
+                            avatar: (!unavailable).then(|| group.avatar.clone()).flatten(),
+                            background: (!unavailable)
+                                .then(|| group.background.clone())
+                                .flatten(),
+                            mobile_background: (!unavailable)
+                                .then(|| group.mobile_background.clone())
+                                .flatten(),
+                            accent_color: if unavailable {
+                                "#7758ed".to_owned()
+                            } else {
+                                group.accent_color.clone()
+                            },
+                            members_can_send_messages: !unavailable
+                                && group.members_can_send_messages,
+                            members_can_send_media: !unavailable && group.members_can_send_media,
+                            frequency: (!unavailable)
+                                .then(|| {
+                                    self.group_frequencies
+                                        .get(&group.group_id)
+                                        .and_then(|frequency| display_frequency(frequency).ok())
+                                })
+                                .flatten(),
+                            owner_public_key: if unavailable {
+                                String::new()
+                            } else {
+                                group.owner_public_key.clone()
+                            },
+                            remote_deletion_supported: !unavailable
+                                && !group.authority_nonce_base64.is_empty(),
+                            is_active: self.active_group_id.as_deref() == Some(&group.group_id),
+                            unread_count: if unavailable {
+                                0
+                            } else {
+                                self.group_unread_count(&group.group_id)
+                            },
+                            read_state_initialized: unavailable
+                                || self.group_activity_initialized.contains(&group.group_id),
+                            safety_restriction: restriction,
+                        }
                     })
                     .collect()
             },
@@ -2532,7 +2751,7 @@ impl ClientState {
                 let mut contacts = self
                     .direct_contacts
                     .iter()
-                    .filter(|contact| !self.is_hidden(&contact.public_key))
+                    .filter(|contact| !self.is_content_hidden(&contact.public_key))
                     .collect::<Vec<_>>();
                 contacts.sort_by(|left, right| {
                     self.direct_latest_activity
@@ -2559,7 +2778,7 @@ impl ClientState {
             known_people: self
                 .known_people
                 .iter()
-                .filter(|contact| !self.is_hidden(&contact.public_key))
+                .filter(|contact| !self.is_content_hidden(&contact.public_key))
                 .map(|contact| DirectSummary {
                     public_key: contact.public_key.clone(),
                     username: contact.username.clone(),
@@ -2701,6 +2920,7 @@ impl NoiseClient {
             mls_control_logs: HashMap::new(),
             group_event_caches: HashMap::new(),
             noise_reported_message_event_ids: HashMap::new(),
+            safety_directives: Vec::new(),
             direct_event_cache: DirectEventCache::default(),
             groups: Vec::new(),
             group_memberships: HashMap::new(),
@@ -3113,57 +3333,130 @@ impl NoiseClient {
         load_state(path.as_ref())?.summary()
     }
 
+    pub async fn sync_safety_directives(
+        &self,
+        path: impl AsRef<Path>,
+        safety_url: &str,
+        signing_public_key_base64: Option<String>,
+    ) -> anyhow::Result<LocalSummary> {
+        let path = path.as_ref();
+        let safety_url = normalize_safety_intake_url(safety_url)?;
+        let signing_public_key = if let Some(public_key) =
+            signing_public_key_base64.filter(|value| !value.trim().is_empty())
+        {
+            public_key
+        } else {
+            if !is_local_safety_intake_url(&safety_url) {
+                bail!("this noise safety build is missing its pinned directive signing key")
+            }
+            let response = self
+                .http
+                .get(format!("{safety_url}/v1/key"))
+                .send()
+                .await
+                .context("could not reach the noise safety service")?;
+            if !response.status().is_success() {
+                bail!("the noise safety service is unavailable")
+            }
+            let bytes = response
+                .bytes()
+                .await
+                .context("could not read the noise safety public key")?;
+            if bytes.len() > 8_192 {
+                bail!("the noise safety public key response is invalid")
+            }
+            let key: SafetyIntakeKey =
+                serde_json::from_slice(&bytes).context("the noise safety public key is invalid")?;
+            if key.version != 1 {
+                bail!("the noise safety public key version is unsupported")
+            }
+            key.directive_signing_public_key_base64
+                .context("the noise safety service is missing its directive signing key")?
+        };
+
+        let response = self
+            .http
+            .get(format!("{safety_url}/v1/directives"))
+            .send()
+            .await
+            .context("could not reach the noise safety service")?;
+        if !response.status().is_success()
+            || response
+                .content_length()
+                .is_some_and(|length| length > MAX_SAFETY_DIRECTIVE_FEED_BYTES as u64)
+        {
+            bail!("the noise safety directive feed is unavailable")
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .context("could not read the noise safety directive feed")?;
+        if bytes.len() > MAX_SAFETY_DIRECTIVE_FEED_BYTES {
+            bail!("the noise safety directive feed is invalid")
+        }
+        let feed: SafetyDirectiveFeed =
+            serde_json::from_slice(&bytes).context("the noise safety directive feed is invalid")?;
+        if feed.version != 1 || feed.directives.len() > MAX_SAFETY_DIRECTIVES {
+            bail!("the noise safety directive feed version is unsupported")
+        }
+
+        let mut received = HashMap::<String, SafetyDirectiveV1>::new();
+        for directive in feed.directives {
+            directive
+                .verify_with_signing_public_key(&signing_public_key)
+                .context("the noise safety directive feed contains an invalid signature")?;
+            if received
+                .insert(directive.directive_id.clone(), directive.clone())
+                .is_some_and(|existing| existing != directive)
+            {
+                bail!("the noise safety directive feed contains a conflicting decision")
+            }
+        }
+
+        let mut state = load_state(path)?;
+        let mut known = state
+            .safety_directives
+            .iter()
+            .cloned()
+            .map(|directive| (directive.directive_id.clone(), directive))
+            .collect::<HashMap<_, _>>();
+        for directive in known.values() {
+            directive
+                .verify_with_signing_public_key(&signing_public_key)
+                .context("the cached noise safety directives are invalid")?;
+        }
+        let before = known.len();
+        for (directive_id, directive) in received {
+            if let Some(existing) = known.get(&directive_id) {
+                if existing != &directive {
+                    bail!("the noise safety directive feed changed a signed decision")
+                }
+            } else {
+                known.insert(directive_id, directive);
+            }
+        }
+        if known.len() > MAX_SAFETY_DIRECTIVES {
+            bail!("the noise safety directive history is too large")
+        }
+        if known.len() != before {
+            state.safety_directives = known.into_values().collect();
+            state.safety_directives.sort_by(|left, right| {
+                safety_directive_order(left).cmp(&safety_directive_order(right))
+            });
+            state.group_conversation_cache.clear();
+            state.apply_safety_marker_filters();
+            save_state(path, &state)?;
+        }
+        state.summary()
+    }
+
     pub fn cached_conversation(
         &self,
         path: impl AsRef<Path>,
         group_id: &str,
     ) -> anyhow::Result<Option<Conversation>> {
         let state = load_state(path.as_ref())?;
-        let group = state
-            .groups
-            .iter()
-            .find(|group| group.group_id == group_id)
-            .context("unknown group")?;
-        state.ensure_group_access(group)?;
-        let mut cached = state.group_conversation_cache.get(group_id).cloned();
-        if cached.is_none()
-            && let Some(event_cache) = state.group_event_caches.get(group_id)
-        {
-            if let Some(portable) = event_cache.portable_conversation.as_ref() {
-                cached = Some(portable.clone());
-            } else if state
-                .mls_group_state(group_id)
-                .is_some_and(|mls| mls.epoch(group_id).is_ok())
-            {
-                let identity_public_key = state.identity()?.public_key_base64();
-                let view = rebuild_group_state(&state, group, &event_cache.events)?;
-                if view.members.contains_key(&identity_public_key) {
-                    let mut conversation =
-                        cached_conversation_from_view(&state, group, view, &identity_public_key);
-                    conversation.has_older_messages = event_cache.has_older_messages;
-                    cached = Some(conversation);
-                }
-            }
-        }
-        if let Some(conversation) = cached.as_mut() {
-            let identity_public_key = state.identity()?.public_key_base64();
-            apply_current_group_profiles(conversation, &state, &identity_public_key);
-            hide_privately_reported_messages(
-                conversation,
-                state.noise_reported_message_event_ids.get(group_id),
-            );
-            let blocked = state.active_hidden_keys();
-            filter_conversation_for_blocks(conversation, &blocked);
-            conversation.group.is_active = state.active_group_id.as_deref() == Some(group_id);
-            conversation.group.unread_count = state.group_unread_count(group_id);
-            conversation.group.read_state_initialized =
-                state.group_activity_initialized.contains(group_id);
-            conversation.general_unread_count = state.topic_unread_count(group_id, None);
-            for topic in &mut conversation.topics {
-                topic.unread_count = state.topic_unread_count(group_id, Some(&topic.topic_id));
-            }
-        }
-        Ok(cached)
+        cached_conversation_from_state(&state, group_id)
     }
 
     #[must_use]
@@ -3183,7 +3476,9 @@ impl NoiseClient {
             .iter()
             .find(|group| group.group_id == group_id)
             .context("unknown group")?;
-        state.ensure_group_access(group)?;
+        if state.active_group_safety_restriction(group_id).is_none() {
+            state.ensure_group_access(group)?;
+        }
         state.active_group_id = Some(group_id.to_owned());
         save_state(path, &state)?;
         state.summary()
@@ -3268,7 +3563,11 @@ impl NoiseClient {
         let identity = state.identity()?;
         let relays = relay_list(relays)?;
         let mut accepted = 0usize;
-        for group in &state.groups {
+        for group in state.groups.iter().filter(|group| {
+            state
+                .active_group_safety_restriction(&group.group_id)
+                .is_none()
+        }) {
             accepted += self
                 .publish_group_presence(group, &identity, &relays, active)
                 .await;
@@ -3276,7 +3575,7 @@ impl NoiseClient {
         for contact in state
             .direct_contacts
             .iter()
-            .filter(|contact| !state.is_hidden(&contact.public_key))
+            .filter(|contact| !state.is_content_hidden(&contact.public_key))
         {
             let Ok(mailbox) = identity.direct_mailbox(&contact.public_key, &contact.public_key)
             else {
@@ -3302,13 +3601,14 @@ impl NoiseClient {
             .find(|group| group.group_id == group_id)
             .cloned()
             .context("unknown group")?;
+        state.ensure_group_access(&group)?;
         let identity_public_key = state.identity()?.public_key_base64();
         let events = self.fetch_events(&group, relay_list(relays)?).await?;
         let view = rebuild_group_state(&state, &group, &events)?;
         let own_message_ids = view
             .messages
             .iter()
-            .filter(|message| !state.is_hidden(&message.author_public_key))
+            .filter(|message| !state.is_content_hidden(&message.author_public_key))
             .filter(|message| message.author_public_key == identity_public_key)
             .map(|message| message.message_id.clone())
             .collect::<HashSet<_>>();
@@ -3316,7 +3616,7 @@ impl NoiseClient {
         let mut replies = view
             .messages
             .iter()
-            .filter(|message| !state.is_hidden(&message.author_public_key))
+            .filter(|message| !state.is_content_hidden(&message.author_public_key))
             .filter(|message| message.author_public_key != identity_public_key)
             .filter(|message| {
                 message
@@ -3756,7 +4056,9 @@ impl NoiseClient {
                 .direct_contacts
                 .iter()
                 .chain(state.known_people.iter())
-                .find(|person| person.public_key == public_key && !state.is_hidden(public_key))
+                .find(|person| {
+                    person.public_key == public_key && !state.is_content_hidden(public_key)
+                })
                 .and_then(|person| person.album.as_ref())
         }
         .context("this album does not belong to a known profile")?;
@@ -4880,11 +5182,7 @@ impl NoiseClient {
             save_state(path, &state)?;
         }
         if let Some(pending) = state.mls_pending_epochs.get(&group.group_id).cloned() {
-            let valid = pending_mls_epoch_is_valid(
-                &pending,
-                &group.group_id,
-                &self_public_key,
-            );
+            let valid = pending_mls_epoch_is_valid(&pending, &group.group_id, &self_public_key);
             let accepted = valid
                 && control_log.as_ref().is_some_and(|log| {
                     log.epochs
@@ -4897,16 +5195,13 @@ impl NoiseClient {
                 save_state_immediately(path, &state)?;
             } else {
                 let still_extends_head = valid
-                    && control_log.as_ref().is_some_and(|log| {
-                        log.head().1 == pending.record.previous_record_id
-                    });
+                    && control_log
+                        .as_ref()
+                        .is_some_and(|log| log.head().1 == pending.record.previous_record_id);
                 if still_extends_head {
                     match self.publish_mls_epoch(&relays, &pending.record).await? {
                         ControlHead::Extended => {
-                            state.set_mls_group_state(
-                                &group.group_id,
-                                pending.candidate,
-                            );
+                            state.set_mls_group_state(&group.group_id, pending.candidate);
                             if let Some(log) = control_log.as_mut() {
                                 log.epochs.push(pending.record);
                                 state
@@ -5420,6 +5715,7 @@ impl NoiseClient {
                 is_active: true,
                 unread_count: 0,
                 read_state_initialized: false,
+                safety_restriction: None,
             },
             display_frequency: display_frequency(&frequency)?,
             frequency,
@@ -5492,6 +5788,7 @@ impl NoiseClient {
                 is_active: true,
                 unread_count: 0,
                 read_state_initialized: false,
+                safety_restriction: None,
             },
         })
     }
@@ -5512,7 +5809,7 @@ impl NoiseClient {
         if public_key == self_public_key {
             bail!("you cannot start a direct message with yourself")
         }
-        if state.is_hidden(public_key) {
+        if state.is_content_hidden(public_key) {
             bail!("you cannot message this person while either of you has the other blocked")
         }
         direct_mailbox_id(public_key).context("that identity has an invalid public key")?;
@@ -5728,7 +6025,7 @@ impl NoiseClient {
     ) -> anyhow::Result<LocalSummary> {
         let path = path.as_ref();
         let mut state = load_state(path)?;
-        if state.is_hidden(public_key) {
+        if state.is_content_hidden(public_key) {
             bail!("this conversation is unavailable while either person is blocked")
         }
         if !state
@@ -5790,12 +6087,13 @@ impl NoiseClient {
                 locations: Vec::new(),
                 people: Vec::new(),
                 has_more_history: state.direct_event_cache.has_older_events
-                    || state.group_event_caches.values().any(|cache| {
-                        cache.has_older_messages
-                            || cache
-                                .topic_streams
-                                .values()
-                                .any(|topic| topic.has_older_messages)
+                    || state.group_event_caches.iter().any(|(group_id, cache)| {
+                        state.active_group_safety_restriction(group_id).is_none()
+                            && (cache.has_older_messages
+                                || cache
+                                    .topic_streams
+                                    .values()
+                                    .any(|topic| topic.has_older_messages))
                     }),
                 older_scopes: Vec::new(),
             });
@@ -5804,7 +6102,7 @@ impl NoiseClient {
             bail!("search queries can contain at most 128 characters")
         }
         let limit = limit.clamp(1, 100);
-        let hidden = state.active_hidden_keys();
+        let hidden = state.active_content_hidden_keys();
         let identity_public_key = state.identity()?.public_key_base64();
         let current_profiles = current_profiles_by_public_key(&state, identity_public_key.as_str());
         let group_summaries = state
@@ -5820,6 +6118,9 @@ impl NoiseClient {
             let Some(group_summary) = group_summaries.get(&group.group_id) else {
                 continue;
             };
+            if group_summary.safety_restriction.is_some() {
+                continue;
+            }
             if let Some(score) = search_score(
                 query,
                 [
@@ -5853,9 +6154,22 @@ impl NoiseClient {
                     },
                 ));
             }
-            let Some(conversation) = self.cached_conversation(path, &group.group_id)? else {
+            let conversation_was_cached = state
+                .group_conversation_cache
+                .contains_key(&group.group_id);
+            let Some(conversation) = cached_conversation_from_state(&state, &group.group_id)? else {
                 continue;
             };
+            if !conversation_was_cached
+                && let Some(event_cache) = state.group_event_caches.get(&group.group_id)
+            {
+                cache_materialized_group_conversation(
+                    path,
+                    &group.group_id,
+                    event_cache,
+                    &conversation,
+                );
+            }
             for topic in conversation.topics.iter().filter(|topic| !topic.archived) {
                 if let Some(score) = search_score(query, [topic.name.as_str(), topic.icon.as_str()])
                 {
@@ -6002,6 +6316,9 @@ impl NoiseClient {
             state
                 .group_event_caches
                 .iter()
+                .filter(|(group_id, _)| {
+                    state.active_group_safety_restriction(group_id).is_none()
+                })
                 .flat_map(|(group_id, cache)| {
                     let mut scopes = Vec::new();
                     if cache.has_older_messages {
@@ -6051,6 +6368,37 @@ impl NoiseClient {
         })
     }
 
+    pub fn prepare_local_search(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        let path = path.as_ref();
+        let state = load_state(path)?;
+        for group in &state.groups {
+            if state
+                .active_group_safety_restriction(&group.group_id)
+                .is_some()
+            {
+                continue;
+            }
+            if state
+                .group_conversation_cache
+                .contains_key(&group.group_id)
+            {
+                continue;
+            }
+            let Some(conversation) = cached_conversation_from_state(&state, &group.group_id)? else {
+                continue;
+            };
+            if let Some(event_cache) = state.group_event_caches.get(&group.group_id) {
+                cache_materialized_group_conversation(
+                    path,
+                    &group.group_id,
+                    event_cache,
+                    &conversation,
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn mark_direct_read(
         &self,
         path: impl AsRef<Path>,
@@ -6091,7 +6439,7 @@ impl NoiseClient {
             .active_direct_public_key
             .clone()
             .context("choose a direct conversation first")?;
-        if state.is_hidden(&public_key) {
+        if state.is_content_hidden(&public_key) {
             bail!("this conversation is unavailable while either person is blocked")
         }
         let contact = state
@@ -6134,7 +6482,7 @@ impl NoiseClient {
         let direct_mailboxes = state
             .direct_contacts
             .iter()
-            .filter(|contact| !state.is_hidden(&contact.public_key))
+            .filter(|contact| !state.is_content_hidden(&contact.public_key))
             .filter_map(|contact| {
                 identity
                     .direct_mailbox(&contact.public_key, &self_public_key)
@@ -6202,7 +6550,7 @@ impl NoiseClient {
             .find(|contact| contact.public_key == public_key)
             .cloned()
             .context("this person is not known on this device")?;
-        if state.is_hidden(&contact.public_key) {
+        if state.is_content_hidden(&contact.public_key) {
             bail!("you cannot message this person while either of you has the other blocked")
         }
         if !contact.accepts_direct_messages {
@@ -8059,6 +8407,7 @@ impl NoiseClient {
             .find(|group| group.group_id == group_id)
             .cloned()
             .context("unknown group")?;
+        state.ensure_group_access(&group)?;
         let identity_public_key = state.identity()?.public_key_base64();
         let mut existing = state
             .group_event_caches
@@ -8067,14 +8416,14 @@ impl NoiseClient {
             .context("group history is not available yet")?;
         if !existing.has_older_messages {
             if let Some(mut conversation) = existing.portable_conversation.clone() {
-                filter_conversation_for_blocks(&mut conversation, &state.active_hidden_keys());
+                apply_official_content_filters(&mut conversation, &state);
                 return Ok(conversation);
             }
             let view = rebuild_group_state(&state, &group, &existing.events)?;
             let mut conversation =
                 cached_conversation_from_view(&state, &group, view, &identity_public_key);
             conversation.has_older_messages = false;
-            filter_conversation_for_blocks(&mut conversation, &state.active_hidden_keys());
+            apply_official_content_filters(&mut conversation, &state);
             return Ok(conversation);
         }
 
@@ -8174,7 +8523,7 @@ impl NoiseClient {
         let mut conversation =
             cached_conversation_from_view(&state, &group, view, &identity_public_key);
         conversation.has_older_messages = cache.has_older_messages;
-        filter_conversation_for_blocks(&mut conversation, &state.active_hidden_keys());
+        apply_official_content_filters(&mut conversation, &state);
         state.group_event_caches.insert(group_id.to_owned(), cache);
         state
             .group_conversation_cache
@@ -8239,6 +8588,7 @@ impl NoiseClient {
             .find(|group| group.group_id == group_id)
             .cloned()
             .context("unknown group")?;
+        state.ensure_group_access(&group)?;
         let relays = relay_list(relays)?;
         if let Some(cache) = state
             .group_event_caches
@@ -8563,8 +8913,7 @@ impl NoiseClient {
                 merge_portable_group_state(&mut conversation, portable);
             }
             conversation.has_older_messages = cache.has_older_messages;
-            let blocked = state.active_hidden_keys();
-            filter_conversation_for_blocks(&mut conversation, &blocked);
+            apply_official_content_filters(&mut conversation, &state);
             conversation
         });
         let conversation_cache_changed = conversation.as_ref().is_some_and(|conversation| {
@@ -8661,11 +9010,15 @@ impl NoiseClient {
     ) -> anyhow::Result<LocalSummary> {
         let path = path.as_ref();
         let mut state = load_state(path)?;
-        if !state.groups.iter().any(|group| group.group_id == group_id) {
-            bail!("unknown group")
-        }
+        let group = state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .cloned()
+            .context("unknown group")?;
+        state.ensure_group_access(&group)?;
         if let Some(topic_id) = topic_id {
-            let topic_is_known = state
+            let topic_is_known_in_snapshot = state
                 .group_conversation_cache
                 .get(group_id)
                 .or_else(|| {
@@ -8680,7 +9033,16 @@ impl NoiseClient {
                         .iter()
                         .any(|topic| topic.topic_id == topic_id && !topic.archived)
                 });
-            if !topic_is_known {
+            let topic_is_known_in_events = state
+                .group_event_caches
+                .get(group_id)
+                .and_then(|cache| rebuild_group_state(&state, &group, &cache.events).ok())
+                .is_some_and(|view| {
+                    view.topics
+                        .get(topic_id)
+                        .is_some_and(|topic| !topic.archived)
+                });
+            if !topic_is_known_in_snapshot && !topic_is_known_in_events {
                 bail!("unknown topic")
             }
         }
@@ -8936,6 +9298,7 @@ impl NoiseClient {
                 is_active: true,
                 unread_count: state.group_unread_count(&group.group_id),
                 read_state_initialized: state.topic_read_state_initialized(&group.group_id, None),
+                safety_restriction: None,
             },
             topics,
             general_unread_count: state.topic_unread_count(&group.group_id, None),
@@ -8975,8 +9338,7 @@ impl NoiseClient {
             has_older_messages: cache.has_older_messages,
         };
         apply_current_group_profiles(&mut conversation, &state, &identity_public_key);
-        let blocked = state.active_hidden_keys();
-        filter_conversation_for_blocks(&mut conversation, &blocked);
+        apply_official_content_filters(&mut conversation, &state);
         state
             .group_conversation_cache
             .insert(group.group_id.clone(), conversation.clone());
@@ -9146,7 +9508,7 @@ impl NoiseClient {
                             .get(&message.counterparty_public_key)
                             .copied()
                             .unwrap_or_default()
-                        && !state.is_hidden(&message.counterparty_public_key)
+                        && !state.is_content_hidden(&message.counterparty_public_key)
                         && (message.message.author_public_key == self_public_key
                             || state
                                 .direct_policy_rejected_through
@@ -11309,6 +11671,23 @@ fn hide_privately_reported_messages(
     }
 }
 
+fn apply_official_content_filters(conversation: &mut Conversation, state: &ClientState) {
+    filter_conversation_for_blocks(conversation, &state.active_content_hidden_keys());
+    let suppressed = state.suppressed_event_ids(&conversation.group.group_id);
+    if suppressed.is_empty() {
+        return;
+    }
+    conversation
+        .messages
+        .retain(|message| !suppressed.contains(&message.event_id));
+    conversation
+        .reports
+        .retain(|report| !suppressed.contains(&report.message.event_id));
+    conversation
+        .reported_message_event_ids
+        .retain(|event_id| !suppressed.contains(event_id));
+}
+
 fn strip_conversation_media_previews(conversation: &mut Conversation) {
     for attachment in conversation
         .messages
@@ -11439,6 +11818,109 @@ fn topic_summaries(
             .then_with(|| left.topic_id.cmp(&right.topic_id))
     });
     summaries
+}
+
+fn cached_conversation_from_state(
+    state: &ClientState,
+    group_id: &str,
+) -> anyhow::Result<Option<Conversation>> {
+    let group = state
+        .groups
+        .iter()
+        .find(|group| group.group_id == group_id)
+        .context("unknown group")?;
+    state.ensure_group_access(group)?;
+    let mut cached = state.group_conversation_cache.get(group_id).cloned();
+    if cached.is_none()
+        && let Some(event_cache) = state.group_event_caches.get(group_id)
+    {
+        if let Some(portable) = event_cache.portable_conversation.as_ref() {
+            cached = Some(portable.clone());
+        } else if state
+            .mls_group_state(group_id)
+            .is_some_and(|mls| mls.epoch(group_id).is_ok())
+        {
+            let identity_public_key = state.identity()?.public_key_base64();
+            let view = rebuild_group_state(state, group, &event_cache.events)?;
+            if view.members.contains_key(&identity_public_key) {
+                let mut conversation =
+                    cached_conversation_from_view(state, group, view, &identity_public_key);
+                conversation.has_older_messages = event_cache.has_older_messages;
+                cached = Some(conversation);
+            }
+        }
+    }
+    if let Some(conversation) = cached.as_mut() {
+        let identity_public_key = state.identity()?.public_key_base64();
+        apply_current_group_profiles(conversation, state, &identity_public_key);
+        hide_privately_reported_messages(
+            conversation,
+            state.noise_reported_message_event_ids.get(group_id),
+        );
+        apply_official_content_filters(conversation, state);
+        conversation.group.is_active = state.active_group_id.as_deref() == Some(group_id);
+        conversation.group.unread_count = state.group_unread_count(group_id);
+        conversation.group.read_state_initialized =
+            state.group_activity_initialized.contains(group_id);
+        conversation.general_unread_count = state.topic_unread_count(group_id, None);
+        for topic in &mut conversation.topics {
+            topic.unread_count = state.topic_unread_count(group_id, Some(&topic.topic_id));
+        }
+    }
+    Ok(cached)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(test)))]
+fn cache_materialized_group_conversation(
+    path: &Path,
+    group_id: &str,
+    source_event_cache: &GroupEventCache,
+    conversation: &Conversation,
+) {
+    let cache = native_state_cache();
+    let mut guard = cache
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(entry) = guard.entries.get_mut(path) else {
+        return;
+    };
+    if entry
+        .state
+        .group_event_caches
+        .get(group_id)
+        .is_some_and(|current| {
+            current.events.len() == source_event_cache.events.len()
+                && current
+                    .events
+                    .iter()
+                    .zip(&source_event_cache.events)
+                    .all(|(left, right)| left.event_id == right.event_id)
+                && current.latest_cursor == source_event_cache.latest_cursor
+                && current.older_cursor == source_event_cache.older_cursor
+                && current.message_limit == source_event_cache.message_limit
+                && current.has_older_messages == source_event_cache.has_older_messages
+                && current.needs_recent_hydration == source_event_cache.needs_recent_hydration
+                && current.needs_control_hydration == source_event_cache.needs_control_hydration
+                && current.topic_streams == source_event_cache.topic_streams
+                && current.portable_conversation.is_some()
+                    == source_event_cache.portable_conversation.is_some()
+        })
+    {
+        entry
+            .state
+            .group_conversation_cache
+            .insert(group_id.to_owned(), conversation.clone());
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn cache_materialized_group_conversation(
+    _path: &Path,
+    _group_id: &str,
+    _source_event_cache: &GroupEventCache,
+    _conversation: &Conversation,
+) {
 }
 
 fn cached_conversation_from_view(
@@ -11584,6 +12066,7 @@ fn cached_conversation_from_view(
             is_active: state.active_group_id.as_deref() == Some(group.group_id.as_str()),
             unread_count: state.group_unread_count(&group.group_id),
             read_state_initialized: state.topic_read_state_initialized(&group.group_id, None),
+            safety_restriction: None,
         },
         topics,
         general_unread_count: state.topic_unread_count(&group.group_id, None),
@@ -11772,7 +12255,7 @@ fn cached_direct_messages(state: &ClientState) -> anyhow::Result<Vec<DecryptedDi
                         .get(&message.counterparty_public_key)
                         .copied()
                         .unwrap_or_default()
-                    && !state.is_hidden(&message.counterparty_public_key)
+                    && !state.is_content_hidden(&message.counterparty_public_key)
                     && (message.message.author_public_key == self_public_key
                         || !state
                             .direct_messages_blocked_at(message.message.created_at_millis)) =>
@@ -11807,6 +12290,7 @@ fn direct_inbox_from_messages(
     let conversations = state
         .direct_contacts
         .iter()
+        .filter(|contact| !state.is_content_hidden(&contact.public_key))
         .map(|contact| {
             let mut messages = messages_by_contact
                 .remove(&contact.public_key)
@@ -12039,6 +12523,7 @@ fn ensure_active_topic(
     group: &GroupMembership,
     topic_id: &str,
 ) -> anyhow::Result<AcceptedTopic> {
+    state.ensure_group_access(group)?;
     let mut view = cached_group_view(state, group)?;
     let topic = view.topics.remove(topic_id).context("unknown topic")?;
     if topic.archived {
@@ -12978,7 +13463,7 @@ fn resolve_media_scope(
             .direct_contacts
             .iter()
             .chain(state.known_people.iter())
-            .filter(|person| !state.is_hidden(&person.public_key))
+            .filter(|person| !state.is_content_hidden(&person.public_key))
             .any(|person| {
                 profile_media_scope_id(&person.public_key).ok().as_deref()
                     == Some(scope_id.as_str())
@@ -13040,6 +13525,19 @@ fn purge_scope_cache(_cache_path: &Path, scope_id: &str) -> anyhow::Result<()> {
         bail!("conversation has an invalid local cache identifier")
     }
     Ok(())
+}
+
+fn safety_directive_order(directive: &SafetyDirectiveV1) -> (u64, &str) {
+    (
+        directive.issued_at_millis,
+        directive.directive_id.as_str(),
+    )
+}
+
+fn safety_restriction_is_active(directive: &SafetyDirectiveV1) -> bool {
+    directive
+        .expires_at_millis
+        .is_none_or(|expires_at_millis| expires_at_millis > current_millis())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -13567,6 +14065,7 @@ mod tests {
             mls_control_logs: HashMap::new(),
             group_event_caches: HashMap::new(),
             noise_reported_message_event_ids: HashMap::new(),
+            safety_directives: Vec::new(),
             direct_event_cache: DirectEventCache::default(),
             groups: Vec::new(),
             group_memberships: HashMap::new(),
@@ -14570,6 +15069,7 @@ mod tests {
                 is_active: false,
                 unread_count: 0,
                 read_state_initialized: false,
+                safety_restriction: None,
             },
             topics: Vec::new(),
             general_unread_count: 0,

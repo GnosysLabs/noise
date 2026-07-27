@@ -18,8 +18,8 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use clap::{Parser, Subcommand};
 use noise_core::{
-    SafetyEncryptionKeyPair, SealedSafetyReportV1, noise_signature_for_public_key,
-    safety_recipient_key_id,
+    SafetyDirectiveV1, SafetyEncryptionKeyPair, SealedSafetyReportV1,
+    noise_signature_for_public_key, safety_recipient_key_id,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{fs, io::AsyncWriteExt, net::TcpListener};
@@ -31,6 +31,8 @@ const DEFAULT_BIND: &str = "127.0.0.1:4310";
 const DEFAULT_REVIEW_BIND: &str = "127.0.0.1:4311";
 const MAX_REPORT_BODY_BYTES: usize = 384 * 1024;
 const MAX_CIPHERTEXT_BYTES: usize = 256 * 1024;
+const MAX_DIRECTIVE_BYTES: usize = 64 * 1024;
+const MAX_DIRECTIVES: usize = 10_000;
 const RATE_LIMIT_REPORTS: u32 = 30;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 
@@ -56,6 +58,9 @@ enum Command {
         public_key_file: PathBuf,
         #[arg(long)]
         spool_dir: PathBuf,
+        /// Publish verified, content-free decisions from this read-only directory.
+        #[arg(long)]
+        directive_dir: Option<PathBuf>,
         #[arg(long, default_value = DEFAULT_BIND)]
         bind: SocketAddr,
     },
@@ -100,6 +105,12 @@ struct ReceiptResponse {
 }
 
 #[derive(Serialize)]
+struct DirectiveFeedResponse {
+    version: u32,
+    directives: Vec<SafetyDirectiveV1>,
+}
+
+#[derive(Serialize)]
 struct ErrorResponse {
     error: &'static str,
 }
@@ -108,6 +119,7 @@ struct ErrorResponse {
 struct AppState {
     recipient: PublicRecipientKey,
     spool_dir: PathBuf,
+    directive_dir: Option<PathBuf>,
     rate_limits: Arc<Mutex<HashMap<IpAddr, RateWindow>>>,
 }
 
@@ -127,8 +139,15 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve {
             public_key_file,
             spool_dir,
+            directive_dir,
             bind,
-        } => serve(&public_key_file, &spool_dir, bind).await,
+        } => serve(
+            &public_key_file,
+            &spool_dir,
+            directive_dir.as_deref(),
+            bind,
+        )
+        .await,
         Command::Review {
             secret_key_file,
             spool_dir,
@@ -168,15 +187,29 @@ async fn generate_keys(public_output: &Path, secret_output: &Path) -> anyhow::Re
     Ok(())
 }
 
-async fn serve(public_key_file: &Path, spool_dir: &Path, bind: SocketAddr) -> anyhow::Result<()> {
+async fn serve(
+    public_key_file: &Path,
+    spool_dir: &Path,
+    directive_dir: Option<&Path>,
+    bind: SocketAddr,
+) -> anyhow::Result<()> {
     let recipient = read_public_key(public_key_file).await?;
+    if directive_dir.is_some() && recipient.directive_signing_public_key_base64.is_none() {
+        bail!("the public key file is missing its directive signing public key")
+    }
     fs::create_dir_all(spool_dir)
         .await
         .with_context(|| format!("could not create {}", spool_dir.display()))?;
     secure_directory(spool_dir).await?;
+    if let Some(directive_dir) = directive_dir {
+        fs::create_dir_all(directive_dir)
+            .await
+            .with_context(|| format!("could not create {}", directive_dir.display()))?;
+    }
     let state = AppState {
         recipient,
         spool_dir: spool_dir.to_owned(),
+        directive_dir: directive_dir.map(Path::to_owned),
         rate_limits: Arc::new(Mutex::new(HashMap::new())),
     };
     let cors = CorsLayer::new()
@@ -189,6 +222,7 @@ async fn serve(public_key_file: &Path, spool_dir: &Path, bind: SocketAddr) -> an
     let router = Router::new()
         .route("/health/ready", get(ready))
         .route("/v1/key", get(recipient_key))
+        .route("/v1/directives", get(directive_feed))
         .route("/v1/reports", post(submit_report))
         .layer(DefaultBodyLimit::max(MAX_REPORT_BODY_BYTES))
         .layer(cors)
@@ -215,6 +249,54 @@ async fn ready(State(state): State<AppState>) -> Json<ReadyResponse> {
 
 async fn recipient_key(State(state): State<AppState>) -> Json<PublicRecipientKey> {
     Json(state.recipient)
+}
+
+async fn directive_feed(
+    State(state): State<AppState>,
+) -> Result<Json<DirectiveFeedResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let Some(directory) = state.directive_dir.as_deref() else {
+        return Ok(Json(DirectiveFeedResponse {
+            version: 1,
+            directives: Vec::new(),
+        }));
+    };
+    let signing_public_key = state
+        .recipient
+        .directive_signing_public_key_base64
+        .as_deref()
+        .ok_or_else(internal_error)?;
+    let mut entries = fs::read_dir(directory).await.map_err(|_| internal_error())?;
+    let mut directives = Vec::new();
+    while let Some(entry) = entries.next_entry().await.map_err(|_| internal_error())? {
+        if directives.len() >= MAX_DIRECTIVES {
+            return Err(internal_error());
+        }
+        let file_type = entry.file_type().await.map_err(|_| internal_error())?;
+        if !file_type.is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+        {
+            continue;
+        }
+        let bytes = fs::read(entry.path()).await.map_err(|_| internal_error())?;
+        if bytes.is_empty() || bytes.len() > MAX_DIRECTIVE_BYTES {
+            return Err(internal_error());
+        }
+        let directive: SafetyDirectiveV1 =
+            serde_json::from_slice(&bytes).map_err(|_| internal_error())?;
+        directive
+            .verify_with_signing_public_key(signing_public_key)
+            .map_err(|_| internal_error())?;
+        directives.push(directive);
+    }
+    directives.sort_by(|left, right| {
+        left.issued_at_millis
+            .cmp(&right.issued_at_millis)
+            .then_with(|| left.directive_id.cmp(&right.directive_id))
+    });
+    Ok(Json(DirectiveFeedResponse {
+        version: 1,
+        directives,
+    }))
 }
 
 async fn submit_report(

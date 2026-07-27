@@ -53,6 +53,7 @@ import {
   isTauri,
   listLocalAccounts,
   noise,
+  noiseSafetyDirectiveSigningPublicKey,
   noiseSafetyPublicKey,
   noiseSafetyUrl,
   prepareGroupBackground,
@@ -1637,6 +1638,7 @@ export default function App() {
   const [directMenu, setDirectMenu] = useState<{ direct: DirectSummary; x: number; y: number } | null>(null);
   const identityPublicKey = summary?.identity.public_key ?? null;
   const blockedPublicKeyKey = summary?.hidden_public_keys.join("|") ?? "";
+  const activeSafetyRestrictionKey = safetyRestrictionKey(summary);
   const previousBlockedPublicKeyKey = useRef("");
   const lastPresenceActivityAt = useRef(Date.now());
   const selfPresenceActive = useRef(true);
@@ -2215,10 +2217,30 @@ export default function App() {
   const refresh = useCallback(async () => {
     if (groupSelectionInFlight.current) return;
     const generation = ++refreshGeneration.current;
-    const local = await noise<LocalSummary>({ action: "status" });
+    let local = await noise<LocalSummary>({ action: "status" });
     if (generation !== refreshGeneration.current) return;
     if (!local) {
       setSummary(null);
+      setLoading(false);
+      return;
+    }
+    if (noiseSafetyUrl) {
+      try {
+        local = await noise<LocalSummary>({
+          action: "sync_safety_directives",
+          safety_url: noiseSafetyUrl,
+          signing_public_key_base64: noiseSafetyDirectiveSigningPublicKey,
+        }) ?? local;
+      } catch {
+        // Keep enforcing the last-known signed decisions while the feed retries.
+      }
+      if (generation !== refreshGeneration.current) return;
+    }
+    if (local.identity.safety_restriction) {
+      setSummary(local);
+      setConversation(null);
+      setDirectConversation(null);
+      setGroupEncryption(null);
       setLoading(false);
       return;
     }
@@ -2226,6 +2248,14 @@ export default function App() {
     if (sidebarMode === "groups") {
       const activeGroup = local.groups.find((group) => group.is_active);
       if (!activeGroup) {
+        setSummary(local);
+        setConversation(null);
+        setGroupEncryption(null);
+        setLoading(false);
+        return;
+      }
+      if (activeGroup.safety_restriction) {
+        groupConversationCache.current.delete(activeGroup.group_id);
         setSummary(local);
         setConversation(null);
         setGroupEncryption(null);
@@ -2454,6 +2484,58 @@ export default function App() {
   }, [refresh]);
 
   useEffect(() => {
+    if (!identityPublicKey || !noiseSafetyUrl) return;
+    let stopped = false;
+    let running = false;
+    const sync = async () => {
+      if (stopped || running) return;
+      running = true;
+      try {
+        const next = await noise<LocalSummary>({
+          action: "sync_safety_directives",
+          safety_url: noiseSafetyUrl,
+          signing_public_key_base64: noiseSafetyDirectiveSigningPublicKey,
+        });
+        if (stopped || !next) return;
+        const nextKey = safetyRestrictionKey(next);
+        if (nextKey !== activeSafetyRestrictionKey) {
+          groupConversationCache.current.clear();
+          directConversationCache.current.clear();
+          setConversation(null);
+          setDirectConversation(null);
+          setGroupEncryption(null);
+          activeTopicIdRef.current = null;
+          setActiveTopicId(null);
+          setGroupMenu(null);
+          setDirectMenu(null);
+          setDialog(null);
+        }
+        setSummary(next);
+        if (!next.identity.safety_restriction && nextKey !== activeSafetyRestrictionKey) {
+          void refresh().catch(() => undefined);
+        }
+      } catch {
+        // Last-known valid decisions remain enforced and the feed retries.
+      } finally {
+        running = false;
+      }
+    };
+    const interval = window.setInterval(() => void sync(), 30_000);
+    const onFocus = () => void sync();
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") void sync();
+    };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      stopped = true;
+      window.clearInterval(interval);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [activeSafetyRestrictionKey, identityPublicKey, refresh]);
+
+  useEffect(() => {
     if (!isTauri || !identityPublicKey) return;
     void ensureNotificationPermission();
   }, [identityPublicKey]);
@@ -2462,6 +2544,7 @@ export default function App() {
     (group) => group.group_id === desiredGroupIdRef.current,
   ) ?? summary?.groups.find((group) => group.is_active) ?? null;
   const activeGroup = summaryActiveGroup
+    && !summaryActiveGroup.safety_restriction
     && conversation?.group.group_id === summaryActiveGroup.group_id
     ? withCurrentGroupProfile(summaryActiveGroup, conversation.group)
     : summaryActiveGroup;
@@ -2475,10 +2558,13 @@ export default function App() {
       void markActiveGroupRead(activeGroupId);
     }
   }, [activeGroupId, activeTopicId, markActiveGroupRead, markActiveTopicRead]);
-  const activeGroupBackground = sidebarMode === "groups" ? activeGroup?.background ?? null : null;
+  const activeGroupBackground = sidebarMode === "groups" && !activeGroup?.safety_restriction
+    ? activeGroup?.background ?? null
+    : null;
   const activeAccentStyle = accentStyle(sidebarMode === "groups" ? activeGroup?.accent_color : null);
   const appBackgroundSource = useProfileImageSource(activeGroupBackground);
   const groupWatchKey = summary?.groups
+    .filter((group) => !group.safety_restriction)
     .map((group) => group.group_id)
     .sort()
     .join("|") ?? "";
@@ -2487,6 +2573,7 @@ export default function App() {
     if (
       sidebarMode !== "groups"
       || !activeGroupId
+      || activeGroup?.safety_restriction
       || !groupEncryption
       || groupEncryption.group_id !== activeGroupId
       || groupEncryption.phase === "active"
@@ -2551,6 +2638,7 @@ export default function App() {
     };
   }, [
     activeGroupId,
+    activeGroup?.safety_restriction,
     groupEncryption?.group_id,
     groupEncryption?.phase,
     sidebarMode,
@@ -2689,6 +2777,7 @@ export default function App() {
   useEffect(() => {
     if (!identityPublicKey || !summary) return;
     const groups = summary.groups
+      .filter((group) => !group.safety_restriction)
       .filter((group) => sidebarMode !== "groups" || group.group_id !== activeGroupId);
     let stopped = false;
     let initialSyncQueue = Promise.resolve();
@@ -2817,7 +2906,7 @@ export default function App() {
   ]);
 
   useEffect(() => {
-    if (sidebarMode !== "groups" || !activeGroupId) return;
+    if (sidebarMode !== "groups" || !activeGroupId || activeGroup?.safety_restriction) return;
     let stopped = false;
     const watch = async () => {
       let revision: number | null = groupWatchRevisions.current.get(activeGroupId) ?? null;
@@ -2902,6 +2991,7 @@ export default function App() {
     };
   }, [
     activeGroupId,
+    activeGroup?.safety_restriction,
     handleDeletedGroup,
     identityPublicKey,
     sidebarMode,
@@ -3293,6 +3383,7 @@ export default function App() {
 
   async function selectGroup(group: GroupSummary) {
     topicSelectionGeneration.current += 1;
+    activeTopicIdRef.current = null;
     setActiveTopicId(null);
     setPendingTopicId(null);
     if (group.group_id === activeGroupId && !pendingGroupId) {
@@ -3311,6 +3402,18 @@ export default function App() {
       if (previousGroupId !== group.group_id) {
         await cancelMediaDownloads();
         await cancelGroupLoading();
+      }
+      if (group.safety_restriction) {
+        const local = await noise<LocalSummary>({
+          action: "select_group",
+          group_id: group.group_id,
+        });
+        if (generation !== refreshGeneration.current) return;
+        desiredGroupIdRef.current = group.group_id;
+        groupConversationCache.current.delete(group.group_id);
+        setConversation(null);
+        setSummary(local);
+        return;
       }
 
       let cached = groupConversationCache.current.get(group.group_id);
@@ -3786,6 +3889,23 @@ export default function App() {
       </>
     );
   }
+  if (summary.identity.safety_restriction) {
+    return (
+      <>
+        <SafetyUnavailable
+          kind="identity"
+          expiresAtMillis={summary.identity.safety_restriction.expires_at_millis}
+          onSignOut={() => {
+            void noise({ action: "logout" })
+              .then(() => window.location.reload())
+              .catch((cause) => setError(message(cause)));
+          }}
+        />
+        {error && <ErrorToast error={error} onClose={() => setError(null)} />}
+        <UpdateBanner {...updater} />
+      </>
+    );
+  }
 
   const rawSelectedConversationState =
     conversation?.group.group_id === activeGroupId ? conversation : null;
@@ -3982,7 +4102,12 @@ export default function App() {
 
       <main className="conversation-pane">
         <section className={`mode-pane ${sidebarMode === "groups" ? "active" : "inactive"}`} aria-hidden={sidebarMode !== "groups"}>
-          {selectedConversation ? (
+          {activeGroup?.safety_restriction ? (
+            <SafetyUnavailable
+              kind="group"
+              expiresAtMillis={activeGroup.safety_restriction.expires_at_millis}
+            />
+          ) : selectedConversation ? (
             <ConversationPanel
               key={`${selectedConversation.group.group_id}:${effectiveTopicId ?? "general"}`}
               conversation={selectedConversation}
@@ -5006,14 +5131,17 @@ function Sidebar({
           return (
             <div className="group-entry" key={group.group_id}>
               <button
-                className={`group-row ${group.is_active ? "active" : ""} ${pendingGroupId === group.group_id ? "pending" : ""}`}
+                className={`group-row ${group.is_active ? "active" : ""} ${pendingGroupId === group.group_id ? "pending" : ""} ${group.safety_restriction ? "restricted" : ""}`}
                 onClick={() => onSelect(group)}
                 onContextMenu={(event) => {
                   event.preventDefault();
+                  if (group.safety_restriction) return;
                   onContextMenu(group, event.clientX, event.clientY);
                 }}
               >
-                <Avatar name={group.name} image={group.avatar} size={27} square />
+                {group.safety_restriction
+                  ? <span className="restricted-group-icon"><ShieldOff size={15} /></span>
+                  : <Avatar name={group.name} image={group.avatar} size={27} square />}
                 <span>{group.name}{group.content_rating === "explicit" && <i className="explicit-badge">EXPLICIT</i>}</span>
                 {group.unread_count > 0 && (
                   <span
@@ -9941,6 +10069,47 @@ async function markTopicRead(groupId: string, topicId: string): Promise<LocalSum
   });
 }
 
+function SafetyUnavailable({
+  kind,
+  expiresAtMillis,
+  onSignOut,
+}: {
+  kind: "group" | "identity";
+  expiresAtMillis: number | null;
+  onSignOut?: () => void;
+}) {
+  const temporary = expiresAtMillis !== null;
+  const expiry = temporary
+    ? new Intl.DateTimeFormat(undefined, {
+        dateStyle: "medium",
+        timeStyle: "short",
+      }).format(new Date(expiresAtMillis))
+    : null;
+  return (
+    <div className={`safety-unavailable ${kind}`}>
+      <span className="safety-unavailable-mark"><ShieldOff /></span>
+      <strong>
+        {kind === "group"
+          ? temporary
+            ? "This group is temporarily unavailable"
+            : "This group is unavailable in official noise apps"
+          : temporary
+            ? "This identity is temporarily unavailable"
+            : "This identity is unavailable in official noise apps"}
+      </strong>
+      <span>
+        {kind === "group"
+          ? temporary
+            ? "Official noise apps have paused access during a safety review."
+            : "Its name, artwork, messages, members, and unread activity are hidden here."
+          : "This restriction applies anywhere this identity uses an official noise app."}
+      </span>
+      {expiry && <small>Access returns automatically after {expiry}, unless the restriction changes.</small>}
+      {onSignOut && <button onClick={onSignOut}><LogOut size={14} /> sign out</button>}
+    </div>
+  );
+}
+
 function EncryptionPending({ phase }: { phase: GroupEncryptionStatus["phase"] }) {
   return (
     <div className="encryption-pending">
@@ -10112,6 +10281,21 @@ function fileBase64(blob: Blob) {
     };
     reader.readAsDataURL(blob);
   });
+}
+
+function safetyRestrictionKey(summary: LocalSummary | null): string {
+  if (!summary) return "";
+  const identity = summary.identity.safety_restriction
+    ? `identity:${summary.identity.safety_restriction.expires_at_millis ?? "indefinite"}`
+    : "";
+  const groups = summary.groups
+    .filter((group) => group.safety_restriction)
+    .map((group) =>
+      `${group.group_id}:${group.safety_restriction?.expires_at_millis ?? "indefinite"}`
+    )
+    .sort()
+    .join("|");
+  return `${identity}|${groups}`;
 }
 
 function message(cause: unknown) { return cause instanceof Error ? cause.message : String(cause); }

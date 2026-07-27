@@ -36,6 +36,14 @@ enum Request {
     Status {
         state_path: String,
     },
+    SyncSafetyDirectives {
+        state_path: String,
+        safety_url: String,
+        signing_public_key_base64: Option<String>,
+    },
+    PrepareLocalSearch {
+        state_path: String,
+    },
     SearchLocal {
         state_path: String,
         query: String,
@@ -637,6 +645,11 @@ fn state_lock() -> &'static Mutex<()> {
     STATE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn search_lock() -> &'static Mutex<()> {
+    static SEARCH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    SEARCH_LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn session_ending() -> &'static AtomicBool {
     static SESSION_ENDING: AtomicBool = AtomicBool::new(false);
     &SESSION_ENDING
@@ -782,12 +795,25 @@ fn invoke(request_json: &str) -> Result<Value, String> {
     if !is_logout && session_ending().load(Ordering::Acquire) {
         return Err("session ended".to_owned());
     }
+    let _search_guard = if matches!(
+        &request,
+        Request::PrepareLocalSearch { .. } | Request::SearchLocal { .. }
+    ) {
+        Some(
+            search_lock()
+                .lock()
+                .map_err(|_| "local search lock is unavailable".to_owned())?,
+        )
+    } else {
+        None
+    };
     // The watch holds a network request for up to 20 seconds and never writes
     // local state. Everything else is serialized so a refresh cannot save an
     // older state snapshot over a message or profile update in progress.
     let _state_guard = if matches!(
         &request,
         Request::DiscoverRelayMasks { .. }
+            | Request::PrepareLocalSearch { .. }
             | Request::SearchLocal { .. }
             | Request::ResolveContactSignal { .. }
             | Request::WatchGroup { .. }
@@ -851,6 +877,26 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                     .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())
+        }
+        Request::SyncSafetyDirectives {
+            state_path,
+            safety_url,
+            signing_public_key_base64,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.sync_safety_directives(
+                    state_path,
+                    &safety_url,
+                    signing_public_key_base64,
+                ))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::PrepareLocalSearch { state_path } => {
+            client
+                .prepare_local_search(state_path)
+                .map_err(|error| error.to_string())?;
+            Ok(Value::Null)
         }
         Request::SearchLocal {
             state_path,

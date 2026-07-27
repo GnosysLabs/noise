@@ -19,7 +19,8 @@ Run the public intake with only the public file:
 ```sh
 cargo run -p noise-safety-intake -- serve \
   --public-key-file noiseSaftey/dev-data/recipient-public.json \
-  --spool-dir noiseSaftey/dev-data/inbox
+  --spool-dir noiseSaftey/dev-data/inbox \
+  --directive-dir noiseSaftey/dev-data/inbox/.review-state/directive-outbox
 ```
 
 Run the private reviewer on a separate loopback port:
@@ -62,8 +63,13 @@ signer is deterministically derived from the existing recipient secret with a
 separate KDF context, preserving compatibility with existing encrypted inbox
 files.
 
-The outbox is not a public directive feed yet, and official noise apps do not
-consume or enforce these files yet.
+The public service exposes only verified, content-free files from the outbox at
+`GET /v1/directives`. Official clients verify every item with a pinned signing
+key, merge it into durable last-known local state, hide suppressed events and
+restricted identities, and replace restricted groups with a neutral unavailable
+screen. An empty or truncated feed never erases a decision already learned by a
+client. Expired temporary restrictions stop applying locally, while indefinite
+restrictions remain until a newer signed restore arrives.
 
 During development, the intake and reviewer can share this local directory. A
 production reviewer must remain unreachable from the internet and obtain only
@@ -73,5 +79,6 @@ key.
 
 The client development build uses `http://127.0.0.1:4310`. A production build
 must configure both `VITE_NOISE_SAFETY_URL` and the pinned
-`VITE_NOISE_SAFETY_PUBLIC_KEY`; it will not trust a key fetched from a remote
-intake.
+`VITE_NOISE_SAFETY_PUBLIC_KEY` for reports, plus
+`VITE_NOISE_SAFETY_DIRECTIVE_SIGNING_PUBLIC_KEY` for enforcement. It will not
+trust keys fetched from a remote intake.

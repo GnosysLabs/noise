@@ -31,6 +31,8 @@ export const noiseSafetyUrl = import.meta.env.VITE_NOISE_SAFETY_URL?.trim()
   || (import.meta.env.DEV ? "http://127.0.0.1:4310" : null);
 export const noiseSafetyPublicKey =
   import.meta.env.VITE_NOISE_SAFETY_PUBLIC_KEY?.trim() || null;
+export const noiseSafetyDirectiveSigningPublicKey =
+  import.meta.env.VITE_NOISE_SAFETY_DIRECTIVE_SIGNING_PUBLIC_KEY?.trim() || null;
 
 export const isTauri = "__TAURI_INTERNALS__" in window;
 document.documentElement.dataset.runtime = isTauri ? "tauri" : "browser";

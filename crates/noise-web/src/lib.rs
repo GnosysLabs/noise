@@ -58,6 +58,16 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 )
             }
         }
+        "sync_safety_directives" => data(
+            client
+                .sync_safety_directives(
+                    STATE_PATH,
+                    &required::<String>(&request, "safety_url")?,
+                    optional::<String>(&request, "signing_public_key_base64")?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
         "search_local" => data(
             client
                 .search_local(
