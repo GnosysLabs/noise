@@ -1,0 +1,3 @@
+noise-safety-sync ALL=(noise-safety) NOPASSWD: /usr/local/bin/noise-safety-intake sync-list-reports --spool-dir /var/lib/noise-safety/inbox
+noise-safety-sync ALL=(noise-safety) NOPASSWD: /usr/local/bin/noise-safety-intake sync-read-report --public-key-file /etc/noise-safety/recipient-public.json --spool-dir /var/lib/noise-safety/inbox --receipt-id *
+noise-safety-sync ALL=(noise-safety) NOPASSWD: /usr/local/bin/noise-safety-intake sync-install-directive --public-key-file /etc/noise-safety/recipient-public.json --directive-dir /var/lib/noise-safety/directives --directive-id *

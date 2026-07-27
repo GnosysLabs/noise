@@ -1,0 +1,40 @@
+#!/bin/sh
+
+set -eu
+
+valid_identifier() {
+    [ "${#1}" -eq 64 ] || return 1
+    case "$1" in
+        *[!0-9a-fA-F]*) return 1 ;;
+    esac
+}
+
+case "${SSH_ORIGINAL_COMMAND:-}" in
+    list)
+        exec sudo -n -u noise-safety \
+            /usr/local/bin/noise-safety-intake sync-list-reports \
+            --spool-dir /var/lib/noise-safety/inbox
+        ;;
+    "read "*)
+        receipt_id=${SSH_ORIGINAL_COMMAND#read }
+        valid_identifier "$receipt_id" || exit 64
+        exec sudo -n -u noise-safety \
+            /usr/local/bin/noise-safety-intake sync-read-report \
+            --public-key-file /etc/noise-safety/recipient-public.json \
+            --spool-dir /var/lib/noise-safety/inbox \
+            --receipt-id "$receipt_id"
+        ;;
+    "install "*)
+        directive_id=${SSH_ORIGINAL_COMMAND#install }
+        valid_identifier "$directive_id" || exit 64
+        exec sudo -n -u noise-safety \
+            /usr/local/bin/noise-safety-intake sync-install-directive \
+            --public-key-file /etc/noise-safety/recipient-public.json \
+            --directive-dir /var/lib/noise-safety/directives \
+            --directive-id "$directive_id"
+        ;;
+    *)
+        echo "unsupported noise safety sync operation" >&2
+        exit 64
+        ;;
+esac

@@ -22,7 +22,11 @@ use noise_core::{
     noise_signature_for_public_key, safety_recipient_key_id,
 };
 use serde::{Deserialize, Serialize};
-use tokio::{fs, io::AsyncWriteExt, net::TcpListener};
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 use tower_http::cors::CorsLayer;
 
 mod review;
@@ -74,6 +78,32 @@ enum Command {
         state_dir: Option<PathBuf>,
         #[arg(long, default_value = DEFAULT_REVIEW_BIND)]
         bind: SocketAddr,
+    },
+    /// List verified encrypted-report receipt identifiers for restricted sync.
+    #[command(hide = true)]
+    SyncListReports {
+        #[arg(long)]
+        spool_dir: PathBuf,
+    },
+    /// Write one verified encrypted report envelope to stdout for restricted sync.
+    #[command(hide = true)]
+    SyncReadReport {
+        #[arg(long)]
+        public_key_file: PathBuf,
+        #[arg(long)]
+        spool_dir: PathBuf,
+        #[arg(long)]
+        receipt_id: String,
+    },
+    /// Install one correctly signed, content-free directive from stdin.
+    #[command(hide = true)]
+    SyncInstallDirective {
+        #[arg(long)]
+        public_key_file: PathBuf,
+        #[arg(long)]
+        directive_dir: PathBuf,
+        #[arg(long)]
+        directive_id: String,
     },
 }
 
@@ -141,20 +171,163 @@ async fn main() -> anyhow::Result<()> {
             spool_dir,
             directive_dir,
             bind,
-        } => serve(
-            &public_key_file,
-            &spool_dir,
-            directive_dir.as_deref(),
-            bind,
-        )
-        .await,
+        } => serve(&public_key_file, &spool_dir, directive_dir.as_deref(), bind).await,
         Command::Review {
             secret_key_file,
             spool_dir,
             state_dir,
             bind,
         } => review::serve(&secret_key_file, &spool_dir, state_dir.as_deref(), bind).await,
+        Command::SyncListReports { spool_dir } => sync_list_reports(&spool_dir).await,
+        Command::SyncReadReport {
+            public_key_file,
+            spool_dir,
+            receipt_id,
+        } => sync_read_report(&public_key_file, &spool_dir, &receipt_id).await,
+        Command::SyncInstallDirective {
+            public_key_file,
+            directive_dir,
+            directive_id,
+        } => sync_install_directive(&public_key_file, &directive_dir, &directive_id).await,
     }
+}
+
+async fn sync_list_reports(spool_dir: &Path) -> anyhow::Result<()> {
+    let mut entries = fs::read_dir(spool_dir)
+        .await
+        .with_context(|| format!("could not read {}", spool_dir.display()))?;
+    let mut receipt_ids = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_file() {
+            continue;
+        }
+        let Some(receipt_id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_suffix(".json"))
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        if !valid_hex_identifier(&receipt_id) {
+            continue;
+        }
+        let metadata = entry.metadata().await?;
+        if metadata.len() == 0 || metadata.len() as usize > MAX_REPORT_BODY_BYTES {
+            bail!("invalid encrypted report file")
+        }
+        receipt_ids.push(receipt_id);
+        if receipt_ids.len() > MAX_DIRECTIVES {
+            bail!("the encrypted report inbox is too large")
+        }
+    }
+    receipt_ids.sort();
+    let mut stdout = tokio::io::stdout();
+    for receipt_id in receipt_ids {
+        stdout.write_all(receipt_id.as_bytes()).await?;
+        stdout.write_all(b"\n").await?;
+    }
+    stdout.flush().await?;
+    Ok(())
+}
+
+async fn sync_read_report(
+    public_key_file: &Path,
+    spool_dir: &Path,
+    receipt_id: &str,
+) -> anyhow::Result<()> {
+    if !valid_hex_identifier(receipt_id) {
+        bail!("invalid report receipt identifier")
+    }
+    let recipient = read_public_key(public_key_file).await?;
+    let bytes = read_verified_envelope(&recipient, spool_dir, receipt_id).await?;
+    let mut stdout = tokio::io::stdout();
+    stdout.write_all(&bytes).await?;
+    stdout.flush().await?;
+    Ok(())
+}
+
+async fn read_verified_envelope(
+    recipient: &PublicRecipientKey,
+    spool_dir: &Path,
+    receipt_id: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let path = spool_dir.join(format!("{receipt_id}.json"));
+    let metadata = fs::symlink_metadata(&path)
+        .await
+        .with_context(|| format!("could not read report {receipt_id}"))?;
+    if !metadata.file_type().is_file() || metadata.len() as usize > MAX_REPORT_BODY_BYTES {
+        bail!("invalid encrypted report file")
+    }
+    let bytes = fs::read(&path).await?;
+    if blake3::hash(&bytes).to_hex().as_str() != receipt_id {
+        bail!("encrypted report receipt does not match its contents")
+    }
+    let envelope: SealedSafetyReportV1 =
+        serde_json::from_slice(&bytes).context("invalid encrypted report")?;
+    validate_envelope(recipient, &envelope)
+        .map_err(|_| anyhow::anyhow!("invalid encrypted report"))?;
+    Ok(bytes)
+}
+
+async fn sync_install_directive(
+    public_key_file: &Path,
+    directive_dir: &Path,
+    directive_id: &str,
+) -> anyhow::Result<()> {
+    if !valid_hex_identifier(directive_id) {
+        bail!("invalid safety directive identifier")
+    }
+    let recipient = read_public_key(public_key_file).await?;
+    let signing_public_key = recipient
+        .directive_signing_public_key_base64
+        .as_deref()
+        .context("the public key file is missing its directive signing public key")?;
+    let mut bytes = Vec::new();
+    tokio::io::stdin()
+        .take((MAX_DIRECTIVE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.is_empty() || bytes.len() > MAX_DIRECTIVE_BYTES {
+        bail!("invalid safety directive file")
+    }
+    let directive = verified_sync_directive(&bytes, directive_id, signing_public_key)?;
+
+    let path = directive_dir.join(format!("{directive_id}.json"));
+    match write_new_bytes(&path, &bytes, true).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let existing_bytes = fs::read(&path).await?;
+            let existing: SafetyDirectiveV1 = serde_json::from_slice(&existing_bytes)
+                .context("existing safety directive is invalid")?;
+            if existing != directive {
+                bail!("a different safety directive already uses this identifier")
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    println!("installed");
+    Ok(())
+}
+
+fn verified_sync_directive(
+    bytes: &[u8],
+    directive_id: &str,
+    signing_public_key: &str,
+) -> anyhow::Result<SafetyDirectiveV1> {
+    let directive: SafetyDirectiveV1 =
+        serde_json::from_slice(bytes).context("invalid safety directive")?;
+    if directive.directive_id != directive_id {
+        bail!("safety directive identifier does not match its contents")
+    }
+    directive
+        .verify_with_signing_public_key(signing_public_key)
+        .context("invalid safety directive signature")?;
+    Ok(directive)
+}
+
+fn valid_hex_identifier(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 async fn generate_keys(public_output: &Path, secret_output: &Path) -> anyhow::Result<()> {
@@ -266,7 +439,9 @@ async fn directive_feed(
         .directive_signing_public_key_base64
         .as_deref()
         .ok_or_else(internal_error)?;
-    let mut entries = fs::read_dir(directory).await.map_err(|_| internal_error())?;
+    let mut entries = fs::read_dir(directory)
+        .await
+        .map_err(|_| internal_error())?;
     let mut directives = Vec::new();
     while let Some(entry) = entries.next_entry().await.map_err(|_| internal_error())? {
         if directives.len() >= MAX_DIRECTIVES {
@@ -515,5 +690,39 @@ mod tests {
 
         assert!(validate_envelope(&public, &envelope).is_ok());
         assert_eq!(recipient.open(&envelope).unwrap(), report);
+    }
+
+    #[test]
+    fn restricted_sync_accepts_only_the_pinned_directive_signature_and_id() {
+        let recipient = SafetyEncryptionKeyPair::generate().unwrap();
+        let signer = recipient.directive_signing_key_pair().unwrap();
+        let directive = SafetyDirectiveV1::suppress_event(
+            &signer,
+            SafetyReportCategoryV1::ChildSafety,
+            "ab".repeat(32),
+            "cd".repeat(32),
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(&directive).unwrap();
+
+        assert!(
+            verified_sync_directive(&bytes, &directive.directive_id, &signer.public_key_base64(),)
+                .is_ok()
+        );
+        assert!(
+            verified_sync_directive(&bytes, &"ef".repeat(32), &signer.public_key_base64()).is_err()
+        );
+        let other_signer = SafetyEncryptionKeyPair::generate()
+            .unwrap()
+            .directive_signing_key_pair()
+            .unwrap();
+        assert!(
+            verified_sync_directive(
+                &bytes,
+                &directive.directive_id,
+                &other_signer.public_key_base64(),
+            )
+            .is_err()
+        );
     }
 }

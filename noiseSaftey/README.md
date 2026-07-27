@@ -33,10 +33,14 @@ cargo run -p noise-safety-intake -- review \
 ```
 
 On the reviewer Mac, the generated **noise safety reviewer** launcher runs
-`noiseSaftey/open-reviewer.exp` in Terminal and opens the private one-time URL
-automatically. Keep that Terminal window open while reviewing; closing it stops
-the reviewer. Clicking the launcher again reopens the same private session
-instead of starting a second reviewer.
+`noiseSaftey/open-reviewer.exp` in Terminal. Before opening the private
+one-time URL, it uses the dedicated restricted sync key to pull verified
+encrypted envelopes from production. While the reviewer is open, it checks
+again every ten seconds and uploads only correctly signed, content-free
+directives from the local outbox. Keep that Terminal window open while
+reviewing; closing it stops both the reviewer and its sync loop. Clicking the
+launcher again reopens the same private session instead of starting a second
+reviewer.
 
 The reviewer prints a random, single-session localhost URL. It decrypts and
 cryptographically verifies reports only inside that private service. New
@@ -123,3 +127,11 @@ The production recipient secret remains on the reviewer Mac. Encrypted inbox
 files are pulled over SSH for local review, and signed directive JSON files are
 uploaded after a decision. The public VPS does not receive the reviewer secret
 or a reviewer dashboard.
+
+Production sync does not use the Mac's root-capable VPS key. The server has a
+separate `noise-safety-sync` SSH account whose key is forced through
+`noiseSaftey/deploy/noise-safety-sync-gateway`. That gateway accepts only
+`list`, `read <receipt-id>`, and `install <directive-id>`. The first two expose
+only verified HPKE envelopes; the last accepts only directives whose signature
+matches the public key pinned by the intake. SSH disables PTY, forwarding,
+agent forwarding, X11 forwarding, and user commands for this key.

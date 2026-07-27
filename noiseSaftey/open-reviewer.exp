@@ -4,6 +4,11 @@ set timeout -1
 set reviewer_opened 0
 set cache_dir "/Users/christopher/Library/Caches/noise-safety-reviewer"
 set url_file "$cache_dir/private-url"
+set sync_script "/Users/christopher/Dev/noise/noiseSaftey/sync-production.sh"
+set production_root "/Users/christopher/Library/Application Support/noise/safety-production"
+set production_secret "$production_root/recipient-secret.json"
+set production_inbox "$production_root/inbox"
+set production_state "$production_root/review-state"
 
 file mkdir $cache_dir
 file attributes $cache_dir -permissions 0700
@@ -61,10 +66,33 @@ if {[file exists $url_file]} {
     file delete $url_file
 }
 
+set initial_sync_output ""
+if {[catch {exec $sync_script} initial_sync_output]} {
+    puts "Could not sync the production safety inbox."
+    puts $initial_sync_output
+    exit 1
+}
+if {$initial_sync_output ne ""} {
+    puts $initial_sync_output
+}
+
+proc sync_production {sync_script} {
+    set sync_output ""
+    if {[catch {exec $sync_script} sync_output]} {
+        puts "Production safety sync failed; it will retry."
+        puts $sync_output
+    } elseif {$sync_output ne ""} {
+        puts $sync_output
+    }
+    after 10000 [list sync_production $sync_script]
+}
+after 10000 [list sync_production $sync_script]
+
 cd "/Users/christopher/Dev/noise"
 spawn -noecho cargo run -q -p noise-safety-intake -- review \
-    --secret-key-file noiseSaftey/dev-data/recipient-secret.json \
-    --spool-dir noiseSaftey/dev-data/inbox
+    --secret-key-file "$production_secret" \
+    --spool-dir "$production_inbox" \
+    --state-dir "$production_state"
 
 expect {
     -re {open this private URL: (http://127\.0\.0\.1:4311/[^\r\n ]+)} {
