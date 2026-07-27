@@ -1,5 +1,6 @@
 use std::{
-    ffi::{CStr, CString, c_char},
+    collections::HashMap,
+    ffi::{CStr, CString, c_char, c_void},
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
@@ -9,7 +10,10 @@ use std::{
     },
 };
 
-use futures_util::future::{AbortHandle, Abortable};
+use futures_util::{
+    FutureExt,
+    future::{AbortHandle, Abortable},
+};
 use noise_client::{
     DirectMessagePolicy, ForwardedFrom, GroupContentRating, MediaAttachment, NoiseClient,
     ProfileAlbum, ProfileAlbumItem, ProfileImage, SafetyReportCategoryV1,
@@ -670,12 +674,39 @@ fn active_session_operations() -> &'static Mutex<Vec<(u64, AbortHandle, Option<L
     OPERATIONS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn next_async_watch_id() -> &'static AtomicU64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    &NEXT_ID
+}
+
+fn active_async_watches() -> &'static Mutex<HashMap<u64, AbortHandle>> {
+    static WATCHES: OnceLock<Mutex<HashMap<u64, AbortHandle>>> = OnceLock::new();
+    WATCHES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cancel_async_watch(operation_id: u64) {
+    if let Ok(mut watches) = active_async_watches().lock()
+        && let Some(operation) = watches.remove(&operation_id)
+    {
+        operation.abort();
+    }
+}
+
+fn cancel_async_watches() {
+    if let Ok(mut watches) = active_async_watches().lock() {
+        for (_, operation) in watches.drain() {
+            operation.abort();
+        }
+    }
+}
+
 fn cancel_session_operations() {
     if let Ok(mut operations) = active_session_operations().lock() {
         for (_, operation, _) in operations.drain(..) {
             operation.abort();
         }
     }
+    cancel_async_watches();
 }
 
 fn loading_generation(class: LoadingClass) -> &'static AtomicU64 {
@@ -804,9 +835,8 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             .fetch_add(1, Ordering::AcqRel)
             .saturating_add(1)
     });
-    let preparation_search_generation =
-        matches!(&request, Request::PrepareLocalSearch { .. })
-            .then(|| search_generation().load(Ordering::Acquire));
+    let preparation_search_generation = matches!(&request, Request::PrepareLocalSearch { .. })
+        .then(|| search_generation().load(Ordering::Acquire));
     let _search_guard = if matches!(
         &request,
         Request::PrepareLocalSearch { .. } | Request::SearchLocal { .. }
@@ -819,9 +849,9 @@ fn invoke(request_json: &str) -> Result<Value, String> {
     } else {
         None
     };
-    if requested_search_generation.is_some_and(|generation| {
-        search_generation().load(Ordering::Acquire) != generation
-    }) {
+    if requested_search_generation
+        .is_some_and(|generation| search_generation().load(Ordering::Acquire) != generation)
+    {
         return Err("search superseded".to_owned());
     }
     // The watch holds a network request for up to 20 seconds and never writes
@@ -912,29 +942,27 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         )
         .map_err(|error| error.to_string()),
         Request::PrepareLocalSearch { state_path } => {
-            client
-                .prepare_local_search_until(state_path, || {
-                    preparation_search_generation.is_some_and(|generation| {
-                        search_generation().load(Ordering::Acquire) != generation
-                    })
+            let result = client.prepare_local_search_until(state_path, || {
+                preparation_search_generation.is_some_and(|generation| {
+                    search_generation().load(Ordering::Acquire) != generation
                 })
-                .map_err(|error| error.to_string())?;
+            });
+            result.map_err(|error| error.to_string())?;
             Ok(Value::Null)
         }
         Request::SearchLocal {
             state_path,
             query,
             limit,
-        } => serde_json::to_value(
-            client
-                .search_local_until(state_path, &query, limit, || {
-                    requested_search_generation.is_some_and(|generation| {
-                        search_generation().load(Ordering::Acquire) != generation
-                    })
+        } => {
+            let result = client.search_local_until(state_path, &query, limit, || {
+                requested_search_generation.is_some_and(|generation| {
+                    search_generation().load(Ordering::Acquire) != generation
                 })
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string()),
+            });
+            serde_json::to_value(result.map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())
+        }
         Request::PublishContactSignal { state_path, relays } => serde_json::to_value(
             runtime()?
                 .block_on(client.publish_contact_signal(state_path, relays))
@@ -2114,6 +2142,89 @@ fn invoke(request_json: &str) -> Result<Value, String> {
     }
 }
 
+async fn invoke_async_watch(request_json: String) -> Result<Value, String> {
+    let request_value =
+        serde_json::from_str::<Value>(&request_json).map_err(|error| error.to_string())?;
+    let mask_relays = request_value
+        .get("mask_relays")
+        .and_then(Value::as_array)
+        .map(|relays| {
+            relays
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let request =
+        serde_json::from_value::<Request>(request_value).map_err(|error| error.to_string())?;
+
+    if session_ending().load(Ordering::Acquire) {
+        return Err("session ended".to_owned());
+    }
+
+    let client = NoiseClient::with_mask_relays(mask_relays).map_err(|error| error.to_string())?;
+    match request {
+        Request::WatchAccount {
+            state_path,
+            since,
+            relays,
+        } => serde_json::to_value(
+            client
+                .watch_account(state_path, since, relays)
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::WatchReadState {
+            state_path,
+            since,
+            relays,
+        } => serde_json::to_value(
+            client
+                .watch_read_state(state_path, since, relays)
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::WatchDirect {
+            state_path,
+            since,
+            relays,
+        } => serde_json::to_value(
+            client
+                .watch_direct(state_path, since, relays)
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::WatchGroup {
+            state_path,
+            since,
+            relays,
+        } => serde_json::to_value(
+            client
+                .watch_group(state_path, since, relays)
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::WatchGroupId {
+            state_path,
+            group_id,
+            since,
+            relays,
+        } => serde_json::to_value(
+            client
+                .watch_group_id(state_path, &group_id, since, relays)
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        _ => Err("request is not an asynchronous watch".to_owned()),
+    }
+}
+
 pub fn response_json(request_json: &str) -> String {
     match invoke(request_json) {
         Ok(data) => json!({ "ok": true, "data": data }).to_string(),
@@ -2128,6 +2239,128 @@ fn owned_c_string(value: String) -> *mut c_char {
             .expect("static error response is a valid C string")
             .into_raw(),
     }
+}
+
+type NoiseAsyncCallback = unsafe extern "C" fn(u64, *mut c_char, *mut c_void);
+
+fn async_response_json(result: Result<Value, String>) -> String {
+    match result {
+        Ok(data) => json!({ "ok": true, "data": data }).to_string(),
+        Err(error) => json!({ "ok": false, "error": error }).to_string(),
+    }
+}
+
+fn deliver_async_response(
+    operation_id: u64,
+    context: usize,
+    callback: NoiseAsyncCallback,
+    response: String,
+) {
+    let response = owned_c_string(response);
+    // SAFETY: The caller promises that the callback and context remain valid
+    // until exactly one completion. This function is the sole completion path
+    // for every accepted asynchronous request.
+    unsafe {
+        callback(operation_id, response, context as *mut c_void);
+    }
+}
+
+/// Start a long-polling watch on the shared async Rust runtime.
+///
+/// The callback is invoked exactly once with a string that belongs to the
+/// caller and must be released with `noise_free_string`. Cancelling an
+/// operation causes its callback to receive a cancellation error promptly.
+///
+/// # Safety
+///
+/// `request_json` must point to a valid, NUL-terminated string for this call.
+/// `callback` and `context` must remain valid until the callback is invoked.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn noise_invoke_watch_async(
+    request_json: *const c_char,
+    context: *mut c_void,
+    callback: NoiseAsyncCallback,
+) -> u64 {
+    let operation_id = next_async_watch_id().fetch_add(1, Ordering::Relaxed);
+    let context = context as usize;
+
+    let request = if request_json.is_null() {
+        Err("request was null".to_owned())
+    } else {
+        catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: The pointer contract is documented on this export and
+            // the bytes are copied before the function returns.
+            let request = unsafe { CStr::from_ptr(request_json) };
+            request
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| "request was not UTF-8".to_owned())
+        }))
+        .unwrap_or_else(|_| Err("noise core panicked".to_owned()))
+    };
+
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => {
+            deliver_async_response(
+                operation_id,
+                context,
+                callback,
+                async_response_json(Err(error)),
+            );
+            return operation_id;
+        }
+    };
+
+    let runtime = match runtime() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            deliver_async_response(
+                operation_id,
+                context,
+                callback,
+                async_response_json(Err(error)),
+            );
+            return operation_id;
+        }
+    };
+
+    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    match active_async_watches().lock() {
+        Ok(mut watches) => {
+            watches.insert(operation_id, abort_handle);
+        }
+        Err(_) => {
+            deliver_async_response(
+                operation_id,
+                context,
+                callback,
+                async_response_json(Err("async watch lock is unavailable".to_owned())),
+            );
+            return operation_id;
+        }
+    }
+
+    runtime.0.spawn(async move {
+        let future = AssertUnwindSafe(invoke_async_watch(request)).catch_unwind();
+        let result = match Abortable::new(future, abort_registration).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("noise core panicked".to_owned()),
+            Err(_) => Err("request canceled".to_owned()),
+        };
+        if let Ok(mut watches) = active_async_watches().lock() {
+            watches.remove(&operation_id);
+        }
+        deliver_async_response(operation_id, context, callback, async_response_json(result));
+    });
+
+    operation_id
+}
+
+/// Cancel a watch started by `noise_invoke_watch_async`.
+#[unsafe(no_mangle)]
+pub extern "C" fn noise_cancel_watch(operation_id: u64) {
+    cancel_async_watch(operation_id);
 }
 
 /// Invoke one noise client operation.

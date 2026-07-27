@@ -6388,24 +6388,13 @@ impl NoiseClient {
                     },
                 ));
             }
-            let conversation_was_cached =
-                state.group_conversation_cache.contains_key(&group.group_id);
-            let Some(conversation) = cached_conversation_from_state(&state, &group.group_id)?
+            let Some(conversation) =
+                cached_search_conversation_from_state(path, &state, &group.group_id)?
             else {
                 continue;
             };
             if should_stop() {
                 bail!("search superseded")
-            }
-            if !conversation_was_cached
-                && let Some(event_cache) = state.group_event_caches.get(&group.group_id)
-            {
-                cache_materialized_group_conversation(
-                    path,
-                    &group.group_id,
-                    event_cache,
-                    &conversation,
-                );
             }
             for topic in conversation.topics.iter().filter(|topic| !topic.archived) {
                 if let Some(score) = search_score(query, [topic.name.as_str(), topic.icon.as_str()])
@@ -6428,7 +6417,7 @@ impl NoiseClient {
                 .iter()
                 .map(|topic| (topic.topic_id.as_str(), topic.name.as_str()))
                 .collect::<HashMap<_, _>>();
-            for message in conversation.messages {
+            for message in &conversation.messages {
                 if hidden.contains(&message.author_public_key) {
                     continue;
                 }
@@ -6447,16 +6436,16 @@ impl NoiseClient {
                 message_matches.push((
                     score,
                     SearchMessageResult {
-                        event_id: message.event_id,
-                        author_public_key: message.author_public_key,
+                        event_id: message.event_id.clone(),
+                        author_public_key: message.author_public_key.clone(),
                         username,
                         avatar,
-                        text: message.text,
-                        attachment: message.attachment,
+                        text: message.text.clone(),
+                        attachment: message.attachment.clone(),
                         created_at_millis: message.created_at_millis,
                         group_id: Some(group.group_id.clone()),
                         group_name: Some(group_summary.name.clone()),
-                        topic_id: message.topic_id,
+                        topic_id: message.topic_id.clone(),
                         topic_name: Some(topic_name.to_owned()),
                         direct_public_key: None,
                     },
@@ -6630,20 +6619,12 @@ impl NoiseClient {
             if state.group_conversation_cache.contains_key(&group.group_id) {
                 continue;
             }
-            let Some(conversation) = cached_conversation_from_state(&state, &group.group_id)?
+            let Some(_) = cached_search_conversation_from_state(path, &state, &group.group_id)?
             else {
                 continue;
             };
             if should_stop() {
                 bail!("search superseded")
-            }
-            if let Some(event_cache) = state.group_event_caches.get(&group.group_id) {
-                cache_materialized_group_conversation(
-                    path,
-                    &group.group_id,
-                    event_cache,
-                    &conversation,
-                );
             }
         }
         Ok(())
@@ -12138,57 +12119,129 @@ fn cached_conversation_from_state(
     Ok(cached)
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(test)))]
-fn cache_materialized_group_conversation(
-    path: &Path,
-    group_id: &str,
-    source_event_cache: &GroupEventCache,
-    conversation: &Conversation,
-) {
-    let cache = native_state_cache();
-    let mut guard = cache
-        .0
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(entry) = guard.entries.get_mut(path) else {
-        return;
-    };
-    if entry
-        .state
-        .group_event_caches
-        .get(group_id)
-        .is_some_and(|current| {
-            current.events.len() == source_event_cache.events.len()
-                && current
-                    .events
-                    .iter()
-                    .zip(&source_event_cache.events)
-                    .all(|(left, right)| left.event_id == right.event_id)
-                && current.latest_cursor == source_event_cache.latest_cursor
-                && current.older_cursor == source_event_cache.older_cursor
-                && current.message_limit == source_event_cache.message_limit
-                && current.has_older_messages == source_event_cache.has_older_messages
-                && current.needs_recent_hydration == source_event_cache.needs_recent_hydration
-                && current.needs_control_hydration == source_event_cache.needs_control_hydration
-                && current.topic_streams == source_event_cache.topic_streams
-                && current.portable_conversation.is_some()
-                    == source_event_cache.portable_conversation.is_some()
-        })
-    {
-        entry
-            .state
-            .group_conversation_cache
-            .insert(group_id.to_owned(), conversation.clone());
-    }
+#[cfg(not(target_arch = "wasm32"))]
+type SearchConversationHandle = Arc<Conversation>;
+#[cfg(target_arch = "wasm32")]
+type SearchConversationHandle = Rc<Conversation>;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, PartialEq, Eq)]
+struct SearchConversationRevision {
+    event_ids: Vec<String>,
+    latest_cursor: Option<GroupEventCursor>,
+    older_cursor: Option<GroupEventCursor>,
+    message_limit: usize,
+    has_older_messages: bool,
+    needs_recent_hydration: bool,
+    needs_control_hydration: bool,
+    topic_streams: Vec<(String, TopicStreamCache)>,
+    has_portable_conversation: bool,
+    hidden_public_keys: Vec<String>,
+    hidden_event_ids: Vec<String>,
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
-fn cache_materialized_group_conversation(
+#[cfg(not(target_arch = "wasm32"))]
+struct SearchConversationCacheEntry {
+    revision: SearchConversationRevision,
+    conversation: SearchConversationHandle,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn search_conversation_cache()
+-> &'static Mutex<HashMap<PathBuf, HashMap<String, SearchConversationCacheEntry>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, HashMap<String, SearchConversationCacheEntry>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn search_conversation_revision(
+    state: &ClientState,
+    group_id: &str,
+) -> Option<SearchConversationRevision> {
+    let event_cache = state.group_event_caches.get(group_id)?;
+    let mut topic_streams = event_cache
+        .topic_streams
+        .iter()
+        .map(|(topic_id, stream)| (topic_id.clone(), stream.clone()))
+        .collect::<Vec<_>>();
+    topic_streams.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hidden_public_keys = state
+        .active_content_hidden_keys()
+        .into_iter()
+        .collect::<Vec<_>>();
+    hidden_public_keys.sort();
+    let mut hidden_event_ids = state.suppressed_event_ids(group_id);
+    if let Some(reported) = state.noise_reported_message_event_ids.get(group_id) {
+        hidden_event_ids.extend(reported.iter().cloned());
+    }
+    let mut hidden_event_ids = hidden_event_ids.into_iter().collect::<Vec<_>>();
+    hidden_event_ids.sort();
+    Some(SearchConversationRevision {
+        event_ids: event_cache
+            .events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect(),
+        latest_cursor: event_cache.latest_cursor.clone(),
+        older_cursor: event_cache.older_cursor.clone(),
+        message_limit: event_cache.message_limit,
+        has_older_messages: event_cache.has_older_messages,
+        needs_recent_hydration: event_cache.needs_recent_hydration,
+        needs_control_hydration: event_cache.needs_control_hydration,
+        topic_streams,
+        has_portable_conversation: event_cache.portable_conversation.is_some(),
+        hidden_public_keys,
+        hidden_event_ids,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cached_search_conversation_from_state(
+    path: &Path,
+    state: &ClientState,
+    group_id: &str,
+) -> anyhow::Result<Option<SearchConversationHandle>> {
+    let Some(revision) = search_conversation_revision(state, group_id) else {
+        return cached_conversation_from_state(state, group_id)
+            .map(|conversation| conversation.map(Arc::new));
+    };
+    if let Some(conversation) = search_conversation_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(path)
+        .and_then(|groups| groups.get(group_id))
+        .filter(|entry| entry.revision == revision)
+        .map(|entry| Arc::clone(&entry.conversation))
+    {
+        return Ok(Some(conversation));
+    }
+    let Some(conversation) = cached_conversation_from_state(state, group_id)? else {
+        return Ok(None);
+    };
+    let conversation = Arc::new(conversation);
+    search_conversation_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(path.to_path_buf())
+        .or_default()
+        .insert(
+            group_id.to_owned(),
+            SearchConversationCacheEntry {
+                revision,
+                conversation: Arc::clone(&conversation),
+            },
+        );
+    Ok(Some(conversation))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn cached_search_conversation_from_state(
     _path: &Path,
-    _group_id: &str,
-    _source_event_cache: &GroupEventCache,
-    _conversation: &Conversation,
-) {
+    state: &ClientState,
+    group_id: &str,
+) -> anyhow::Result<Option<SearchConversationHandle>> {
+    cached_conversation_from_state(state, group_id).map(|conversation| conversation.map(Rc::new))
 }
 
 fn cached_conversation_from_view(
@@ -14304,6 +14357,10 @@ fn remove_state(path: &Path) -> anyhow::Result<()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .entries
         .remove(path);
+    search_conversation_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(path);
     if path.exists() {
         fs::remove_file(path)
             .with_context(|| format!("could not erase local identity {}", path.display()))?;
@@ -14313,6 +14370,10 @@ fn remove_state(path: &Path) -> anyhow::Result<()> {
 
 #[cfg(all(not(target_arch = "wasm32"), test))]
 fn remove_state(path: &Path) -> anyhow::Result<()> {
+    search_conversation_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(path);
     if path.exists() {
         fs::remove_file(path)
             .with_context(|| format!("could not erase local identity {}", path.display()))?;
