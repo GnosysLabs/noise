@@ -1,6 +1,7 @@
 # noise device sessions
 
-Status: version-one signing primitives implemented in `noise-core`
+Status: version-one signing primitives and central authentication endpoints
+implemented; client integration and production deployment pending
 
 Updated: 2026-07-27
 

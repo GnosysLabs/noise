@@ -2,7 +2,8 @@
 
 - Status: accepted direction for implementation planning
 - Decision date: 2026-07-27
-- Implementation status: production foundation and protocol design in progress
+- Implementation status: production foundation, protocol design, and central
+  authentication API in progress
 - Media storage: Cloudflare R2 selected
 - Deployment model: local development followed by production; no staging environment
 

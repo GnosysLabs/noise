@@ -68,6 +68,11 @@ are documented in `DEVICE-SESSIONS.md` and implemented in `noise-core`.
 Authentication and renewal are invisible operations performed by the same
 installation; another device is never required.
 
+The first runnable authentication API is implemented in `crates/noise-central`
+and documented in `CENTRAL-API.md`. Its complete registration, session, logout,
+and revocation flow passed against a disposable PostgreSQL database on Cyphers
+VPS. It has not been installed, routed through nginx, or connected to clients.
+
 The initial canonical database contract is documented in
 `CANONICAL-SCHEMA.md` and implemented by
 `deploy/central/migrations/0001_canonical_schema.sql`. On 2026-07-27 that
@@ -95,7 +100,8 @@ backup and cannot be hidden inside an ordinary application deployment.
 
 ## Work still required before traffic
 
-- implement the central API and transactional schema access layer;
+- extend the central API from authentication into account-vault, membership,
+  encrypted-event, MLS, realtime, media, and safety operations;
 - apply the canonical migration as part of the first reversible service
   deployment, not as an isolated production mutation;
 - implement the transactional outbox/job claim contract;

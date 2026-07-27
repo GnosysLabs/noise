@@ -249,6 +249,8 @@ same-installation session contract and canonical PostgreSQL schema were
 specified and the migration was validated in a disposable database without
 changing production. The version-one installation registration, silent session
 proof, and revocation primitives now exist in `noise-core` with fixed
-cross-platform vectors. The next implementation work is the central API. The
-importer should be built only after the verifier can reproduce every aggregate
-and digest in this document from copied data.
+cross-platform vectors. The first central authentication API and PostgreSQL
+transaction layer also passed an isolated end-to-end test. The next service
+work is encrypted account-vault and canonical event compatibility, alongside
+the migration verifier. The importer should be built only after the verifier
+can reproduce every aggregate and digest in this document from copied data.
