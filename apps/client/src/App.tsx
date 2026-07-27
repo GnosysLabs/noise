@@ -181,8 +181,8 @@ const REPORT_CATEGORIES: Array<{
   },
   {
     value: "threats_or_immediate_danger",
-    label: "threats or immediate danger",
-    detail: "a credible threat, emergency, or risk of imminent harm",
+    label: "a specific threat",
+    detail: "a credible threat of violence made through noise",
     destination: "noise",
   },
   {
@@ -9514,6 +9514,9 @@ function ReportMessageDialog({
               <p className="report-route-note"><Shield size={14} /> this category goes privately to noise safety</p>
             ) : (
               <p className="report-route-note"><Shield size={14} /> this category goes to the group founder and moderators</p>
+            )}
+            {category === "threats_or_immediate_danger" && (
+              <p className="report-emergency-note"><TriangleAlert size={14} /> if anyone is in immediate danger, contact local emergency services. a noise report is not an emergency service.</p>
             )}
             <LabeledArea label="details (optional)" count={`${details.length}/180`}>
               <textarea

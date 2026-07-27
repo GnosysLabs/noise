@@ -511,6 +511,8 @@ button:disabled { cursor: default; opacity: 0.48; }
 .report-category-list i { display: grid; width: 18px; height: 18px; flex: none; place-items: center; border: 1px solid rgba(255,255,255,.12); border-radius: 50%; color: var(--accent-light); font-style: normal; }
 .report-route-note { margin: 0; border-radius: 8px; color: var(--muted); font-size: 10px; line-height: 1.45; }
 .report-route-note { display: flex; align-items: center; gap: 7px; padding: 8px 9px; background: rgba(var(--accent-rgb),.1); }
+.report-emergency-note { display: flex; align-items: flex-start; gap: 7px; margin: 0; padding: 8px 9px; border-radius: 8px; background: rgba(210,138,87,.1); color: #d9b79e; font-size: 10px; line-height: 1.45; }
+.report-emergency-note svg { flex: none; margin-top: 1px; }
 @media (max-width: 760px) {
   .modal.report-message-modal { width: min(430px, 100%); }
   .report-message-modal .dialog-heading { display: block; }

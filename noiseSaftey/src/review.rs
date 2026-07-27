@@ -985,7 +985,7 @@ fn category_label(category: SafetyReportCategoryV1) -> &'static str {
         SafetyReportCategoryV1::GroupRules => "group rules",
         SafetyReportCategoryV1::HarassmentOrHatefulBehavior => "harassment or hateful behavior",
         SafetyReportCategoryV1::SpamScamOrImpersonation => "spam, scam, or impersonation",
-        SafetyReportCategoryV1::ThreatsOrImmediateDanger => "threats or immediate danger",
+        SafetyReportCategoryV1::ThreatsOrImmediateDanger => "a specific threat",
         SafetyReportCategoryV1::SexualExploitationOrNonConsensualSexualContent => {
             "sexual exploitation or non-consensual content"
         }
