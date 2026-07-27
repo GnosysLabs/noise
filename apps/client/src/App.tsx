@@ -219,6 +219,22 @@ function groupReportReason(category: SafetyReportCategory, details: string) {
   return details ? `${label}: ${details}` : label;
 }
 
+function birthdayInputToIso(value: string): string | null {
+  const input = value.trim();
+  const monthFirst = input.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})$/);
+  const yearFirst = input.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  const parts = monthFirst
+    ? { year: Number(monthFirst[3]), month: Number(monthFirst[1]), day: Number(monthFirst[2]) }
+    : yearFirst
+      ? { year: Number(yearFirst[1]), month: Number(yearFirst[2]), day: Number(yearFirst[3]) }
+      : null;
+  if (!parts || parts.year < 1 || parts.month < 1 || parts.month > 12) return null;
+  const leapYear = parts.year % 4 === 0 && (parts.year % 100 !== 0 || parts.year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (parts.day < 1 || parts.day > daysInMonth[parts.month - 1]) return null;
+  return `${String(parts.year).padStart(4, "0")}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
+}
+
 function albumButtonLabel(
   album: { item_count: number } | null | undefined,
   label = "album",
@@ -8419,12 +8435,13 @@ function Onboarding({
   const usernameReady = username.trim().length > 0
     && Array.from(username.trim()).length <= MAX_DISPLAY_NAME_LENGTH;
   const passwordReady = passwordRequirements.every((requirement) => requirement.met);
-  const birthDateReady = /^\d{4}-\d{2}-\d{2}$/.test(birthDate);
+  const birthDateForSubmission = birthdayInputToIso(birthDate);
+  const birthDateReady = birthDateForSubmission !== null;
   const createReady = usernameReady && passwordReady && birthDateReady;
   const submitCreate = () => {
     setCreateAttempted(true);
-    if (busy || !createReady) return;
-    void onCreate(username.trim(), password, birthDate);
+    if (busy || !createReady || !birthDateForSubmission) return;
+    void onCreate(username.trim(), password, birthDateForSubmission);
   };
   return (
     <div className="onboarding" data-tauri-drag-region>
@@ -8433,8 +8450,10 @@ function Onboarding({
           <ArrowLeft size={14} /> back to my account
         </button>
       )}
-      <NoiseMark size={54} />
-      <h1>noise</h1>
+      <div className="onboarding-brand">
+        <NoiseMark size={48} />
+        <h1>noise</h1>
+      </div>
       <p>no phone number. no email. just your noise ID and password.</p>
       <div className="onboarding-tabs">
         <button className={mode === "create" ? "active" : ""} onClick={() => setMode("create")}>create identity</button>
@@ -8444,8 +8463,8 @@ function Onboarding({
         <input autoFocus value={username} maxLength={MAX_DISPLAY_NAME_LENGTH} aria-invalid={createAttempted && !usernameReady} onChange={(event) => setUsername(event.target.value)} placeholder="display name" />
         <label className="onboarding-birth-date">
           <span>birth date · Noise is 18+</span>
-          <input type="date" autoComplete="bday" value={birthDate} aria-invalid={createAttempted && !birthDateReady} onChange={(event) => setBirthDate(event.target.value)} />
-          <small>checked for 18+ eligibility, then discarded</small>
+          <input type="text" autoComplete="bday" value={birthDate} maxLength={10} aria-invalid={createAttempted && !birthDateReady} onChange={(event) => setBirthDate(event.target.value)} placeholder="MM/DD/YYYY" />
+          <small>type your date · checked for 18+ eligibility, then discarded</small>
         </label>
         <input type="password" autoComplete="new-password" value={password} aria-describedby="password-requirements" aria-invalid={createAttempted && !passwordReady} onChange={(event) => setPassword(event.target.value)} placeholder="strong password" />
         <input type="password" autoComplete="new-password" value={confirmation} aria-describedby="password-requirements" aria-invalid={createAttempted && password !== confirmation} onChange={(event) => setConfirmation(event.target.value)} placeholder="confirm password" onKeyDown={(event) => { if (event.key === "Enter") submitCreate(); }} />

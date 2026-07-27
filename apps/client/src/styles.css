@@ -396,13 +396,14 @@ button:disabled { cursor: default; opacity: 0.48; }
 .encryption-pending span { max-width: 360px; color: var(--muted); font-size: 13px; }
 .encryption-pending small { max-width: 420px; color: var(--faint); font-size: 11px; }
 .onboarding { gap: 10px; }
-.onboarding > svg, .empty-group > svg, .browser-foundation > svg { color: var(--accent); }
-.onboarding h1 { margin: 10px 0 -5px; font-size: 44px; letter-spacing: -2.5px; }
+.onboarding-brand { display: flex; align-items: center; gap: 11px; margin-bottom: 1px; }
+.onboarding-brand > svg, .empty-group > svg, .browser-foundation > svg { color: var(--accent); }
+.onboarding h1 { margin: 0; font-size: 44px; letter-spacing: -2.5px; line-height: 1; }
 .onboarding p { margin: 0 0 10px; color: var(--muted); font-size: 14px; }
 .onboarding input { width: 300px; height: 45px; padding: 0 15px; border: 0; outline: 0; border-radius: 11px; background: var(--soft); font-size: 16px; }
 .onboarding input[aria-invalid="true"] { box-shadow: inset 0 0 0 1px rgba(255,112,125,.7); }
 .onboarding-birth-date { display: flex; width: 300px; flex-direction: column; gap: 5px; color: var(--muted); font-size: 10px; }
-.onboarding-birth-date input { color-scheme: dark; }
+.onboarding-birth-date input { font-variant-numeric: tabular-nums; letter-spacing: .35px; }
 .onboarding-birth-date small { color: var(--faint); }
 .onboarding > button { display: flex; align-items: center; justify-content: center; gap: 7px; width: 300px; height: 44px; margin-top: 2px; border-radius: 22px; background: var(--accent); color: var(--accent-contrast); }
 .onboarding > button.onboarding-cancel-add { position: absolute; top: 72px; left: 22px; width: auto; height: 34px; margin: 0; padding: 0 13px; border-radius: 9px; background: rgba(255,255,255,.075); color: var(--muted); font-size: 11px; font-weight: 600; }
