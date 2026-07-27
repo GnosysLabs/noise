@@ -35,7 +35,8 @@ cargo run -p noise-safety-intake -- review \
 On the reviewer Mac, the generated **noise safety reviewer** launcher runs
 `noiseSaftey/open-reviewer.exp` in Terminal and opens the private one-time URL
 automatically. Keep that Terminal window open while reviewing; closing it stops
-the reviewer.
+the reviewer. Clicking the launcher again reopens the same private session
+instead of starting a second reviewer.
 
 The reviewer prints a random, single-session localhost URL. It decrypts and
 cryptographically verifies reports only inside that private service. New
