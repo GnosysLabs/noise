@@ -235,6 +235,13 @@ function birthdayInputToIso(value: string): string | null {
   return `${String(parts.year).padStart(4, "0")}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
 }
 
+function formatBirthdayInput(value: string) {
+  const digits = value.replace(/\D/g, "").slice(0, 8);
+  if (digits.length <= 2) return digits;
+  if (digits.length <= 4) return `${digits.slice(0, 2)}-${digits.slice(2)}`;
+  return `${digits.slice(0, 2)}-${digits.slice(2, 4)}-${digits.slice(4)}`;
+}
+
 function albumButtonLabel(
   album: { item_count: number } | null | undefined,
   label = "album",
@@ -8463,7 +8470,7 @@ function Onboarding({
         <input autoFocus value={username} maxLength={MAX_DISPLAY_NAME_LENGTH} aria-invalid={createAttempted && !usernameReady} onChange={(event) => setUsername(event.target.value)} placeholder="display name" />
         <label className="onboarding-birth-date">
           <span>birth date · Noise is 18+</span>
-          <input type="text" autoComplete="bday" value={birthDate} maxLength={10} aria-invalid={createAttempted && !birthDateReady} onChange={(event) => setBirthDate(event.target.value)} placeholder="MM-DD-YYYY" />
+          <input type="text" inputMode="numeric" autoComplete="bday" value={birthDate} maxLength={10} aria-invalid={createAttempted && !birthDateReady} onChange={(event) => setBirthDate(formatBirthdayInput(event.target.value))} placeholder="MM-DD-YYYY" />
           <small>type your date · checked for 18+ eligibility, then discarded</small>
         </label>
         <input type="password" autoComplete="new-password" value={password} aria-describedby="password-requirements" aria-invalid={createAttempted && !passwordReady} onChange={(event) => setPassword(event.target.value)} placeholder="strong password" />
