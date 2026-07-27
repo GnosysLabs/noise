@@ -9490,7 +9490,6 @@ function ReportMessageDialog({
       <DialogHeading icon={<TriangleAlert />} title="report message" detail="choose what is wrong" />
       <div className="report-dialog-layout">
         <section className="report-dialog-categories">
-          <div className="report-target-preview"><strong>{message.username}</strong><p>{reportMessagePreview(message)}</p></div>
           <div className="report-category-list" role="radiogroup" aria-label="report category">
             {categories.map((item) => (
               <button
@@ -9509,6 +9508,7 @@ function ReportMessageDialog({
           </div>
         </section>
         <section className="report-dialog-details">
+          <div className="report-target-preview"><strong>{message.username}</strong><p>{reportMessagePreview(message)}</p></div>
           {selectedCategory ? <>
             {selectedCategory.destination === "noise" ? (
               <p className="report-route-note"><Shield size={14} /> this category goes privately to noise safety</p>

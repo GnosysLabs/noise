@@ -495,7 +495,7 @@ button:disabled { cursor: default; opacity: 0.48; }
 .report-dialog-layout { display: grid; min-height: 390px; grid-template-columns: minmax(0, 1.08fr) minmax(320px, .92fr); gap: 18px; }
 .report-dialog-categories, .report-dialog-details { min-width: 0; display: flex; flex-direction: column; gap: 10px; }
 .report-dialog-details { padding-left: 18px; border-left: 1px solid rgba(255,255,255,.075); }
-.report-selection-prompt { min-height: 100%; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 6px; padding: 30px; color: var(--faint); text-align: center; }
+.report-selection-prompt { min-height: 0; display: flex; flex: 1; align-items: center; justify-content: center; flex-direction: column; gap: 6px; padding: 30px; color: var(--faint); text-align: center; }
 .report-selection-prompt strong { color: var(--muted); font-size: 12px; }
 .report-selection-prompt span { max-width: 250px; font-size: 10px; line-height: 1.45; }
 .report-target-preview { padding: 11px 12px; border-left: 2px solid #d28a57; border-radius: 4px 10px 10px 4px; background: rgba(255,255,255,.045); }
