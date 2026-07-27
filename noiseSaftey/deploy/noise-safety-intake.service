@@ -24,6 +24,7 @@ RestrictRealtime=true
 RestrictSUIDSGID=true
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_INET AF_INET6
+InaccessiblePaths=/etc/noise-safety-reviewer /var/lib/noise-safety-reviewer
 ReadWritePaths=/var/lib/noise-safety/inbox
 
 [Install]

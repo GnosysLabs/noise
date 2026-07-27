@@ -4,8 +4,10 @@ This is the separate, write-only intake boundary for reports sent to noise
 safety. It accepts only HPKE-sealed `SealedSafetyReportV1` envelopes and stores
 them without decrypting, previewing, emailing, or logging report contents.
 
-The same binary provides the public intake and the private localhost-only
-reviewer. Production keeps those roles on separate machines.
+The same binary provides the public intake and the private reviewer.
+Production keeps those roles under separate Unix accounts and systemd
+sandboxes. The reviewer listens only on a mode-`0600` Unix socket consumed by
+Tailscale Serve; it has no public or loopback TCP listener.
 
 Generate separate public and private recipient-key files:
 
@@ -32,22 +34,21 @@ cargo run -p noise-safety-intake -- review \
   --spool-dir noiseSaftey/dev-data/inbox
 ```
 
-On the reviewer Mac, the generated **noise safety reviewer** launcher runs
-`noiseSaftey/open-reviewer.exp` in Terminal. Before opening the private
-one-time URL, it uses the dedicated restricted sync key to pull verified
-encrypted envelopes from production. While the reviewer is open, it checks
-again every ten seconds and uploads only correctly signed, content-free
-directives from the local outbox. Keep that Terminal window open while
-reviewing; closing it stops both the reviewer and its sync loop. Clicking the
-launcher again reopens the same private session instead of starting a second
-reviewer.
+The generated **noise safety reviewer** launcher runs
+`noiseSaftey/open-reviewer.exp` and opens the production tailnet URL. The
+browser must be on the noise Tailscale network. Tailscale supplies the
+authenticated login, and the reviewer accepts only the exact accounts listed
+by repeated `--tailscale-login` arguments. There is no separate reviewer
+password and no public fallback URL.
 
-The reviewer prints a random, single-session localhost URL. It decrypts and
-cryptographically verifies reports only inside that private service. New
-reports include encrypted human context: names displayed at report time, noise
-signatures, the cryptographically verifiable founder, and a reporter-signed
-moderator snapshot. Reports created before that context was added still show
-noise signatures, but their names remain unavailable.
+After Tailscale authentication, the stable root URL redirects to a random
+single-process capability path. The reviewer records the authenticated
+Tailscale login with each immutable decision. It decrypts and
+cryptographically verifies reports only inside the isolated reviewer service.
+New reports include encrypted human context: names displayed at report time,
+noise signatures, the cryptographically verifiable founder, and a
+reporter-signed moderator snapshot. Reports created before that context was
+added still show noise signatures, but their names remain unavailable.
 
 The reviewer never renders or retrieves reported media. A reviewer may
 deliberately download the complete decrypted and verified report as JSON; that
@@ -81,11 +82,12 @@ screen. An empty or truncated feed never erases a decision already learned by a
 client. Expired temporary restrictions stop applying locally, while indefinite
 restrictions remain until a newer signed restore arrives.
 
-During development, the intake and reviewer can share this local directory. A
-production reviewer must remain unreachable from the internet and obtain only
-encrypted envelopes through an outbound pull or another authenticated private
-transfer. The public intake must never receive or mount the private recipient
-key.
+During development, the intake and reviewer can share this local directory.
+The production reviewer remains unreachable from the public internet. A
+root-owned bridge copies only envelopes verified by the public intake into the
+reviewer's private inbox and installs only correctly signed, content-free
+directives in the public feed. The public intake never receives or mounts the
+private recipient key.
 
 The client development build uses `http://127.0.0.1:4310`. A production build
 must configure both `VITE_NOISE_SAFETY_URL` and the pinned
@@ -96,14 +98,16 @@ trust keys fetched from a remote intake.
 ## Review and enforcement workflow
 
 1. Official clients send only an HPKE-sealed envelope to the public intake.
-2. The production reviewer Mac pulls the still-encrypted inbox files over SSH.
-3. The localhost reviewer decrypts and verifies a case. It never downloads or
-   renders reported media.
+2. A root-owned local bridge copies the still-encrypted, verified envelope into
+   the isolated reviewer inbox.
+3. An allowlisted Tailscale user opens the private web reviewer. The reviewer
+   decrypts and verifies a case without downloading or rendering reported
+   media.
 4. **No action** closes the case without publishing anything. **Hide message**,
    **Pause group for 24 hours**, **Block group**, and **Block author** create a
    signed, content-free directive.
-5. The signed directive JSON is uploaded to the public directive directory.
-   The private report and reviewer key stay on the reviewer Mac.
+5. The bridge cryptographically verifies each signed directive and installs it
+   in the public directive directory.
 6. Official clients verify the public feed with their pinned key, enforce the
    directive, and purge affected decrypted caches. A failed or interrupted
    purge remains pending and retries on the next safety sync.
@@ -123,13 +127,26 @@ the unprivileged `noise-safety` user. Its deployment uses:
 - `noiseSaftey/deploy/noise-safety-intake.service` — the sandboxed systemd unit;
 - `noiseSaftey/deploy/safety.makenoise.chat.nginx` — the HTTPS proxy source.
 
-The production recipient secret remains on the reviewer Mac. Encrypted inbox
-files are pulled over SSH for local review, and signed directive JSON files are
-uploaded after a decision. The public VPS does not receive the reviewer secret
-or a reviewer dashboard.
+The production recipient secret is stored mode `0600` under the separate
+`noise-safety-reviewer` account. The public `noise-safety` account cannot read
+that key or the decrypted reviewer state. Tailscale Serve connects directly to
+the reviewer's private Unix socket, and the application independently checks
+the exact `Tailscale-User-Login` allowlist before showing any report.
 
-Production sync does not use the Mac's root-capable VPS key. The server has a
-separate `noise-safety-sync` SSH account whose key is forced through
+The online reviewer deployment uses:
+
+- `/etc/noise-safety-reviewer/recipient-secret.json` — private recipient key;
+- `/var/lib/noise-safety-reviewer/inbox` — private encrypted-envelope mirror;
+- `/var/lib/noise-safety-reviewer/state` — decisions and signed outbox;
+- `noiseSaftey/deploy/noise-safety-reviewer.service` — isolated reviewer;
+- `noiseSaftey/deploy/noise-safety-reviewer-sync.timer` — ten-second bridge;
+- `https://cyphers-vps.yakalo-lizard.ts.net:8443/` — tailnet-only reviewer
+  URL. Port 8443 avoids the VPS's public nginx listener on 443.
+
+The restricted Mac sync remains available for emergency encrypted export; it
+does not participate in normal online reviewing and does not use the Mac's
+root-capable VPS key. The server has a separate `noise-safety-sync` SSH account
+whose key is forced through
 `noiseSaftey/deploy/noise-safety-sync-gateway`. That gateway accepts only
 `list`, `read <receipt-id>`, and `install <directive-id>`. The first two expose
 only verified HPKE envelopes; the last accepts only directives whose signature

@@ -76,6 +76,15 @@ enum Command {
         spool_dir: PathBuf,
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// Permit this exact Tailscale login through a Tailscale Serve proxy.
+        #[arg(long)]
+        tailscale_login: Vec<String>,
+        /// Host and optional port presented by Tailscale Serve, without a scheme or path.
+        #[arg(long)]
+        external_host: Option<String>,
+        /// Private Unix socket used by Tailscale Serve instead of a TCP listener.
+        #[arg(long)]
+        unix_socket: Option<PathBuf>,
         #[arg(long, default_value = DEFAULT_REVIEW_BIND)]
         bind: SocketAddr,
     },
@@ -176,8 +185,22 @@ async fn main() -> anyhow::Result<()> {
             secret_key_file,
             spool_dir,
             state_dir,
+            tailscale_login,
+            external_host,
+            unix_socket,
             bind,
-        } => review::serve(&secret_key_file, &spool_dir, state_dir.as_deref(), bind).await,
+        } => {
+            review::serve(
+                &secret_key_file,
+                &spool_dir,
+                state_dir.as_deref(),
+                &tailscale_login,
+                external_host.as_deref(),
+                unix_socket.as_deref(),
+                bind,
+            )
+            .await
+        }
         Command::SyncListReports { spool_dir } => sync_list_reports(&spool_dir).await,
         Command::SyncReadReport {
             public_key_file,

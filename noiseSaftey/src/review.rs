@@ -12,7 +12,7 @@ use axum::{
     Router,
     body::Body,
     extract::{DefaultBodyLimit, Path as RoutePath, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
@@ -25,7 +25,11 @@ use noise_core::{
 use rand::random;
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::{fs, io::AsyncWriteExt, net::TcpListener};
+use tokio::{
+    fs,
+    io::AsyncWriteExt,
+    net::{TcpListener, UnixListener},
+};
 use zeroize::Zeroize;
 
 use super::{PrivateRecipientKey, secure_directory, secure_file};
@@ -34,6 +38,8 @@ const MAX_ENVELOPE_FILE_BYTES: usize = 384 * 1024;
 const MAX_SECRET_FILE_BYTES: usize = 8 * 1024;
 const MAX_DECISION_FILE_BYTES: usize = 64 * 1024;
 const GROUP_QUARANTINE_MILLIS: u64 = 24 * 60 * 60 * 1_000;
+const TAILSCALE_LOGIN_HEADER: HeaderName = HeaderName::from_static("tailscale-user-login");
+const FORWARDED_HOST_HEADER: HeaderName = HeaderName::from_static("x-forwarded-host");
 
 #[derive(Clone)]
 struct ReviewState {
@@ -46,6 +52,7 @@ struct ReviewState {
     outbox_dir: PathBuf,
     token: String,
     expected_host: String,
+    tailscale_logins: Arc<Vec<String>>,
 }
 
 struct ReviewItem {
@@ -117,6 +124,8 @@ struct ReviewDecisionRecord {
     outcome: ReviewOutcome,
     decided_at_millis: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    decided_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     directive: Option<SafetyDirectiveV1>,
 }
 
@@ -124,11 +133,22 @@ pub(crate) async fn serve(
     secret_key_file: &Path,
     spool_dir: &Path,
     configured_state_dir: Option<&Path>,
+    configured_tailscale_logins: &[String],
+    configured_external_host: Option<&str>,
+    unix_socket: Option<&Path>,
     bind: SocketAddr,
 ) -> anyhow::Result<()> {
-    if !bind.ip().is_loopback() {
+    if unix_socket.is_none() && !bind.ip().is_loopback() {
         bail!("the private reviewer can bind only to a loopback address")
     }
+    if unix_socket.is_some() && configured_external_host.is_none() {
+        bail!("a reviewer Unix socket requires Tailscale reviewer access")
+    }
+    let tailscale_logins =
+        validate_tailscale_access(configured_tailscale_logins, configured_external_host)?;
+    let expected_host = configured_external_host
+        .map(str::to_owned)
+        .unwrap_or_else(|| bind.to_string());
     let recipient = read_private_key(secret_key_file).await?;
     let spool_metadata = fs::metadata(spool_dir)
         .await
@@ -165,9 +185,11 @@ pub(crate) async fn serve(
         decisions_dir,
         outbox_dir,
         token,
-        expected_host: bind.to_string(),
+        expected_host,
+        tailscale_logins: Arc::new(tailscale_logins),
     };
     let router = Router::new()
+        .route("/", get(review_entry))
         .route("/{token}", get(review_index))
         .route(
             "/{token}/reports/{receipt_id}/decisions/no-action",
@@ -195,11 +217,12 @@ pub(crate) async fn serve(
         )
         .layer(DefaultBodyLimit::max(1_024))
         .with_state(state.clone());
-    let listener = TcpListener::bind(bind)
-        .await
-        .with_context(|| format!("could not bind private reviewer to {bind}"))?;
-    let review_url = format!("http://{bind}/{}", state.token);
-    println!("noise safety reviewer listening locally");
+    let review_url = if state.tailscale_logins.is_empty() {
+        format!("http://{bind}/{}", state.token)
+    } else {
+        format!("https://{}/", state.expected_host)
+    };
+    println!("noise safety reviewer listening on its private transport");
     println!("open this private URL: {review_url}");
     println!("recipient key id: {}", state.recipient_key_id);
     println!(
@@ -208,9 +231,74 @@ pub(crate) async fn serve(
     );
     println!("directive outbox: {}", state.outbox_dir.display());
     std::io::Write::flush(&mut std::io::stdout())?;
-    axum::serve(listener, router)
+    if let Some(socket_path) = unix_socket {
+        prepare_unix_socket(socket_path).await?;
+        let listener = UnixListener::bind(socket_path)
+            .with_context(|| format!("could not bind {}", socket_path.display()))?;
+        secure_unix_socket(socket_path).await?;
+        axum::serve(listener, router)
+            .await
+            .context("noise safety reviewer stopped")
+    } else {
+        let listener = TcpListener::bind(bind)
+            .await
+            .with_context(|| format!("could not bind private reviewer to {bind}"))?;
+        axum::serve(listener, router)
+            .await
+            .context("noise safety reviewer stopped")
+    }
+}
+
+#[cfg(unix)]
+async fn prepare_unix_socket(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let Some(parent) = path.parent() else {
+        bail!("the reviewer Unix socket requires a parent directory")
+    };
+    let parent_metadata = fs::symlink_metadata(parent)
         .await
-        .context("noise safety reviewer stopped")
+        .with_context(|| format!("could not read {}", parent.display()))?;
+    if !parent_metadata.file_type().is_dir() {
+        bail!("the reviewer Unix socket parent is not a directory")
+    }
+    match fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            fs::remove_file(path)
+                .await
+                .with_context(|| format!("could not replace stale {}", path.display()))?;
+        }
+        Ok(_) => bail!("the reviewer Unix socket path is occupied by a non-socket file"),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn prepare_unix_socket(_path: &Path) -> anyhow::Result<()> {
+    bail!("reviewer Unix sockets are not supported on this platform")
+}
+
+#[cfg(unix)]
+async fn secure_unix_socket(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .with_context(|| format!("could not secure {}", path.display()))
+}
+
+#[cfg(not(unix))]
+async fn secure_unix_socket(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+async fn review_entry(State(state): State<ReviewState>, headers: HeaderMap) -> Response {
+    if state.tailscale_logins.is_empty() || tailscale_identity(&state, &headers).is_none() {
+        return reviewer_error(StatusCode::NOT_FOUND, "reviewer not found");
+    }
+    secure_redirect(&format!("/{}", state.token))
 }
 
 async fn review_index(
@@ -219,12 +307,15 @@ async fn review_index(
     State(state): State<ReviewState>,
     headers: HeaderMap,
 ) -> Response {
-    if !authorized(&state, &token, &headers) {
+    let Some(reviewer_identity) = authorized_identity(&state, &token, &headers) else {
         return reviewer_error(StatusCode::NOT_FOUND, "reviewer not found");
-    }
+    };
     let queue = ReviewQueue::from_query(query.queue.as_deref());
     match load_reports(&state).await {
-        Ok(reports) => secure_html(StatusCode::OK, render_index(&state, &reports, queue)),
+        Ok(reports) => secure_html(
+            StatusCode::OK,
+            render_index(&state, &reports, queue, &reviewer_identity),
+        ),
         Err(_) => reviewer_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "the private report inbox could not be read",
@@ -237,7 +328,7 @@ async fn download_report(
     State(state): State<ReviewState>,
     headers: HeaderMap,
 ) -> Response {
-    if !authorized(&state, &token, &headers) || !valid_receipt_id(&receipt_id) {
+    if authorized_identity(&state, &token, &headers).is_none() || !valid_receipt_id(&receipt_id) {
         return reviewer_error(StatusCode::NOT_FOUND, "reviewer not found");
     }
     let report = match verify_report_file(&state, &receipt_id).await {
@@ -334,7 +425,10 @@ async fn decide(
     headers: HeaderMap,
     outcome: ReviewOutcome,
 ) -> Response {
-    if !authorized(&state, &token, &headers) || !valid_receipt_id(&receipt_id) {
+    let Some(reviewer_identity) = authorized_identity(&state, &token, &headers) else {
+        return reviewer_error(StatusCode::NOT_FOUND, "reviewer not found");
+    };
+    if !valid_receipt_id(&receipt_id) {
         return reviewer_error(StatusCode::NOT_FOUND, "reviewer not found");
     }
     let report = match verify_report_file(&state, &receipt_id).await {
@@ -383,6 +477,7 @@ async fn decide(
         report_id: report.report_id.clone(),
         outcome,
         decided_at_millis,
+        decided_by: Some(reviewer_identity),
         directive,
     };
     let mut bytes = match serde_json::to_vec_pretty(&decision) {
@@ -395,8 +490,8 @@ async fn decide(
         }
     };
     bytes.push(b'\n');
-    match write_private_file(&decision_path, &bytes).await {
-        Ok(()) => {}
+    let persisted_decision = match write_private_file(&decision_path, &bytes).await {
+        Ok(()) => decision,
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
             let Ok(existing) = read_decision(&decision_path).await else {
                 return reviewer_error(
@@ -412,6 +507,7 @@ async fn decide(
                     "this report already has a different final decision",
                 );
             }
+            existing
         }
         Err(_) => {
             return reviewer_error(
@@ -419,8 +515,11 @@ async fn decide(
                 "the decision could not be saved",
             );
         }
-    }
-    if materialize_directive(&state, &decision).await.is_err() {
+    };
+    if materialize_directive(&state, &persisted_decision)
+        .await
+        .is_err()
+    {
         return reviewer_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "the signed directive could not be placed in the outbox",
@@ -729,12 +828,114 @@ async fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all().await
 }
 
-fn authorized(state: &ReviewState, token: &str, headers: &HeaderMap) -> bool {
-    let valid_host = headers
-        .get(header::HOST)
+fn validate_tailscale_access(
+    configured_logins: &[String],
+    configured_external_host: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    if configured_logins.is_empty() != configured_external_host.is_none() {
+        bail!("Tailscale reviewer access requires both --external-host and --tailscale-login")
+    }
+    let Some(external_host) = configured_external_host else {
+        return Ok(Vec::new());
+    };
+    if external_host.is_empty()
+        || external_host.contains('/')
+        || external_host.trim() != external_host
+        || !valid_external_host(external_host)
+    {
+        bail!("the external reviewer host must be a hostname with an optional port")
+    }
+    let mut logins = Vec::with_capacity(configured_logins.len());
+    for login in configured_logins {
+        let normalized = login.trim().to_ascii_lowercase();
+        if normalized.is_empty()
+            || normalized != login.as_str()
+            || !normalized.is_ascii()
+            || normalized.contains(['\r', '\n'])
+        {
+            bail!("invalid Tailscale reviewer login")
+        }
+        if !logins.contains(&normalized) {
+            logins.push(normalized);
+        }
+    }
+    Ok(logins)
+}
+
+fn authorized_identity(state: &ReviewState, token: &str, headers: &HeaderMap) -> Option<String> {
+    if !valid_reviewer_host(state, headers)
+        || !constant_time_equal(token.as_bytes(), state.token.as_bytes())
+    {
+        return None;
+    }
+    if state.tailscale_logins.is_empty() {
+        return Some("local reviewer".to_owned());
+    }
+    tailscale_identity(state, headers)
+}
+
+fn tailscale_identity(state: &ReviewState, headers: &HeaderMap) -> Option<String> {
+    if !valid_reviewer_host(state, headers) {
+        return None;
+    }
+    let login = headers
+        .get(&TAILSCALE_LOGIN_HEADER)?
+        .to_str()
+        .ok()?
+        .to_ascii_lowercase();
+    tailscale_login_allowed(&state.tailscale_logins, &login).then_some(login)
+}
+
+fn valid_reviewer_host(state: &ReviewState, headers: &HeaderMap) -> bool {
+    let host_header = if state.tailscale_logins.is_empty() {
+        header::HOST
+    } else {
+        FORWARDED_HOST_HEADER
+    };
+    headers
+        .get(host_header)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|host| host == state.expected_host);
-    valid_host && constant_time_equal(token.as_bytes(), state.token.as_bytes())
+        .is_some_and(|host| reviewer_host_matches(&state.expected_host, host))
+}
+
+fn tailscale_login_allowed(allowed_logins: &[String], login: &str) -> bool {
+    allowed_logins
+        .iter()
+        .any(|allowed| constant_time_equal(allowed.as_bytes(), login.as_bytes()))
+}
+
+fn reviewer_host_matches(expected: &str, presented: &str) -> bool {
+    if expected.contains(':') {
+        presented.eq_ignore_ascii_case(expected)
+    } else {
+        presented
+            .strip_suffix(":443")
+            .unwrap_or(presented)
+            .eq_ignore_ascii_case(expected)
+    }
+}
+
+fn valid_external_host(value: &str) -> bool {
+    if !value.is_ascii() || value.contains('@') {
+        return false;
+    }
+    let (hostname, port) = match value.rsplit_once(':') {
+        Some((hostname, port)) => {
+            let Ok(port) = port.parse::<u16>() else {
+                return false;
+            };
+            if port == 0 {
+                return false;
+            }
+            (hostname, Some(port))
+        }
+        None => (value, None),
+    };
+    !hostname.is_empty()
+        && hostname
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+        && port.is_none_or(|port| port > 0)
 }
 
 fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
@@ -761,7 +962,12 @@ fn decision_path(decisions_dir: &Path, receipt_id: &str) -> PathBuf {
     decisions_dir.join(format!("{receipt_id}.json"))
 }
 
-fn render_index(state: &ReviewState, reports: &[ReviewItem], queue: ReviewQueue) -> String {
+fn render_index(
+    state: &ReviewState,
+    reports: &[ReviewItem],
+    queue: ReviewQueue,
+    reviewer_identity: &str,
+) -> String {
     let open_count = reports.iter().filter(|report| !report.is_decided()).count();
     let closed_count = reports.len().saturating_sub(open_count);
     let mut html = String::with_capacity(16_384);
@@ -791,9 +997,19 @@ details.technical{border:1px solid #ffffff0c;border-radius:10px;background:#1514
 .report-foot{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 20px;border-top:1px solid #ffffff0d;background:#17161980}
 .report-foot>span{color:#958c98;font-size:10px}.actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:7px}.actions button{padding:9px 11px;border:1px solid #ffffff14;border-radius:9px;background:#302d33;color:#eee7f0;font-size:10px;font-weight:850;cursor:pointer}.actions .hide{background:#b8ff38;color:#192000}.actions .pause{border-color:#ff9a5b55;background:#ff9a5b18;color:#ffc49f}.actions .block{border-color:#ff718566;background:#ff71851a;color:#ff9aaa}
 @media(max-width:680px){main{width:min(100% - 20px,980px);padding-top:30px}header{align-items:flex-start;flex-direction:column}.queue-bar{align-items:flex-start;flex-direction:column}.facts,.people{grid-template-columns:1fr}.report-head{flex-direction:column}.report-foot{align-items:flex-start;flex-direction:column}.actions{justify-content:flex-start}}
-</style></head><body><main><header><div><p class="eyebrow">LOCAL / PRIVATE / VERIFIED</p><h1>noise safety</h1>
-<p class="lede">This reviewer reads encrypted envelope files from the local inbox. It never accepts internet connections and never renders or downloads reported media.</p></div>"#,
+</style></head><body><main><header><div>"#,
     );
+    if state.tailscale_logins.is_empty() {
+        html.push_str(
+            r#"<p class="eyebrow">LOCAL / PRIVATE / VERIFIED</p><h1>noise safety</h1>
+<p class="lede">This reviewer reads encrypted envelope files from the local inbox. It never accepts internet connections and never renders or downloads reported media.</p></div>"#,
+        );
+    } else {
+        html.push_str(
+            r#"<p class="eyebrow">PRIVATE / VERIFIED / TAILNET</p><h1>noise safety</h1>
+<p class="lede">This reviewer is available only through the private noise tailnet. Reports are decrypted inside the isolated reviewer service; reported media is never rendered or downloaded.</p></div>"#,
+        );
+    }
     let _ = write!(
         html,
         r#"<a class="refresh" href="/{}?queue={}">refresh inbox</a></header>"#,
@@ -802,7 +1018,7 @@ details.technical{border:1px solid #ffffff0c;border-radius:10px;background:#1514
     );
     let _ = write!(
         html,
-        r#"<div class="queue-bar"><nav class="tabs" aria-label="report queue"><a class="tab{}" href="/{}?queue=open">open <span>{}</span></a><a class="tab{}" href="/{}?queue=closed">closed <span>{}</span></a></nav><div class="summary"><span>{} total</span><span>key {}</span></div></div>"#,
+        r#"<div class="queue-bar"><nav class="tabs" aria-label="report queue"><a class="tab{}" href="/{}?queue=open">open <span>{}</span></a><a class="tab{}" href="/{}?queue=closed">closed <span>{}</span></a></nav><div class="summary"><span>{} total</span><span>{}</span><span>key {}</span></div></div>"#,
         if queue == ReviewQueue::Open {
             " active"
         } else {
@@ -818,6 +1034,7 @@ details.technical{border:1px solid #ffffff0c;border-radius:10px;background:#1514
         state.token,
         closed_count,
         reports.len(),
+        escape_html(reviewer_identity),
         short_identifier(&state.recipient_key_id),
     );
     let visible_reports = reports
@@ -826,9 +1043,7 @@ details.technical{border:1px solid #ffffff0c;border-radius:10px;background:#1514
         .collect::<Vec<_>>();
     if visible_reports.is_empty() {
         html.push_str(match queue {
-            ReviewQueue::Open => {
-                r#"<div class="empty">No open reports are waiting in this local inbox.</div>"#
-            }
+            ReviewQueue::Open => r#"<div class="empty">No open reports are waiting.</div>"#,
             ReviewQueue::Closed => r#"<div class="empty">No reports have been closed yet.</div>"#,
         });
     } else {
@@ -975,8 +1190,9 @@ fn render_report(html: &mut String, state: &ReviewState, item: &ReviewItem) {
     if let Some(decision) = &item.decision {
         let _ = write!(
             html,
-            r#"<span class="badge verified">{}</span>"#,
-            outcome_label(decision.outcome)
+            r#"<span class="badge verified">{} · {}</span>"#,
+            outcome_label(decision.outcome),
+            escape_html(decision.decided_by.as_deref().unwrap_or("legacy reviewer")),
         );
     } else if item.legacy_reviewed {
         html.push_str(r#"<span class="badge verified">reviewed (legacy)</span>"#);
@@ -1146,5 +1362,35 @@ mod tests {
         assert!(constant_time_equal(b"private-token", b"private-token"));
         assert!(!constant_time_equal(b"private-token", b"public-token"));
         assert!(!constant_time_equal(b"short", b"longer"));
+    }
+
+    #[test]
+    fn tailscale_access_requires_an_exact_allowlisted_identity_and_host() {
+        let allowed = vec![
+            "cmcelvogue91@gmail.com".to_owned(),
+            "aramodo@gmail.com".to_owned(),
+        ];
+        assert!(tailscale_login_allowed(&allowed, "cmcelvogue91@gmail.com"));
+        assert!(tailscale_login_allowed(&allowed, "aramodo@gmail.com"));
+        assert!(!tailscale_login_allowed(&allowed, "other@gmail.com"));
+        assert!(reviewer_host_matches(
+            "cyphers-vps.yakalo-lizard.ts.net:8443",
+            "cyphers-vps.yakalo-lizard.ts.net:8443",
+        ));
+        assert!(!reviewer_host_matches(
+            "cyphers-vps.yakalo-lizard.ts.net:8443",
+            "safety.makenoise.chat",
+        ));
+        assert!(valid_external_host("cyphers-vps.yakalo-lizard.ts.net:8443"));
+        assert!(!valid_external_host(
+            "cyphers-vps.yakalo-lizard.ts.net:not-a-port"
+        ));
+    }
+
+    #[test]
+    fn tailscale_access_configuration_cannot_be_partially_enabled() {
+        assert!(validate_tailscale_access(&[], None).is_ok());
+        assert!(validate_tailscale_access(&["cmcelvogue91@gmail.com".to_owned()], None).is_err());
+        assert!(validate_tailscale_access(&[], Some("cyphers-vps.yakalo-lizard.ts.net")).is_err());
     }
 }

@@ -1,0 +1,25 @@
+[Unit]
+Description=bridge verified noise safety reports and directives
+After=noise-safety-intake.service noise-safety-reviewer.service
+Requires=noise-safety-intake.service noise-safety-reviewer.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/noise-safety-reviewer-sync
+UMask=0077
+
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/var/lib/noise-safety-reviewer/inbox /var/lib/noise-safety/directives

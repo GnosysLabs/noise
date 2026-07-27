@@ -1,0 +1,11 @@
+[Unit]
+Description=refresh the private noise safety reviewer
+
+[Timer]
+OnBootSec=2s
+OnUnitActiveSec=10s
+AccuracySec=1s
+Unit=noise-safety-reviewer-sync.service
+
+[Install]
+WantedBy=timers.target

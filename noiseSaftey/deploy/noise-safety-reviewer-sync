@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+binary="/usr/local/bin/noise-safety-intake"
+public_key="/etc/noise-safety/recipient-public.json"
+source_inbox="/var/lib/noise-safety/inbox"
+reviewer_inbox="/var/lib/noise-safety-reviewer/inbox"
+reviewer_outbox="/var/lib/noise-safety-reviewer/state/directive-outbox"
+directive_dir="/var/lib/noise-safety/directives"
+reviewer_user="noise-safety-reviewer"
+
+report_count=0
+while IFS= read -r receipt_id; do
+    [[ "$receipt_id" =~ ^[0-9a-f]{64}$ ]] || exit 1
+    target="$reviewer_inbox/$receipt_id.json"
+    if [[ -e "$target" ]]; then
+        [[ -f "$target" && ! -L "$target" ]] || exit 1
+        continue
+    fi
+
+    temporary="$(mktemp "$reviewer_inbox/.report.XXXXXXXX")"
+    if ! runuser -u noise-safety -- "$binary" sync-read-report \
+        --public-key-file "$public_key" \
+        --spool-dir "$source_inbox" \
+        --receipt-id "$receipt_id" >"$temporary"
+    then
+        rm -f -- "$temporary"
+        exit 1
+    fi
+    chown "$reviewer_user:$reviewer_user" "$temporary"
+    chmod 0600 "$temporary"
+    mv -n -- "$temporary" "$target"
+    if [[ -e "$temporary" ]]; then
+        rm -f -- "$temporary"
+    fi
+    report_count=$((report_count + 1))
+done < <(
+    runuser -u noise-safety -- "$binary" sync-list-reports \
+        --spool-dir "$source_inbox"
+)
+
+directive_count=0
+shopt -s nullglob
+for directive_path in "$reviewer_outbox"/*.json; do
+    [[ -f "$directive_path" && ! -L "$directive_path" ]] || exit 1
+    directive_file="${directive_path##*/}"
+    directive_id="${directive_file%.json}"
+    [[ "$directive_id" =~ ^[0-9a-f]{64}$ ]] || exit 1
+    runuser -u noise-safety -- "$binary" sync-install-directive \
+        --public-key-file "$public_key" \
+        --directive-dir "$directive_dir" \
+        --directive-id "$directive_id" <"$directive_path"
+    directive_count=$((directive_count + 1))
+done
+
+if ((report_count > 0 || directive_count > 0)); then
+    printf 'noise safety reviewer sync: %d new report(s), %d verified directive(s)\n' \
+        "$report_count" "$directive_count"
+fi
