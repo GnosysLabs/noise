@@ -57,7 +57,7 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 "$windows_host" \
 scp -q "$repo_root/scripts/release-windows.ps1" "$windows_host:$remote_script"
 
 remote_command=$(
-  printf "& '%s' -Repository '%s' -Revision '%s' -OutputDirectory '%s'" \
+  printf '$passwordValues = @($input); if ($passwordValues.Count -ne 1) { throw "Updater password input is invalid" }; $env:NOISE_WINDOWS_UPDATER_PASSWORD = [string]$passwordValues[0]; & '\''%s'\'' -Repository '\''%s'\'' -Revision '\''%s'\'' -OutputDirectory '\''%s'\''' \
     "$remote_script" "$windows_repo" "$revision" "$remote_output"
 )
 remote_encoded=$(

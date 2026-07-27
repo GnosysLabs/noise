@@ -65,7 +65,11 @@ if (-not (Test-Path -LiteralPath "$UpdaterKeyPath.pub" -PathType Leaf)) {
     throw "Updater public key is missing: $UpdaterKeyPath.pub"
 }
 
-$updaterPassword = [Console]::In.ReadToEnd()
+$updaterPassword = $env:NOISE_WINDOWS_UPDATER_PASSWORD
+Remove-Item Env:NOISE_WINDOWS_UPDATER_PASSWORD -ErrorAction SilentlyContinue
+if ([string]::IsNullOrWhiteSpace($updaterPassword)) {
+    $updaterPassword = [Console]::In.ReadToEnd()
+}
 if ([string]::IsNullOrWhiteSpace($updaterPassword)) {
     throw "Updater signing password was not supplied on standard input"
 }
