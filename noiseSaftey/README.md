@@ -4,7 +4,8 @@ This is the separate, write-only intake boundary for reports sent to noise
 safety. It accepts only HPKE-sealed `SealedSafetyReportV1` envelopes and stores
 them without decrypting, previewing, emailing, or logging report contents.
 
-It is currently a development service, not a deployed public endpoint.
+The same binary provides the public intake and the private localhost-only
+reviewer. Production keeps those roles on separate machines.
 
 Generate separate public and private recipient-key files:
 
@@ -34,10 +35,9 @@ cargo run -p noise-safety-intake -- review \
 The reviewer prints a random, single-session localhost URL. It decrypts and
 cryptographically verifies reports only inside that private service. New
 reports include encrypted human context: names displayed at report time, noise
-signatures, the reporter's follow-up preference, the cryptographically
-verifiable founder, and a reporter-signed moderator snapshot. Reports created
-before that context was added still show noise signatures, but their names
-remain unavailable.
+signatures, the cryptographically verifiable founder, and a reporter-signed
+moderator snapshot. Reports created before that context was added still show
+noise signatures, but their names remain unavailable.
 
 The reviewer never renders or retrieves reported media. A reviewer may
 deliberately download the complete decrypted and verified report as JSON; that
@@ -82,6 +82,24 @@ must configure both `VITE_NOISE_SAFETY_URL` and the pinned
 `VITE_NOISE_SAFETY_PUBLIC_KEY` for reports, plus
 `VITE_NOISE_SAFETY_DIRECTIVE_SIGNING_PUBLIC_KEY` for enforcement. It will not
 trust keys fetched from a remote intake.
+
+## Review and enforcement workflow
+
+1. Official clients send only an HPKE-sealed envelope to the public intake.
+2. The production reviewer Mac pulls the still-encrypted inbox files over SSH.
+3. The localhost reviewer decrypts and verifies a case. It never downloads or
+   renders reported media.
+4. **No action** closes the case without publishing anything. **Hide message**,
+   **Pause group for 24 hours**, **Block group**, and **Block author** create a
+   signed, content-free directive.
+5. The signed directive JSON is uploaded to the public directive directory.
+   The private report and reviewer key stay on the reviewer Mac.
+6. Official clients verify the public feed with their pinned key, enforce the
+   directive, and purge affected decrypted caches. A failed or interrupted
+   purge remains pending and retries on the next safety sync.
+
+The full client behavior, cache policy, restoration behavior, and limits are
+documented in [`docs/SAFETY.md`](../docs/SAFETY.md).
 
 ## Production boundary
 

@@ -1,9 +1,7 @@
 # noise safety reporting foundation
 
-This document defines the protocol boundary for escalating a report from an
-official noise client to noise safety. The category-first client flow and the
-separate write-only development intake now exist, but the intake is not yet
-deployed as a public production service.
+This document defines the protocol and operational boundary for escalating a
+report from an official noise client to noise safety.
 
 ## Authority boundary
 
@@ -11,24 +9,31 @@ noise keeps three different responsibilities separate:
 
 1. Group founders and moderators handle ordinary community rules.
 2. Members can hide, block, leave, and report without moderator permission.
-3. noise safety handles severe platform-wide concerns and reports where group
-   staff are involved, unsafe to contact, or have not acted.
+3. noise safety handles the small set of severe platform-wide concerns defined
+   below.
 
 Independent relays remain availability infrastructure. They do not receive
 plaintext, decide whether a report is valid, or gain authority over a group.
 
 ## Routing
 
-Official clients expose one **Report** action followed by a category:
+Official clients expose one **Report** action followed by a category. These go
+to the group founder and moderators:
 
 - group rules;
 - harassment or hateful behavior;
 - spam, scam, or impersonation;
-- threats or immediate danger;
-- sexual exploitation or non-consensual sexual content;
-- child safety;
-- sexually explicit content in a group that is not properly labeled; or
+- sexually explicit content in a group that is not properly labeled; and
 - something else.
+
+These go privately to noise safety:
+
+- a specific, credible threat of violence made through noise;
+- sexual exploitation or non-consensual sexual content; and
+- child safety.
+
+The threat screen tells the reporter to contact local emergency services when
+anyone is in immediate danger. noise safety is not an emergency service.
 
 Consensual sexually explicit material and groups labeled for it are allowed.
 They are not a noise-level violation merely because they contain intimate or
@@ -68,11 +73,6 @@ their storefront rules require that, while still honoring the synced value.
 This is an official-client policy gate, not a claim that a self-declared date
 or open-source client is cryptographic proof of age.
 
-Ordinary group-rule, harassment, and spam reports route to group staff by
-default. Severe categories route to noise safety. Every group-staff route must
-offer **Report to noise instead** when group staff are involved or the member
-feels unsafe reporting to them.
-
 A report to noise is never published into the group's moderation history and
 does not notify its founder or moderators.
 
@@ -91,9 +91,7 @@ does not notify its founder or moderators.
   10,000-character message limit; and
 - an optional short reporter statement.
 
-The app tells the reporter that the exact reported text will be sent inside the
-encrypted safety report and must not add surrounding chat history. Text is
-necessary to assess harassment, scams, threats, and other text violations. The
+Text is necessary to assess a specific threat and other text violations. The
 schema has no media attachment field, media key, deletion capability, thumbnail,
 or payload byte field. An ordinary hash does not establish that media is
 illegal. It can identify exact bytes, link duplicates, or match a separately
@@ -155,12 +153,69 @@ unknown media. Temporary suppression and quarantine decisions must be recorded
 as precautionary actions unless evidence has been verified through an approved
 process.
 
-## Deferred work
+## End-to-end workflow
 
-This foundation intentionally does not yet implement:
+1. A member chooses **Report**, selects a category, and optionally adds a short
+   statement. The reported message disappears from that member's view
+   immediately. The app also offers block and leave.
+2. An ordinary category becomes a group moderation event for the founder and
+   moderators. A severe category becomes an HPKE-sealed report sent to the
+   write-only public intake. Media bytes, previews, and decryption keys are
+   never included.
+3. The public intake stores only the encrypted envelope. It cannot decrypt or
+   preview the report.
+4. A reviewer pulls encrypted envelopes to the private reviewer, which binds
+   only to localhost. Opening a case verifies the report, reporter, original
+   event, and available group context. The reviewer sees the single reported
+   message's text and the submitted statement, but never retrieves media.
+5. The reviewer closes the case with no action, hides the reported message,
+   pauses the group for 24 hours, blocks the group indefinitely, or blocks the
+   reported author indefinitely.
+6. An enforcement action creates a signed, content-free directive. Only its
+   target identifiers, policy reason, issue time, and optional expiry are
+   uploaded to the public `/v1/directives` feed.
+7. Official clients poll that feed, verify every directive against their pinned
+   signing key, and merge it into durable last-known local state. A missing,
+   empty, or truncated response never removes an already learned directive.
+8. A later signed group or identity restore supersedes an indefinite
+   restriction. A temporary group restriction stops applying at its signed
+   expiry.
 
-- deployment of the write-only intake endpoint;
-- production transfer between the public intake and private reviewer;
-- signed official-client suppression or group-quarantine decisions;
-- trusted hash integrations; or
-- legal evidence and external reporting procedures.
+## Official-client enforcement and cache purge
+
+The client persists a newly verified directive before deleting cached content.
+It records the purge as complete only after deletion succeeds, so a crash or
+filesystem failure leaves the purge pending for the next safety sync.
+
+- **Hide message:** remove the event from official conversation views, unread
+  state, and reports; delete that group's complete-file and decrypted-chunk
+  media caches.
+- **Pause or block group:** replace the group with the neutral unavailable
+  state and delete that group's decrypted media caches.
+- **Block author:** remove that author's content, clear the shared profile-image
+  cache, delete the author's direct-message media scope, and delete all known
+  group media caches.
+
+The browser keeps decrypted chunks only in a memory LRU, so enforcement clears
+that memory cache. Native and browser downloads carry a cache generation; a
+download that began before a purge cannot refill the old cache afterward.
+Attachment fetches check current safety state before and after retrieval, so a
+stale screen cannot rebuild media hidden by a directive.
+
+The group-level deletion used for message and identity actions is intentionally
+conservative. A hidden message may evict unrelated allowed media from its
+group, and a blocked author evicts group media across the account because old
+media can outlive the compacted event window that identified its author.
+Allowed media can be downloaded again. This is preferable to retaining a
+prohibited attachment because a cache entry could not be mapped perfectly.
+
+## Limits and deferred work
+
+An official-client directive cannot erase encrypted objects from independent
+storage nodes, delete copies another person already saved, or force an
+unofficial client to comply. It makes the content unavailable through official
+noise apps and removes decrypted local cache material those apps control.
+
+Trusted known-content hash integrations, a formal legal evidence process, and
+external reporting procedures remain separate future work. They are not
+implied by opening a report or issuing a precautionary directive.

@@ -34,6 +34,7 @@ enum Request {
     },
     SyncSafetyDirectives {
         state_path: String,
+        cache_path: String,
         safety_url: String,
         signing_public_key_base64: Option<String>,
     },
@@ -874,12 +875,14 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         }
         Request::SyncSafetyDirectives {
             state_path,
+            cache_path,
             safety_url,
             signing_public_key_base64,
         } => serde_json::to_value(
             runtime()?
                 .block_on(client.sync_safety_directives(
                     state_path,
+                    cache_path,
                     &safety_url,
                     signing_public_key_base64,
                 ))

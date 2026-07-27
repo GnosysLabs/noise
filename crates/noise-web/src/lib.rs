@@ -62,6 +62,7 @@ async fn dispatch(request: Value) -> Result<Value, String> {
             client
                 .sync_safety_directives(
                     STATE_PATH,
+                    CACHE_PATH,
                     &required::<String>(&request, "safety_url")?,
                     optional::<String>(&request, "signing_public_key_base64")?,
                 )

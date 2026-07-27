@@ -183,6 +183,30 @@ fn active_media_chunk_downloads()
     DOWNLOADS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn media_cache_generations() -> &'static Mutex<HashMap<String, u64>> {
+    static GENERATIONS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn media_cache_generation(scope_id: &str) -> u64 {
+    *media_cache_generations()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(scope_id.to_owned())
+        .or_default()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn advance_media_cache_generation(scope_id: &str) {
+    let mut generations = media_cache_generations()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let generation = generations.entry(scope_id.to_owned()).or_default();
+    *generation = generation.saturating_add(1);
+}
+
 /// How long this installation has been looking at one unchanged situation.
 ///
 /// Admission turns and stale-leaf recovery are both measured from the moment
@@ -282,6 +306,11 @@ impl MediaChunkLru {
             }
         }
     }
+
+    fn clear(&mut self) {
+        self.chunks.clear();
+        self.total_bytes = 0;
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -295,6 +324,23 @@ thread_local! {
         RefCell::new(MediaChunkLru::new(WEB_MEDIA_CHUNK_CACHE_BYTES));
     static WEB_MEDIA_CHUNK_DOWNLOADS: RefCell<HashMap<String, WebChunkDownload>> =
         RefCell::new(HashMap::new());
+    static WEB_MEDIA_CACHE_GENERATIONS: RefCell<HashMap<String, u64>> =
+        RefCell::new(HashMap::new());
+}
+
+#[cfg(target_arch = "wasm32")]
+fn media_cache_generation(scope_id: &str) -> u64 {
+    WEB_MEDIA_CACHE_GENERATIONS
+        .with(|generations| *generations.borrow().get(scope_id).unwrap_or(&0))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn advance_media_cache_generation(scope_id: &str) {
+    WEB_MEDIA_CACHE_GENERATIONS.with(|generations| {
+        let mut generations = generations.borrow_mut();
+        let generation = generations.entry(scope_id.to_owned()).or_default();
+        *generation = generation.saturating_add(1);
+    });
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -802,6 +848,11 @@ struct ClientState {
     /// deliberately excluded from the cross-device account vault.
     #[serde(default)]
     safety_directives: Vec<SafetyDirectiveV1>,
+    /// A directive is recorded here only after any required local
+    /// decrypted-content purge completed. Keeping this separate makes an
+    /// interrupted purge retry on the next safety sync.
+    #[serde(default)]
+    safety_cache_purged_directive_ids: HashSet<String>,
     #[serde(default)]
     direct_event_cache: DirectEventCache,
     groups: Vec<GroupMembership>,
@@ -1524,7 +1575,10 @@ impl ClientState {
     }
 
     fn ensure_group_access(&self, group: &GroupMembership) -> anyhow::Result<()> {
-        if self.active_group_safety_restriction(&group.group_id).is_some() {
+        if self
+            .active_group_safety_restriction(&group.group_id)
+            .is_some()
+        {
             bail!("this group is unavailable in official noise apps")
         }
         if group.content_rating == GroupContentRating::Explicit
@@ -1963,6 +2017,7 @@ impl ClientState {
             group_event_caches: contents.group_event_caches,
             noise_reported_message_event_ids: HashMap::new(),
             safety_directives: Vec::new(),
+            safety_cache_purged_directive_ids: HashSet::new(),
             direct_event_cache: DirectEventCache::default(),
             groups: contents.groups,
             group_memberships: contents.group_memberships,
@@ -2165,7 +2220,11 @@ impl ClientState {
         let mut activity = messages
             .iter()
             .filter(|message| !self.is_content_hidden(&message.author_public_key))
-            .filter(|message| !self.suppressed_event_ids(group_id).contains(&message.event_id))
+            .filter(|message| {
+                !self
+                    .suppressed_event_ids(group_id)
+                    .contains(&message.event_id)
+            })
             .map(|message| MessageMarker {
                 created_at_millis: message.created_at_millis,
                 event_id: message.event_id.clone(),
@@ -2177,7 +2236,11 @@ impl ClientState {
             .iter()
             .filter(|message| message.author_public_key != self_public_key)
             .filter(|message| !self.is_content_hidden(&message.author_public_key))
-            .filter(|message| !self.suppressed_event_ids(group_id).contains(&message.event_id))
+            .filter(|message| {
+                !self
+                    .suppressed_event_ids(group_id)
+                    .contains(&message.event_id)
+            })
             .map(|message| MessageMarker {
                 created_at_millis: message.created_at_millis,
                 event_id: message.event_id.clone(),
@@ -2218,7 +2281,11 @@ impl ClientState {
             .iter()
             .filter(|message| message.author_public_key != self_public_key)
             .filter(|message| !self.is_content_hidden(&message.author_public_key))
-            .filter(|message| !self.suppressed_event_ids(group_id).contains(&message.event_id))
+            .filter(|message| {
+                !self
+                    .suppressed_event_ids(group_id)
+                    .contains(&message.event_id)
+            })
         {
             incoming_by_topic
                 .entry(topic_activity_key(group_id, message.topic_id.as_deref()))
@@ -2330,8 +2397,7 @@ impl ClientState {
             .filter(|directive| {
                 matches!(
                     directive.action,
-                    SafetyDirectiveActionV1::RestrictGroup
-                        | SafetyDirectiveActionV1::RestoreGroup
+                    SafetyDirectiveActionV1::RestrictGroup | SafetyDirectiveActionV1::RestoreGroup
                 ) && directive.group_id.as_deref() == Some(group_id)
             })
             .max_by(|left, right| safety_directive_order(left).cmp(&safety_directive_order(right)))
@@ -2341,10 +2407,7 @@ impl ClientState {
             })
     }
 
-    fn active_identity_safety_restriction(
-        &self,
-        public_key: &str,
-    ) -> Option<&SafetyDirectiveV1> {
+    fn active_identity_safety_restriction(&self, public_key: &str) -> Option<&SafetyDirectiveV1> {
         self.safety_directives
             .iter()
             .filter(|directive| {
@@ -2585,11 +2648,11 @@ impl ClientState {
 
     fn summary(&self) -> anyhow::Result<LocalSummary> {
         let public_key = self.identity()?.public_key_base64();
-        let identity_safety_restriction = self
-            .active_identity_safety_restriction(&public_key)
-            .map(|directive| SafetyRestrictionSummary {
-                expires_at_millis: directive.expires_at_millis,
-            });
+        let identity_safety_restriction =
+            self.active_identity_safety_restriction(&public_key)
+                .map(|directive| SafetyRestrictionSummary {
+                    expires_at_millis: directive.expires_at_millis,
+                });
         Ok(LocalSummary {
             identity: IdentitySummary {
                 username: self.profile.username.clone(),
@@ -2706,9 +2769,7 @@ impl ClientState {
                                 group.content_rating
                             },
                             avatar: (!unavailable).then(|| group.avatar.clone()).flatten(),
-                            background: (!unavailable)
-                                .then(|| group.background.clone())
-                                .flatten(),
+                            background: (!unavailable).then(|| group.background.clone()).flatten(),
                             mobile_background: (!unavailable)
                                 .then(|| group.mobile_background.clone())
                                 .flatten(),
@@ -2921,6 +2982,7 @@ impl NoiseClient {
             group_event_caches: HashMap::new(),
             noise_reported_message_event_ids: HashMap::new(),
             safety_directives: Vec::new(),
+            safety_cache_purged_directive_ids: HashSet::new(),
             direct_event_cache: DirectEventCache::default(),
             groups: Vec::new(),
             group_memberships: HashMap::new(),
@@ -3336,10 +3398,12 @@ impl NoiseClient {
     pub async fn sync_safety_directives(
         &self,
         path: impl AsRef<Path>,
+        cache_path: impl AsRef<Path>,
         safety_url: &str,
         signing_public_key_base64: Option<String>,
     ) -> anyhow::Result<LocalSummary> {
         let path = path.as_ref();
+        let cache_path = cache_path.as_ref();
         let safety_url = normalize_safety_intake_url(safety_url)?;
         let signing_public_key = if let Some(public_key) =
             signing_public_key_base64.filter(|value| !value.trim().is_empty())
@@ -3445,7 +3509,34 @@ impl NoiseClient {
             });
             state.group_conversation_cache.clear();
             state.apply_safety_marker_filters();
-            save_state(path, &state)?;
+            // Persist the signed enforcement state before touching caches. If
+            // the process stops during deletion, the unacknowledged directive
+            // remains pending and the next sync retries the purge.
+            save_state_immediately(path, &state)?;
+        }
+
+        let pending_cache_directives = state
+            .safety_directives
+            .iter()
+            .filter(|directive| {
+                !state
+                    .safety_cache_purged_directive_ids
+                    .contains(&directive.directive_id)
+                    && safety_directive_requires_cache_purge(&state, directive)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !pending_cache_directives.is_empty() {
+            purge_safety_directive_caches(cache_path, &state, &pending_cache_directives)?;
+        }
+        let processed_directive_ids = state
+            .safety_directives
+            .iter()
+            .map(|directive| directive.directive_id.clone())
+            .collect::<HashSet<_>>();
+        if state.safety_cache_purged_directive_ids != processed_directive_ids {
+            state.safety_cache_purged_directive_ids = processed_directive_ids;
+            save_state_immediately(path, &state)?;
         }
         state.summary()
     }
@@ -4547,8 +4638,11 @@ impl NoiseClient {
         relays: Vec<String>,
     ) -> anyhow::Result<AttachmentData> {
         validate_media_reference(attachment)?;
-        let state = load_state(path.as_ref())?;
+        let path = path.as_ref();
+        let cache_path = cache_path.as_ref();
+        let state = load_state(path)?;
         let scope_id = resolve_media_scope(&state, scope_id)?;
+        ensure_attachment_allowed_by_safety(&state, &scope_id, attachment)?;
         let _relays = relay_list(relays)?;
         #[cfg(target_arch = "wasm32")]
         {
@@ -4565,6 +4659,12 @@ impl NoiseClient {
             if output.len() as u64 != attachment.byte_length {
                 bail!("media does not match its manifest")
             }
+            if let Err(error) =
+                ensure_attachment_allowed_by_safety(&load_state(path)?, &scope_id, attachment)
+            {
+                purge_scope_cache(cache_path, &scope_id)?;
+                return Err(error);
+            }
             return Ok(AttachmentData {
                 mime_type: attachment.mime_type.clone(),
                 file_path: format!(
@@ -4576,7 +4676,7 @@ impl NoiseClient {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let cache_directory = cache_path.as_ref().join("media").join(&scope_id);
+            let cache_directory = cache_path.join("media").join(&scope_id);
             fs::create_dir_all(&cache_directory).context("could not create the media cache")?;
             let extension = media_extension(&attachment.mime_type);
             let file_path =
@@ -4585,6 +4685,12 @@ impl NoiseClient {
                 .metadata()
                 .is_ok_and(|metadata| metadata.len() == attachment.byte_length)
             {
+                if let Err(error) =
+                    ensure_attachment_allowed_by_safety(&load_state(path)?, &scope_id, attachment)
+                {
+                    purge_scope_cache(cache_path, &scope_id)?;
+                    return Err(error);
+                }
                 return Ok(AttachmentData {
                     mime_type: attachment.mime_type.clone(),
                     file_path: file_path.to_string_lossy().into_owned(),
@@ -4596,7 +4702,7 @@ impl NoiseClient {
             let mut chunks = futures_util::stream::iter(attachment.chunks.iter().cloned())
                 .map(|chunk| {
                     let scope_id = scope_id.clone();
-                    let cache_path = cache_path.as_ref().to_owned();
+                    let cache_path = cache_path.to_owned();
                     async move {
                         self.fetch_attachment_chunk(&cache_path, &scope_id, &chunk)
                             .await
@@ -4621,6 +4727,12 @@ impl NoiseClient {
             {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&file_path, fs::Permissions::from_mode(0o600))?;
+            }
+            if let Err(error) =
+                ensure_attachment_allowed_by_safety(&load_state(path)?, &scope_id, attachment)
+            {
+                purge_scope_cache(cache_path, &scope_id)?;
+                return Err(error);
             }
             Ok(AttachmentData {
                 mime_type: attachment.mime_type.clone(),
@@ -4647,15 +4759,17 @@ impl NoiseClient {
         if offset >= attachment.byte_length {
             bail!("media range starts beyond the attachment")
         }
-        let state = load_state(path.as_ref())?;
+        let path = path.as_ref();
+        let cache_path = cache_path.as_ref();
+        let state = load_state(path)?;
         let scope_id = resolve_media_scope(&state, scope_id)?;
+        ensure_attachment_allowed_by_safety(&state, &scope_id, attachment)?;
         let _relays = relay_list(relays)?;
         let requested_end = offset
             .saturating_add(byte_length)
             .min(attachment.byte_length);
         let extension = media_extension(&attachment.mime_type);
         let complete_file = cache_path
-            .as_ref()
             .join("media")
             .join(&scope_id)
             .join(format!("{}.{}", attachment.chunks[0].blob_id, extension));
@@ -4670,13 +4784,20 @@ impl NoiseClient {
             let mut output = vec![0_u8; (requested_end - offset) as usize];
             file.read_exact(&mut output)
                 .context("could not read cached media range")?;
-            return Ok(AttachmentRangeData {
+            let result = AttachmentRangeData {
                 mime_type: attachment.mime_type.clone(),
                 data_base64: STANDARD.encode(&output),
                 offset,
                 byte_length: output.len() as u64,
                 total_byte_length: attachment.byte_length,
-            });
+            };
+            if let Err(error) =
+                ensure_attachment_allowed_by_safety(&load_state(path)?, &scope_id, attachment)
+            {
+                purge_scope_cache(cache_path, &scope_id)?;
+                return Err(error);
+            }
+            return Ok(result);
         }
         let selected = select_media_chunks(attachment, offset, requested_end);
 
@@ -4693,7 +4814,7 @@ impl NoiseClient {
                 .cloned()
                 .collect::<Vec<_>>();
             let client = self.clone();
-            let cache_path = cache_path.as_ref().to_owned();
+            let cache_path = cache_path.to_owned();
             let scope_id = scope_id.clone();
             tokio::spawn(async move {
                 let mut downloads =
@@ -4714,7 +4835,7 @@ impl NoiseClient {
 
         let mut downloaded =
             futures_util::stream::iter(selected.into_iter().map(|(index, start, chunk)| {
-                let cache_path = cache_path.as_ref().to_owned();
+                let cache_path = cache_path.to_owned();
                 let scope_id = scope_id.clone();
                 async move {
                     let plaintext = self
@@ -4740,13 +4861,20 @@ impl NoiseClient {
         if output.len() as u64 != requested_end - offset {
             bail!("media range does not match its manifest")
         }
-        Ok(AttachmentRangeData {
+        let result = AttachmentRangeData {
             mime_type: attachment.mime_type.clone(),
             data_base64: STANDARD.encode(&output),
             offset,
             byte_length: output.len() as u64,
             total_byte_length: attachment.byte_length,
-        })
+        };
+        if let Err(error) =
+            ensure_attachment_allowed_by_safety(&load_state(path)?, &scope_id, attachment)
+        {
+            purge_scope_cache(cache_path, &scope_id)?;
+            return Err(error);
+        }
+        Ok(result)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -4756,6 +4884,7 @@ impl NoiseClient {
         scope_id: &str,
         chunk: &MediaChunk,
     ) -> anyhow::Result<Vec<u8>> {
+        let cache_generation = media_cache_generation(scope_id);
         let cache_directory = cache_path.join("media-chunks").join(scope_id);
         fs::create_dir_all(&cache_directory).context("could not create media chunk cache")?;
         let file_path = cache_directory.join(format!("{}.chunk", chunk.blob_id));
@@ -4797,6 +4926,9 @@ impl NoiseClient {
             if plaintext.len() != chunk.byte_length as usize {
                 bail!("media chunk does not match its manifest")
             }
+            if media_cache_generation(scope_id) != cache_generation {
+                bail!("media cache changed during download")
+            }
 
             static TEMPORARY_ID: AtomicU64 = AtomicU64::new(1);
             let temporary = cache_directory.join(format!(
@@ -4805,6 +4937,10 @@ impl NoiseClient {
                 TEMPORARY_ID.fetch_add(1, Ordering::Relaxed)
             ));
             fs::write(&temporary, &plaintext).context("could not cache decrypted media chunk")?;
+            if media_cache_generation(scope_id) != cache_generation {
+                let _ = fs::remove_file(&temporary);
+                bail!("media cache changed during download")
+            }
             if let Err(error) = fs::rename(&temporary, &file_path) {
                 if !file_path
                     .metadata()
@@ -4836,7 +4972,7 @@ impl NoiseClient {
     pub async fn fetch_attachment_range(
         &self,
         path: impl AsRef<Path>,
-        _cache_path: impl AsRef<Path>,
+        cache_path: impl AsRef<Path>,
         scope_id: Option<String>,
         attachment: &MediaAttachment,
         offset: u64,
@@ -4850,8 +4986,11 @@ impl NoiseClient {
         if offset >= attachment.byte_length {
             bail!("media range starts beyond the attachment")
         }
-        let state = load_state(path.as_ref())?;
+        let path = path.as_ref();
+        let cache_path = cache_path.as_ref();
+        let state = load_state(path)?;
         let scope_id = resolve_media_scope(&state, scope_id)?;
+        ensure_attachment_allowed_by_safety(&state, &scope_id, attachment)?;
         let _relays = relay_list(relays)?;
         let requested_end = offset
             .saturating_add(byte_length)
@@ -4897,13 +5036,20 @@ impl NoiseClient {
         if output.len() as u64 != requested_end - offset {
             bail!("media range does not match its manifest")
         }
-        Ok(AttachmentRangeData {
+        let result = AttachmentRangeData {
             mime_type: attachment.mime_type.clone(),
             data_base64: STANDARD.encode(&output),
             offset,
             byte_length: output.len() as u64,
             total_byte_length: attachment.byte_length,
-        })
+        };
+        if let Err(error) =
+            ensure_attachment_allowed_by_safety(&load_state(path)?, &scope_id, attachment)
+        {
+            purge_scope_cache(cache_path, &scope_id)?;
+            return Err(error);
+        }
+        Ok(result)
     }
 
     /// Browser media chunks live in a memory LRU instead of the disk cache the
@@ -4915,6 +5061,7 @@ impl NoiseClient {
         scope_id: &str,
         chunk: &MediaChunk,
     ) -> anyhow::Result<Rc<Vec<u8>>> {
+        let cache_generation = media_cache_generation(scope_id);
         if let Some(cached) = WEB_MEDIA_CHUNKS.with(|cache| {
             cache
                 .borrow_mut()
@@ -4965,6 +5112,9 @@ impl NoiseClient {
         };
 
         let plaintext = download.await.map_err(anyhow::Error::msg)?;
+        if media_cache_generation(scope_id) != cache_generation {
+            bail!("media cache changed during download")
+        }
         WEB_MEDIA_CHUNK_DOWNLOADS.with(|downloads| {
             downloads.borrow_mut().remove(&chunk.blob_id);
         });
@@ -6154,10 +6304,10 @@ impl NoiseClient {
                     },
                 ));
             }
-            let conversation_was_cached = state
-                .group_conversation_cache
-                .contains_key(&group.group_id);
-            let Some(conversation) = cached_conversation_from_state(&state, &group.group_id)? else {
+            let conversation_was_cached =
+                state.group_conversation_cache.contains_key(&group.group_id);
+            let Some(conversation) = cached_conversation_from_state(&state, &group.group_id)?
+            else {
                 continue;
             };
             if !conversation_was_cached
@@ -6316,9 +6466,7 @@ impl NoiseClient {
             state
                 .group_event_caches
                 .iter()
-                .filter(|(group_id, _)| {
-                    state.active_group_safety_restriction(group_id).is_none()
-                })
+                .filter(|(group_id, _)| state.active_group_safety_restriction(group_id).is_none())
                 .flat_map(|(group_id, cache)| {
                     let mut scopes = Vec::new();
                     if cache.has_older_messages {
@@ -6378,13 +6526,11 @@ impl NoiseClient {
             {
                 continue;
             }
-            if state
-                .group_conversation_cache
-                .contains_key(&group.group_id)
-            {
+            if state.group_conversation_cache.contains_key(&group.group_id) {
                 continue;
             }
-            let Some(conversation) = cached_conversation_from_state(&state, &group.group_id)? else {
+            let Some(conversation) = cached_conversation_from_state(&state, &group.group_id)?
+            else {
                 continue;
             };
             if let Some(event_cache) = state.group_event_caches.get(&group.group_id) {
@@ -13481,6 +13627,131 @@ fn resolve_media_scope(
     Ok(scope_id)
 }
 
+fn safety_directive_requires_cache_purge(
+    state: &ClientState,
+    directive: &SafetyDirectiveV1,
+) -> bool {
+    match directive.action {
+        SafetyDirectiveActionV1::SuppressEvent => true,
+        SafetyDirectiveActionV1::RestrictGroup => {
+            directive.group_id.as_deref().is_some_and(|group_id| {
+                state
+                    .active_group_safety_restriction(group_id)
+                    .is_some_and(|active| active.directive_id == directive.directive_id)
+            })
+        }
+        SafetyDirectiveActionV1::RestrictIdentity => directive
+            .identity_public_key
+            .as_deref()
+            .is_some_and(|public_key| {
+                state
+                    .active_identity_safety_restriction(public_key)
+                    .is_some_and(|active| active.directive_id == directive.directive_id)
+            }),
+        SafetyDirectiveActionV1::RestoreGroup | SafetyDirectiveActionV1::RestoreIdentity => false,
+    }
+}
+
+fn purge_safety_directive_caches(
+    cache_path: &Path,
+    state: &ClientState,
+    directives: &[SafetyDirectiveV1],
+) -> anyhow::Result<()> {
+    let mut scopes = HashSet::<String>::new();
+    let mut restricted_identities = HashSet::<String>::new();
+    for directive in directives {
+        match directive.action {
+            SafetyDirectiveActionV1::SuppressEvent | SafetyDirectiveActionV1::RestrictGroup => {
+                if let Some(group_id) = directive.group_id.as_ref() {
+                    scopes.insert(group_id.clone());
+                }
+            }
+            SafetyDirectiveActionV1::RestrictIdentity => {
+                if let Some(public_key) = directive.identity_public_key.as_ref() {
+                    restricted_identities.insert(public_key.clone());
+                }
+            }
+            SafetyDirectiveActionV1::RestoreGroup | SafetyDirectiveActionV1::RestoreIdentity => {}
+        }
+    }
+
+    // Profile and group artwork share one encrypted-blob cache. Clear it for
+    // every enforcement action so avatars or artwork associated with hidden
+    // content do not remain locally materialized.
+    purge_profile_image_cache(cache_path)?;
+
+    if !restricted_identities.is_empty() {
+        // Old media can outlive the compacted event window that would identify
+        // its author. Clear every known group scope rather than risk retaining
+        // an attachment whose author can no longer be mapped locally.
+        scopes.extend(state.groups.iter().map(|group| group.group_id.clone()));
+        if let Ok(identity) = state.identity() {
+            for public_key in &restricted_identities {
+                scopes.insert(identity.direct_scope_id(public_key)?);
+            }
+        }
+    }
+
+    for scope_id in scopes {
+        purge_scope_cache(cache_path, &scope_id)?;
+    }
+    Ok(())
+}
+
+fn same_media_reference(left: &MediaAttachment, right: &MediaAttachment) -> bool {
+    left.mime_type == right.mime_type
+        && left.byte_length == right.byte_length
+        && left.chunks == right.chunks
+}
+
+fn ensure_attachment_allowed_by_safety(
+    state: &ClientState,
+    scope_id: &str,
+    attachment: &MediaAttachment,
+) -> anyhow::Result<()> {
+    if let Some(group) = state.groups.iter().find(|group| group.group_id == scope_id) {
+        if state
+            .active_group_safety_restriction(&group.group_id)
+            .is_some()
+        {
+            bail!("this group is unavailable in official noise apps")
+        }
+        let has_safety_filter = !state.suppressed_event_ids(&group.group_id).is_empty()
+            || !state.active_safety_restricted_identity_keys().is_empty();
+        if !has_safety_filter {
+            return Ok(());
+        }
+        let visible =
+            cached_conversation_from_state(state, &group.group_id)?.is_some_and(|conversation| {
+                conversation.messages.iter().any(|message| {
+                    message
+                        .attachment
+                        .as_ref()
+                        .is_some_and(|candidate| same_media_reference(candidate, attachment))
+                }) || conversation.reports.iter().any(|report| {
+                    report
+                        .message
+                        .attachment
+                        .as_ref()
+                        .is_some_and(|candidate| same_media_reference(candidate, attachment))
+                })
+            });
+        if !visible {
+            bail!("this media is unavailable in official noise apps")
+        }
+        return Ok(());
+    }
+
+    if let Ok(identity) = state.identity() {
+        for public_key in state.active_safety_restricted_identity_keys() {
+            if identity.direct_scope_id(&public_key).ok().as_deref() == Some(scope_id) {
+                bail!("this media is unavailable in official noise apps")
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_reply_reference(reply_to_message_id: Option<&str>) -> anyhow::Result<()> {
     if reply_to_message_id.is_some_and(|message_id| {
         message_id.len() != 64 || !message_id.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -13514,6 +13785,7 @@ fn purge_scope_cache(cache_path: &Path, scope_id: &str) -> anyhow::Result<()> {
     if scope_id.len() != 64 || !scope_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("conversation has an invalid local cache identifier")
     }
+    advance_media_cache_generation(scope_id);
     for directory in [
         cache_path.join("media").join(scope_id),
         cache_path.join("media-chunks").join(scope_id),
@@ -13531,14 +13803,13 @@ fn purge_scope_cache(_cache_path: &Path, scope_id: &str) -> anyhow::Result<()> {
     if scope_id.len() != 64 || !scope_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("conversation has an invalid local cache identifier")
     }
+    advance_media_cache_generation(scope_id);
+    WEB_MEDIA_CHUNKS.with(|cache| cache.borrow_mut().clear());
     Ok(())
 }
 
 fn safety_directive_order(directive: &SafetyDirectiveV1) -> (u64, &str) {
-    (
-        directive.issued_at_millis,
-        directive.directive_id.as_str(),
-    )
+    (directive.issued_at_millis, directive.directive_id.as_str())
 }
 
 fn safety_restriction_is_active(directive: &SafetyDirectiveV1) -> bool {
@@ -14073,6 +14344,7 @@ mod tests {
             group_event_caches: HashMap::new(),
             noise_reported_message_event_ids: HashMap::new(),
             safety_directives: Vec::new(),
+            safety_cache_purged_directive_ids: HashSet::new(),
             direct_event_cache: DirectEventCache::default(),
             groups: Vec::new(),
             group_memberships: HashMap::new(),
@@ -14735,6 +15007,48 @@ mod tests {
 
         // Length mismatches are cache misses (stale or corrupt entries).
         assert!(cache.get("a", 2).is_none());
+    }
+
+    #[test]
+    fn safety_event_purge_removes_decrypted_group_and_profile_caches() {
+        let identity = Identity::generate();
+        let mut state = account_state(&identity, &test_credentials(), test_profile(None), 1, 1);
+        let group = GroupMembership::create_owned("safety purge", identity.public_key_base64());
+        let group_id = group.group_id.clone();
+        state.add_group(group);
+        let signer = noise_core::SafetyEncryptionKeyPair::generate()
+            .unwrap()
+            .directive_signing_key_pair()
+            .unwrap();
+        let directive = SafetyDirectiveV1::suppress_event(
+            &signer,
+            SafetyReportCategoryV1::ChildSafety,
+            group_id.clone(),
+            "cd".repeat(32),
+        )
+        .unwrap();
+        let cache_path = std::env::temp_dir().join(format!(
+            "noise-safety-cache-purge-{}-{}",
+            std::process::id(),
+            current_nanos(),
+        ));
+        let complete = cache_path.join("media").join(&group_id).join("media.mp4");
+        let chunk = cache_path
+            .join("media-chunks")
+            .join(&group_id)
+            .join("chunk.chunk");
+        let profile = cache_path.join("profile-blobs").join("avatar.json");
+        for file in [&complete, &chunk, &profile] {
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, b"decrypted").unwrap();
+        }
+
+        purge_safety_directive_caches(&cache_path, &state, &[directive]).unwrap();
+
+        assert!(!complete.exists());
+        assert!(!chunk.exists());
+        assert!(!profile.exists());
+        fs::remove_dir_all(cache_path).unwrap();
     }
 
     fn test_credentials() -> AccountCredentials {
