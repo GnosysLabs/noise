@@ -240,7 +240,9 @@ No production service change should begin until these gaps are closed:
   and
 - establish the final write freeze or accepted-write journal.
 
-The next implementation step remains provisioning the private production
-Cloudflare R2 bucket and its narrow credentials, CORS, lifecycle, inventory,
-and recovery boundaries. The importer should be built only after the verifier
-can reproduce every aggregate and digest in this document from copied data.
+The private production Cloudflare R2 bucket baseline was provisioned on
+2026-07-27. Its bucket-scoped runtime credential will be created only when the
+production service has a protected secret destination. The next architecture
+decision is selecting the initial PostgreSQL, queue, and deployment providers.
+The importer should be built only after the verifier can reproduce every
+aggregate and digest in this document from copied data.

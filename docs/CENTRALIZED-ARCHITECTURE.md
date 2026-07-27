@@ -248,8 +248,9 @@ For new uploads:
 5. The client asks the API to finalize the upload.
 6. The service verifies the expected object IDs, hashes, byte lengths, block
    count, and completed R2 objects before making the media reference usable.
-7. Unfinalized objects remain under a temporary prefix and are removed by a
-   bounded cleanup lifecycle.
+7. Unfinalized objects remain under the `temporary/` prefix and are removed
+   after one day by a bucket lifecycle rule. Completed objects never remain
+   under that prefix.
 8. The signed encrypted message references the completed opaque object.
 
 Downloads use short-lived, object-specific presigned GET capabilities or an
@@ -695,9 +696,12 @@ Before implementation:
 
 1. Produce a read-only inventory of both official relay stores and current
    client endpoint behavior.
-2. Provision the private production Cloudflare R2 media bucket with documented
-   CORS, lifecycle, credential, and recovery boundaries. Local development
-   uses an isolated adapter; there is no staging deployment.
+2. Provisioned 2026-07-27: the private `noise-media-production` Cloudflare R2
+   bucket uses Standard storage, no public URL or custom domain, narrow
+   production-web CORS, and one-day `temporary/` cleanup. Create its
+   bucket-scoped runtime credential only when the production service has a
+   protected secret destination. Local development uses an isolated adapter;
+   there is no staging deployment.
 3. Choose the initial PostgreSQL, queue, and deployment providers.
 4. Define the signed device-session protocol and minimum server-visible
    membership record.

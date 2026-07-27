@@ -1,0 +1,30 @@
+{
+  "rules": [
+    {
+      "allowed": {
+        "origins": [
+          "https://app.makenoise.chat"
+        ],
+        "methods": [
+          "GET",
+          "HEAD",
+          "PUT"
+        ],
+        "headers": [
+          "Content-Type",
+          "Range",
+          "x-amz-checksum-sha256",
+          "x-amz-content-sha256"
+        ]
+      },
+      "exposeHeaders": [
+        "Accept-Ranges",
+        "Content-Length",
+        "Content-Range",
+        "ETag",
+        "x-amz-checksum-sha256"
+      ],
+      "maxAgeSeconds": 3600
+    }
+  ]
+}
