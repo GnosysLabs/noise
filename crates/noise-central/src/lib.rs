@@ -106,6 +106,14 @@ pub async fn build_app(config: &CentralConfig) -> anyhow::Result<Router> {
         )
         .route("/v1/events", post(events::publish_group_event))
         .route(
+            "/v1/direct-events",
+            get(events::direct_events_after).post(events::publish_direct_event),
+        )
+        .route(
+            "/v1/direct-events/latest",
+            get(events::latest_direct_events),
+        )
+        .route(
             "/v1/groups/{group_id}/events",
             get(events::group_events_after),
         )

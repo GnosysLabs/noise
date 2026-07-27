@@ -1,7 +1,8 @@
 # noise canonical PostgreSQL schema
 
 Status: initial schema contract consumed by the authentication,
-encrypted-account-vault, canonical group-event, and MLS control service layers
+encrypted-account-vault, canonical group/direct-event, and MLS control service
+layers
 
 Updated: 2026-07-27
 
@@ -86,9 +87,12 @@ protocol scope. Before importing production history, the migration verifier
 must prove that the signed union satisfies this invariant. Any equivocation is
 recorded and reviewed; one relay is never silently preferred.
 
-Topics are streams under a group. Direct conversations have a canonical
-two-account binding and their own stream. Cursors describe transport order,
-not permission to decrypt or display an invalid event.
+Topics are streams under a group. Direct conversations have a deterministic
+protocol scope, canonical two-account binding, and one stream. The central
+service stores one existing receiver-mailbox encrypted envelope per logical
+direct event; both bound participants read that envelope rather than retaining
+the legacy relay transport's second sender-mailbox copy. Cursors describe
+transport order, not permission to decrypt or display an invalid event.
 
 ## Account vaults
 
@@ -144,8 +148,8 @@ service startup. Production application traffic remains on the relays until:
 5. the compatibility importer verifies the production object union.
 
 The service now consumes the account, device, session, account-vault, group,
-membership, MLS control, stream, event, restriction, cursor, and outbox
-portions of this contract in isolated validation. Direct events, media, push,
+direct-thread, membership, MLS control, stream, event, restriction, cursor, and
+outbox portions of this contract in isolated validation. Media, push,
 safety-directive ingestion, and workers remain to be implemented.
 
 The empty production `noise` database is intentionally left unchanged by these

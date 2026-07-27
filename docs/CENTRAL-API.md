@@ -1,7 +1,7 @@
 # noise central API
 
-Status: authentication, encrypted account-vault, canonical group-event, and
-MLS control service implemented; not deployed
+Status: authentication, encrypted account-vault, canonical group/direct-event,
+and MLS control service implemented; not deployed
 
 Updated: 2026-07-27
 
@@ -25,6 +25,9 @@ The first runnable central-service layer implements:
 | `POST /v1/events` | Verify and canonically order a signed encrypted group or topic event |
 | `GET /v1/groups/{group_id}/events` | Fetch visible events after a canonical cursor |
 | `GET /v1/groups/{group_id}/events/latest` | Fetch the latest visible canonical event page |
+| `POST /v1/direct-events` | Verify and canonically order one receiver-addressed encrypted direct event |
+| `GET /v1/direct-events` | Fetch one authenticated participant's visible direct-thread events after a cursor |
+| `GET /v1/direct-events/latest` | Fetch the latest visible page for one authenticated direct-thread participant |
 | `POST /v2/mls/genesis` | Verify and establish one founder-signed MLS epoch-zero control record |
 | `POST /v2/mls/epochs` | Verify and append one authorized MLS epoch transition to the current head |
 | `POST /v2/mls/join-requests` | Store an authenticated account's signed group-scoped KeyPackage request |
@@ -38,6 +41,35 @@ must be URL-encoded by a client when it contains reserved URL characters.
 
 This service does not change the user-facing sign-in flow. Session challenges
 and renewal are background operations performed by the same installation.
+
+## Canonical direct threads
+
+The direct-event publication body contains `recipient_public_key` and `event`.
+The event is the existing signed, encrypted receiver-mailbox copy. The server
+derives the expected receiver mailbox from the public key and rejects the
+request unless the signed event's `group_id` matches it. This binds the
+otherwise encrypted routing claim without exposing message text, profiles,
+attachments, block state, or thread-deletion state.
+
+The server derives the deterministic two-participant `direct_scope_id`, creates
+one canonical thread and stream for that account pair, and stores only the
+receiver-addressed copy. Both participants fetch the same canonical stream and
+can decrypt that copy with their existing pairwise secret. The sender-mailbox
+duplicate used by the legacy relay transport is not stored a second time.
+
+Reads supply `peer_public_key` as a URL-encoded query parameter and require a
+valid bearer session. A lookup returns a stream only when the authenticated
+account and the named peer are the two accounts bound to the derived scope.
+Unknown accounts, nonexistent threads, and unrelated account pairs all produce
+an empty page rather than exposing thread existence.
+
+Existing pairwise block changes remain encrypted direct events and are enforced
+by clients, as they are today. The server cannot infer a private block from
+ciphertext. Safety-wide account restrictions are server-visible and prevent
+the restricted account from authenticating; an actively restricted or deleted
+recipient cannot receive a newly accepted direct event. Hidden or restricted
+direct events are omitted from both participants' pages while the returned
+high-water cursor still advances past the moderated envelope.
 
 ## Account restore bootstrap
 
@@ -87,6 +119,16 @@ revealing account metadata.
 - Event reads require active membership and omit hidden or restricted events.
   The returned high-water cursor lets a client advance safely past moderated
   gaps without seeing the hidden envelopes.
+- Direct publication requires the authenticated author and an active,
+  unrestricted recipient; verifies that the signed receiver-mailbox ID matches
+  the claimed recipient; and binds the event to exactly one deterministic
+  two-account scope.
+- Direct reads require either bound participant, return one canonical encrypted
+  receiver copy to both, and apply the same event hiding/restriction filter and
+  safe high-water cursor behavior as group reads.
+- Exact direct-event retries return the original cursor, including retries that
+  race while the direct thread is being created. A conflicting event ID or
+  author-sequence claim is rejected.
 - MLS genesis creates or binds the canonical group and founder, records epoch
   zero, and materializes the founder membership in one transaction.
 - Epoch writes lock the group control head, require an exact parent record and
@@ -183,10 +225,15 @@ a disposable PostgreSQL database on Cyphers VPS. The test covered:
 7. signed self-removal request, founder-authored removal commit, epoch-two
    membership materialization, rejection of the removed member's next event,
    retained control-log access, and successful founder publication;
-8. current-session logout and a new invisible session;
-9. account-signed installation revocation and idempotent replay;
-10. rejection of the revoked bearer token and new session challenges; and
-11. confirmation that raw bearer tokens and raw challenge nonces were not
+8. a third authenticated account, receiver-bound direct-event publication,
+   exact retry, rejection of a sender-mailbox event misrouted as a receiver
+   copy, two-party pagination and local decryption in both directions;
+9. moderation hiding of a direct event with safe cursor advancement, plus the
+   one-thread/one-stream database invariants;
+10. current-session logout and a new invisible session;
+11. account-signed installation revocation and idempotent replay;
+12. rejection of the revoked bearer token and new session challenges; and
+13. confirmation that raw bearer tokens and raw challenge nonces were not
    stored.
 
 The disposable database and source/build directories were removed afterward.
@@ -197,7 +244,6 @@ The production `noise` schema remained empty.
 The service is not production-ready and has no public nginx route. Remaining
 central API layers include:
 
-- canonical direct-thread authorization and encrypted direct events;
 - realtime WebSocket catch-up;
 - media upload/download capabilities and R2 runtime credentials;
 - safety directive ingestion and restriction maintenance;

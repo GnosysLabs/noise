@@ -250,8 +250,10 @@ specified and the migration was validated in a disposable database without
 changing production. The version-one installation registration, silent session
 proof, and revocation primitives now exist in `noise-core` with fixed
 cross-platform vectors. The central authentication, encrypted account-vault
-compare-and-swap, canonical group-event, and MLS control/membership transaction
-layers also passed an isolated end-to-end test. The next service work is
-canonical direct-event compatibility, alongside the migration verifier. The
-importer should be built only after the verifier can reproduce every aggregate
-and digest in this document from copied data.
+compare-and-swap, canonical group/direct-event, and MLS control/membership
+transaction layers also passed an isolated end-to-end test. The direct layer
+uses one existing receiver-mailbox envelope per logical event, authorizes both
+bound participants without decrypting it, and applies server-side safety
+hiding. The next service work is the migration verifier. The importer should be
+built only after the verifier can reproduce every aggregate and digest in this
+document from copied data.

@@ -4,9 +4,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use clap::Parser;
 use noise_central::{CentralConfig, build_app};
 use noise_core::{
-    AccountVault, CentralInstallationAuthKey, GroupEventPayload, GroupMembership, Identity,
-    MlsAccountState, MlsControlLog, MlsJoinRequest, MlsRemovalRequest, SignedEvent,
-    derive_account_credentials,
+    AccountVault, CentralInstallationAuthKey, DirectMessagePolicy, GroupEventPayload,
+    GroupMembership, Identity, MlsAccountState, MlsControlLog, MlsJoinRequest, MlsRemovalRequest,
+    Profile, SignedEvent, derive_account_credentials,
 };
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -26,6 +26,13 @@ struct SessionResponse {
 #[derive(Deserialize)]
 struct EventAcceptance {
     event_id: String,
+    canonical_cursor: i64,
+}
+
+#[derive(Deserialize)]
+struct DirectEventAcceptance {
+    event_id: String,
+    direct_scope_id: String,
     canonical_cursor: i64,
 }
 
@@ -165,6 +172,14 @@ async fn complete_installation_session_and_revocation_flow() {
     )
     .await;
     verify_mls_control_flow(
+        &http,
+        &base,
+        &database,
+        &identity,
+        &first_session.access_token,
+    )
+    .await;
+    verify_direct_event_flow(
         &http,
         &base,
         &database,
@@ -793,6 +808,328 @@ async fn verify_mls_control_flow(
     assert_eq!(mls_outbox.get::<_, i64>(0), 5);
 }
 
+async fn verify_direct_event_flow(
+    http: &reqwest::Client,
+    base: &str,
+    database: &tokio_postgres::Client,
+    sender: &Identity,
+    sender_access_token: &str,
+) {
+    let recipient = Identity::from_secret_base64(&STANDARD_NO_PAD.encode([0x88; 32])).unwrap();
+    let recipient_installation_key =
+        CentralInstallationAuthKey::from_secret_base64(&STANDARD_NO_PAD.encode([0x99; 32]))
+            .unwrap();
+    let recipient_installation_id = STANDARD_NO_PAD.encode([0xaa; 32]);
+    let recipient_session = register_test_installation(
+        http,
+        base,
+        &recipient,
+        &recipient_installation_key,
+        &recipient_installation_id,
+    )
+    .await;
+    let sender_public_key = sender.public_key_base64();
+    let recipient_public_key = recipient.public_key_base64();
+    let sender_profile = Profile {
+        username: "sender".into(),
+        bio: String::new(),
+        avatar: None,
+        album: None,
+        accepts_direct_messages: true,
+        direct_message_policy: DirectMessagePolicy::Everyone,
+    };
+    let recipient_mailbox = sender
+        .direct_mailbox(&recipient_public_key, &recipient_public_key)
+        .unwrap();
+    let first = SignedEvent::direct_message(
+        sender,
+        &recipient_mailbox,
+        &recipient_public_key,
+        &sender_profile,
+        "canonical encrypted hello",
+        None,
+        None,
+        1,
+    )
+    .unwrap();
+    let first_acceptance = publish_direct_event(
+        http,
+        base,
+        sender_access_token,
+        &recipient_public_key,
+        &first,
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(first_acceptance.event_id, first.event_id);
+    assert_eq!(
+        first_acceptance.direct_scope_id,
+        sender.direct_scope_id(&recipient_public_key).unwrap()
+    );
+    assert_eq!(first_acceptance.canonical_cursor, 5);
+
+    let retry = publish_direct_event(
+        http,
+        base,
+        sender_access_token,
+        &recipient_public_key,
+        &first,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(retry.canonical_cursor, first_acceptance.canonical_cursor);
+
+    let sender_mailbox = sender
+        .direct_mailbox(&recipient_public_key, &sender_public_key)
+        .unwrap();
+    let wrongly_addressed = SignedEvent::direct_message(
+        sender,
+        &sender_mailbox,
+        &recipient_public_key,
+        &sender_profile,
+        "must not be accepted into the recipient thread",
+        None,
+        None,
+        2,
+    )
+    .unwrap();
+    let rejected = http
+        .post(format!("{base}/v1/direct-events"))
+        .bearer_auth(sender_access_token)
+        .json(&serde_json::json!({
+            "recipient_public_key": recipient_public_key,
+            "event": wrongly_addressed,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    let sender_page = fetch_direct_events(
+        http,
+        base,
+        sender_access_token,
+        &recipient_public_key,
+        0,
+        Some(1),
+    )
+    .await;
+    assert_eq!(sender_page.events.len(), 1);
+    assert_eq!(sender_page.events[0].event.event_id, first.event_id);
+    assert_eq!(sender_page.next_cursor, 5);
+    assert!(!sender_page.has_more);
+
+    let recipient_page = fetch_direct_events(
+        http,
+        base,
+        &recipient_session.access_token,
+        &sender_public_key,
+        0,
+        None,
+    )
+    .await;
+    assert_eq!(recipient_page.events.len(), 1);
+    let recipient_view = recipient
+        .direct_mailbox(&sender_public_key, &recipient_public_key)
+        .unwrap();
+    let GroupEventPayload::DirectMessage {
+        recipient_public_key: decrypted_recipient,
+        text,
+        ..
+    } = recipient_page.events[0]
+        .event
+        .decrypt(&recipient_view)
+        .unwrap()
+    else {
+        panic!("expected a direct message");
+    };
+    assert_eq!(decrypted_recipient, recipient_public_key);
+    assert_eq!(text, "canonical encrypted hello");
+    let GroupEventPayload::DirectMessage {
+        text: sender_view_text,
+        ..
+    } = sender_page.events[0]
+        .event
+        .decrypt(&recipient_mailbox)
+        .unwrap()
+    else {
+        panic!("expected sender to decrypt the canonical receiver copy");
+    };
+    assert_eq!(sender_view_text, "canonical encrypted hello");
+
+    let recipient_profile = Profile {
+        username: "recipient".into(),
+        ..sender_profile
+    };
+    let reply_mailbox = recipient
+        .direct_mailbox(&sender_public_key, &sender_public_key)
+        .unwrap();
+    let reply = SignedEvent::direct_message(
+        &recipient,
+        &reply_mailbox,
+        &sender_public_key,
+        &recipient_profile,
+        "canonical encrypted reply",
+        None,
+        None,
+        1,
+    )
+    .unwrap();
+    let reply_acceptance = publish_direct_event(
+        http,
+        base,
+        &recipient_session.access_token,
+        &sender_public_key,
+        &reply,
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(reply_acceptance.canonical_cursor, 6);
+    assert_eq!(
+        reply_acceptance.direct_scope_id,
+        first_acceptance.direct_scope_id
+    );
+
+    let first_page = fetch_direct_events(
+        http,
+        base,
+        sender_access_token,
+        &recipient_public_key,
+        0,
+        Some(1),
+    )
+    .await;
+    assert_eq!(first_page.events[0].event.event_id, first.event_id);
+    assert_eq!(first_page.next_cursor, 5);
+    assert!(first_page.has_more);
+    let remaining = fetch_direct_events(
+        http,
+        base,
+        sender_access_token,
+        &recipient_public_key,
+        first_page.next_cursor,
+        None,
+    )
+    .await;
+    assert_eq!(remaining.events.len(), 1);
+    assert_eq!(remaining.events[0].event.event_id, reply.event_id);
+    assert_eq!(remaining.next_cursor, 6);
+    assert!(!remaining.has_more);
+
+    let latest: CanonicalEventPage = http
+        .get(format!("{base}/v1/direct-events/latest"))
+        .bearer_auth(&recipient_session.access_token)
+        .query(&[
+            ("peer_public_key", sender_public_key.as_str()),
+            ("limit", "1"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(latest.events.len(), 1);
+    assert_eq!(latest.events[0].event.event_id, reply.event_id);
+    assert_eq!(latest.next_cursor, 6);
+    assert!(latest.has_more);
+
+    database
+        .execute(
+            "UPDATE noise.events
+             SET hidden_at = clock_timestamp()
+             WHERE event_id = $1",
+            &[&decode_hex(&first.event_id)],
+        )
+        .await
+        .unwrap();
+    let moderated = fetch_direct_events(
+        http,
+        base,
+        sender_access_token,
+        &recipient_public_key,
+        0,
+        None,
+    )
+    .await;
+    assert_eq!(moderated.events.len(), 1);
+    assert_eq!(moderated.events[0].event.event_id, reply.event_id);
+    assert_eq!(moderated.next_cursor, 6);
+
+    let concurrent = SignedEvent::direct_message(
+        sender,
+        &recipient_mailbox,
+        &recipient_public_key,
+        &Profile {
+            username: "sender".into(),
+            bio: String::new(),
+            avatar: None,
+            album: None,
+            accepts_direct_messages: true,
+            direct_message_policy: DirectMessagePolicy::Everyone,
+        },
+        "one event despite a concurrent retry",
+        None,
+        None,
+        3,
+    )
+    .unwrap();
+    let concurrent_body = serde_json::json!({
+        "recipient_public_key": recipient_public_key,
+        "event": concurrent,
+    });
+    let first_request = http
+        .post(format!("{base}/v1/direct-events"))
+        .bearer_auth(sender_access_token)
+        .json(&concurrent_body)
+        .send();
+    let second_request = http
+        .post(format!("{base}/v1/direct-events"))
+        .bearer_auth(sender_access_token)
+        .json(&concurrent_body)
+        .send();
+    let (first_response, second_response) = tokio::join!(first_request, second_request);
+    let first_response = first_response.unwrap();
+    let second_response = second_response.unwrap();
+    assert_eq!(
+        [first_response.status(), second_response.status()]
+            .into_iter()
+            .filter(|status| *status == StatusCode::CREATED)
+            .count(),
+        1
+    );
+    assert_eq!(
+        [first_response.status(), second_response.status()]
+            .into_iter()
+            .filter(|status| *status == StatusCode::OK)
+            .count(),
+        1
+    );
+    let first_concurrent: DirectEventAcceptance = first_response.json().await.unwrap();
+    let second_concurrent: DirectEventAcceptance = second_response.json().await.unwrap();
+    assert_eq!(first_concurrent.canonical_cursor, 7);
+    assert_eq!(
+        first_concurrent.canonical_cursor,
+        second_concurrent.canonical_cursor
+    );
+
+    let structure = database
+        .query_one(
+            "SELECT
+                (SELECT count(*) FROM noise.direct_threads),
+                (SELECT count(*) FROM noise.streams WHERE stream_kind = 'direct'),
+                (SELECT count(*) FROM noise.events WHERE scope_kind = 'direct')",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(structure.get::<_, i64>(0), 1);
+    assert_eq!(structure.get::<_, i64>(1), 1);
+    assert_eq!(structure.get::<_, i64>(2), 3);
+}
+
 async fn register_test_installation(
     http: &reqwest::Client,
     base: &str,
@@ -837,6 +1174,57 @@ async fn register_test_installation(
         )
         .unwrap();
     open_session(http, base, &proof).await
+}
+
+async fn publish_direct_event(
+    http: &reqwest::Client,
+    base: &str,
+    access_token: &str,
+    recipient_public_key: &str,
+    event: &SignedEvent,
+    expected_status: StatusCode,
+) -> DirectEventAcceptance {
+    let response = http
+        .post(format!("{base}/v1/direct-events"))
+        .bearer_auth(access_token)
+        .json(&serde_json::json!({
+            "recipient_public_key": recipient_public_key,
+            "event": event,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), expected_status);
+    response.json().await.unwrap()
+}
+
+async fn fetch_direct_events(
+    http: &reqwest::Client,
+    base: &str,
+    access_token: &str,
+    peer_public_key: &str,
+    after: i64,
+    limit: Option<u16>,
+) -> CanonicalEventPage {
+    let mut request = http
+        .get(format!("{base}/v1/direct-events"))
+        .bearer_auth(access_token)
+        .query(&[
+            ("peer_public_key", peer_public_key),
+            ("after", &after.to_string()),
+        ]);
+    if let Some(limit) = limit {
+        request = request.query(&[("limit", limit)]);
+    }
+    request
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
 }
 
 fn text_payload(text: &str) -> GroupEventPayload {

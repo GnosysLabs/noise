@@ -7,7 +7,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use deadpool_postgres::{GenericClient, Transaction};
-use noise_core::SignedEvent;
+use noise_core::{SignedEvent, direct_mailbox_id, direct_scope_id};
 use serde::{Deserialize, Serialize};
 use tokio_postgres::error::SqlState;
 
@@ -34,6 +34,26 @@ pub struct LatestEventsQuery {
     stream_locator: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct DirectEventsAfterQuery {
+    peer_public_key: String,
+    #[serde(default)]
+    after: i64,
+    limit: Option<u16>,
+}
+
+#[derive(Deserialize)]
+pub struct LatestDirectEventsQuery {
+    peer_public_key: String,
+    limit: Option<u16>,
+}
+
+#[derive(Deserialize)]
+pub struct DirectEventPublication {
+    recipient_public_key: String,
+    event: SignedEvent,
+}
+
 #[derive(Serialize)]
 pub struct EventAcceptance {
     status: &'static str,
@@ -52,6 +72,14 @@ pub struct CanonicalEventPage {
     events: Vec<CanonicalEvent>,
     next_cursor: i64,
     has_more: bool,
+}
+
+#[derive(Serialize)]
+pub struct DirectEventAcceptance {
+    status: &'static str,
+    event_id: String,
+    direct_scope_id: String,
+    canonical_cursor: i64,
 }
 
 pub async fn publish_group_event(
@@ -294,6 +322,327 @@ pub async fn latest_group_events(
     }))
 }
 
+pub async fn publish_direct_event(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<DirectEventPublication>,
+) -> Result<(StatusCode, Json<DirectEventAcceptance>), ApiError> {
+    request
+        .event
+        .verify()
+        .map_err(|_| ApiError::bad_request("invalid_event"))?;
+    if request.event.encryption_version != 1
+        || request.event.epoch.is_some()
+        || request.event.stream_locator.is_some()
+    {
+        return Err(ApiError::bad_request("invalid_direct_event"));
+    }
+    let session = authenticate_session(&state, &headers).await?;
+    let decoded = DecodedEvent::new(&request.event)?;
+    if decoded.author_public_key != session.identity_public_key {
+        return Err(ApiError::bad_request("event_author_mismatch"));
+    }
+    let recipient_public_key =
+        decode_canonical_array::<32>(&request.recipient_public_key, "invalid_recipient_key")?;
+    if recipient_public_key == session.identity_public_key {
+        return Err(ApiError::bad_request("invalid_direct_recipient"));
+    }
+    let expected_mailbox = direct_mailbox_id(&request.recipient_public_key)
+        .map_err(|_| ApiError::bad_request("invalid_recipient_key"))
+        .and_then(|value| decode_hex_32(&value, "invalid_recipient_key"))?;
+    if decoded.group_id != expected_mailbox {
+        return Err(ApiError::bad_request("direct_recipient_mismatch"));
+    }
+    let scope_id = direct_scope_id(
+        &request.event.author_public_key,
+        &request.recipient_public_key,
+    )
+    .map_err(|_| ApiError::bad_request("invalid_direct_participants"))?;
+    let decoded_scope_id = decode_hex_32(&scope_id, "invalid_direct_participants")?;
+    let signed_wire_record = serde_json::to_vec(&request.event).map_err(ApiError::database)?;
+
+    let mut client = state
+        .database
+        .pool
+        .get()
+        .await
+        .map_err(ApiError::database)?;
+    let transaction = client.transaction().await.map_err(ApiError::database)?;
+
+    if let Some(existing) = transaction
+        .query_opt(
+            "SELECT canonical_cursor, scope_kind, protocol_scope_id, signed_wire_record
+             FROM noise.events
+             WHERE event_id = $1",
+            &[&decoded.event_id.as_slice()],
+        )
+        .await
+        .map_err(ApiError::database)?
+    {
+        let existing_scope_kind: &str = existing.get(1);
+        let existing_scope_id: Vec<u8> = existing.get(2);
+        let existing_wire: Vec<u8> = existing.get(3);
+        if existing_scope_kind != "direct"
+            || existing_scope_id != decoded_scope_id
+            || existing_wire != signed_wire_record
+        {
+            return Err(ApiError::conflict("event_id_conflict"));
+        }
+        let cursor: i64 = existing.get(0);
+        transaction.commit().await.map_err(ApiError::database)?;
+        return Ok((
+            StatusCode::OK,
+            Json(DirectEventAcceptance {
+                status: "accepted",
+                event_id: request.event.event_id,
+                direct_scope_id: scope_id,
+                canonical_cursor: cursor,
+            }),
+        ));
+    }
+
+    let recipient = transaction
+        .query_opt(
+            "SELECT a.account_id
+             FROM noise.accounts a
+             LEFT JOIN noise.account_restrictions ar
+               ON ar.account_id = a.account_id
+              AND (ar.expires_at IS NULL OR ar.expires_at > clock_timestamp())
+             WHERE a.identity_public_key = $1
+               AND a.status = 'active'
+               AND ar.account_id IS NULL",
+            &[&recipient_public_key.as_slice()],
+        )
+        .await
+        .map_err(ApiError::database)?
+        .ok_or_else(|| ApiError::not_found("direct_recipient_unavailable"))?;
+    let recipient_account_id: i64 = recipient.get(0);
+    let (account_low_id, account_high_id) = if session.account_id < recipient_account_id {
+        (session.account_id, recipient_account_id)
+    } else {
+        (recipient_account_id, session.account_id)
+    };
+    transaction
+        .execute(
+            "INSERT INTO noise.direct_threads (
+                protocol_scope_id, account_low_id, account_high_id
+             ) VALUES ($1, $2, $3)
+             ON CONFLICT (account_low_id, account_high_id) DO NOTHING",
+            &[
+                &decoded_scope_id.as_slice(),
+                &account_low_id,
+                &account_high_id,
+            ],
+        )
+        .await
+        .map_err(ApiError::database)?;
+    let thread = transaction
+        .query_one(
+            "SELECT direct_thread_pk, protocol_scope_id
+             FROM noise.direct_threads
+             WHERE account_low_id = $1 AND account_high_id = $2
+             FOR UPDATE",
+            &[&account_low_id, &account_high_id],
+        )
+        .await
+        .map_err(ApiError::database)?;
+    let direct_thread_pk: i64 = thread.get(0);
+    let stored_scope_id: Vec<u8> = thread.get(1);
+    if stored_scope_id != decoded_scope_id {
+        return Err(ApiError::conflict("direct_thread_scope_conflict"));
+    }
+    let stream_pk = ensure_direct_stream(&transaction, direct_thread_pk, &decoded_scope_id).await?;
+    if let Some(existing) = transaction
+        .query_opt(
+            "SELECT canonical_cursor, scope_kind, protocol_scope_id, signed_wire_record
+             FROM noise.events
+             WHERE event_id = $1",
+            &[&decoded.event_id.as_slice()],
+        )
+        .await
+        .map_err(ApiError::database)?
+    {
+        let existing_scope_kind: &str = existing.get(1);
+        let existing_scope_id: Vec<u8> = existing.get(2);
+        let existing_wire: Vec<u8> = existing.get(3);
+        if existing_scope_kind != "direct"
+            || existing_scope_id != decoded_scope_id
+            || existing_wire != signed_wire_record
+        {
+            return Err(ApiError::conflict("event_id_conflict"));
+        }
+        let cursor: i64 = existing.get(0);
+        transaction.commit().await.map_err(ApiError::database)?;
+        return Ok((
+            StatusCode::OK,
+            Json(DirectEventAcceptance {
+                status: "accepted",
+                event_id: request.event.event_id,
+                direct_scope_id: scope_id,
+                canonical_cursor: cursor,
+            }),
+        ));
+    }
+    let cursor_row = transaction
+        .query_one(
+            "UPDATE noise.cursor_clock
+             SET last_cursor = last_cursor + 1
+             WHERE singleton
+             RETURNING last_cursor",
+            &[],
+        )
+        .await
+        .map_err(ApiError::database)?;
+    let canonical_cursor: i64 = cursor_row.get(0);
+    let author_sequence = request.event.author_sequence.to_string();
+    let created_at_millis = request.event.created_at_millis.to_string();
+    transaction
+        .execute(
+            "INSERT INTO noise.events (
+                event_id, canonical_cursor, scope_kind, protocol_scope_id,
+                direct_thread_pk, stream_pk, author_account_id, author_sequence,
+                created_at_millis, encryption_version, nonce, ciphertext,
+                signature, signed_wire_record
+             ) VALUES (
+                $1, $2, 'direct', $3, $4, $5, $6, $7::text::numeric,
+                $8::text::numeric, 1, $9, $10, $11, $12
+             )",
+            &[
+                &decoded.event_id.as_slice(),
+                &canonical_cursor,
+                &decoded_scope_id.as_slice(),
+                &direct_thread_pk,
+                &stream_pk,
+                &session.account_id,
+                &author_sequence,
+                &created_at_millis,
+                &decoded.nonce.as_slice(),
+                &decoded.ciphertext,
+                &decoded.signature.as_slice(),
+                &signed_wire_record,
+            ],
+        )
+        .await
+        .map_err(event_conflict)?;
+    transaction
+        .execute(
+            "UPDATE noise.streams
+             SET latest_cursor = $2
+             WHERE stream_pk = $1",
+            &[&stream_pk, &canonical_cursor],
+        )
+        .await
+        .map_err(ApiError::database)?;
+    let outbox_payload = serde_json::to_vec(&serde_json::json!({
+        "canonical_cursor": canonical_cursor,
+        "event_id": request.event.event_id,
+        "direct_scope_id": scope_id,
+    }))
+    .map_err(ApiError::database)?;
+    transaction
+        .execute(
+            "INSERT INTO noise.outbox_events (
+                topic, aggregate_kind, aggregate_id, payload
+             ) VALUES ('event.accepted', 'event', $1, $2)",
+            &[&decoded.event_id.as_slice(), &outbox_payload],
+        )
+        .await
+        .map_err(ApiError::database)?;
+    transaction.commit().await.map_err(ApiError::database)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(DirectEventAcceptance {
+            status: "accepted",
+            event_id: request.event.event_id,
+            direct_scope_id: scope_id,
+            canonical_cursor,
+        }),
+    ))
+}
+
+pub async fn direct_events_after(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DirectEventsAfterQuery>,
+    headers: HeaderMap,
+) -> Result<Json<CanonicalEventPage>, ApiError> {
+    if query.after < 0 {
+        return Err(ApiError::bad_request("invalid_cursor"));
+    }
+    let limit = page_limit(query.limit)?;
+    let session = authenticate_session(&state, &headers).await?;
+    let client = state
+        .database
+        .pool
+        .get()
+        .await
+        .map_err(ApiError::database)?;
+    let Some(stream) = find_direct_stream(&client, &session, &query.peer_public_key).await? else {
+        return Ok(Json(CanonicalEventPage {
+            events: Vec::new(),
+            next_cursor: query.after,
+            has_more: false,
+        }));
+    };
+    let mut events = read_events_after(
+        &client,
+        stream.stream_pk,
+        query.after,
+        stream.latest_cursor,
+        limit + 1,
+    )
+    .await?;
+    let has_more = events.len() > limit as usize;
+    if has_more {
+        events.pop();
+    }
+    let next_cursor = if has_more {
+        events
+            .last()
+            .map_or(query.after, |event| event.canonical_cursor)
+    } else {
+        query.after.max(stream.latest_cursor)
+    };
+    Ok(Json(CanonicalEventPage {
+        events,
+        next_cursor,
+        has_more,
+    }))
+}
+
+pub async fn latest_direct_events(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LatestDirectEventsQuery>,
+    headers: HeaderMap,
+) -> Result<Json<CanonicalEventPage>, ApiError> {
+    let limit = page_limit(query.limit)?;
+    let session = authenticate_session(&state, &headers).await?;
+    let client = state
+        .database
+        .pool
+        .get()
+        .await
+        .map_err(ApiError::database)?;
+    let Some(stream) = find_direct_stream(&client, &session, &query.peer_public_key).await? else {
+        return Ok(Json(CanonicalEventPage {
+            events: Vec::new(),
+            next_cursor: 0,
+            has_more: false,
+        }));
+    };
+    let mut events =
+        read_latest_events(&client, stream.stream_pk, stream.latest_cursor, limit + 1).await?;
+    let has_more = events.len() > limit as usize;
+    if has_more {
+        events.remove(0);
+    }
+    Ok(Json(CanonicalEventPage {
+        events,
+        next_cursor: stream.latest_cursor,
+        has_more,
+    }))
+}
+
 struct DecodedEvent {
     event_id: [u8; 32],
     group_id: [u8; 32],
@@ -486,9 +835,79 @@ async fn ensure_stream(
         .map_err(ApiError::database)
 }
 
+async fn ensure_direct_stream(
+    transaction: &Transaction<'_>,
+    direct_thread_pk: i64,
+    scope_id: &[u8; 32],
+) -> Result<i64, ApiError> {
+    if let Some(row) = transaction
+        .query_opt(
+            "SELECT stream_pk
+             FROM noise.streams
+             WHERE direct_thread_pk = $1 AND stream_kind = 'direct'",
+            &[&direct_thread_pk],
+        )
+        .await
+        .map_err(ApiError::database)?
+    {
+        return Ok(row.get(0));
+    }
+    transaction
+        .query_one(
+            "INSERT INTO noise.streams (
+                stream_kind, direct_thread_pk, protocol_stream_locator
+             ) VALUES ('direct', $1, $2)
+             RETURNING stream_pk",
+            &[&direct_thread_pk, &scope_id.as_slice()],
+        )
+        .await
+        .map(|row| row.get(0))
+        .map_err(ApiError::database)
+}
+
 struct Stream {
     stream_pk: i64,
     latest_cursor: i64,
+}
+
+async fn find_direct_stream<C: GenericClient + Sync>(
+    client: &C,
+    session: &AuthenticatedSession,
+    peer_public_key: &str,
+) -> Result<Option<Stream>, ApiError> {
+    let peer_public_key = decode_canonical_array::<32>(peer_public_key, "invalid_peer_key")?;
+    if peer_public_key == session.identity_public_key {
+        return Err(ApiError::bad_request("invalid_direct_peer"));
+    }
+    let peer_public_key_base64 = STANDARD_NO_PAD.encode(peer_public_key);
+    let self_public_key_base64 = STANDARD_NO_PAD.encode(session.identity_public_key);
+    let scope_id = direct_scope_id(&self_public_key_base64, &peer_public_key_base64)
+        .map_err(|_| ApiError::bad_request("invalid_direct_participants"))
+        .and_then(|value| decode_hex_32(&value, "invalid_direct_participants"))?;
+    let row = client
+        .query_opt(
+            "SELECT s.stream_pk, s.latest_cursor
+             FROM noise.accounts peer
+             JOIN noise.direct_threads dt
+               ON dt.account_low_id = LEAST($1, peer.account_id)
+              AND dt.account_high_id = GREATEST($1, peer.account_id)
+              AND dt.protocol_scope_id = $3
+             JOIN noise.streams s
+               ON s.direct_thread_pk = dt.direct_thread_pk
+              AND s.stream_kind = 'direct'
+             WHERE peer.identity_public_key = $2",
+            &[
+                &session.account_id,
+                &peer_public_key.as_slice(),
+                &scope_id.as_slice(),
+            ],
+        )
+        .await
+        .map_err(ApiError::database)?;
+    Ok(row.map(|row| Stream {
+        stream_pk: row.get(0),
+        latest_cursor: row.get(1),
+    }))
 }
 
 async fn find_stream<C: GenericClient + Sync>(
