@@ -23,6 +23,15 @@ Treat source state, build output, signature, published artifact, deployed state,
 
 For an all-platform release, preflight all targets first, then build macOS and Windows concurrently from the same accepted source state. Web, relay, and App Store deployments remain distinct publication actions.
 
+For Windows, prefer the user's Tailscale-connected PC as the release builder.
+Run `scripts/release-windows-remote.sh <exact-commit>` from the Mac; it uses the
+`noise-windows` SSH alias, builds in a temporary worktree on the PC, and returns
+the NSIS installer plus updater signature to
+`target/release/windows-assets/`. The GitHub Actions Windows workflow is an
+unsigned manual fallback, not the default release path. See
+[references/windows.md](references/windows.md) for the host, signing, and
+verification rules.
+
 ## Release invariants
 
 - Never expose private-key, certificate, provisioning-profile, or password contents in commands, logs, patches, or chat.
@@ -58,7 +67,7 @@ Report each requested target independently:
 | Target | Source | Built | Signed | Published/deployed | Live verification |
 |---|---|---:|---:|---:|---:|
 | macOS | revision/tree | result | codesign + notarization | GitHub/update manifest | installed launch/update |
-| Windows | revision/tree | result | Authenticode + updater | GitHub/update manifest | installed launch/update |
+| Windows | revision/tree | result | updater + Authenticode status | GitHub/update manifest | installed launch/update |
 | Web | revision/tree | result | n/a | served asset hash | browser behavior |
 | iOS | core + iOS revisions | result | distribution profile | App Store Connect/TestFlight | physical iPhone |
 | Relay | revision/tree | result | signed channel/package | installed or channel | local/public health |

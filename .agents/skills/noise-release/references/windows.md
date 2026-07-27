@@ -1,35 +1,59 @@
 # Windows desktop
 
-## Current pipeline
+## Canonical release pipeline
 
-The canonical workflow is `.github/workflows/client-windows.yml`. It installs Node 22, pnpm 10.30.3, stable Rust, and builds an x64 NSIS installer:
+The canonical Windows release machine is the user's PC over Tailscale SSH:
 
-```powershell
-pnpm --dir apps/client install --frozen-lockfile
-'{"bundle":{"createUpdaterArtifacts":false}}' |
-  Set-Content apps/client/src-tauri/tauri.ci.conf.json
-pnpm --dir apps/client tauri build --config src-tauri/tauri.ci.conf.json --ci
+```sh
+scripts/release-windows-remote.sh <exact-commit>
 ```
 
-The installer is normally under `target/release/bundle/nsis/*-setup.exe`.
+The Mac-side script:
+
+1. Requires the exact commit to be present on `origin/main`.
+2. Connects through the `noise-windows` SSH alias.
+3. Sends the updater password from the existing macOS Keychain entry without
+   printing it.
+4. Runs `scripts/release-windows.ps1` in a temporary detached worktree on the
+   PC, leaving the PC's main checkout untouched.
+5. Builds the NSIS installer with Tauri updater signing enabled.
+6. Copies the installer and `.sig` back to `target/release/windows-assets/`.
+7. Verifies the revision, version, PE GUI subsystem, and SHA-256 hashes.
+
+The PC checkout is `C:\Users\cmcel\noise`. Its ignored build output and old log
+files are not release source. Do not reset or clean that checkout to prepare a
+release.
+
+## GitHub fallback
+
+`.github/workflows/client-windows.yml` is an unsigned manual fallback. It
+installs Node 22, pnpm 10.30.3, stable Rust, disables updater artifacts, and
+builds an x64 NSIS installer. It is useful for diagnosing whether a clean
+Windows runner compiles, but it is not the normal release path.
 
 ## Important signing status
 
-The checked-in Windows CI deliberately disables updater artifacts and does not configure an Authenticode certificate in `tauri.conf.json`. Its installer is suitable for testing, but it is not a complete signed public release.
+The PC has the noise Tauri updater key, so the canonical workflow produces the
+updater `.sig`. It currently has no Windows Authenticode certificate in the
+current user's certificate store. The updater signature proves the artifact is
+authorized by noise's updater key; it does not remove Windows SmartScreen's
+unsigned-publisher warning.
 
-Do not claim Windows is signed or updater-ready merely because the workflow passed. Before a public Windows release, explicitly configure and verify:
+Before claiming Authenticode publisher signing, explicitly configure and
+verify:
 
 1. An accessible code-signing certificate without exposing its private key or password.
 2. A timestamp server and Tauri Windows signing configuration.
-3. A Tauri updater artifact signed by the existing noise updater key.
-4. A Windows platform entry in the same final `latest.json` used by the desktop release.
 
-Do not invent certificate thumbprints, passwords, remote Windows hosts, or signing commands. Resolve them from the authorized machine/secret store at release time and add them to repository automation rather than a one-off shell history.
+The release still requires a Windows platform entry in the same final
+`latest.json` used by the desktop release.
 
 ## Build options
 
-- For an ordinary test artifact, dispatch the `Windows client` GitHub workflow and download its `noise-windows-<sha>` artifact.
-- For a user-authorized build on their Windows machine, first confirm the exact host, checkout revision, working-tree state, certificate availability, and output path. Build the same accepted revision as macOS.
+- For a release artifact, run `scripts/release-windows-remote.sh` with the same
+  accepted revision used for macOS.
+- For an unsigned fallback artifact, dispatch `Windows client (unsigned
+  fallback)` and download its `noise-windows-<sha>` artifact.
 
 ## Verify
 
