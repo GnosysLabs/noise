@@ -20,7 +20,7 @@ const SAFETY_REPORT_CONTEXT: &str = "xyz.gnosyslabs.noise.safety-report.v1";
 const SAFETY_HPKE_INFO: &[u8] = b"xyz.gnosyslabs.noise.safety-envelope.v1";
 const SAFETY_KEY_ID_CONTEXT: &str = "xyz.gnosyslabs.noise.safety-key-id.v1";
 const MAX_REPORT_DETAILS_CHARS: usize = 1_000;
-const MAX_REPORTED_TEXT_CHARS: usize = 4_000;
+const MAX_REPORTED_TEXT_CHARS: usize = 10_000;
 const MAX_ENCRYPTED_OBJECTS: usize = 256;
 const MAX_RELAY_URL_BYTES: usize = 2_048;
 
@@ -75,9 +75,9 @@ pub struct SafetyEncryptedShardV1 {
 ///
 /// `reported_event` remains encrypted. Including the complete signed event
 /// lets the safety service verify its author, group, event id, and timestamp
-/// without receiving the decrypted message or any media bytes. Threat reports
-/// may explicitly include one bounded text excerpt so staff can assess the
-/// danger without receiving surrounding history.
+/// without receiving media bytes. The exact text of the single reported
+/// message may be included so staff can assess it without receiving surrounding
+/// history.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SafetyReportV1 {
     pub version: u32,
@@ -161,9 +161,7 @@ impl SafetyReportV1 {
                 .as_deref()
                 .is_some_and(|details| details.chars().count() > MAX_REPORT_DETAILS_CHARS)
             || self.reported_text_excerpt.as_deref().is_some_and(|text| {
-                text.trim().is_empty()
-                    || text.chars().count() > MAX_REPORTED_TEXT_CHARS
-                    || self.category != SafetyReportCategoryV1::ThreatsOrImmediateDanger
+                text.trim().is_empty() || text.chars().count() > MAX_REPORTED_TEXT_CHARS
             })
             || self.encrypted_objects.len() > MAX_ENCRYPTED_OBJECTS
         {
@@ -400,7 +398,7 @@ mod tests {
             SignedEvent::chat(&author, &group, "encrypted report target", 1).unwrap();
         let report = SafetyReportV1::create(
             &reporter,
-            SafetyReportCategoryV1::ThreatsOrImmediateDanger,
+            SafetyReportCategoryV1::HarassmentOrHatefulBehavior,
             reported_event,
             Some(membership_proof),
             Some(SafetyMediaFingerprintV1 {
@@ -415,7 +413,7 @@ mod tests {
                     shard_id: "b".repeat(64),
                 }],
             }],
-            Some("A direct threat from the reported message.".into()),
+            Some("The exact text of the reported message.".into()),
             Some("Group staff may be involved.".into()),
         )
         .unwrap();
@@ -431,7 +429,7 @@ mod tests {
         assert_eq!(opened, report);
         assert_eq!(
             opened.reported_text_excerpt.as_deref(),
-            Some("A direct threat from the reported message.")
+            Some("The exact text of the reported message.")
         );
         assert_eq!(decoded.recipient_key_id, restored_key.key_id());
         assert!(

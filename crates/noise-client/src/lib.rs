@@ -7107,9 +7107,8 @@ impl NoiseClient {
             })
             .max_by_key(|event| (event.created_at_millis, event.author_sequence))
             .cloned();
-        let reported_text_excerpt = (category == SafetyReportCategoryV1::ThreatsOrImmediateDanger)
-            .then(|| target.text.trim().to_owned())
-            .filter(|text| !text.is_empty());
+        let reported_text_excerpt =
+            (!target.text.trim().is_empty()).then(|| target.text.trim().to_owned());
         let report = SafetyReportV1::create(
             &identity,
             category,

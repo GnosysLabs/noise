@@ -9406,9 +9406,9 @@ function ReportMessageDialog({
         )}
         {destination === "noise" && (
           <p className="report-data-note">
-            {category === "threats_or_immediate_danger" && message.text.trim()
-              ? "The text of this message will be included so the threat can be assessed. Surrounding messages and media bytes are not sent."
-              : "Message text and media bytes are not sent. noise receives signed event metadata and encrypted object locations."}
+            {message.text.trim()
+              ? "The exact text of this message will be included in the encrypted report. Surrounding messages and media bytes are not sent."
+              : "This message has no text. Media bytes are not sent; noise receives signed event metadata and encrypted object locations."}
           </p>
         )}
         <LabeledArea label="details (optional)" count={`${details.length}/180`}>

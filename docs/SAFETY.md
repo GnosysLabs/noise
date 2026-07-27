@@ -87,17 +87,17 @@ does not notify its founder or moderators.
 - an optional reporter-authored signed event providing group context;
 - an optional SHA-256 fingerprint computed locally over reported media;
 - optional opaque encrypted-object and shard locations;
-- for **threats or immediate danger only**, an optional excerpt of up to 4,000
-  characters from the single reported text message; and
+- the exact text of the single reported message, when present, up to the normal
+  10,000-character message limit; and
 - an optional short reporter statement.
 
-The bounded threat excerpt is a deliberate exception to the metadata-only
-default: the app must tell the reporter that the text will be sent, and it
-must not add surrounding chat history. The schema has no general plaintext
-message field, media attachment field, media key, deletion capability,
-thumbnail, or payload byte field. An ordinary hash does not establish that
-media is illegal. It can identify exact bytes, link duplicates, or match a
-separately governed trusted hash source.
+The app tells the reporter that the exact reported text will be sent inside the
+encrypted safety report and must not add surrounding chat history. Text is
+necessary to assess harassment, scams, threats, and other text violations. The
+schema has no media attachment field, media key, deletion capability, thumbnail,
+or payload byte field. An ordinary hash does not establish that media is
+illegal. It can identify exact bytes, link duplicates, or match a separately
+governed trusted hash source.
 
 The reporter signature covers every field using canonical struct-order JSON
 prefixed by the fixed context
