@@ -6,6 +6,7 @@
 .env
 .env.*
 !.env.example
+!/apps/client/.env.production
 node_modules/
 .pnpm-store/
 dist/

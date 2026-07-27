@@ -1,7 +1,12 @@
 server {
-    listen 80;
-    listen [::]:80;
+    listen 443 ssl;
+    listen [::]:443 ssl;
     server_name safety.makenoise.chat;
+
+    ssl_certificate /etc/letsencrypt/live/safety.makenoise.chat/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/safety.makenoise.chat/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
 
     client_max_body_size 384k;
 
@@ -19,4 +24,11 @@ server {
         proxy_buffering off;
         proxy_read_timeout 30s;
     }
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name safety.makenoise.chat;
+    return 301 https://$host$request_uri;
 }
