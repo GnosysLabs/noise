@@ -3077,7 +3077,9 @@ impl NoiseClient {
         self.publish_account_state(&mut state, &relays).await?;
         self.publish_read_state_for_state(&mut state, &relays)
             .await?;
-        save_state(path, &state)?;
+        // Account creation is not complete until the local vault is durable.
+        // The desktop registry is committed only after this call returns.
+        save_state_immediately(path, &state)?;
         state.summary()
     }
 
@@ -3141,7 +3143,9 @@ impl NoiseClient {
         if !has_read_state {
             let _ = self.publish_read_state_for_state(&mut state, &relays).await;
         }
-        save_state(path, &state)?;
+        // Sign-in is not complete until the restored local vault is durable.
+        // The desktop registry is committed only after this call returns.
+        save_state_immediately(path, &state)?;
         state.summary()
     }
 

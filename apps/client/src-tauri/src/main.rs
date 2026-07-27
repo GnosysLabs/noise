@@ -283,6 +283,16 @@ async fn execute_noise_request(app: &tauri::AppHandle, mut request: Value) -> Va
     if response.get("ok").and_then(Value::as_bool) == Some(true) {
         if matches!(action.as_str(), "logout" | "delete_account") {
             let _ = remove_active_account_from_registry(&paths.id);
+        } else if matches!(action.as_str(), "initialize" | "sign_in") {
+            // Creating or restoring an identity is a storage transaction:
+            // noise-client has already committed the encrypted vault, and the
+            // call must not report success until the account registry agrees.
+            if let Err(error) = update_active_account_metadata(&paths.id, &response) {
+                return json!({
+                    "ok": false,
+                    "error": format!("could not commit the local account: {error}"),
+                });
+            }
         } else {
             let _ = update_active_account_metadata(&paths.id, &response);
         }

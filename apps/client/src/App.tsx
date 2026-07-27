@@ -1581,6 +1581,7 @@ export default function App() {
     nonce: number;
   } | null>(null);
   const [loading, setLoading] = useState(true);
+  const [accountBootstrapError, setAccountBootstrapError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const clearRecoveredRelayError = useCallback(() => {
@@ -2223,16 +2224,34 @@ export default function App() {
     if (markActiveRead && active?.has_unread) await markDirectRead(active.public_key);
   }, [applyDirectInbox, clearRecoveredRelayError, markDirectRead]);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (authenticatedLocal?: LocalSummary) => {
     if (groupSelectionInFlight.current) return;
     const generation = ++refreshGeneration.current;
-    let local = await noise<LocalSummary>({ action: "status" });
+    let local = authenticatedLocal
+      ?? await noise<LocalSummary>({ action: "status" });
     if (generation !== refreshGeneration.current) return;
     if (!local) {
+      const accounts = await listLocalAccounts();
+      if (generation !== refreshGeneration.current) return;
+      setLocalAccounts(accounts);
+      const activeAccountIsKnown = accounts.active_account_id !== null
+        && accounts.accounts.some(
+          (account) => account.id === accounts.active_account_id,
+        );
+      // A committed selected account must already have a durable vault. Treat
+      // any disagreement as a storage invariant failure, never as a brand-new
+      // installation and never as something timing-based that polling can fix.
+      if (activeAccountIsKnown) {
+        throw new Error("noise could not open the selected profile on this device");
+      }
+    }
+    if (!local) {
       setSummary(null);
+      setAccountBootstrapError(null);
       setLoading(false);
       return;
     }
+    setAccountBootstrapError(null);
     if (noiseSafetyUrl) {
       try {
         local = await noise<LocalSummary>({
@@ -2487,7 +2506,9 @@ export default function App() {
   useEffect(() => {
     void refresh()
       .catch((cause) => {
-        if (!isSupersededLoading(cause)) setError(message(cause));
+        if (!isSupersededLoading(cause)) {
+          setAccountBootstrapError(message(cause));
+        }
       })
       .finally(() => setLoading(false));
   }, [refresh]);
@@ -3922,6 +3943,23 @@ export default function App() {
   }
 
   if (loading) return <><Loading /><UpdateBanner {...updater} /></>;
+  if (accountBootstrapError && !summary) {
+    return (
+      <>
+        <AccountBootstrapFailure
+          error={accountBootstrapError}
+          retry={() => {
+            setAccountBootstrapError(null);
+            setLoading(true);
+            void refresh()
+              .catch((cause) => setAccountBootstrapError(message(cause)))
+              .finally(() => setLoading(false));
+          }}
+        />
+        <UpdateBanner {...updater} />
+      </>
+    );
+  }
   if (!summary) {
     return (
       <>
@@ -3961,7 +3999,7 @@ export default function App() {
             // transition and must never leave a live sign-in form behind.
             setSummary(local);
             setLoading(false);
-            void refresh().catch((cause) => {
+            void refresh(local).catch((cause) => {
               if (!isSupersededLoading(cause)) setError(message(cause));
             });
           }, false)
@@ -10308,6 +10346,27 @@ function EncryptionPending({ phase }: { phase: GroupEncryptionStatus["phase"] })
           : "restoring encrypted group access from your noise account"}
       </span>
       <small>nothing to approve — this screen updates on its own</small>
+    </div>
+  );
+}
+
+function AccountBootstrapFailure({
+  error,
+  retry,
+}: {
+  error: string;
+  retry: () => void;
+}) {
+  return (
+    <div className="safety-unavailable identity account-bootstrap-failure">
+      <span className="safety-unavailable-mark"><TriangleAlert /></span>
+      <strong>this profile could not be opened</strong>
+      <span>{error}</span>
+      <small>
+        noise has kept the saved profile on this device and will not replace it
+        with a create-account screen.
+      </small>
+      <button onClick={retry}>check profile storage again</button>
     </div>
   );
 }
