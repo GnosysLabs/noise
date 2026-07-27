@@ -78,12 +78,13 @@ Cyphers VPS. It has not been installed, routed through nginx, or connected to
 clients.
 
 The initial canonical database contract is documented in
-`CANONICAL-SCHEMA.md` and implemented by
-`deploy/central/migrations/0001_canonical_schema.sql`. On 2026-07-27 that
-migration and a representative constraint smoke test passed in a disposable
-PostgreSQL database on this host. The disposable database was removed and the
-production `noise` schema remained empty. The migration is not applied to
-production until a central-service release can consume it.
+`CANONICAL-SCHEMA.md` and implemented by the ordered SQL files in
+`deploy/central/migrations/`. On 2026-07-27 the initial migration and a
+representative constraint smoke test passed in a disposable PostgreSQL
+database on this host. The disposable database was removed and the production
+`noise` schema remained empty. Both current migrations must be applied in
+order before installing the central service; they are not applied to
+production until a central-service release can consume them.
 
 ## Deployment and rollback boundary
 
@@ -106,7 +107,7 @@ backup and cannot be hidden inside an ordinary application deployment.
 
 - extend the central API into canonical direct events, realtime, media, and
   safety-directive operations;
-- apply the canonical migration as part of the first reversible service
+- apply the canonical migrations in order as part of the first reversible service
   deployment, not as an isolated production mutation;
 - implement the transactional outbox/job claim contract;
 - choose and configure the canonical API hostname;

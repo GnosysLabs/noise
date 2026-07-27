@@ -214,6 +214,8 @@ The production evidence fixes the following rules:
 3. Deduplicate immutable records by their protocol ID and reject conflicting
    payloads for the same ID.
 4. Select the highest valid signed account-vault revision per locator.
+   Multiple locators signed by the same identity remain recovery aliases for
+   one canonical account.
 5. Preserve deleted-account and group-deletion records.
 6. Namespace legacy shard IDs and tombstones by original relay provider.
 7. Reconcile encrypted media by verified payload hash and byte length while
@@ -222,6 +224,15 @@ The production evidence fixes the following rules:
 9. Exclude filesystem orphans unless a verified database reference exists.
 10. Run a final frozen capture or journal every accepted write between capture
     and cutover.
+
+The implemented read-only verifier has also been run against clean standalone
+copies of both production databases. The signed union, account revisions, MLS
+chains, and direct-message reconciliation passed. It confirmed eight
+identity-level recovery-locator alias sets, seven byte-identically shared
+legacy group-sequence duplicates that the current client already reduces
+deterministically, and three valid legacy APNs `sandbox` registrations. A full
+passing run remains pending because that database-only check intentionally did
+not copy the encrypted shard trees.
 
 ## Phase 0 work still open
 
@@ -236,7 +247,8 @@ No production service change should begin until these gaps are closed:
 - build an isolated restore environment and prove both database snapshots open;
 - verify representative legacy shard retrieval from restored copies;
 - classify the single primary filesystem orphan;
-- build the signed-object migration verifier from these counts and merge rules;
+- run the signed-object migration verifier against the final clean restored
+  snapshots and resolve every blocker;
   and
 - establish the final write freeze or accepted-write journal.
 
@@ -254,6 +266,11 @@ compare-and-swap, canonical group/direct-event, and MLS control/membership
 transaction layers also passed an isolated end-to-end test. The direct layer
 uses one existing receiver-mailbox envelope per logical event, authorizes both
 bound participants without decrypting it, and applies server-side safety
-hiding. The next service work is the migration verifier. The importer should be
-built only after the verifier can reproduce every aggregate and digest in this
-document from copied data.
+hiding. The read-only migration verifier is now implemented with deterministic
+union, account revision, direct-copy, MLS-chain, and encrypted-shard checks.
+Its disposable fixtures cover both passing and blocked migrations, and its
+database-only production snapshot run passed every check except the
+intentionally absent encrypted shard files. The next step is durable production
+database/media backups and a complete isolated restored run. The importer
+should be built only after that report passes and reproduces the aggregates and
+digests in this document.

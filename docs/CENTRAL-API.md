@@ -107,7 +107,9 @@ revealing account metadata.
 - Vault writes require `If-Match`, advance exactly one signed revision, retain
   every accepted encrypted version, and update the head atomically. Exact
   retries are idempotent.
-- A signed vault locator and identity are bound to one authenticated account.
+- Every signed vault locator and identity are bound to one authenticated
+  account. An account may retain multiple recovery-locator aliases, each with
+  its own signed revision chain.
   A signed tombstone marks the account deleted and revokes all of its sessions
   in the same transaction.
 - Event publication verifies the envelope signature and authenticated author,
@@ -185,7 +187,7 @@ The production PostgreSQL role has a 20-connection limit. The service's
 maximum accepted pool size leaves connections available for migrations,
 maintenance, and recovery.
 
-At startup the service requires canonical schema migration version 1. It does
+At startup the service requires canonical schema migration version 2. It does
 not apply migrations automatically.
 
 ## HTTP boundary

@@ -6,7 +6,10 @@ layers
 
 Updated: 2026-07-27
 
-Migration: `deploy/central/migrations/0001_canonical_schema.sql`
+Migrations:
+
+- `deploy/central/migrations/0001_canonical_schema.sql`
+- `deploy/central/migrations/0002_recovery_aliases.sql`
 
 ## Purpose
 
@@ -101,6 +104,10 @@ Every verified encrypted account-vault revision is retained in
 revision for a locator. Updating the head uses compare-and-swap in one
 transaction.
 
+An account may own multiple identity-signed recovery locators. Each locator
+retains its own revision chain and head; all of those locator aliases resolve
+to the same canonical account.
+
 Deleted vaults retain their signed tombstone and contain no nonce or
 ciphertext. The importer verifies both relays and selects the highest valid
 signed revision; it does not make either relay globally authoritative.
@@ -138,8 +145,9 @@ fingerprint and bounded replay result, not a plaintext request body.
 
 ## Deployment
 
-The first migration is applied by the migration process, not automatically at
-service startup. Production application traffic remains on the relays until:
+The migrations are applied in version order by the migration process, not
+automatically at service startup. Production application traffic remains on
+the relays until:
 
 1. the migration has been applied to an isolated PostgreSQL database;
 2. the schema and constraints have been inspected;

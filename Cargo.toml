@@ -3,6 +3,7 @@ members = [
     "apps/client/src-tauri",
     "crates/noise-core",
     "crates/noise-central",
+    "crates/noise-migration-verifier",
     "crates/noise-client",
     "crates/noise-transport",
     "crates/noise-ffi",
@@ -44,6 +45,7 @@ openmls_traits = "=0.5.0"
 rand = "0.9"
 reed-solomon-erasure = "6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 scraper = "0.24"
 semver = "1"
 serde = { version = "1", features = ["derive"] }

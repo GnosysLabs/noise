@@ -136,9 +136,12 @@ CREATE INDEX sessions_device_active_idx
 
 CREATE TABLE noise.account_vault_locators (
     locator bytea PRIMARY KEY CHECK (octet_length(locator) = 32),
-    account_id bigint NOT NULL UNIQUE REFERENCES noise.accounts(account_id),
+    account_id bigint NOT NULL REFERENCES noise.accounts(account_id),
     created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
+
+CREATE INDEX account_vault_locators_account_idx
+    ON noise.account_vault_locators (account_id);
 
 CREATE TABLE noise.account_vault_versions (
     locator bytea NOT NULL CHECK (octet_length(locator) = 32),
@@ -467,7 +470,8 @@ CREATE TABLE noise.push_subscriptions (
     push_subscription_pk bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     device_pk bigint NOT NULL REFERENCES noise.devices(device_pk),
     provider text NOT NULL CHECK (provider IN ('apns', 'fcm', 'webpush')),
-    environment text NOT NULL CHECK (environment IN ('production', 'development')),
+    environment text NOT NULL
+        CHECK (environment IN ('production', 'development', 'sandbox')),
     token_lookup_hash bytea NOT NULL UNIQUE CHECK (octet_length(token_lookup_hash) = 32),
     routing_token_ciphertext bytea NOT NULL
         CHECK (octet_length(routing_token_ciphertext) > 16),

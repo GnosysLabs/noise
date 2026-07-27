@@ -714,6 +714,9 @@ Before implementation:
    membership record.
 5. Specify the canonical event and cursor schema.
 6. Specify legacy media compatibility and central R2 object resolution.
-7. Build the migration verifier before writing the importer.
+7. Implemented 2026-07-27: build the read-only migration verifier before
+   writing the importer. A clean production database-only run passed all
+   signed-object and reconciliation checks; its final complete run remains
+   gated on immutable database/media backups and an isolated restore.
 8. Review this document and explicitly approve any change to the privacy
    boundary before code changes begin.
