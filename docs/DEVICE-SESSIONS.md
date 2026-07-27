@@ -1,6 +1,6 @@
 # noise device sessions
 
-Status: accepted protocol boundary for central-service implementation
+Status: version-one signing primitives implemented in `noise-core`
 
 Updated: 2026-07-27
 
@@ -104,6 +104,19 @@ Every signature uses a versioned, ASCII signing context before the binary
 fields. Length-prefixed fields are used rather than delimiter-separated user
 input.
 
+The canonical signing encoder is implemented in
+`crates/noise-core/src/central_auth.rs`:
+
+- `field(value)` is a four-byte unsigned big-endian length followed by the raw
+  value bytes;
+- a record starts with `field(ASCII context)` followed by the four-byte
+  unsigned big-endian protocol version;
+- decoded 32-byte keys, IDs, and nonces are encoded with `field`;
+- timestamps, registration versions, and revocation sequences are eight-byte
+  unsigned big-endian integers; and
+- JSON fields use canonical unpadded base64, but signatures cover the decoded
+  binary values rather than the base64 text.
+
 ### Registration statement
 
 Context:
@@ -159,9 +172,26 @@ Fields:
 The account identity key signs revocation. The sequence must advance so a
 replayed older record cannot undo newer device state.
 
-The exact binary encoding and test vectors must be added to `noise-core`
-before the API accepts these statements. JSON serialization is not the signing
-format.
+JSON serialization is not the signing format.
+
+### Fixed version-one vectors
+
+`noise-core` fixes cross-platform vectors using:
+
+- account identity secret: 32 bytes of `0x11`;
+- installation authentication secret: 32 bytes of `0x22`;
+- installation ID: 32 bytes of `0x33`;
+- challenge ID: 32 bytes of `0x44`;
+- challenge nonce: 32 bytes of `0x55`;
+- registration time/version: `1722000000123` / `7`;
+- session-proof time: `1722000000456`; and
+- revocation sequence/time: `8` / `1722000000789`.
+
+| Statement | BLAKE3 of canonical signing bytes | Unpadded base64 Ed25519 signature |
+| --- | --- | --- |
+| registration | `4f06d990b71faa511e4abc4d062a10a323148f685dab923ee943aeefde7d08b1` | `xspjZYyfF4MM6vjXQA33cSL8Amb+piGSX+PTfd26fURgtR20VzVxWSR0+JR+SBxczcAZOfUUvGZqbFvf2It+AA` |
+| session proof | `15ad48701d159c6e3007ab18f2dabb811fa3eb2484d5ad238bf25cbb1595ba09` | `9O0HYuRX5O9fzD1lAAXu96Aa0dHNQ59tr8Lv1iRdisIJ6LfnrHDY9P16h4xxxpbnspT6vU4B9pwmc5+hizFgCw` |
+| revocation | `f9587a59f9c520838912c6604494ad28d83ac87ece27a14bc2759de1c8ce774a` | `FICi1Ej84OpSd/IjQcwM8qIZRzKqTF2srXUTD55shQFyoHErzIBxSwbIA5ntr1i8N9SoiLx5X7e+GXt0dmCUAw` |
 
 ## Service endpoints
 

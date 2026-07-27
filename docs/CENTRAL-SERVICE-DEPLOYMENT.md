@@ -63,9 +63,10 @@ The PostgreSQL foundation contains:
 The database password exists only in the protected server environment file. It
 must not be printed, copied into Git, or embedded in a client build.
 
-The signed installation-session contract is documented in
-`DEVICE-SESSIONS.md`. Authentication and renewal are invisible operations
-performed by the same installation; another device is never required.
+The signed installation-session contract and fixed cross-platform test vectors
+are documented in `DEVICE-SESSIONS.md` and implemented in `noise-core`.
+Authentication and renewal are invisible operations performed by the same
+installation; another device is never required.
 
 The initial canonical database contract is documented in
 `CANONICAL-SCHEMA.md` and implemented by
@@ -94,8 +95,6 @@ backup and cannot be hidden inside an ordinary application deployment.
 
 ## Work still required before traffic
 
-- implement the signed installation-session statements and test vectors in
-  `noise-core`;
 - implement the central API and transactional schema access layer;
 - apply the canonical migration as part of the first reversible service
   deployment, not as an isolated production mutation;

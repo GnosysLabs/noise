@@ -15,8 +15,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
+mod central_auth;
 mod production_e2ee;
 mod safety;
+pub use central_auth::{
+    CentralInstallationAuthKey, CentralInstallationRegistrationV1, CentralInstallationRevocationV1,
+    CentralSessionProofV1,
+};
 pub use production_e2ee::{
     HistoryKeyLink, MlsAccountState, MlsCommitBundle, MlsControlLog, MlsDeviceCredential,
     MlsEpochRecord, MlsEpochSummary, MlsGroupGenesis, MlsJoinRequest, MlsLegacyHistoryBridge,

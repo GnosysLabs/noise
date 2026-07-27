@@ -247,7 +247,8 @@ bucket-scoped runtime credential will be created only when the production
 service can consume it from the protected server environment. The invisible
 same-installation session contract and canonical PostgreSQL schema were
 specified and the migration was validated in a disposable database without
-changing production. The next implementation work is the signed protocol
-primitives and central API. The importer should be built only after the
-verifier can reproduce every aggregate and digest in this document from copied
-data.
+changing production. The version-one installation registration, silent session
+proof, and revocation primitives now exist in `noise-core` with fixed
+cross-platform vectors. The next implementation work is the central API. The
+importer should be built only after the verifier can reproduce every aggregate
+and digest in this document from copied data.
