@@ -8463,7 +8463,7 @@ function Onboarding({
         <input autoFocus value={username} maxLength={MAX_DISPLAY_NAME_LENGTH} aria-invalid={createAttempted && !usernameReady} onChange={(event) => setUsername(event.target.value)} placeholder="display name" />
         <label className="onboarding-birth-date">
           <span>birth date · Noise is 18+</span>
-          <input type="text" autoComplete="bday" value={birthDate} maxLength={10} aria-invalid={createAttempted && !birthDateReady} onChange={(event) => setBirthDate(event.target.value)} placeholder="MM/DD/YYYY" />
+          <input type="text" autoComplete="bday" value={birthDate} maxLength={10} aria-invalid={createAttempted && !birthDateReady} onChange={(event) => setBirthDate(event.target.value)} placeholder="MM-DD-YYYY" />
           <small>type your date · checked for 18+ eligibility, then discarded</small>
         </label>
         <input type="password" autoComplete="new-password" value={password} aria-describedby="password-requirements" aria-invalid={createAttempted && !passwordReady} onChange={(event) => setPassword(event.target.value)} placeholder="strong password" />
