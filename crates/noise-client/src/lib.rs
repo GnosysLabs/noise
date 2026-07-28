@@ -88,6 +88,12 @@ const ONLINE_PRESENCE_REMAINING_MILLIS: u64 = 15_000;
 const RECENT_GROUP_PRESENCE_MILLIS: u64 = 5 * 60_000;
 const EVENT_REPLICA_SETTLE_MILLIS: u64 = 500;
 const RELAY_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn central_session_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 #[cfg(not(target_arch = "wasm32"))]
 const MEDIA_CHUNK_DOWNLOAD_CONCURRENCY: usize = 8;
 #[cfg(target_arch = "wasm32")]
@@ -3200,10 +3206,16 @@ impl NoiseClient {
     }
 
     pub async fn bind_central_state(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
-        if self.central.is_none() || !state_exists(path.as_ref()) {
+        let path = path.as_ref();
+        if self.central.is_none() || !state_exists(path) {
             return Ok(());
         }
-        let path = path.as_ref();
+        #[cfg(not(target_arch = "wasm32"))]
+        let _session_guard = central_session_lock().lock().await;
+        self.bind_central_state_locked(path).await
+    }
+
+    async fn bind_central_state_locked(&self, path: &Path) -> anyhow::Result<()> {
         let mut state = load_state(path)?;
         let previous = state.central_installation.clone();
         self.ensure_central_session(&mut state).await?;
@@ -3211,6 +3223,48 @@ impl NoiseClient {
             save_state_immediately(path, &state)?;
         }
         Ok(())
+    }
+
+    async fn recover_central_session(
+        &self,
+        path: &Path,
+        failed_token: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let Some(central) = self.central.as_ref() else {
+            return Ok(());
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let _session_guard = central_session_lock().lock().await;
+
+        let mut state = load_state(path)?;
+        let current_token = state
+            .central_installation
+            .as_ref()
+            .and_then(|installation| installation.access_token.as_deref());
+        let now = current_millis();
+        let current_is_fresh = state
+            .central_installation
+            .as_ref()
+            .is_some_and(|installation| {
+                installation.access_token.is_some()
+                    && installation.access_token_expires_at_millis > now.saturating_add(5 * 60_000)
+            });
+
+        // Another request may have renewed the installation while this watch
+        // was receiving its 401. Adopt that token instead of opening another
+        // session. Otherwise invalidate the rejected token and renew once.
+        if current_is_fresh && current_token != failed_token {
+            central
+                .set_access_token(current_token.map(str::to_owned))
+                .await;
+            return Ok(());
+        }
+        if let Some(installation) = state.central_installation.as_mut() {
+            installation.access_token = None;
+            installation.access_token_expires_at_millis = 0;
+        }
+        self.ensure_central_session(&mut state).await?;
+        save_state_immediately(path, &state)
     }
 
     async fn ensure_central_session(&self, state: &mut ClientState) -> anyhow::Result<()> {
@@ -4105,7 +4159,7 @@ impl NoiseClient {
         since: Option<u64>,
         relays: Vec<RelayDescriptor>,
     ) -> anyhow::Result<GroupWatch> {
-        match self.watch_id(&group, since, relays).await {
+        match self.watch_id(path, &group, since, relays).await {
             Ok(change) => Ok(change),
             Err(error) if error.to_string() == "group has been deleted" => {
                 let mut state = load_state(path)?;
@@ -4233,7 +4287,8 @@ impl NoiseClient {
         since: Option<u64>,
         relays: Vec<String>,
     ) -> anyhow::Result<GroupWatch> {
-        let state = load_state(path.as_ref())?;
+        let path = path.as_ref();
+        let state = load_state(path)?;
         let account = state
             .account
             .as_ref()
@@ -4246,7 +4301,7 @@ impl NoiseClient {
 
         for index in 0..relays.len() {
             let Ok(response) = self
-                .relay_request(&relays, index, "GET", &endpoint, &[])
+                .relay_request_with_session_retry(path, &relays, index, "GET", &endpoint, &[])
                 .await
             else {
                 continue;
@@ -4269,7 +4324,8 @@ impl NoiseClient {
         since: Option<u64>,
         relays: Vec<String>,
     ) -> anyhow::Result<GroupWatch> {
-        let state = load_state(path.as_ref())?;
+        let path = path.as_ref();
+        let state = load_state(path)?;
         let credentials = state.account_read_state_credentials()?;
         let revision = since
             .map(|revision| revision.to_string())
@@ -4280,7 +4336,7 @@ impl NoiseClient {
 
         for index in 0..relays.len() {
             let Ok(response) = self
-                .relay_request(&relays, index, "GET", &endpoint, &[])
+                .relay_request_with_session_retry(path, &relays, index, "GET", &endpoint, &[])
                 .await
             else {
                 continue;
@@ -4299,6 +4355,7 @@ impl NoiseClient {
 
     async fn watch_id(
         &self,
+        path: &Path,
         group: &GroupMembership,
         since: Option<u64>,
         relays: Vec<RelayDescriptor>,
@@ -4311,7 +4368,7 @@ impl NoiseClient {
         let mut deleted_relays = 0usize;
         for index in 0..relays.len() {
             let Ok(response) = self
-                .relay_request(&relays, index, "GET", &endpoint, &[])
+                .relay_request_with_session_retry(path, &relays, index, "GET", &endpoint, &[])
                 .await
             else {
                 continue;
@@ -4400,6 +4457,7 @@ impl NoiseClient {
 
     async fn watch_direct_id(
         &self,
+        path: &Path,
         id: &str,
         direct_mailboxes: &[(String, GroupMembership)],
         since: Option<u64>,
@@ -4411,7 +4469,7 @@ impl NoiseClient {
         let endpoint = format!("/v1/groups/{id}/watch/{revision}");
         for index in 0..relays.len() {
             let Ok(response) = self
-                .relay_request(&relays, index, "GET", &endpoint, &[])
+                .relay_request_with_session_retry(path, &relays, index, "GET", &endpoint, &[])
                 .await
             else {
                 continue;
@@ -7537,7 +7595,8 @@ impl NoiseClient {
         since: Option<u64>,
         relays: Vec<String>,
     ) -> anyhow::Result<GroupWatch> {
-        let state = load_state(path.as_ref())?;
+        let path = path.as_ref();
+        let state = load_state(path)?;
         let identity = state.identity()?;
         let self_public_key = identity.public_key_base64();
         let mailbox_id = direct_mailbox_id(&self_public_key)?;
@@ -7552,8 +7611,14 @@ impl NoiseClient {
                     .map(|mailbox| (contact.public_key.clone(), mailbox))
             })
             .collect::<Vec<_>>();
-        self.watch_direct_id(&mailbox_id, &direct_mailboxes, since, relay_list(relays)?)
-            .await
+        self.watch_direct_id(
+            path,
+            &mailbox_id,
+            &direct_mailboxes,
+            since,
+            relay_list(relays)?,
+        )
+        .await
     }
 
     pub async fn say_direct(
@@ -13174,6 +13239,33 @@ impl NoiseClient {
             }
         }
         self.direct_request(storage, method, path, body).await
+    }
+
+    async fn relay_request_with_session_retry(
+        &self,
+        state_path: &Path,
+        relays: &[RelayDescriptor],
+        storage_index: usize,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> anyhow::Result<PlainResponse> {
+        let failed_token = self
+            .central
+            .as_ref()
+            .map(central::CentralTransport::access_token)
+            .transpose()?
+            .flatten();
+        let response = self
+            .relay_request(relays, storage_index, method, path, body)
+            .await?;
+        if response.status != 401 || self.central.is_none() {
+            return Ok(response);
+        }
+        self.recover_central_session(state_path, failed_token.as_deref())
+            .await?;
+        self.relay_request(relays, storage_index, method, path, body)
+            .await
     }
 
     async fn central_request(

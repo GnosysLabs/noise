@@ -65,6 +65,15 @@ impl CentralTransport {
         }
     }
 
+    pub(crate) fn access_token(&self) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .access_token
+            .read()
+            .map_err(|_| anyhow!("central service session lock is unavailable"))?
+            .as_deref()
+            .map(str::to_owned))
+    }
+
     pub(crate) async fn request(
         &self,
         method: Method,
