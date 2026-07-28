@@ -9601,17 +9601,31 @@ function GroupSettingsDialog({ group, explicitContentEnabled, bannedMembers, pre
       </div>
       <div className="group-settings-panel" role="tabpanel">
         {tab === "identity" && <div className="group-settings-identity">
-          <div className="group-identity-images">
+          <div className="identity-profile-row group-identity-profile-row">
             <div className="identity-editor">
               <div className="identity-image-control">
-                <ImagePicker name={group.name} existing={group.avatar} selection={image} square />
+                <ImagePicker name={name} existing={group.avatar} selection={image} square disabled={busy} />
                 {hasGroupIcon && <button className="identity-image-remove" disabled={busy} onClick={image.remove} aria-label="remove group icon" title="remove group icon"><X size={11} /></button>}
               </div>
               <small>group icon</small>
             </div>
+            <LabeledArea label="group name" count={`${name.length}/80`}><input disabled={busy} value={name} maxLength={80} onChange={(event) => setName(event.target.value)} /></LabeledArea>
           </div>
-          <LabeledArea label="name"><input value={name} onChange={(event) => setName(event.target.value)} /></LabeledArea>
-          <LabeledArea label="description" count={`${description.length}/200`}><textarea value={description} onChange={(event) => setDescription(event.target.value)} /></LabeledArea>
+          <LabeledArea label="bio" count={`${description.length}/200`}><textarea disabled={busy} value={description} maxLength={200} onChange={(event) => setDescription(event.target.value)} /></LabeledArea>
+          <section className="settings-section group-identity-frequency">
+            <h3>frequency</h3>
+            <div className="group-frequency-settings">
+              <div className="group-frequency-value">
+                <span>{group.frequency ?? "not stored on this device"}</span>
+                {group.frequency && <CopyButton value={group.frequency} label="copy frequency" iconOnly disabled={busy} />}
+              </div>
+              <p>{group.frequency ? "Anyone with this code can join the group." : "Generate one to revoke any older invitation and create a code this device can manage."}</p>
+              {group.remote_deletion_supported ? <div className="group-frequency-actions">
+                {group.frequency && <button className={revokeArmed ? "confirm" : "danger"} disabled={busy} onClick={() => { if (revokeArmed) { setRevokeArmed(false); void onRotateFrequency(true); } else { setRevokeArmed(true); } }}><Trash2 size={13} /> {revokeArmed ? "confirm revoke" : "revoke"}</button>}
+                <button disabled={busy} onClick={() => { setRevokeArmed(false); void onRotateFrequency(false); }}><Radio size={13} /> {group.frequency ? "generate new" : "generate frequency"}</button>
+              </div> : <small className="legacy-frequency-note">This legacy group cannot authenticate frequency rotation.</small>}
+            </div>
+          </section>
         </div>}
         {tab === "appearance" && <div className="group-settings-appearance">
           <div className="group-background-pickers">
@@ -9635,18 +9649,6 @@ function GroupSettingsDialog({ group, explicitContentEnabled, bannedMembers, pre
           <label className="settings-toggle-row"><span><strong>send media</strong><small>moderators can always upload media</small></span><input type="checkbox" role="switch" checked={membersCanSendMedia} onChange={(event) => setMembersCanSendMedia(event.target.checked)} /></label>
           <h3>content label</h3>
           <label className="settings-toggle-row"><span><strong>sexual content or nudity</strong><small>{group.content_rating === "explicit" ? "this permanent flame marker cannot be removed" : explicitContentEnabled ? "permits sexual content or nudity, permanently marks the group, and replaces its frequency" : "enable groups with sexual content or nudity in your Content settings first"}</small></span><input type="checkbox" role="switch" checked={contentRating === "explicit"} disabled={group.content_rating === "explicit" || !explicitContentEnabled} onChange={(event) => setContentRating(event.target.checked ? "explicit" : "general")} /></label>
-          <h3 className="frequency-heading">frequency</h3>
-          <div className="group-frequency-settings">
-            <div className="group-frequency-value">
-              <span>{group.frequency ?? "not stored on this device"}</span>
-              {group.frequency && <CopyButton value={group.frequency} label="copy frequency" iconOnly disabled={busy} />}
-            </div>
-            <p>{group.frequency ? "Anyone with this code can join the group." : "Generate one to revoke any older invitation and create a code this device can manage."}</p>
-            {group.remote_deletion_supported ? <div className="group-frequency-actions">
-              {group.frequency && <button className={revokeArmed ? "confirm" : "danger"} disabled={busy} onClick={() => { if (revokeArmed) { setRevokeArmed(false); void onRotateFrequency(true); } else { setRevokeArmed(true); } }}><Trash2 size={13} /> {revokeArmed ? "confirm revoke" : "revoke"}</button>}
-              <button disabled={busy} onClick={() => { setRevokeArmed(false); void onRotateFrequency(false); }}><Radio size={13} /> {group.frequency ? "generate new" : "generate frequency"}</button>
-            </div> : <small className="legacy-frequency-note">This legacy group cannot authenticate frequency rotation.</small>}
-          </div>
         </section>}
         {tab === "banned" && <section className="settings-section">
           {bannedMembers.length ? <div className="banned-user-list">{bannedMembers.map((member) => <div className="banned-user-row" key={member.public_key}><PresenceAvatar name={member.username} image={member.avatar} size={30} status={presenceStatuses.get(member.public_key) ?? "offline"} /><span><strong>{member.username}</strong><small>{member.bio || "banned from this group"}</small></span><button disabled={busy} onClick={() => void onUnban(member)}>unban</button></div>)}</div> : <p className="empty-banned-users">no one is banned</p>}
