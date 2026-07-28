@@ -50,7 +50,7 @@ impl Database {
             .context("canonical noise schema is not installed")?
             .context("canonical noise schema has no migration record")?;
         let version: i32 = row.get(0);
-        if version != 3 {
+        if version != 4 {
             anyhow::bail!("unsupported canonical schema version {version}");
         }
         Ok(())

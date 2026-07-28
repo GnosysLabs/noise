@@ -425,7 +425,8 @@ CREATE TABLE noise.media_blocks (
     media_object_id bytea NOT NULL REFERENCES noise.media_objects(media_object_id),
     block_index integer NOT NULL CHECK (block_index >= 0),
     storage_key text NOT NULL UNIQUE
-        CHECK (storage_key ~ '^(temporary|objects)/[A-Za-z0-9/_-]+$'),
+        CHECK (storage_key ~ '^temporary/[A-Za-z0-9/_-]+$'
+            OR storage_key ~ '^objects/[A-Za-z0-9/_-]+[.]nsb2$'),
     ciphertext_length bigint NOT NULL CHECK (ciphertext_length > 0),
     ciphertext_hash bytea NOT NULL CHECK (octet_length(ciphertext_hash) = 32),
     state text NOT NULL DEFAULT 'pending'
