@@ -9611,7 +9611,7 @@ function GroupSettingsDialog({ group, explicitContentEnabled, bannedMembers, pre
             </div>
             <LabeledArea label="group name" count={`${name.length}/80`}><input disabled={busy} value={name} maxLength={80} onChange={(event) => setName(event.target.value)} /></LabeledArea>
           </div>
-          <LabeledArea label="bio" count={`${description.length}/200`}><textarea disabled={busy} value={description} maxLength={200} onChange={(event) => setDescription(event.target.value)} /></LabeledArea>
+          <LabeledArea label="description" count={`${description.length}/200`}><textarea disabled={busy} value={description} maxLength={200} onChange={(event) => setDescription(event.target.value)} /></LabeledArea>
           <section className="settings-section group-identity-frequency">
             <h3>frequency</h3>
             <div className="group-frequency-settings">
