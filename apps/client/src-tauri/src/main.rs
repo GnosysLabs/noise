@@ -280,6 +280,43 @@ async fn execute_noise_request(app: &tauri::AppHandle, mut request: Value) -> Va
         Err(error) => json!({ "ok": false, "error": error.to_string() }),
     };
     if response.get("ok").and_then(Value::as_bool) == Some(true) {
+        if action == "fetch_attachment"
+            && let Some(file_path) = response
+                .get("data")
+                .and_then(|data| data.get("file_path"))
+                .and_then(Value::as_str)
+        {
+            let source = match fs::canonicalize(file_path) {
+                Ok(source) => source,
+                Err(error) => {
+                    return json!({
+                        "ok": false,
+                        "error": format!("could not open cached media: {error}"),
+                    });
+                }
+            };
+            let cache = match fs::canonicalize(&paths.cache) {
+                Ok(cache) => cache,
+                Err(error) => {
+                    return json!({
+                        "ok": false,
+                        "error": format!("could not locate the media cache: {error}"),
+                    });
+                }
+            };
+            if !source.starts_with(&cache) {
+                return json!({
+                    "ok": false,
+                    "error": "cached media is outside this account's private cache",
+                });
+            }
+            if let Err(error) = app.asset_protocol_scope().allow_file(&source) {
+                return json!({
+                    "ok": false,
+                    "error": format!("could not authorize cached media for display: {error}"),
+                });
+            }
+        }
         if matches!(action.as_str(), "logout" | "delete_account") {
             let _ = remove_active_account_from_registry(&paths.id);
         } else if matches!(action.as_str(), "initialize" | "sign_in") {
