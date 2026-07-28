@@ -943,6 +943,8 @@ struct ClientState {
     #[serde(default)]
     group_unread_messages: HashMap<String, Vec<MessageMarker>>,
     #[serde(default)]
+    group_joined_at_millis: HashMap<String, u64>,
+    #[serde(default)]
     topic_read_through: HashMap<String, MessageMarker>,
     #[serde(default)]
     topic_unread_messages: HashMap<String, Vec<MessageMarker>>,
@@ -1670,6 +1672,32 @@ impl ClientState {
         self.known_profile_versions_hydrated = true;
     }
 
+    fn ensure_group_join_baselines(&mut self) {
+        let Ok(identity_public_key) = self.identity().map(|identity| identity.public_key_base64())
+        else {
+            return;
+        };
+        let baselines = self
+            .groups
+            .iter()
+            .filter(|group| !self.group_joined_at_millis.contains_key(&group.group_id))
+            .filter_map(|group| {
+                let cache = self.group_event_caches.get(&group.group_id)?;
+                let view = rebuild_group_state(self, group, &cache.events).ok()?;
+                let joined_at_millis = view.members.get(&identity_public_key)?.joined_at_millis;
+                Some((group.group_id.clone(), joined_at_millis))
+            })
+            .collect::<Vec<_>>();
+        self.group_joined_at_millis.extend(baselines);
+        let current_groups = self
+            .groups
+            .iter()
+            .map(|group| group.group_id.as_str())
+            .collect::<HashSet<_>>();
+        self.group_joined_at_millis
+            .retain(|group_id, _| current_groups.contains(group_id.as_str()));
+    }
+
     fn identity(&self) -> anyhow::Result<Identity> {
         Identity::from_secret_base64(&self.identity_secret_base64)
             .context("stored identity is invalid")
@@ -2239,6 +2267,7 @@ impl ClientState {
             group_latest_activity: contents.group_latest_activity,
             group_read_through: contents.group_read_through,
             group_unread_messages: HashMap::new(),
+            group_joined_at_millis: HashMap::new(),
             topic_read_through: contents.topic_read_through,
             topic_unread_messages: HashMap::new(),
             topic_latest_incoming: HashMap::new(),
@@ -2297,6 +2326,7 @@ impl ClientState {
             compacted.portable_conversation = portable_conversation;
             state.group_event_caches.insert(group_id, compacted);
         }
+        state.ensure_group_join_baselines();
         state.apply_block_filters();
         Ok(state)
     }
@@ -2362,11 +2392,20 @@ impl ClientState {
     }
 
     fn group_unread_count(&self, group_id: &str) -> usize {
+        let joined_at_millis = self.group_joined_at_millis.get(group_id).copied();
+        let count_unread = |unread: &Vec<MessageMarker>| {
+            unread
+                .iter()
+                .filter(|marker| {
+                    joined_at_millis.is_none_or(|joined_at| marker.created_at_millis > joined_at)
+                })
+                .count()
+        };
         let topic_count = self
             .topic_unread_messages
             .iter()
             .filter(|(key, _)| topic_key_belongs_to_group(key, group_id))
-            .map(|(_, unread)| unread.len())
+            .map(|(_, unread)| count_unread(unread))
             .sum::<usize>();
         if self
             .topic_activity_initialized
@@ -2377,15 +2416,24 @@ impl ClientState {
         } else {
             self.group_unread_messages
                 .get(group_id)
-                .map(Vec::len)
+                .map(count_unread)
                 .unwrap_or_default()
         }
     }
 
     fn topic_unread_count(&self, group_id: &str, topic_id: Option<&str>) -> usize {
+        let joined_at_millis = self.group_joined_at_millis.get(group_id).copied();
         self.topic_unread_messages
             .get(&topic_activity_key(group_id, topic_id))
-            .map(Vec::len)
+            .map(|unread| {
+                unread
+                    .iter()
+                    .filter(|marker| {
+                        joined_at_millis
+                            .is_none_or(|joined_at| marker.created_at_millis > joined_at)
+                    })
+                    .count()
+            })
             .unwrap_or_default()
     }
 
@@ -2427,6 +2475,7 @@ impl ClientState {
         group_id: &str,
         messages: &[AcceptedMessage],
         self_public_key: &str,
+        self_joined_at_millis: Option<u64>,
     ) -> bool {
         let topic_read_before = self.topic_read_through.clone();
         let topic_unread_before = self.topic_unread_messages.clone();
@@ -2471,6 +2520,16 @@ impl ClientState {
         let mut incoming = incoming;
         incoming.sort();
         incoming.dedup();
+        if let Some(joined_at_millis) = self_joined_at_millis {
+            self.group_joined_at_millis
+                .insert(group_id.to_owned(), joined_at_millis);
+        }
+        let self_joined_at_millis =
+            self_joined_at_millis.or_else(|| self.group_joined_at_millis.get(group_id).copied());
+        let arrived_after_join = |marker: &MessageMarker| {
+            self_joined_at_millis
+                .is_none_or(|joined_at_millis| marker.created_at_millis > joined_at_millis)
+        };
 
         if let Some(latest) = activity.last().cloned() {
             advance_message_marker(&mut self.group_latest_activity, group_id, latest);
@@ -2480,14 +2539,37 @@ impl ClientState {
         }
 
         if self.group_activity_initialized.insert(group_id.to_owned()) {
-            if let Some(latest) = incoming.last().cloned() {
-                advance_message_marker(&mut self.group_read_through, group_id, latest);
+            let initial_read = if self_joined_at_millis.is_some() {
+                incoming
+                    .iter()
+                    .filter(|marker| !arrived_after_join(marker))
+                    .last()
+                    .cloned()
+            } else {
+                incoming.last().cloned()
+            };
+            if let Some(marker) = initial_read {
+                advance_message_marker(&mut self.group_read_through, group_id, marker);
             }
-            self.group_unread_messages.remove(group_id);
+            let unread = if self_joined_at_millis.is_some() {
+                incoming
+                    .into_iter()
+                    .filter(arrived_after_join)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if unread.is_empty() {
+                self.group_unread_messages.remove(group_id);
+            } else {
+                self.group_unread_messages
+                    .insert(group_id.to_owned(), unread);
+            }
         } else {
             let read_through = self.group_read_through.get(group_id);
             let unread = incoming
                 .into_iter()
+                .filter(arrived_after_join)
                 .filter(|marker| read_through.is_none_or(|read| marker > read))
                 .collect::<Vec<_>>();
             if unread.is_empty() {
@@ -2524,7 +2606,13 @@ impl ClientState {
                 advance_message_marker(&mut self.topic_latest_incoming, &topic_key, latest.clone());
             }
             if self.topic_activity_initialized.insert(topic_key.clone()) {
-                let initial_read = if topic_key == topic_activity_key(group_id, None) {
+                let initial_read = if self_joined_at_millis.is_some() {
+                    topic_incoming
+                        .iter()
+                        .filter(|marker| !arrived_after_join(marker))
+                        .last()
+                        .cloned()
+                } else if topic_key == topic_activity_key(group_id, None) {
                     self.group_read_through
                         .get(group_id)
                         .cloned()
@@ -2535,11 +2623,24 @@ impl ClientState {
                 if let Some(marker) = initial_read {
                     advance_message_marker(&mut self.topic_read_through, &topic_key, marker);
                 }
-                self.topic_unread_messages.remove(&topic_key);
+                let unread = if self_joined_at_millis.is_some() {
+                    topic_incoming
+                        .into_iter()
+                        .filter(arrived_after_join)
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                if unread.is_empty() {
+                    self.topic_unread_messages.remove(&topic_key);
+                } else {
+                    self.topic_unread_messages.insert(topic_key, unread);
+                }
             } else {
                 let read_through = self.topic_read_through.get(&topic_key);
                 let unread = topic_incoming
                     .into_iter()
+                    .filter(arrived_after_join)
                     .filter(|marker| read_through.is_none_or(|read| marker > read))
                     .collect::<Vec<_>>();
                 if unread.is_empty() {
@@ -3353,6 +3454,7 @@ impl NoiseClient {
             group_latest_activity: HashMap::new(),
             group_read_through: HashMap::new(),
             group_unread_messages: HashMap::new(),
+            group_joined_at_millis: HashMap::new(),
             topic_read_through: HashMap::new(),
             topic_unread_messages: HashMap::new(),
             topic_latest_incoming: HashMap::new(),
@@ -10070,9 +10172,18 @@ impl NoiseClient {
                     .iter()
                     .any(|member| member.public_key == identity_public_key)
             });
+        let self_joined_at_millis = view
+            .members
+            .get(&identity_public_key)
+            .map(|member| member.joined_at_millis);
         let mut state_changed = existing_cache.as_ref() != Some(&cache)
             || is_member
-                && state.record_group_activity(&group_id, &view.messages, &identity_public_key);
+                && state.record_group_activity(
+                    &group_id,
+                    &view.messages,
+                    &identity_public_key,
+                    self_joined_at_millis,
+                );
         state
             .group_event_caches
             .insert(group_id.clone(), cache.clone());
@@ -10344,7 +10455,16 @@ impl NoiseClient {
         state
             .group_event_caches
             .insert(group.group_id.clone(), cache.clone());
-        state.record_group_activity(&group.group_id, &view.messages, &identity_public_key);
+        let self_joined_at_millis = view
+            .members
+            .get(&identity_public_key)
+            .map(|member| member.joined_at_millis);
+        state.record_group_activity(
+            &group.group_id,
+            &view.messages,
+            &identity_public_key,
+            self_joined_at_millis,
+        );
         let mut state_changed = true;
         let resolved_owner = view.owner_public_key.clone().unwrap_or_default();
         let resolved_profile = view.profile.clone();
@@ -15931,6 +16051,7 @@ fn load_state(path: &Path) -> anyhow::Result<ClientState> {
         serde_json::from_slice(&bytes).context("local state is invalid")?;
     normalize_legacy_state_direct_message_policies(&mut state);
     state.ensure_group_membership_records();
+    state.ensure_group_join_baselines();
     state.hydrate_known_profile_versions();
     let cache = native_state_cache();
     let mut guard = cache
@@ -15957,6 +16078,7 @@ fn load_state(path: &Path) -> anyhow::Result<ClientState> {
         serde_json::from_slice(&bytes).context("local state is invalid")?;
     normalize_legacy_state_direct_message_policies(&mut state);
     state.ensure_group_membership_records();
+    state.ensure_group_join_baselines();
     state.hydrate_known_profile_versions();
     Ok(state)
 }
@@ -15971,6 +16093,7 @@ fn load_state(path: &Path) -> anyhow::Result<ClientState> {
         serde_json::from_slice(&bytes).context("local state is invalid")?;
     normalize_legacy_state_direct_message_policies(&mut state);
     state.ensure_group_membership_records();
+    state.ensure_group_join_baselines();
     state.hydrate_known_profile_versions();
     Ok(state)
 }
@@ -16279,6 +16402,7 @@ mod tests {
             group_latest_activity: HashMap::new(),
             group_read_through: HashMap::new(),
             group_unread_messages: HashMap::new(),
+            group_joined_at_millis: HashMap::new(),
             topic_read_through: HashMap::new(),
             topic_unread_messages: HashMap::new(),
             topic_latest_incoming: HashMap::new(),

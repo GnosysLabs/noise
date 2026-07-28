@@ -687,6 +687,7 @@ const mediaDimensionCache = loadStoredMediaDimensions();
 const sentMediaPreviewCache = new Map<string, NonNullable<MessageSummary["local_attachment"]>>();
 const imagePosterCache = new Map<string, string>();
 const videoPosterCache = new Map<string, string>();
+const convertedMediaObjectUrls = new Set<string>();
 const renderedMessageCounts = new Map<string, number>();
 let mediaCacheGeneration = 0;
 
@@ -799,6 +800,8 @@ function clearMediaMemoryCache() {
   );
   for (const preview of previews) URL.revokeObjectURL(preview);
   sentMediaPreviewCache.clear();
+  for (const source of convertedMediaObjectUrls) URL.revokeObjectURL(source);
+  convertedMediaObjectUrls.clear();
   imagePosterCache.clear();
   videoPosterCache.clear();
   decodedImageCache.clear();
@@ -1066,8 +1069,8 @@ function preparePendingMedia(file: File): PendingMedia {
           immediatePreview,
           prepareMediaPreviewFromFile(preparedFile, "video"),
         )
-      : file.type.startsWith("image/") && !sticker
-        ? prepareImagePreviewSource(previewUrl)
+      : (file.type.startsWith("image/") || isHeicMedia(file.type, file.name)) && !sticker
+        ? prepareMediaPreviewFromFile(preparedFile, "image")
         : null,
   };
 }
@@ -1120,7 +1123,7 @@ async function prepareMediaPreviewFromFile(
 
 async function optimizeOutgoingMedia(file: File) {
   if (
-    file.type.startsWith("image/")
+    (file.type.startsWith("image/") || isHeicMedia(file.type, file.name))
     && file.type !== "image/gif"
   ) {
     return optimizeOutgoingImage(file);
@@ -1132,12 +1135,15 @@ async function optimizeOutgoingMedia(file: File) {
 }
 
 async function optimizeOutgoingImage(file: File) {
+  const heic = isHeicMedia(file.type, file.name);
+  let sourceFile = file;
   let bitmap: ImageBitmap | null = null;
   try {
-    bitmap = await createImageBitmap(file);
+    if (heic) sourceFile = await convertHeicFile(file);
+    bitmap = await createImageBitmap(sourceFile);
     const maximumDimension = Math.max(bitmap.width, bitmap.height);
-    if (maximumDimension <= 2_560 && file.size <= 4 * 1024 * 1024) {
-      return file;
+    if (maximumDimension <= 2_560 && sourceFile.size <= 4 * 1024 * 1024) {
+      return sourceFile;
     }
     const scale = Math.min(1, 2_560 / maximumDimension);
     const canvas = document.createElement("canvas");
@@ -1175,19 +1181,63 @@ async function optimizeOutgoingImage(file: File) {
       if (blob.size > 6 * 1024 * 1024 && profile !== profiles.at(-1)) {
         continue;
       }
-      if (blob.size >= file.size) return file;
-      const name = file.name.replace(/\.[^.]+$/, "") || "noise-photo";
+      if (!heic && blob.size >= sourceFile.size) return sourceFile;
+      const name = sourceFile.name.replace(/\.[^.]+$/, "") || "noise-photo";
       return new File([blob], `${name}.jpg`, {
         type: "image/jpeg",
-        lastModified: file.lastModified,
+        lastModified: sourceFile.lastModified,
       });
     }
-  } catch {
+  } catch (cause) {
+    if (heic) {
+      throw new Error(`this HEIC photo could not be converted: ${message(cause)}`);
+    }
     return file;
   } finally {
     bitmap?.close();
   }
   return file;
+}
+
+function isHeicMedia(mimeType?: string | null, fileName?: string | null) {
+  const normalizedMime = mimeType?.toLowerCase() ?? "";
+  const normalizedName = fileName?.toLowerCase() ?? "";
+  return normalizedMime === "image/heic"
+    || normalizedMime === "image/heif"
+    || normalizedMime === "image/heic-sequence"
+    || normalizedMime === "image/heif-sequence"
+    || /\.(heic|heics|heif)$/i.test(normalizedName);
+}
+
+async function convertHeicBlob(blob: Blob) {
+  const { default: heic2any } = await import("heic2any");
+  const input = isHeicMedia(blob.type)
+    ? blob
+    : new Blob([blob], { type: "image/heic" });
+  const converted = await heic2any({
+    blob: input,
+    toType: "image/jpeg",
+    quality: 0.9,
+  });
+  const output = Array.isArray(converted) ? converted[0] : converted;
+  if (!output?.size) throw new Error("the HEIC decoder returned an empty image");
+  return output;
+}
+
+async function convertHeicFile(file: File) {
+  const converted = await convertHeicBlob(file);
+  const name = file.name.replace(/\.[^.]+$/, "") || "noise-photo";
+  return new File([converted], `${name}.jpg`, {
+    type: "image/jpeg",
+    lastModified: file.lastModified,
+  });
+}
+
+async function renderableHeicSource(source: string) {
+  const response = await fetch(source);
+  if (!response.ok) throw new Error("the HEIC photo could not be read");
+  const converted = await convertHeicBlob(await response.blob());
+  return URL.createObjectURL(converted);
 }
 
 async function optimizeOutgoingVideo(file: File) {
@@ -1225,7 +1275,7 @@ async function chooseNativePendingMedia() {
     filters: [{
       name: "media",
       extensions: [
-        "jpg", "jpeg", "png", "gif", "webp",
+        "jpg", "jpeg", "png", "gif", "webp", "heic", "heif",
         "mov", "mp4", "m4v", "avi", "mpeg", "mpg",
         "mp3", "m4a", "wav", "aac", "ogg",
       ],
@@ -1244,8 +1294,8 @@ async function pendingMediaFromNativePath(sourcePath: string) {
     mime_type: string;
     byte_length: number;
   }>("inspect_media_upload", { sourcePath });
-  const previewUrl = convertFileSrc(inspected.file_path);
-  const file = (async () => {
+  let previewUrl = convertFileSrc(inspected.file_path);
+  const preparedFile = (async () => {
     const prepared = await invoke<{
       file_path: string;
       file_name: string;
@@ -1266,6 +1316,11 @@ async function pendingMediaFromNativePath(sourcePath: string) {
       lastModified: Date.now(),
     });
   })();
+  const heic = isHeicMedia(inspected.mime_type, inspected.file_name);
+  const file = heic
+    ? preparedFile.then(convertHeicFile)
+    : preparedFile;
+  if (heic) previewUrl = URL.createObjectURL(await file);
   return {
     name: inspected.file_name,
     mimeType: inspected.mime_type,
@@ -1278,7 +1333,9 @@ async function pendingMediaFromNativePath(sourcePath: string) {
           prepareMediaPreviewFromFile(file, "video"),
         )
       : inspected.mime_type.startsWith("image/")
-        ? prepareImagePreviewSource(previewUrl)
+        ? (heic
+            ? prepareMediaPreviewFromFile(file, "image")
+            : prepareImagePreviewSource(previewUrl))
         : null,
   } satisfies PendingMedia;
 }
@@ -7473,10 +7530,18 @@ function requestMediaSource(
           relays,
         });
         if (!data) throw new Error("media is not available yet");
-        const next = isTauri
+        const storedSource = isTauri
           ? (await import("@tauri-apps/api/core")).convertFileSrc(data.file_path)
           : data.file_path;
-        if (generation === mediaCacheGeneration) mediaCache.set(cacheKey, next);
+        const next = isHeicMedia(attachment.mime_type, attachment.file_name)
+          ? await renderableHeicSource(storedSource)
+          : storedSource;
+        if (generation === mediaCacheGeneration) {
+          mediaCache.set(cacheKey, next);
+          if (next !== storedSource) convertedMediaObjectUrls.add(next);
+        } else if (next !== storedSource) {
+          URL.revokeObjectURL(next);
+        }
         return next;
       } catch (cause) {
         if (
@@ -7556,10 +7621,13 @@ async function pendingMediaFromAttachment(
   if (blob.size !== attachment.byte_length) {
     throw new Error("forwarded media does not match the original attachment");
   }
-  const file = new File([blob], attachment.file_name || "noise-media", {
+  const originalFile = new File([blob], attachment.file_name || "noise-media", {
     type: attachment.mime_type || data.mime_type,
     lastModified: Date.now(),
   });
+  const file = isHeicMedia(originalFile.type, originalFile.name)
+    ? await convertHeicFile(originalFile)
+    : originalFile;
   const embeddedPreview = attachment.preview_data_base64
     && attachment.preview_mime_type === "image/jpeg"
     && attachment.pixel_width
@@ -7577,7 +7645,8 @@ async function pendingMediaFromAttachment(
     byteLength: file.size,
     file: Promise.resolve(file),
     previewUrl: URL.createObjectURL(file),
-    mediaPreview: embeddedPreview,
+    mediaPreview: embeddedPreview
+      ?? (file.type.startsWith("image/") ? prepareMediaPreviewFromFile(Promise.resolve(file), "image") : null),
   };
 }
 
@@ -8944,15 +9013,16 @@ function ProfileAlbumDialog({
         setUploadIndex(index);
         let attachment = queued.attachment;
         if (!attachment) {
+          const preparedFile = optimizeOutgoingMedia(queued.file);
           const pending: PendingMedia = {
             name: queued.file.name,
             mimeType: queued.file.type,
             byteLength: queued.file.size,
-            file: Promise.resolve(queued.file),
+            file: preparedFile,
             previewUrl: queued.previewUrl,
             mediaPreview: queued.file.type.startsWith("video/")
               ? prepareVideoPreviewSource(queued.previewUrl)
-              : prepareImagePreviewSource(queued.previewUrl),
+              : prepareMediaPreviewFromFile(preparedFile, "image"),
           };
           attachment = await uploadPendingMedia(
             pending,

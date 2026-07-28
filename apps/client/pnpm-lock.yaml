@@ -35,6 +35,9 @@ importers:
       emoji-mart:
         specifier: ^5.6.0
         version: 5.6.0
+      heic2any:
+        specifier: 0.0.4
+        version: 0.0.4
       linkify-it:
         specifier: ^5.0.0
         version: 5.0.2
@@ -662,6 +665,9 @@ packages:
     resolution: {integrity: sha512-3hN7NaskYvMDLQY55gnW3NQ+mesEAepTqlg+VEbj7zzqEMBVNhzcGYYeqFo/TlYz6eQiFcp1HcsCZO+nGgS8zg==}
     engines: {node: '>=6.9.0'}
 
+  heic2any@0.0.4:
+    resolution: {integrity: sha512-3lLnZiDELfabVH87htnRolZ2iehX9zwpRyGNz22GKXIu0fznlblf0/ftppXKNqS26dqFSeqfIBhAmAj/uSp0cA==}
+
   js-tokens@4.0.0:
     resolution: {integrity: sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==}
 
@@ -1266,6 +1272,8 @@ snapshots:
     optional: true
 
   gensync@1.0.0-beta.2: {}
+
+  heic2any@0.0.4: {}
 
   js-tokens@4.0.0: {}
 
