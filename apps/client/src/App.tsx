@@ -1081,6 +1081,13 @@ function isKlipyStickerFileName(fileName?: string | null) {
   return Boolean(fileName?.toLowerCase().startsWith("klipy-sticker-"));
 }
 
+function isKlipyMediaFileName(fileName?: string | null) {
+  const normalized = fileName?.toLowerCase() ?? "";
+  return normalized.startsWith("klipy-gif-")
+    || normalized.startsWith("klipy-sticker-")
+    || normalized.startsWith("klipy-clip-");
+}
+
 function firstMediaPreview(
   ...candidates: Array<Promise<MediaPreview | null> | null>
 ): Promise<MediaPreview | null> {
@@ -8800,7 +8807,11 @@ function ForwardMessageDialog({
 }
 
 function MediaGalleryDialog({ group, messages, onClose }: { group: GroupSummary; messages: MessageSummary[]; onClose: () => void }) {
-  const media = messages.filter((item): item is MediaMessage => item.attachment !== null);
+  const media = messages.filter(
+    (item): item is MediaMessage =>
+      item.attachment !== null
+      && !isKlipyMediaFileName(item.attachment.file_name),
+  );
   const [selected, setSelected] = useState<MediaMessage | null>(null);
   const selectedIndex = selected
     ? media.findIndex((item) => item.event_id === selected.event_id)
