@@ -650,7 +650,23 @@ async fn dispatch(request: Value) -> Result<Value, String> {
         ),
         "mark_direct_read" => data(
             client
-                .mark_direct_read(STATE_PATH, &required::<String>(&request, "public_key")?)
+                .mark_direct_read(
+                    STATE_PATH,
+                    &required::<String>(&request, "public_key")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "set_direct_disappearing_after_read" => data(
+            client
+                .set_direct_disappearing_after_read(
+                    STATE_PATH,
+                    &required::<String>(&request, "public_key")?,
+                    optional::<u32>(&request, "seconds")?,
+                    relays(&request)?,
+                )
+                .await
                 .map_err(|error| error.to_string())?,
         ),
         "watch_direct" => data(

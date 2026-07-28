@@ -23,6 +23,8 @@ CREATE TABLE noise.direct_event_receipts (
     CHECK (expires_at IS NULL OR expires_at > read_at)
 );
 
+ALTER TABLE noise.direct_event_receipts OWNER TO noise_app;
+
 INSERT INTO noise.direct_event_receipts (event_id, recipient_account_id)
 SELECT
     event.event_id,
