@@ -194,6 +194,7 @@ export type MessageSummary = {
   upload_progress?: number;
   upload_error?: string;
   local_attachment?: {
+    file_name?: string;
     preview_url: string;
     mime_type: string;
     poster_url?: string;

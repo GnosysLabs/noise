@@ -683,6 +683,13 @@ const mediaPreparationPromises = new Map<string, Promise<void>>();
 const decodedImageCache = new Set<string>();
 const MEDIA_DIMENSIONS_STORAGE_KEY = "noise.media-dimensions.v1";
 const mediaDimensionCache = loadStoredMediaDimensions();
+type StickerContentBounds = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+const stickerContentBoundsCache = new Map<string, StickerContentBounds>();
 const sentMediaPreviewCache = new Map<string, NonNullable<MessageSummary["local_attachment"]>>();
 const imagePosterCache = new Map<string, string>();
 const videoPosterCache = new Map<string, string>();
@@ -1047,8 +1054,9 @@ type MediaPreview = {
 };
 
 function preparePendingMedia(file: File): PendingMedia {
+  const sticker = isKlipyStickerFileName(file.name);
   const previewUrl = URL.createObjectURL(file);
-  const preparedFile = optimizeOutgoingMedia(file);
+  const preparedFile = sticker ? Promise.resolve(file) : optimizeOutgoingMedia(file);
   const immediatePreview = file.type.startsWith("video/")
     ? prepareVideoPreviewSource(previewUrl)
     : null;
@@ -1063,10 +1071,14 @@ function preparePendingMedia(file: File): PendingMedia {
           immediatePreview,
           prepareMediaPreviewFromFile(preparedFile, "video"),
         )
-      : file.type.startsWith("image/")
+      : file.type.startsWith("image/") && !sticker
         ? prepareImagePreviewSource(previewUrl)
         : null,
   };
+}
+
+function isKlipyStickerFileName(fileName?: string | null) {
+  return Boolean(fileName?.toLowerCase().startsWith("klipy-sticker-"));
 }
 
 function firstMediaPreview(
@@ -1451,6 +1463,7 @@ async function optimisticMessage(
     created_at_millis: Date.now(),
     optimistic: true,
     local_attachment: attachment && (localFile || reuseAttachmentPreview) ? {
+      file_name: attachment.name,
       preview_url: reuseAttachmentPreview
         ? attachment.previewUrl
         : URL.createObjectURL(localFile as File),
@@ -6274,6 +6287,22 @@ function ConversationPanel({
     setReplyingTo(null);
     void onSend(text, pendingAttachment, submittedReply?.message_id ?? null);
   }
+  async function sendKlipy(file: File) {
+    if (busy || !canSendMedia) return false;
+    setAttachmentError(null);
+    const submittedReply = replyingTo;
+    const sent = await onSend(
+      "",
+      preparePendingMedia(file),
+      submittedReply?.message_id ?? null,
+    );
+    if (sent) {
+      setReplyingTo((current) =>
+        current?.message_id === submittedReply?.message_id ? null : current
+      );
+    }
+    return sent;
+  }
   return (
     <div className={`conversation group-conversation ${hasBackground ? "has-background" : ""}`}>
       {mediaDragging && <div className="media-drop-overlay" aria-hidden="true"><Images size={34} /><strong>drop media to attach</strong><span>images, video, or audio</span></div>}
@@ -6322,7 +6351,7 @@ function ConversationPanel({
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
         <div className="composer-media-actions">
           <button className="attach-button" disabled={busy || !canSendMedia} onClick={() => void chooseMediaFromDevice()} aria-label="attach media" title={canSendMedia ? "attach media" : "members cannot send media"}><Paperclip size={17} /></button>
-          <KlipyPicker disabled={busy || !canSendMedia} onPick={chooseMedia} />
+          <KlipyPicker disabled={busy || !canSendMedia} onPick={sendKlipy} />
         </div>
         <input ref={fileInput} hidden type="file" accept="image/*,video/*,audio/*" onChange={(event) => void chooseMedia(event.target.files?.[0])} />
         <textarea
@@ -6552,6 +6581,28 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
       setReplyingTo((current) => current ?? submittedReply);
     }
   }
+  async function sendKlipy(
+    file: File,
+    onProgress: (progress: number) => void,
+  ) {
+    if (busy || uploadProgress !== null) return false;
+    setAttachmentError(null);
+    const submittedReply = replyingTo;
+    const controller = new AbortController();
+    const sent = await onSend(
+      "",
+      preparePendingMedia(file),
+      onProgress,
+      submittedReply?.message_id ?? null,
+      controller.signal,
+    );
+    if (sent) {
+      setReplyingTo((current) =>
+        current?.message_id === submittedReply?.message_id ? null : current
+      );
+    }
+    return sent;
+  }
   const person = { public_key: contact.public_key, username: contact.username, bio: contact.bio, avatar: contact.avatar, album: contact.album, accepts_direct_messages: contact.accepts_direct_messages, direct_message_policy: contact.direct_message_policy, presence_status: contactPresence };
   return (
     <div className="conversation direct-conversation">
@@ -6595,7 +6646,7 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
         <div className="composer-media-actions">
           <button className="attach-button" disabled={busy || uploadProgress !== null} onClick={() => void chooseMediaFromDevice()} aria-label="attach media"><Paperclip size={17} /></button>
-          <KlipyPicker disabled={busy || uploadProgress !== null} onPick={chooseMedia} />
+          <KlipyPicker disabled={busy || uploadProgress !== null} onPick={sendKlipy} />
         </div>
         <input ref={fileInput} hidden type="file" accept="image/*,video/*,audio/*" onChange={(event) => void chooseMedia(event.target.files?.[0])} />
         <div className="direct-composer-input">
@@ -7083,6 +7134,7 @@ function MessageMedia({ attachment, scopeId, autoplayVideo = false }: { attachme
   const visibility = useMediaPriority<HTMLDivElement>();
   const image = attachment.mime_type.startsWith("image/");
   const video = attachment.mime_type.startsWith("video/");
+  const sticker = image && isKlipyStickerFileName(attachment.file_name);
   const [videoRequested, setVideoRequested] = useState(autoplayVideo);
   useEffect(() => {
     if (autoplayVideo) setVideoRequested(true);
@@ -7114,11 +7166,12 @@ function MessageMedia({ attachment, scopeId, autoplayVideo = false }: { attachme
       {image ? (
         <ChatImage
           source={source ?? undefined}
-          preview={poster}
+          preview={sticker ? undefined : poster}
           cacheKey={posterCacheKey}
           pixelWidth={attachment.pixel_width}
           pixelHeight={attachment.pixel_height}
           failed={failed}
+          sticker={sticker}
         />
       ) : video ? (
         <ChatVideo
@@ -7193,6 +7246,8 @@ function LocalMessageMedia({
   const poster = attachment.poster_url ?? (manifest ? mediaPoster(manifest) : undefined);
   const posterCacheKey = manifest ? mediaCacheKey(manifest) : undefined;
   const video = attachment.mime_type.startsWith("video/");
+  const sticker = attachment.mime_type.startsWith("image/")
+    && isKlipyStickerFileName(attachment.file_name ?? manifest?.file_name);
   const pendingVideo = video && (uploadProgress !== undefined || Boolean(uploadError));
   const pixelWidth = attachment.pixel_width ?? manifest?.pixel_width;
   const pixelHeight = attachment.pixel_height ?? manifest?.pixel_height;
@@ -7200,7 +7255,7 @@ function LocalMessageMedia({
     <div className="message-media local-message-media">
       <div className="local-message-media-frame">
         {attachment.mime_type.startsWith("image/") ? (
-          <ChatImage source={attachment.preview_url} preview={poster ?? attachment.preview_url} cacheKey={posterCacheKey ?? attachment.preview_url} pixelWidth={pixelWidth} pixelHeight={pixelHeight} />
+          <ChatImage source={attachment.preview_url} preview={sticker ? undefined : poster ?? attachment.preview_url} cacheKey={posterCacheKey ?? attachment.preview_url} pixelWidth={pixelWidth} pixelHeight={pixelHeight} sticker={sticker} />
         ) : pendingVideo ? (
           <div className="chat-video media-pending" style={mediaFrameStyle(pixelWidth, pixelHeight, 288, 176)}>
             {poster ? (
@@ -7679,6 +7734,83 @@ function mediaFrameStyle(
   };
 }
 
+function stickerFrameStyle(
+  dimensions: { width: number; height: number } | null,
+  bounds: StickerContentBounds | null,
+): CSSProperties {
+  const naturalWidth = dimensions?.width ?? 320;
+  const naturalHeight = dimensions?.height ?? 320;
+  const contentWidth = naturalWidth * (bounds?.width ?? 1);
+  const contentHeight = naturalHeight * (bounds?.height ?? 1);
+  const scale = Math.min(1, 320 / contentWidth, 360 / contentHeight);
+  const displayWidth = Math.max(1, Math.round(contentWidth * scale));
+  const displayHeight = Math.max(1, Math.round(contentHeight * scale));
+  return {
+    width: `${displayWidth}px`,
+    maxWidth: "100%",
+    aspectRatio: `${displayWidth} / ${displayHeight}`,
+  };
+}
+
+function stickerImageStyle(
+  bounds: StickerContentBounds | null,
+): CSSProperties | undefined {
+  if (!bounds) return undefined;
+  return {
+    inset: "auto",
+    left: `${(-bounds.x / bounds.width) * 100}%`,
+    top: `${(-bounds.y / bounds.height) * 100}%`,
+    width: `${100 / bounds.width}%`,
+    height: `${100 / bounds.height}%`,
+  };
+}
+
+function measureStickerContent(image: HTMLImageElement): StickerContentBounds | null {
+  try {
+    const maximumSampleEdge = 384;
+    const scale = Math.min(
+      1,
+      maximumSampleEdge / Math.max(image.naturalWidth, image.naturalHeight),
+    );
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    if (!context) return null;
+    context.drawImage(image, 0, 0, canvas.width, canvas.height);
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    let left = canvas.width;
+    let top = canvas.height;
+    let right = -1;
+    let bottom = -1;
+    for (let y = 0; y < canvas.height; y += 1) {
+      for (let x = 0; x < canvas.width; x += 1) {
+        if (pixels[(y * canvas.width + x) * 4 + 3] < 12) continue;
+        left = Math.min(left, x);
+        top = Math.min(top, y);
+        right = Math.max(right, x);
+        bottom = Math.max(bottom, y);
+      }
+    }
+    if (right < left || bottom < top) return null;
+    const paddingX = Math.max(2, Math.round(canvas.width * 0.025));
+    const paddingY = Math.max(2, Math.round(canvas.height * 0.025));
+    left = Math.max(0, left - paddingX);
+    top = Math.max(0, top - paddingY);
+    right = Math.min(canvas.width - 1, right + paddingX);
+    bottom = Math.min(canvas.height - 1, bottom + paddingY);
+    const bounds = {
+      x: left / canvas.width,
+      y: top / canvas.height,
+      width: (right - left + 1) / canvas.width,
+      height: (bottom - top + 1) / canvas.height,
+    };
+    return bounds.width < 0.98 || bounds.height < 0.98 ? bounds : null;
+  } catch {
+    return null;
+  }
+}
+
 function rememberMediaDimensions(cacheKey: string, width: number, height: number) {
   if (
     !Number.isFinite(width)
@@ -7738,6 +7870,7 @@ function ChatImage({
   pixelWidth,
   pixelHeight,
   failed = false,
+  sticker = false,
 }: {
   source?: string;
   preview?: string;
@@ -7745,6 +7878,7 @@ function ChatImage({
   pixelWidth?: number | null;
   pixelHeight?: number | null;
   failed?: boolean;
+  sticker?: boolean;
 }) {
   const suppliedDimensions = pixelWidth && pixelHeight
     ? { width: pixelWidth, height: pixelHeight }
@@ -7759,12 +7893,16 @@ function ChatImage({
       && (suppliedDimensions || mediaDimensionCache.has(cacheKey))
     ),
   );
+  const [stickerBounds, setStickerBounds] = useState<StickerContentBounds | null>(
+    () => sticker ? stickerContentBoundsCache.get(cacheKey) ?? null : null,
+  );
   const [expanded, setExpanded] = useState(false);
   useEffect(() => {
     const knownDimensions = suppliedDimensions ?? mediaDimensionCache.get(cacheKey) ?? null;
     setDimensions(knownDimensions);
     setReady(Boolean(source && decodedImageCache.has(cacheKey) && knownDimensions));
-  }, [cacheKey, pixelHeight, pixelWidth, source]);
+    setStickerBounds(sticker ? stickerContentBoundsCache.get(cacheKey) ?? null : null);
+  }, [cacheKey, pixelHeight, pixelWidth, source, sticker]);
   useEffect(() => {
     if (!expanded) return;
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -7773,7 +7911,9 @@ function ChatImage({
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [expanded]);
-  const style = mediaFrameStyle(dimensions?.width, dimensions?.height);
+  const style = sticker
+    ? stickerFrameStyle(dimensions, stickerBounds)
+    : mediaFrameStyle(dimensions?.width, dimensions?.height);
   const visibleSource = source ?? preview;
   const lightboxRoot = document.querySelector<HTMLElement>(".app-shell")
     ?? document.body;
@@ -7786,7 +7926,7 @@ function ChatImage({
       : undefined;
   return (
     <span
-      className="chat-image"
+      className={`chat-image ${sticker ? "sticker" : ""}`}
       style={style}
       role={visibleSource ? "button" : undefined}
       tabIndex={visibleSource ? 0 : undefined}
@@ -7804,6 +7944,7 @@ function ChatImage({
         <img
           className={ready ? "ready" : ""}
           src={source}
+          style={sticker ? stickerImageStyle(stickerBounds) : undefined}
           alt="shared media"
           onLoad={(event) => {
             const image = event.currentTarget;
@@ -7813,13 +7954,18 @@ function ChatImage({
             };
             rememberMediaDimensions(cacheKey, measured.width, measured.height);
             setDimensions(measured);
+            if (sticker) {
+              const bounds = measureStickerContent(image);
+              if (bounds) stickerContentBoundsCache.set(cacheKey, bounds);
+              setStickerBounds(bounds);
+            }
             decodedImageCache.add(cacheKey);
             setReady(true);
           }}
         />
       )}
       {!ready && preview && <img className="media-preview-cover" src={preview} alt="" aria-hidden="true" />}
-      {!ready && <MediaLoadStatus failed={failed} compact={Boolean(preview)} />}
+      {!ready && <MediaLoadStatus failed={failed} compact={sticker || Boolean(preview)} />}
       {expanded && visibleSource && createPortal(
         <div
           className="image-lightbox"

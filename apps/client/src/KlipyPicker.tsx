@@ -29,7 +29,7 @@ export function KlipyPicker({
   onPick,
 }: {
   disabled: boolean;
-  onPick: (file: File) => void;
+  onPick: (file: File, onProgress: (progress: number) => void) => Promise<boolean>;
 }) {
   const [open, setOpen] = useState(false);
   const [kind, setKind] = useState<KlipyKind>("gif");
@@ -38,6 +38,7 @@ export function KlipyPicker({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pickingId, setPickingId] = useState<string | null>(null);
+  const [sendProgress, setSendProgress] = useState<number | null>(null);
   const root = useRef<HTMLDivElement>(null);
   const searchInput = useRef<HTMLInputElement>(null);
   const requestId = useRef(0);
@@ -96,6 +97,7 @@ export function KlipyPicker({
   async function pick(result: KlipyResult) {
     setPickingId(result.id);
     setError(null);
+    let downloaded = false;
     try {
       const response = await fetch(result.full_url, {
         credentials: "omit",
@@ -106,22 +108,27 @@ export function KlipyPicker({
       if (!blob.size || blob.size > 500 * 1024 * 1024) {
         throw new Error("GIF is too large");
       }
+      downloaded = true;
       const extension = result.mime_type === "image/gif"
         ? "gif"
         : result.mime_type === "image/webp"
           ? "webp"
           : "mp4";
       const safeId = result.id.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 80) || "media";
-      onPick(new File(
+      const sent = await onPick(new File(
         [blob],
         `klipy-${result.kind}-${safeId}.${extension}`,
         { type: result.mime_type },
-      ));
+      ), setSendProgress);
+      if (!sent) throw new Error("media send failed");
       setOpen(false);
     } catch {
-      setError("That GIF could not be downloaded.");
+      setError(downloaded
+        ? "That media could not be sent."
+        : "That media could not be downloaded.");
     } finally {
       setPickingId(null);
+      setSendProgress(null);
     }
   }
 
@@ -192,7 +199,11 @@ export function KlipyPicker({
                 >
                   <img src={result.preview_url} alt={result.title} loading="lazy" />
                   {pickingId === result.id && (
-                    <span><LoaderCircle className="spinner" size={20} /></span>
+                    <span>
+                      {sendProgress === null
+                        ? <LoaderCircle className="spinner" size={20} />
+                        : <small>{sendProgress}%</small>}
+                    </span>
                   )}
                 </button>
               ))
