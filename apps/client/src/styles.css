@@ -114,6 +114,8 @@ button:disabled { cursor: default; opacity: 0.48; }
 .group-context-menu button { width: 100%; display: flex; align-items: center; gap: 9px; padding: 8px 9px; border-radius: 6px; background: transparent; color: #ff8585; text-align: left; font-size: 12px; }
 .group-context-menu button:hover { background: rgba(255,105,105,.1); }
 .group-context-menu button:disabled:hover { background: transparent; }
+.group-context-menu button.clear-action { color: #e8e3ec; }
+.group-context-menu button.clear-action:hover { background: rgba(255,255,255,.07); }
 .member-context-menu { position: fixed; z-index: 60; width: 188px; padding: 5px; border: 1px solid rgba(255,255,255,.09); border-radius: 9px; background: rgba(37,34,41,.98); box-shadow: 0 16px 46px rgba(0,0,0,.5); }
 .member-context-menu button { width: 100%; display: flex; align-items: center; gap: 9px; padding: 8px 9px; border-radius: 6px; background: transparent; color: #e8e3ec; text-align: left; font-size: 12px; }
 .member-context-menu button:hover { background: rgba(255,255,255,.07); }

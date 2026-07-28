@@ -5894,7 +5894,13 @@ function DirectContextMenu({ x, y, onClose, onBlock, onClear, onDelete }: { x: n
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [onClose]);
-  return <div className="group-context-menu" style={{ left: Math.min(x, window.innerWidth - 190), top: Math.min(y, window.innerHeight - 135) }} onMouseDown={(event) => event.stopPropagation()}><button onClick={onClear}><Eraser size={14} /> clear for both</button><button className="danger" onClick={onBlock}><ShieldOff size={14} /> block user</button><button onClick={onDelete}><Trash2 size={14} /> delete conversation</button></div>;
+  return (
+    <div className="group-context-menu" style={{ left: Math.min(x, window.innerWidth - 190), top: Math.min(y, window.innerHeight - 135) }} onMouseDown={(event) => event.stopPropagation()}>
+      <button className="clear-action" onClick={onClear}><Eraser size={14} /> clear for both</button>
+      <button onClick={onDelete}><Trash2 size={14} /> delete conversation</button>
+      <button className="danger" onClick={onBlock}><ShieldOff size={14} /> block user</button>
+    </div>
+  );
 }
 
 function MessageContextMenu({ x, y, busy, onClose, onReact, onReply, onForward, onDownload, onReport, onBlock, onDelete, onBan }: { x: number; y: number; busy: boolean; onClose: () => void; onReact?: () => void; onReply: () => void; onForward: () => void; onDownload?: () => Promise<boolean>; onReport?: () => void; onBlock?: () => void; onDelete?: () => void; onBan?: () => void }) {
