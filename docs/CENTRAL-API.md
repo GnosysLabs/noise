@@ -182,6 +182,7 @@ keys, raw challenge nonces, and raw bearer tokens are not logged.
 | `NOISE_DATABASE_POOL_SIZE` | no | `8`, accepted range `1..=16` |
 | `NOISE_TOKEN_HASH_KEY` | yes | Independent 32-byte random secret |
 | `NOISE_ALLOWED_ORIGIN` | no | Exact HTTPS origin, initially `https://app.makenoise.chat` when web traffic begins |
+| `NOISE_KLIPY_API_KEY` | no | Protected server-side key enabling authenticated GIF, sticker, and clip search |
 
 The production PostgreSQL role has a 20-connection limit. The service's
 maximum accepted pool size leaves connections available for migrations,

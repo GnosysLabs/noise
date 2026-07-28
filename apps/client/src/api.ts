@@ -52,6 +52,7 @@ const browserConcurrentActions = new Set([
   "fetch_avatar",
   "fetch_attachment",
   "fetch_attachment_range",
+  "fetch_klipy_media",
   "fetch_link_preview",
   "fetch_profile_album",
   "group_has_pending_admissions",

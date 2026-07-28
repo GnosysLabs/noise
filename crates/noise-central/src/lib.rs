@@ -2,6 +2,7 @@ mod config;
 mod database;
 mod error;
 mod events;
+mod klipy;
 #[path = "../../noise-relay/src/link_preview.rs"]
 mod link_preview;
 mod media;
@@ -48,6 +49,7 @@ const MAX_BODY_BYTES: usize = 3_000_000;
 struct AppState {
     database: Database,
     token_hash_key: [u8; 32],
+    klipy: Option<klipy::KlipyProxy>,
     media: Option<media::MediaStore>,
     presences: Arc<RwLock<HashMap<String, HashMap<String, GroupPresence>>>>,
 }
@@ -95,10 +97,12 @@ struct HealthResponse {
 
 pub async fn build_app(config: &CentralConfig) -> anyhow::Result<Router> {
     config.validate()?;
+    let klipy = klipy::KlipyProxy::open(config)?;
     let media = media::MediaStore::open(config)?;
     let state = Arc::new(AppState {
         database: Database::connect(config).await?,
         token_hash_key: config.token_hash_key()?,
+        klipy,
         media,
         presences: Arc::new(RwLock::new(HashMap::new())),
     });
@@ -134,6 +138,8 @@ pub async fn build_app(config: &CentralConfig) -> anyhow::Result<Router> {
             get(social::get_contact_signal),
         )
         .route("/v1/link-preview", post(fetch_link_preview))
+        .route("/v1/klipy/trending", get(klipy::trending))
+        .route("/v1/klipy/search", get(klipy::search))
         .route("/v1/events", post(events::publish_group_event))
         .route(
             "/v1/media/{object_id}",

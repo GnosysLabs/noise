@@ -82,6 +82,13 @@ impl ApiError {
         }
     }
 
+    pub const fn bad_gateway(code: &'static str) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            code,
+        }
+    }
+
     pub fn database(_error: impl std::fmt::Display) -> Self {
         // Database error details can contain values supplied by a request.
         // Keep the runtime log deliberately generic.

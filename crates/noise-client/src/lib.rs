@@ -108,6 +108,26 @@ const MAX_ADMISSION_HANDOFF_STEPS: usize = 8;
 pub const DEVICE_SESSION_REVOKED_ERROR: &str = "this device was logged out remotely";
 const DEVICE_LAST_SEEN_REFRESH_MILLIS: u64 = 5 * 60_000;
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KlipyResult {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub preview_url: String,
+    pub preview_blur: Option<String>,
+    pub full_url: String,
+    pub full_mp4_url: Option<String>,
+    pub full_webp_url: Option<String>,
+    pub width: u64,
+    pub height: u64,
+    pub mime_type: String,
+}
+
+#[derive(Deserialize)]
+struct KlipyResponse {
+    results: Vec<KlipyResult>,
+}
+
 #[derive(Clone)]
 pub struct NoiseClient {
     http: reqwest::Client,
@@ -5522,6 +5542,70 @@ impl NoiseClient {
         }
 
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no relay was reachable")))
+    }
+
+    pub async fn fetch_klipy_media(
+        &self,
+        kind: String,
+        query: Option<String>,
+        limit: usize,
+        relays: Vec<String>,
+    ) -> anyhow::Result<Vec<KlipyResult>> {
+        let kind = match kind.as_str() {
+            "gif" => "gif",
+            "sticker" => "sticker",
+            "clip" => "clip",
+            _ => bail!("invalid Klipy media kind"),
+        };
+        let query = query
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if query.is_some_and(|value| value.chars().count() > 100) {
+            bail!("Klipy search is too long")
+        }
+        let limit = limit.clamp(8, 50);
+        let mut parameters = url::form_urlencoded::Serializer::new(String::new());
+        parameters.append_pair("kind", kind);
+        parameters.append_pair("limit", &limit.to_string());
+        let endpoint = if let Some(query) = query {
+            parameters.append_pair("q", query);
+            "search"
+        } else {
+            "trending"
+        };
+        let path = format!("/v1/klipy/{endpoint}?{}", parameters.finish());
+        let relays = relay_list(relays)?;
+        let response = self.relay_request(&relays, 0, "GET", &path, &[]).await?;
+        if response.status != 200 {
+            let code = serde_json::from_slice::<serde_json::Value>(&response.body)
+                .ok()
+                .and_then(|value| value.get("error")?.as_str().map(str::to_owned))
+                .unwrap_or_else(|| response.status.to_string());
+            bail!("Klipy search is unavailable ({code})")
+        }
+        let response: KlipyResponse = serde_json::from_slice(&response.body)
+            .context("central service returned invalid Klipy results")?;
+        if response.results.len() > limit
+            || response.results.iter().any(|result| {
+                result.kind != kind
+                    || result.id.is_empty()
+                    || result.title.chars().count() > 200
+                    || !valid_klipy_result_url(&result.preview_url)
+                    || !valid_klipy_result_url(&result.full_url)
+                    || result.width > 20_000
+                    || result.height > 20_000
+                    || match kind {
+                        "gif" => result.mime_type != "image/gif",
+                        "sticker" => result.mime_type != "image/webp",
+                        "clip" => result.mime_type != "video/mp4",
+                        _ => true,
+                    }
+            })
+        {
+            bail!("central service returned invalid Klipy results")
+        }
+        Ok(response.results)
     }
 
     pub async fn upload_media_chunk(
@@ -12724,6 +12808,15 @@ impl NoiseClient {
         }
         Ok(PlainResponse { status, body })
     }
+}
+
+fn valid_klipy_result_url(value: &str) -> bool {
+    url::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
 }
 
 fn decrypt_direct_event(

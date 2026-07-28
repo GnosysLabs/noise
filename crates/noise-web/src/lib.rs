@@ -332,6 +332,17 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .await
                 .map_err(|error| error.to_string())?,
         ),
+        "fetch_klipy_media" => data(
+            client
+                .fetch_klipy_media(
+                    required::<String>(&request, "kind")?,
+                    optional::<String>(&request, "query")?,
+                    optional::<usize>(&request, "limit")?.unwrap_or(24),
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
         "upload_media_chunk" => data(
             client
                 .upload_media_chunk(

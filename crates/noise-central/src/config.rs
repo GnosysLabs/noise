@@ -49,6 +49,9 @@ pub struct CentralConfig {
 
     #[arg(long, env = "NOISE_R2_SECRET_ACCESS_KEY", hide_env_values = true)]
     pub(crate) r2_secret_access_key: Option<String>,
+
+    #[arg(long, env = "NOISE_KLIPY_API_KEY", hide_env_values = true)]
+    pub(crate) klipy_api_key: Option<String>,
 }
 
 impl CentralConfig {
@@ -87,6 +90,13 @@ impl CentralConfig {
         }
         self.token_hash_key()?;
         self.media_config()?;
+        if self
+            .klipy_api_key
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!("NOISE_KLIPY_API_KEY cannot be empty");
+        }
         Ok(())
     }
 

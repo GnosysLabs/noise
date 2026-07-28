@@ -26,6 +26,10 @@ fn default_search_limit() -> usize {
     60
 }
 
+fn default_klipy_limit() -> usize {
+    24
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum Request {
@@ -213,6 +217,13 @@ enum Request {
     },
     FetchLinkPreview {
         url: String,
+        relays: Vec<String>,
+    },
+    FetchKlipyMedia {
+        kind: String,
+        query: Option<String>,
+        #[serde(default = "default_klipy_limit")]
+        limit: usize,
         relays: Vec<String>,
     },
     UploadMediaChunk {
@@ -911,6 +922,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             | Request::FetchAttachment { .. }
             | Request::FetchAttachmentRange { .. }
             | Request::FetchLinkPreview { .. }
+            | Request::FetchKlipyMedia { .. }
             | Request::FetchProfileAlbum { .. }
             | Request::UploadMediaChunk { .. }
             | Request::UploadMediaChunkToGroup { .. }
@@ -1382,6 +1394,17 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         Request::FetchLinkPreview { url, relays } => serde_json::to_value(
             runtime()?
                 .block_on(client.fetch_link_preview(url, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::FetchKlipyMedia {
+            kind,
+            query,
+            limit,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.fetch_klipy_media(kind, query, limit, relays))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),

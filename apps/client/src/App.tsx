@@ -10,6 +10,7 @@ import {
   Copy,
   Crown,
   Download,
+  Eraser,
   EyeOff,
   Flame,
   Forward,
@@ -71,6 +72,7 @@ import { registerWebMediaStream, webMediaStreamReady } from "./mediaStream";
 import { generateGroupAvatar, generateUserAvatar, generateUserAvatarSource } from "./groupAvatar";
 import { firstLink, linkify, openExternalLink } from "./linkify";
 import { ReactionPicker } from "./ReactionPicker";
+import { KlipyPicker } from "./KlipyPicker";
 import { useLinkPreview } from "./useLinkPreview";
 import type {
   AdultAccessSummary,
@@ -130,6 +132,7 @@ type Dialog =
   | { type: "ban_member"; member: MemberSummary }
   | { type: "leave_group"; group: GroupSummary }
   | { type: "delete_group"; group: GroupSummary }
+  | { type: "clear_direct"; direct: DirectSummary }
   | { type: "delete_direct"; direct: DirectSummary }
   | { type: "delete_direct_message"; message: MessageSummary; publicKey: string; scopeId: string }
   | { type: "delete_account" }
@@ -5048,8 +5051,8 @@ export default function App() {
           }
         />
       )}
-      {dialog?.type === "delete_direct" && (
-        <DeleteDirectDialog
+      {dialog?.type === "clear_direct" && (
+        <ClearDirectDialog
           direct={dialog.direct}
           busy={busy}
           onClose={() => setDialog(null)}
@@ -5074,6 +5077,13 @@ export default function App() {
             setDialog(null);
             void refresh().catch((cause) => setError(message(cause)));
           })}
+        />
+      )}
+      {dialog?.type === "delete_direct" && (
+        <DeleteDirectDialog
+          direct={dialog.direct}
+          busy={busy}
+          onClose={() => setDialog(null)}
           onDelete={(forBoth) => perform(async () => {
             const local = await noise<LocalSummary>({ action: "delete_direct", public_key: dialog.direct.public_key, for_both: forBoth, relays });
             setSummary(local);
@@ -5249,6 +5259,7 @@ export default function App() {
           setDialog({ type: "block_person", person: directMenu.direct });
           setDirectMenu(null);
         }}
+        onClear={() => { setDialog({ type: "clear_direct", direct: directMenu.direct }); setDirectMenu(null); }}
         onDelete={() => { setDialog({ type: "delete_direct", direct: directMenu.direct }); setDirectMenu(null); }}
       />}
       {error && <ErrorToast error={error} onClose={() => setError(null)} />}
@@ -5759,7 +5770,7 @@ function GroupContextMenu({
   );
 }
 
-function DirectContextMenu({ x, y, onClose, onBlock, onDelete }: { x: number; y: number; onClose: () => void; onBlock: () => void; onDelete: () => void }) {
+function DirectContextMenu({ x, y, onClose, onBlock, onClear, onDelete }: { x: number; y: number; onClose: () => void; onBlock: () => void; onClear: () => void; onDelete: () => void }) {
   useEffect(() => {
     const close = () => onClose();
     const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
@@ -5772,7 +5783,7 @@ function DirectContextMenu({ x, y, onClose, onBlock, onDelete }: { x: number; y:
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [onClose]);
-  return <div className="group-context-menu" style={{ left: Math.min(x, window.innerWidth - 190), top: Math.min(y, window.innerHeight - 100) }} onMouseDown={(event) => event.stopPropagation()}><button className="danger" onClick={onBlock}><ShieldOff size={14} /> block user</button><button onClick={onDelete}><Trash2 size={14} /> delete conversation</button></div>;
+  return <div className="group-context-menu" style={{ left: Math.min(x, window.innerWidth - 190), top: Math.min(y, window.innerHeight - 135) }} onMouseDown={(event) => event.stopPropagation()}><button onClick={onClear}><Eraser size={14} /> clear for both</button><button className="danger" onClick={onBlock}><ShieldOff size={14} /> block user</button><button onClick={onDelete}><Trash2 size={14} /> delete conversation</button></div>;
 }
 
 function MessageContextMenu({ x, y, busy, onClose, onReact, onReply, onForward, onDownload, onReport, onBlock, onDelete, onBan }: { x: number; y: number; busy: boolean; onClose: () => void; onReact?: () => void; onReply: () => void; onForward: () => void; onDownload?: () => Promise<boolean>; onReport?: () => void; onBlock?: () => void; onDelete?: () => void; onBan?: () => void }) {
@@ -6309,7 +6320,10 @@ function ConversationPanel({
         {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.group.group_id} onClose={() => setReplyingTo(null)} />}
         {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => { const video = event.currentTarget; if (Number.isFinite(video.duration) && video.duration > 0) video.currentTime = Math.min(0.25, video.duration / 2); }} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}<button onClick={() => setAttachment(null)} aria-label="remove attachment"><X size={14} /></button></div>}
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
-        <button className="attach-button" disabled={busy || !canSendMedia} onClick={() => void chooseMediaFromDevice()} aria-label="attach media" title={canSendMedia ? "attach media" : "members cannot send media"}><Paperclip size={17} /></button>
+        <div className="composer-media-actions">
+          <button className="attach-button" disabled={busy || !canSendMedia} onClick={() => void chooseMediaFromDevice()} aria-label="attach media" title={canSendMedia ? "attach media" : "members cannot send media"}><Paperclip size={17} /></button>
+          <KlipyPicker disabled={busy || !canSendMedia} onPick={chooseMedia} />
+        </div>
         <input ref={fileInput} hidden type="file" accept="image/*,video/*,audio/*" onChange={(event) => void chooseMedia(event.target.files?.[0])} />
         <textarea
           ref={composerInput}
@@ -6579,7 +6593,10 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
         {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.media_scope_id} onClose={() => setReplyingTo(null)} />}
         {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => primeVideoFrame(event.currentTarget)} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}{uploadProgress !== null && <div className="attachment-progress"><i style={{ width: `${uploadProgress}%` }} /><span>{uploadProgress === 0 && attachment.mimeType.startsWith("video/") ? "preparing video" : `${uploadProgress}%`}</span></div>}<button onClick={() => { uploadController?.abort(); setUploadController(null); setAttachment(null); setUploadProgress(null); }} aria-label={uploadProgress !== null ? "cancel upload" : "remove attachment"}><X size={14} /></button></div>}
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
-        <button className="attach-button" disabled={busy} onClick={() => void chooseMediaFromDevice()} aria-label="attach media"><Paperclip size={17} /></button>
+        <div className="composer-media-actions">
+          <button className="attach-button" disabled={busy || uploadProgress !== null} onClick={() => void chooseMediaFromDevice()} aria-label="attach media"><Paperclip size={17} /></button>
+          <KlipyPicker disabled={busy || uploadProgress !== null} onPick={chooseMedia} />
+        </div>
         <input ref={fileInput} hidden type="file" accept="image/*,video/*,audio/*" onChange={(event) => void chooseMedia(event.target.files?.[0])} />
         <div className="direct-composer-input">
           <textarea ref={composerInput} rows={1} value={draft} placeholder={`message ${contact.username}`} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); } }} />
@@ -10096,8 +10113,12 @@ function LeaveGroupDialog({ group, busy, onClose, onLeave }: { group: GroupSumma
   return <Modal onClose={onClose} compact><DialogHeading icon={<LogOut />} title="leave group?" detail={group.name} /><p className="deletion-warning">This removes the group, its decrypted media cache, and its local data from this device.</p><DialogButtons onClose={onClose}><button className="delete-confirm" disabled={busy} onClick={() => void onLeave()}>{busy && <LoaderCircle className="spinner" size={13} />} leave group</button></DialogButtons></Modal>;
 }
 
-function DeleteDirectDialog({ direct, busy, onClose, onClear, onDelete }: { direct: DirectSummary; busy: boolean; onClose: () => void; onClear: () => Promise<boolean>; onDelete: (forBoth: boolean) => Promise<boolean> }) {
-  return <Modal onClose={onClose}><DialogHeading icon={<Trash2 />} title="conversation options" detail={direct.username} /><p className="deletion-warning">Clearing keeps the conversation available. Deleting removes the conversation itself.</p><div className="direct-delete-options"><button className="danger" disabled={busy} onClick={() => void onClear()}><strong>clear for both of us</strong><small>erase every message while keeping the conversation open</small></button><button disabled={busy} onClick={() => void onDelete(false)}><strong>delete just for me</strong><small>erase this device’s conversation and cached media</small></button><button className="danger" disabled={busy} onClick={() => void onDelete(true)}><strong>delete for both of us</strong><small>ask all synced noise clients to erase the entire conversation</small></button></div><DialogButtons onClose={onClose} closeLabel="cancel">{busy && <LoaderCircle className="spinner" size={14} />}</DialogButtons></Modal>;
+function ClearDirectDialog({ direct, busy, onClose, onClear }: { direct: DirectSummary; busy: boolean; onClose: () => void; onClear: () => Promise<boolean> }) {
+  return <Modal onClose={onClose} compact><DialogHeading icon={<Eraser />} title="clear messages for both?" detail={direct.username} /><p className="deletion-warning">This erases every message for both users while keeping the conversation available.</p><DialogButtons onClose={onClose}><button className="delete-confirm" disabled={busy} onClick={() => void onClear()}>{busy && <LoaderCircle className="spinner" size={13} />} clear messages</button></DialogButtons></Modal>;
+}
+
+function DeleteDirectDialog({ direct, busy, onClose, onDelete }: { direct: DirectSummary; busy: boolean; onClose: () => void; onDelete: (forBoth: boolean) => Promise<boolean> }) {
+  return <Modal onClose={onClose}><DialogHeading icon={<Trash2 />} title="delete conversation?" detail={direct.username} /><p className="deletion-warning">Choose whether to remove the conversation only from this device or from both users’ official noise clients.</p><div className="direct-delete-options"><button disabled={busy} onClick={() => void onDelete(false)}><strong>delete just for me</strong><small>erase this device’s conversation and cached media</small></button><button className="danger" disabled={busy} onClick={() => void onDelete(true)}><strong>delete for both of us</strong><small>ask all synced noise clients to erase the entire conversation</small></button></div><DialogButtons onClose={onClose} closeLabel="cancel">{busy && <LoaderCircle className="spinner" size={14} />}</DialogButtons></Modal>;
 }
 
 function DeleteDirectMessageDialog({ message, scopeId, busy, onClose, onDelete }: { message: MessageSummary; scopeId: string; busy: boolean; onClose: () => void; onDelete: () => Promise<boolean> }) {
