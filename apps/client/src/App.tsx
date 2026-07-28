@@ -1936,6 +1936,10 @@ export default function App() {
 
   useEffect(() => {
     const suppressNativeContextMenu = (event: MouseEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest(".composer textarea, .composer input:not([type='file'])")) {
+        return;
+      }
       event.preventDefault();
     };
     document.addEventListener("contextmenu", suppressNativeContextMenu, true);
