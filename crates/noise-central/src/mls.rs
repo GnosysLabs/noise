@@ -694,11 +694,7 @@ pub async fn publish_external_join_package(
         )
         .await
         .map_err(mls_conflict)?;
-    // A published KeyPackage is what lets founders admit a joining member, so
-    // it must wake the group watch like any other control change.
-    let watch_scope = record_group_control_change(&transaction, &group_id).await?;
     transaction.commit().await.map_err(ApiError::database)?;
-    state.watch.wake(&watch_scope).await;
     Ok(StatusCode::ACCEPTED)
 }
 
