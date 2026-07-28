@@ -6696,6 +6696,11 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
   const visibleMessages = conversation.messages.filter(
     (message) => !message.expires_at_millis || message.expires_at_millis > expiryClock,
   );
+  const latestOwnMessageEventId = visibleMessages.reduce<string | null>(
+    (latest, message) =>
+      message.author_public_key === self.public_key ? message.event_id : latest,
+    null,
+  );
   const messageList = useChunkedMessageList(
     contact.public_key,
     visibleMessages,
@@ -6852,7 +6857,7 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
           return (
             <Fragment key={item.event_id}>
               {startsDay && <MessageDateSeparator millis={item.created_at_millis} />}
-              <MessageRow message={item} own={item.author_public_key === self.public_key} presence={item.author_public_key === self.public_key ? selfPresence : contactPresence} replyTo={replyTo} onNavigateToMessage={messageList.navigateToMessage} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} mediaScopeId={conversation.media_scope_id} />
+              <MessageRow message={item} own={item.author_public_key === self.public_key} showDirectReceipt={item.event_id === latestOwnMessageEventId} presence={item.author_public_key === self.public_key ? selfPresence : contactPresence} replyTo={replyTo} onNavigateToMessage={messageList.navigateToMessage} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} mediaScopeId={conversation.media_scope_id} />
             </Fragment>
           );
         })}
@@ -7051,6 +7056,7 @@ function AboutNoiseDialog({ onClose }: { onClose: () => void }) {
 function MessageRow({
   message,
   own,
+  showDirectReceipt = false,
   presence,
   replyTo,
   onNavigateToMessage,
@@ -7062,6 +7068,7 @@ function MessageRow({
 }: {
   message: MessageSummary;
   own: boolean;
+  showDirectReceipt?: boolean;
   presence?: PresenceStatus;
   replyTo?: MessageSummary;
   onNavigateToMessage: (eventId: string) => void;
@@ -7118,12 +7125,12 @@ function MessageRow({
               <TimerReset size={11} />
             </span>
           )}
-          {own && message.read_at_millis ? (
+          {showDirectReceipt && own && message.read_at_millis ? (
             <span className="direct-receipt read" title="read" aria-label="read">
               <Check size={11} />
               <Check size={11} />
             </span>
-          ) : own && message.delivered_at_millis ? (
+          ) : showDirectReceipt && own && message.delivered_at_millis ? (
             <span className="direct-receipt delivered" title="delivered" aria-label="delivered">
               <Check size={11} />
             </span>
