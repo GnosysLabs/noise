@@ -171,17 +171,15 @@ button:disabled { cursor: default; opacity: 0.48; }
 .messages-older { display: grid; min-height: 4px; place-items: center; overflow-anchor: none; }
 .messages-older:has(.messages-older-loading) { min-height: 46px; margin-bottom: 6px; }
 .messages-older-loading { display: grid; width: 38px; height: 38px; place-items: center; border: 1px solid rgba(255,255,255,.09); border-radius: 50%; background: rgba(255,255,255,.05); color: var(--muted); }
-.message-row { display: grid; grid-template-columns: 34px 1fr; gap: 11px; margin-bottom: 17px; overflow-anchor: auto; }
+.message-row { position: relative; isolation: isolate; display: grid; grid-template-columns: 34px 1fr; gap: 11px; margin-bottom: 17px; overflow-anchor: auto; }
 .message-date-separator { display: flex; align-items: center; gap: 12px; margin: 7px 0 18px; color: var(--muted); font-size: 10.5px; font-weight: 700; letter-spacing: .025em; text-align: center; }
 .message-date-separator::before, .message-date-separator::after { height: 1px; flex: 1; background: rgba(255,255,255,.075); content: ""; }
 .message-date-separator span { flex: none; padding: 4px 9px; border: 1px solid rgba(255,255,255,.07); border-radius: 999px; background: rgba(31,29,35,.72); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); }
 .group-conversation.has-background .message-date-separator span { background: rgba(30,28,33,.7); }
-.message-row.search-highlight { animation: search-message-highlight 2.4s cubic-bezier(.22,.61,.36,1); }
+.message-row.search-highlight::after { position: absolute; z-index: 5; inset: -6px; border: 1px solid rgba(var(--accent-rgb),.4); border-radius: 14px; box-shadow: 0 0 16px rgba(var(--accent-rgb),.72); content: ""; opacity: 0; pointer-events: none; will-change: opacity; animation: search-message-highlight 2.4s linear forwards; }
 @keyframes search-message-highlight {
-  0%, 15% { filter: drop-shadow(0 0 13px rgba(var(--accent-rgb),.72)); transform: scale(1.012); }
-  45% { filter: drop-shadow(0 0 13px rgba(var(--accent-rgb),.42)); transform: scale(1.007); }
-  75% { filter: drop-shadow(0 0 13px rgba(var(--accent-rgb),.14)); transform: scale(1.002); }
-  100% { filter: drop-shadow(0 0 13px rgba(var(--accent-rgb),0)); transform: scale(1); }
+  0%, 15% { opacity: 1; }
+  100% { opacity: 0; }
 }
 .message-row > button { align-self: start; padding: 0; background: transparent; }
 .message-meta { display: flex; align-items: baseline; gap: 7px; height: 18px; }
