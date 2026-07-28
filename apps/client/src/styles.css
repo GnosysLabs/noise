@@ -270,14 +270,14 @@ button:disabled { cursor: default; opacity: 0.48; }
 .klipy-search input::placeholder { color: var(--faint); }
 .klipy-search button { display: grid; width: 24px; height: 24px; padding: 0; place-items: center; border-radius: 50%; background: transparent; color: var(--muted); }
 .klipy-search button:hover { background: rgba(255,255,255,.07); color: var(--text); }
-.klipy-results { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-content: start; gap: 5px; height: 310px; overflow-y: auto; overscroll-behavior: contain; padding: 0 8px 8px; }
-.klipy-results > button { position: relative; min-width: 0; aspect-ratio: 4 / 3; overflow: hidden; padding: 0; border-radius: 8px; background: rgba(255,255,255,.055); }
+.klipy-results { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); grid-auto-rows: 82px; align-content: start; gap: 5px; height: 310px; overflow-y: auto; overscroll-behavior: contain; padding: 0 8px 8px; }
+.klipy-results > button { position: relative; width: 100%; min-width: 0; height: 82px; min-height: 0; overflow: hidden; padding: 0; border-radius: 8px; background: rgba(255,255,255,.055); }
 .klipy-results > button:hover { box-shadow: inset 0 0 0 2px var(--accent); }
 .klipy-results > button:disabled { opacity: .48; }
 .klipy-results > button.picking { opacity: 1; }
-.klipy-results img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.klipy-results img { display: block; width: 100%; min-width: 0; height: 100%; min-height: 0; object-fit: cover; }
 .klipy-results > button > span { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(16,14,18,.55); color: #fff; }
-.klipy-status { grid-column: 1 / -1; display: grid; height: 100%; place-items: center; color: var(--muted); font-size: 11px; }
+.klipy-status { grid-column: 1 / -1; grid-row: 1 / span 3; display: grid; place-items: center; color: var(--muted); font-size: 11px; }
 .klipy-status.error { color: #ff9299; }
 .klipy-attribution { display: flex; min-height: 29px; align-items: center; justify-content: space-between; gap: 10px; padding: 0 10px; border-top: 1px solid rgba(255,255,255,.07); color: var(--faint); font-size: 9px; }
 .klipy-attribution a { color: inherit; text-decoration: none; }
