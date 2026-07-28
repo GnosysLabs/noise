@@ -2383,6 +2383,19 @@ export default function App() {
       }
       if (generation !== refreshGeneration.current) return;
     }
+    if (
+      local.identity.avatar
+      && !avatarCache.has(local.identity.avatar.blob_id)
+    ) {
+      try {
+        await loadProfileImageSource(local.identity.avatar);
+      } catch {
+        // Keep the loading screen through the normal avatar attempt. If the
+        // stored avatar is genuinely unavailable, the deterministic fallback
+        // remains preferable to blocking the entire account indefinitely.
+      }
+      if (generation !== refreshGeneration.current) return;
+    }
     if (local.identity.safety_restriction) {
       setSummary(local);
       setConversation(null);
@@ -10322,8 +10335,14 @@ function ReportMessageDialog({
   const [submittedTo, setSubmittedTo] = useState<ReportDestination | null>(null);
   const categories = REPORT_CATEGORIES.filter(
     (item) =>
-      item.value !== "explicit_content_not_properly_labeled"
-      || groupContentRating === "general",
+      (
+        item.value !== "sexual_exploitation_or_non_consensual_sexual_content"
+        || groupContentRating === "explicit"
+      )
+      && (
+        item.value !== "explicit_content_not_properly_labeled"
+        || groupContentRating === "general"
+      ),
   );
   if (submittedTo) {
     return (
