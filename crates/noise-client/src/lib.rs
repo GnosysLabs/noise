@@ -67,7 +67,7 @@ use noise_core::{
 };
 pub use noise_core::{
     DirectMessagePolicy, ForwardedFrom, GroupContentRating, MediaAttachment, MediaChunk,
-    ProfileAlbum, ProfileAlbumItem, ProfileImage, SafetyReportCategoryV1,
+    ModeratorPermissions, ProfileAlbum, ProfileAlbumItem, ProfileImage, SafetyReportCategoryV1,
 };
 pub use noise_transport::LinkPreview;
 use noise_transport::{
@@ -506,6 +506,8 @@ pub struct MemberSummary {
     #[serde(default)]
     pub direct_message_policy: DirectMessagePolicy,
     pub is_moderator: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moderator_permissions: Option<ModeratorPermissions>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -4825,6 +4827,7 @@ impl NoiseClient {
             .context("active group is missing from local state")?;
         let current_group = state.groups[group_index].clone();
         let identity = state.identity()?;
+        let actor_public_key = identity.public_key_base64();
         let (current_profile, owner_public_key) = if current_group.owner_public_key.is_empty() {
             // Legacy memberships did not persist the founder or complete profile,
             // so they still need one reconciliation before they can be edited.
@@ -4853,14 +4856,49 @@ impl NoiseClient {
                 current_group.owner_public_key.clone(),
             )
         };
-        if owner_public_key != identity.public_key_base64() {
-            bail!("only the group founder can edit its identity right now")
-        }
+        let is_owner = owner_public_key == actor_public_key;
+        let permissions = if is_owner {
+            None
+        } else {
+            Some(
+                cached_group_view(&state, &current_group)?
+                    .moderator_permissions_for(&actor_public_key)
+                    .context(
+                        "only the group founder or an authorized moderator can edit this group",
+                    )?,
+            )
+        };
         let members_can_send_messages =
             members_can_send_messages.unwrap_or(current_profile.members_can_send_messages);
         let members_can_send_media =
             members_can_send_media.unwrap_or(current_profile.members_can_send_media);
         let content_rating = content_rating.unwrap_or(current_profile.content_rating);
+        let changes_identity = name != current_profile.name
+            || description != current_profile.description
+            || remove_avatar
+            || avatar_data_base64.is_some();
+        let changes_appearance = remove_background
+            || background_data_base64.is_some()
+            || remove_mobile_background
+            || mobile_background_data_base64.is_some()
+            || accent_color
+                .as_deref()
+                .is_some_and(|color| color != current_profile.accent_color);
+        let changes_rules = rules != current_profile.rules;
+        let changes_general = members_can_send_messages
+            != current_profile.members_can_send_messages
+            || members_can_send_media != current_profile.members_can_send_media;
+        let changes_content_rating = content_rating != current_profile.content_rating;
+        if let Some(permissions) = permissions {
+            if (changes_identity && !permissions.edit_group_identity)
+                || (changes_appearance && !permissions.edit_group_appearance)
+                || (changes_rules && !permissions.edit_group_rules)
+                || (changes_general && !permissions.edit_group_general_settings)
+                || changes_content_rating
+            {
+                bail!("your moderator permissions do not allow those group changes")
+            }
+        }
         let became_explicit = current_profile.content_rating == GroupContentRating::General
             && content_rating == GroupContentRating::Explicit;
         if current_profile.content_rating == GroupContentRating::Explicit
@@ -8180,7 +8218,13 @@ impl NoiseClient {
         let mut state = load_state(path)?;
         let group = state.active_group()?.clone();
         let identity = state.identity()?;
-        ensure_topic_manager(&state, &group, &identity.public_key_base64())?;
+        ensure_moderator_permission(
+            &state,
+            &group,
+            &identity.public_key_base64(),
+            |permissions| permissions.create_topics,
+            "create topics",
+        )?;
         let sequence = state.take_sequence();
         let seed = format!(
             "noise-topic-v1:{}:{}:{}",
@@ -8239,7 +8283,13 @@ impl NoiseClient {
         let mut state = load_state(path)?;
         let group = state.active_group()?.clone();
         let identity = state.identity()?;
-        ensure_topic_manager(&state, &group, &identity.public_key_base64())?;
+        ensure_moderator_permission(
+            &state,
+            &group,
+            &identity.public_key_base64(),
+            |permissions| permissions.edit_topics,
+            "edit topics",
+        )?;
         ensure_active_topic(&state, &group, topic_id)?;
         let sequence = state.take_sequence();
         let event = create_group_event(
@@ -8280,7 +8330,13 @@ impl NoiseClient {
         let mut state = load_state(path)?;
         let group = state.active_group()?.clone();
         let identity = state.identity()?;
-        ensure_topic_manager(&state, &group, &identity.public_key_base64())?;
+        ensure_moderator_permission(
+            &state,
+            &group,
+            &identity.public_key_base64(),
+            |permissions| permissions.delete_topics,
+            "delete topics",
+        )?;
         ensure_active_topic(&state, &group, topic_id)?;
         let sequence = state.take_sequence();
         let event = create_group_event(
@@ -8318,10 +8374,13 @@ impl NoiseClient {
         let mut state = load_state(path)?;
         let group = state.active_group()?.clone();
         let identity = state.identity()?;
-        let view = cached_group_view(&state, &group)?;
-        if view.owner_public_key.as_deref() != Some(identity.public_key_base64().as_str()) {
-            bail!("only the group founder can rearrange topics")
-        }
+        let view = ensure_moderator_permission(
+            &state,
+            &group,
+            &identity.public_key_base64(),
+            |permissions| permissions.edit_topics,
+            "rearrange topics",
+        )?;
         let active_topic_ids = view
             .topics
             .values()
@@ -8551,6 +8610,45 @@ impl NoiseClient {
         Ok(())
     }
 
+    pub async fn set_moderator_permissions(
+        &self,
+        path: impl AsRef<Path>,
+        member_public_key: &str,
+        permissions: ModeratorPermissions,
+        relays: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        let relays = relay_list(relays)?;
+        let group = state.active_group()?.clone();
+        let identity = state.identity()?;
+        let actor_public_key = identity.public_key_base64();
+        let view = cached_group_view(&state, &group)?;
+        if view.owner_public_key.as_deref() != Some(actor_public_key.as_str()) {
+            bail!("only the group founder can change moderator permissions")
+        }
+        if !view.members.contains_key(member_public_key)
+            || !view.moderators.contains(member_public_key)
+        {
+            bail!("choose an active moderator")
+        }
+        let sequence = state.take_sequence();
+        let event = create_group_event(
+            &state,
+            &identity,
+            &group,
+            GroupEventPayload::ModeratorPermissionsSet {
+                member_public_key: member_public_key.to_owned(),
+                permissions,
+            },
+            sequence,
+        )?;
+        self.publish_event(&relays, &event).await?;
+        save_state(path, &state)?;
+        self.apply_published_group_event(path, &group.group_id, event)?;
+        Ok(())
+    }
+
     fn apply_published_group_event(
         &self,
         path: &Path,
@@ -8593,7 +8691,7 @@ impl NoiseClient {
                     .get(&group.group_id)
                     .and_then(|cache| cache.portable_conversation.clone())
             });
-        let (target, is_owner, is_moderator, is_active) =
+        let (target, is_owner, can_remove_messages, is_active) =
             if let Some(conversation) = cached_conversation {
                 let target = conversation
                     .messages
@@ -8608,7 +8706,13 @@ impl NoiseClient {
                 (
                     target,
                     conversation.group.owner_public_key == actor_public_key,
-                    actor.is_some_and(|member| member.is_moderator),
+                    actor
+                        .and_then(|member| {
+                            member
+                                .is_moderator
+                                .then(|| member.moderator_permissions.unwrap_or_default())
+                        })
+                        .is_some_and(|permissions| permissions.review_reports_and_remove_messages),
                     actor.is_some(),
                 )
             } else {
@@ -8643,12 +8747,13 @@ impl NoiseClient {
                 (
                     target,
                     view.owner_public_key.as_deref() == Some(actor_public_key.as_str()),
-                    view.moderators.contains(&actor_public_key),
+                    view.moderator_permissions_for(&actor_public_key)
+                        .is_some_and(|permissions| permissions.review_reports_and_remove_messages),
                     view.members.contains_key(&actor_public_key),
                 )
             };
         if !is_active
-            || (!is_owner && !is_moderator && target.author_public_key != actor_public_key)
+            || (!is_owner && !can_remove_messages && target.author_public_key != actor_public_key)
         {
             bail!("you can only delete your own messages")
         }
@@ -9005,9 +9110,12 @@ impl NoiseClient {
         let actor_public_key = identity.public_key_base64();
         let view = cached_group_view(&state, &group)?;
         let is_owner = view.owner_public_key.as_deref() == Some(actor_public_key.as_str());
-        let is_moderator = view.moderators.contains(&actor_public_key);
-        if (!is_owner && !is_moderator) || !view.members.contains_key(&actor_public_key) {
-            bail!("only the founder or a moderator can resolve reports")
+        let can_review_reports = is_owner
+            || view
+                .moderator_permissions_for(&actor_public_key)
+                .is_some_and(|permissions| permissions.review_reports_and_remove_messages);
+        if !can_review_reports || !view.members.contains_key(&actor_public_key) {
+            bail!("you do not have permission to review reports")
         }
         if !view
             .reports
@@ -9047,9 +9155,12 @@ impl NoiseClient {
         let actor_public_key = identity.public_key_base64();
         let view = cached_group_view(&state, &group)?;
         let is_owner = view.owner_public_key.as_deref() == Some(actor_public_key.as_str());
-        let is_moderator = view.moderators.contains(&actor_public_key);
-        if (!is_owner && !is_moderator) || !view.members.contains_key(&actor_public_key) {
-            bail!("only the founder or a moderator can ban members")
+        let can_ban = is_owner
+            || view
+                .moderator_permissions_for(&actor_public_key)
+                .is_some_and(|permissions| permissions.ban_members);
+        if !can_ban || !view.members.contains_key(&actor_public_key) {
+            bail!("you do not have permission to ban members")
         }
         if member_public_key == actor_public_key
             || view.owner_public_key.as_deref() == Some(member_public_key)
@@ -9116,10 +9227,13 @@ impl NoiseClient {
         let identity = state.identity()?;
         let actor_public_key = identity.public_key_base64();
         let view = cached_group_view(&state, &group)?;
-        if view.owner_public_key.as_deref() != Some(actor_public_key.as_str())
-            || !view.members.contains_key(&actor_public_key)
-        {
-            bail!("only the group founder can unban members")
+        let is_owner = view.owner_public_key.as_deref() == Some(actor_public_key.as_str());
+        let can_unban = is_owner
+            || view
+                .moderator_permissions_for(&actor_public_key)
+                .is_some_and(|permissions| permissions.unban_members);
+        if !can_unban || !view.members.contains_key(&actor_public_key) {
+            bail!("you do not have permission to unban members")
         }
         if !view.banned_members.contains(member_public_key) {
             bail!("that identity is not banned")
@@ -10503,8 +10617,10 @@ impl NoiseClient {
         if state_changed {
             save_state(path, &state)?;
         }
-        let can_view_reports =
-            resolved_owner == identity_public_key || moderators.contains(&identity_public_key);
+        let can_view_reports = resolved_owner == identity_public_key
+            || view
+                .moderator_permissions_for(&identity_public_key)
+                .is_some_and(|permissions| permissions.review_reports_and_remove_messages);
         let mut reactions_by_message = HashMap::<String, Vec<ReactionSummary>>::new();
         for reaction in &view.reactions {
             let summaries = reactions_by_message
@@ -10585,18 +10701,29 @@ impl NoiseClient {
             })
             .collect::<Vec<_>>();
         let topics = topic_summaries(&state, &group.group_id, &view.topics);
+        let moderator_permissions = view.moderator_permissions.clone();
         let mut members = view
             .members
             .into_values()
-            .map(|member| MemberSummary {
-                is_moderator: moderators.contains(&member.public_key),
-                public_key: member.public_key,
-                username: member.username,
-                bio: member.bio,
-                avatar: member.avatar,
-                album: member.album,
-                accepts_direct_messages: member.accepts_direct_messages,
-                direct_message_policy: member.direct_message_policy,
+            .map(|member| {
+                let is_moderator = moderators.contains(&member.public_key);
+                let permissions = is_moderator.then(|| {
+                    moderator_permissions
+                        .get(&member.public_key)
+                        .copied()
+                        .unwrap_or_default()
+                });
+                MemberSummary {
+                    is_moderator,
+                    moderator_permissions: permissions,
+                    public_key: member.public_key,
+                    username: member.username,
+                    bio: member.bio,
+                    avatar: member.avatar,
+                    album: member.album,
+                    accepts_direct_messages: member.accepts_direct_messages,
+                    direct_message_policy: member.direct_message_policy,
+                }
             })
             .collect::<Vec<_>>();
         members.sort_by(|left, right| left.username.cmp(&right.username));
@@ -13955,6 +14082,7 @@ fn cached_conversation_from_view(
     let resolved_owner = view.owner_public_key.clone().unwrap_or_default();
     let resolved_profile = view.profile.clone();
     let moderators = view.moderators.clone();
+    let moderator_permissions = view.moderator_permissions.clone();
     let mut banned_members = view
         .banned_profiles
         .values()
@@ -13968,8 +14096,10 @@ fn cached_conversation_from_view(
         .collect::<Vec<_>>();
     banned_members.sort_by(|left, right| left.username.cmp(&right.username));
 
-    let can_view_reports =
-        resolved_owner == identity_public_key || moderators.contains(identity_public_key);
+    let can_view_reports = resolved_owner == identity_public_key
+        || view
+            .moderator_permissions_for(identity_public_key)
+            .is_some_and(|permissions| permissions.review_reports_and_remove_messages);
     let mut reactions_by_message = HashMap::<String, Vec<ReactionSummary>>::new();
     for reaction in &view.reactions {
         let summaries = reactions_by_message
@@ -14054,15 +14184,25 @@ fn cached_conversation_from_view(
     let mut members = view
         .members
         .into_values()
-        .map(|member| MemberSummary {
-            is_moderator: moderators.contains(&member.public_key),
-            public_key: member.public_key,
-            username: member.username,
-            bio: member.bio,
-            avatar: member.avatar,
-            album: member.album,
-            accepts_direct_messages: member.accepts_direct_messages,
-            direct_message_policy: member.direct_message_policy,
+        .map(|member| {
+            let is_moderator = moderators.contains(&member.public_key);
+            let permissions = is_moderator.then(|| {
+                moderator_permissions
+                    .get(&member.public_key)
+                    .copied()
+                    .unwrap_or_default()
+            });
+            MemberSummary {
+                is_moderator,
+                moderator_permissions: permissions,
+                public_key: member.public_key,
+                username: member.username,
+                bio: member.bio,
+                avatar: member.avatar,
+                album: member.album,
+                accepts_direct_messages: member.accepts_direct_messages,
+                direct_message_policy: member.direct_message_policy,
+            }
         })
         .collect::<Vec<_>>();
     members.sort_by(|left, right| left.username.cmp(&right.username));
@@ -14630,19 +14770,23 @@ fn cached_group_view(state: &ClientState, group: &GroupMembership) -> anyhow::Re
     rebuild_group_state(state, group, &cache.events)
 }
 
-fn ensure_topic_manager(
+fn ensure_moderator_permission(
     state: &ClientState,
     group: &GroupMembership,
     actor_public_key: &str,
-) -> anyhow::Result<()> {
+    allowed: impl FnOnce(ModeratorPermissions) -> bool,
+    action: &str,
+) -> anyhow::Result<GroupState> {
     let view = cached_group_view(state, group)?;
-    if !view.members.contains_key(actor_public_key)
-        || (view.owner_public_key.as_deref() != Some(actor_public_key)
-            && !view.moderators.contains(actor_public_key))
-    {
-        bail!("only group owners and moderators can manage topics")
+    let is_owner = view.owner_public_key.as_deref() == Some(actor_public_key);
+    let is_allowed = is_owner
+        || view
+            .moderator_permissions_for(actor_public_key)
+            .is_some_and(allowed);
+    if !view.members.contains_key(actor_public_key) || !is_allowed {
+        bail!("you do not have permission to {action}")
     }
-    Ok(())
+    Ok(view)
 }
 
 fn ensure_active_topic(

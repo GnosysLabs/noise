@@ -1,6 +1,6 @@
 use noise_client::{
-    DirectMessagePolicy, ForwardedFrom, GroupContentRating, MediaAttachment, NoiseClient,
-    ProfileAlbum, ProfileAlbumItem, ProfileImage,
+    DirectMessagePolicy, ForwardedFrom, GroupContentRating, MediaAttachment, ModeratorPermissions,
+    NoiseClient, ProfileAlbum, ProfileAlbumItem, ProfileImage,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -758,6 +758,18 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                     STATE_PATH,
                     &required::<String>(&request, "member_public_key")?,
                     required::<bool>(&request, "enabled")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(Value::Null)
+        }
+        "set_moderator_permissions" => {
+            client
+                .set_moderator_permissions(
+                    STATE_PATH,
+                    &required::<String>(&request, "member_public_key")?,
+                    required::<ModeratorPermissions>(&request, "permissions")?,
                     relays(&request)?,
                 )
                 .await

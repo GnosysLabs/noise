@@ -15,8 +15,8 @@ use futures_util::{
     future::{AbortHandle, Abortable},
 };
 use noise_client::{
-    DirectMessagePolicy, ForwardedFrom, GroupContentRating, MediaAttachment, NoiseClient,
-    ProfileAlbum, ProfileAlbumItem, ProfileImage, SafetyReportCategoryV1,
+    DirectMessagePolicy, ForwardedFrom, GroupContentRating, MediaAttachment, ModeratorPermissions,
+    NoiseClient, ProfileAlbum, ProfileAlbumItem, ProfileImage, SafetyReportCategoryV1,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -488,6 +488,12 @@ enum Request {
         state_path: String,
         member_public_key: String,
         enabled: bool,
+        relays: Vec<String>,
+    },
+    SetModeratorPermissions {
+        state_path: String,
+        member_public_key: String,
+        permissions: ModeratorPermissions,
         relays: Vec<String>,
     },
     DeleteMessage {
@@ -2044,6 +2050,22 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         } => {
             runtime()?
                 .block_on(client.set_moderator(state_path, &member_public_key, enabled, relays))
+                .map_err(|error| error.to_string())?;
+            Ok(Value::Null)
+        }
+        Request::SetModeratorPermissions {
+            state_path,
+            member_public_key,
+            permissions,
+            relays,
+        } => {
+            runtime()?
+                .block_on(client.set_moderator_permissions(
+                    state_path,
+                    &member_public_key,
+                    permissions,
+                    relays,
+                ))
                 .map_err(|error| error.to_string())?;
             Ok(Value::Null)
         }

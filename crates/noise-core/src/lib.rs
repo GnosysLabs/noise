@@ -1586,6 +1586,47 @@ pub struct ForwardedFrom {
     pub username: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModeratorPermissions {
+    #[serde(default)]
+    pub edit_group_identity: bool,
+    #[serde(default)]
+    pub edit_group_appearance: bool,
+    #[serde(default)]
+    pub edit_group_rules: bool,
+    #[serde(default)]
+    pub edit_group_general_settings: bool,
+    #[serde(default)]
+    pub create_topics: bool,
+    #[serde(default)]
+    pub edit_topics: bool,
+    #[serde(default)]
+    pub delete_topics: bool,
+    #[serde(default)]
+    pub review_reports_and_remove_messages: bool,
+    #[serde(default)]
+    pub ban_members: bool,
+    #[serde(default)]
+    pub unban_members: bool,
+}
+
+impl Default for ModeratorPermissions {
+    fn default() -> Self {
+        Self {
+            edit_group_identity: false,
+            edit_group_appearance: false,
+            edit_group_rules: false,
+            edit_group_general_settings: false,
+            create_topics: true,
+            edit_topics: true,
+            delete_topics: true,
+            review_reports_and_remove_messages: true,
+            ban_members: true,
+            unban_members: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GroupEventPayload {
@@ -1631,6 +1672,10 @@ pub enum GroupEventPayload {
     ModeratorSet {
         member_public_key: String,
         enabled: bool,
+    },
+    ModeratorPermissionsSet {
+        member_public_key: String,
+        permissions: ModeratorPermissions,
     },
     MessageDeleted {
         message_event_id: String,
@@ -2609,6 +2654,7 @@ pub struct GroupState {
     pub owner_public_key: Option<String>,
     pub members: HashMap<String, MemberState>,
     pub moderators: HashSet<String>,
+    pub moderator_permissions: HashMap<String, ModeratorPermissions>,
     pub banned_members: HashSet<String>,
     pub banned_profiles: HashMap<String, MemberState>,
     pub topics: HashMap<String, AcceptedTopic>,
@@ -2619,6 +2665,15 @@ pub struct GroupState {
 }
 
 impl GroupState {
+    pub fn moderator_permissions_for(&self, public_key: &str) -> Option<ModeratorPermissions> {
+        self.moderators.contains(public_key).then(|| {
+            self.moderator_permissions
+                .get(public_key)
+                .copied()
+                .unwrap_or_default()
+        })
+    }
+
     pub fn rebuild(group: &GroupMembership, events: &[SignedEvent]) -> Self {
         Self::rebuild_with_epoch_keys(group, events, &HashMap::new(), &HashMap::new())
     }
@@ -2747,19 +2802,39 @@ impl GroupState {
                     let is_owner =
                         state.owner_public_key.as_deref() == Some(event.author_public_key.as_str());
                     let is_active = state.members.contains_key(&event.author_public_key);
+                    if !profile.mobile_background_updated && profile.mobile_background.is_none() {
+                        profile.mobile_background = state.profile.mobile_background.clone();
+                    }
+                    let permissions = state
+                        .moderator_permissions_for(&event.author_public_key)
+                        .unwrap_or_default();
+                    let changes_identity = profile.name != state.profile.name
+                        || profile.description != state.profile.description
+                        || profile.avatar != state.profile.avatar;
+                    let changes_appearance = profile.background != state.profile.background
+                        || profile.mobile_background != state.profile.mobile_background
+                        || profile.accent_color != state.profile.accent_color;
+                    let changes_rules = profile.rules != state.profile.rules;
+                    let changes_general = profile.members_can_send_messages
+                        != state.profile.members_can_send_messages
+                        || profile.members_can_send_media != state.profile.members_can_send_media;
+                    let changes_content_rating =
+                        profile.content_rating != state.profile.content_rating;
                     let removes_explicit_label = state.profile.content_rating
                         == GroupContentRating::Explicit
                         && profile.content_rating != GroupContentRating::Explicit;
-                    if !is_owner
-                        || !is_active
+                    if !is_active
+                        || (!is_owner
+                            && ((changes_identity && !permissions.edit_group_identity)
+                                || (changes_appearance && !permissions.edit_group_appearance)
+                                || (changes_rules && !permissions.edit_group_rules)
+                                || (changes_general && !permissions.edit_group_general_settings)
+                                || changes_content_rating))
                         || removes_explicit_label
                         || !valid_group_profile(&profile)
                     {
                         state.rejected_events += 1;
                         continue;
-                    }
-                    if !profile.mobile_background_updated && profile.mobile_background.is_none() {
-                        profile.mobile_background = state.profile.mobile_background.clone();
                     }
                     state.profile = profile;
                 }
@@ -2777,10 +2852,12 @@ impl GroupState {
                         .map_or(0, |index| index.saturating_add(1));
                     let is_owner =
                         state.owner_public_key.as_deref() == Some(event.author_public_key.as_str());
-                    let can_moderate =
-                        is_owner || state.moderators.contains(&event.author_public_key);
+                    let can_create_topics = is_owner
+                        || state
+                            .moderator_permissions_for(&event.author_public_key)
+                            .is_some_and(|permissions| permissions.create_topics);
                     let is_active = state.members.contains_key(&event.author_public_key);
-                    if !can_moderate
+                    if !can_create_topics
                         || !is_active
                         || event.stream_locator.is_some()
                         || !valid_hex_id(&topic_id)
@@ -2819,14 +2896,16 @@ impl GroupState {
                 } => {
                     let is_owner =
                         state.owner_public_key.as_deref() == Some(event.author_public_key.as_str());
-                    let can_moderate =
-                        is_owner || state.moderators.contains(&event.author_public_key);
+                    let can_edit_topics = is_owner
+                        || state
+                            .moderator_permissions_for(&event.author_public_key)
+                            .is_some_and(|permissions| permissions.edit_topics);
                     let is_active = state.members.contains_key(&event.author_public_key);
                     let Some(topic) = state.topics.get_mut(&topic_id) else {
                         state.rejected_events += 1;
                         continue;
                     };
-                    if !can_moderate
+                    if !can_edit_topics
                         || !is_active
                         || topic.archived
                         || event.stream_locator.is_some()
@@ -2854,7 +2933,11 @@ impl GroupState {
                         .map(|topic| topic.topic_id.clone())
                         .collect::<HashSet<_>>();
                     let requested_topic_ids = topic_ids.iter().cloned().collect::<HashSet<_>>();
-                    if !is_owner
+                    let can_edit_topics = is_owner
+                        || state
+                            .moderator_permissions_for(&event.author_public_key)
+                            .is_some_and(|permissions| permissions.edit_topics);
+                    if !can_edit_topics
                         || event.stream_locator.is_some()
                         || topic_ids.len() != requested_topic_ids.len()
                         || requested_topic_ids != active_topic_ids
@@ -2871,14 +2954,16 @@ impl GroupState {
                 GroupEventPayload::TopicArchived { topic_id } => {
                     let is_owner =
                         state.owner_public_key.as_deref() == Some(event.author_public_key.as_str());
-                    let can_moderate =
-                        is_owner || state.moderators.contains(&event.author_public_key);
+                    let can_delete_topics = is_owner
+                        || state
+                            .moderator_permissions_for(&event.author_public_key)
+                            .is_some_and(|permissions| permissions.delete_topics);
                     let is_active = state.members.contains_key(&event.author_public_key);
                     let Some(topic) = state.topics.get_mut(&topic_id) else {
                         state.rejected_events += 1;
                         continue;
                     };
-                    if !can_moderate
+                    if !can_delete_topics
                         || !is_active
                         || topic.archived
                         || event.stream_locator.is_some()
@@ -2904,22 +2989,51 @@ impl GroupState {
                         continue;
                     }
                     if enabled {
-                        state.moderators.insert(member_public_key);
+                        state.moderators.insert(member_public_key.clone());
+                        state
+                            .moderator_permissions
+                            .entry(member_public_key)
+                            .or_default();
                     } else {
                         state.moderators.remove(&member_public_key);
+                        state.moderator_permissions.remove(&member_public_key);
                     }
+                }
+                GroupEventPayload::ModeratorPermissionsSet {
+                    member_public_key,
+                    permissions,
+                } => {
+                    let is_owner =
+                        state.owner_public_key.as_deref() == Some(event.author_public_key.as_str());
+                    let owner_is_active = state.members.contains_key(&event.author_public_key);
+                    let target_is_active = state.members.contains_key(&member_public_key);
+                    if !is_owner
+                        || !owner_is_active
+                        || !target_is_active
+                        || !state.moderators.contains(&member_public_key)
+                    {
+                        state.rejected_events += 1;
+                        continue;
+                    }
+                    state
+                        .moderator_permissions
+                        .insert(member_public_key, permissions);
                 }
                 GroupEventPayload::MessageDeleted { message_event_id } => {
                     let is_owner =
                         state.owner_public_key.as_deref() == Some(event.author_public_key.as_str());
-                    let can_moderate =
-                        is_owner || state.moderators.contains(&event.author_public_key);
+                    let can_remove_messages = is_owner
+                        || state
+                            .moderator_permissions_for(&event.author_public_key)
+                            .is_some_and(|permissions| {
+                                permissions.review_reports_and_remove_messages
+                            });
                     let is_active = state.members.contains_key(&event.author_public_key);
                     let target_is_own = state.messages.iter().any(|message| {
                         message.event_id == message_event_id
                             && message.author_public_key == event.author_public_key
                     });
-                    if (!can_moderate && !target_is_own) || !is_active {
+                    if (!can_remove_messages && !target_is_own) || !is_active {
                         state.rejected_events += 1;
                         continue;
                     }
@@ -3002,11 +3116,15 @@ impl GroupState {
                 GroupEventPayload::ReportResolved { report_event_id } => {
                     let is_owner =
                         state.owner_public_key.as_deref() == Some(event.author_public_key.as_str());
-                    let can_moderate =
-                        is_owner || state.moderators.contains(&event.author_public_key);
+                    let can_review_reports = is_owner
+                        || state
+                            .moderator_permissions_for(&event.author_public_key)
+                            .is_some_and(|permissions| {
+                                permissions.review_reports_and_remove_messages
+                            });
                     let is_active = state.members.contains_key(&event.author_public_key);
                     let previous_length = state.reports.len();
-                    if !can_moderate || !is_active {
+                    if !can_review_reports || !is_active {
                         state.rejected_events += 1;
                         continue;
                     }
@@ -3033,13 +3151,15 @@ impl GroupState {
                 } => {
                     let is_owner =
                         state.owner_public_key.as_deref() == Some(event.author_public_key.as_str());
-                    let can_moderate =
-                        is_owner || state.moderators.contains(&event.author_public_key);
+                    let can_ban = is_owner
+                        || state
+                            .moderator_permissions_for(&event.author_public_key)
+                            .is_some_and(|permissions| permissions.ban_members);
                     let actor_is_active = state.members.contains_key(&event.author_public_key);
                     let target_is_owner =
                         state.owner_public_key.as_deref() == Some(member_public_key.as_str());
                     let target_is_moderator = state.moderators.contains(&member_public_key);
-                    if !can_moderate
+                    if !can_ban
                         || !actor_is_active
                         || target_is_owner
                         || (!is_owner && target_is_moderator)
@@ -3053,6 +3173,7 @@ impl GroupState {
                         .remove(&member_public_key)
                         .expect("active banned member was checked");
                     state.moderators.remove(&member_public_key);
+                    state.moderator_permissions.remove(&member_public_key);
                     state.banned_members.insert(member_public_key.clone());
                     state
                         .banned_profiles
@@ -3067,9 +3188,13 @@ impl GroupState {
                 GroupEventPayload::MemberUnbanned { member_public_key } => {
                     let is_owner =
                         state.owner_public_key.as_deref() == Some(event.author_public_key.as_str());
-                    let owner_is_active = state.members.contains_key(&event.author_public_key);
-                    if !is_owner
-                        || !owner_is_active
+                    let can_unban = is_owner
+                        || state
+                            .moderator_permissions_for(&event.author_public_key)
+                            .is_some_and(|permissions| permissions.unban_members);
+                    let actor_is_active = state.members.contains_key(&event.author_public_key);
+                    if !can_unban
+                        || !actor_is_active
                         || !state.banned_members.remove(&member_public_key)
                     {
                         state.rejected_events += 1;
@@ -3082,6 +3207,7 @@ impl GroupState {
                         state.rejected_events += 1;
                     } else {
                         state.moderators.remove(&event.author_public_key);
+                        state.moderator_permissions.remove(&event.author_public_key);
                     }
                 }
                 GroupEventPayload::DirectMessage { .. }

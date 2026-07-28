@@ -644,7 +644,7 @@ button:disabled { cursor: default; opacity: 0.48; }
 .device-session-row > button { padding: 6px 8px; border-radius: 7px; background: rgba(255,92,103,.1); color: #ff9299; font-size: 9.5px; }
 .device-session-row > button.confirm { background: #d94b58; color: #fff; }
 .group-settings-tabs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 3px; padding: 3px; border-radius: 10px; background: rgba(0,0,0,.16); }
-.group-settings-tabs.group-tabs { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.group-settings-tabs.group-tabs { grid-template-columns: repeat(auto-fit, minmax(76px, 1fr)); }
 .group-settings-tabs.user-tabs { grid-template-columns: repeat(6, minmax(0, 1fr)); }
 .group-settings-tabs.group-tabs button { min-width: 0; }
 .group-settings-tabs.user-tabs button { min-width: 0; }
@@ -727,6 +727,22 @@ button:disabled { cursor: default; opacity: 0.48; }
 .banned-user-row > button { padding: 6px 8px; border-radius: 7px; background: rgba(255,255,255,.07); color: #d8d2dc; font-size: 10.5px; }
 .banned-user-row > button:hover { background: rgba(255,255,255,.11); color: #fff; }
 .empty-banned-users { margin: 0; padding: 15px 10px; border-radius: 10px; background: rgba(255,255,255,.025); color: var(--faint); text-align: center; font-size: 11px; }
+.moderator-permissions-settings { gap: 10px; }
+.moderator-permissions-intro { display: flex; flex-direction: column; gap: 3px; padding: 2px 2px 4px; }
+.moderator-permissions-intro strong { font-size: 12px; }
+.moderator-permissions-intro small { color: var(--muted); font-size: 10.5px; line-height: 1.4; }
+.moderator-permission-card { display: flex; flex-direction: column; gap: 9px; padding: 10px; border-radius: 12px; background: rgba(255,255,255,.035); }
+.moderator-permission-person { display: flex; width: 100%; align-items: center; gap: 9px; padding: 0; background: transparent; color: inherit; text-align: left; }
+.moderator-permission-person > svg { flex: none; color: var(--muted); transition: transform .15s ease; }
+.moderator-permission-person > svg.expanded { transform: rotate(90deg); }
+.moderator-permission-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
+.moderator-permission-person strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.moderator-permission-person small { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.moderator-presets { display: flex; gap: 6px; }
+.moderator-presets button { padding: 6px 9px; border-radius: 7px; background: rgba(255,255,255,.07); color: #d8d2dc; font-size: 10px; }
+.moderator-presets button:hover { background: rgba(255,255,255,.11); color: #fff; }
+.moderator-permission-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.moderator-permission-list .settings-toggle-row { min-width: 0; padding: 9px 10px; }
 .image-picker { position: relative; padding: 0; background: transparent; }
 .image-picker > .avatar { display: grid; }
 .image-picker > i { position: absolute; right: -1px; bottom: 2px; display: grid; place-items: center; width: 28px; height: 28px; border: 3px solid #211f27; border-radius: 50%; background: var(--accent); color: var(--accent-contrast); }

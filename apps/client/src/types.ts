@@ -121,6 +121,20 @@ export type MemberSummary = {
   accepts_direct_messages: boolean;
   direct_message_policy: DirectMessagePolicy;
   is_moderator: boolean;
+  moderator_permissions?: ModeratorPermissions | null;
+};
+
+export type ModeratorPermissions = {
+  edit_group_identity: boolean;
+  edit_group_appearance: boolean;
+  edit_group_rules: boolean;
+  edit_group_general_settings: boolean;
+  create_topics: boolean;
+  edit_topics: boolean;
+  delete_topics: boolean;
+  review_reports_and_remove_messages: boolean;
+  ban_members: boolean;
+  unban_members: boolean;
 };
 
 export type MediaChunk = {

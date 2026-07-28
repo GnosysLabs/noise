@@ -100,6 +100,7 @@ import type {
   MediaChunk,
   MemberSummary,
   MessageSummary,
+  ModeratorPermissions,
   ProfileAlbumData,
   ProfileAlbumItem,
   ProfileImage,
@@ -162,6 +163,67 @@ type ForwardDestination =
       publicKey: string;
       label: string;
     };
+
+const DEFAULT_MODERATOR_PERMISSIONS: ModeratorPermissions = {
+  edit_group_identity: false,
+  edit_group_appearance: false,
+  edit_group_rules: false,
+  edit_group_general_settings: false,
+  create_topics: true,
+  edit_topics: true,
+  delete_topics: true,
+  review_reports_and_remove_messages: true,
+  ban_members: true,
+  unban_members: false,
+};
+
+const BASIC_MODERATOR_PERMISSIONS: ModeratorPermissions = {
+  edit_group_identity: false,
+  edit_group_appearance: false,
+  edit_group_rules: false,
+  edit_group_general_settings: false,
+  create_topics: false,
+  edit_topics: false,
+  delete_topics: false,
+  review_reports_and_remove_messages: true,
+  ban_members: true,
+  unban_members: false,
+};
+
+const MANAGER_MODERATOR_PERMISSIONS: ModeratorPermissions = {
+  edit_group_identity: true,
+  edit_group_appearance: true,
+  edit_group_rules: true,
+  edit_group_general_settings: true,
+  create_topics: true,
+  edit_topics: true,
+  delete_topics: true,
+  review_reports_and_remove_messages: true,
+  ban_members: true,
+  unban_members: true,
+};
+
+const MODERATOR_PERMISSION_OPTIONS: Array<{
+  key: keyof ModeratorPermissions;
+  label: string;
+  detail: string;
+}> = [
+  { key: "edit_group_identity", label: "edit group identity", detail: "change the group name, description, and icon" },
+  { key: "edit_group_appearance", label: "edit group appearance", detail: "change backgrounds and the accent color" },
+  { key: "edit_group_rules", label: "edit group rules", detail: "add, change, and remove group rules" },
+  { key: "edit_group_general_settings", label: "edit general settings", detail: "control whether members can send messages and media" },
+  { key: "create_topics", label: "create topics", detail: "add new shared topics" },
+  { key: "edit_topics", label: "edit topics", detail: "rename, lock, and rearrange topics" },
+  { key: "delete_topics", label: "delete topics", detail: "archive topics for everyone" },
+  { key: "review_reports_and_remove_messages", label: "review reports and remove messages", detail: "see the report queue and remove reported or other messages" },
+  { key: "ban_members", label: "ban members", detail: "ban regular members from the group" },
+  { key: "unban_members", label: "unban members", detail: "restore previously banned identities" },
+];
+
+function moderatorPermissions(member: MemberSummary | undefined): ModeratorPermissions | null {
+  if (!member?.is_moderator) return null;
+  return member.moderator_permissions ?? DEFAULT_MODERATOR_PERMISSIONS;
+}
 
 const REPORT_CATEGORIES: Array<{
   value: SafetyReportCategory;
@@ -2026,7 +2088,11 @@ export default function App() {
         ...current,
         members: current.members.map((member) =>
           member.public_key === memberPublicKey
-            ? { ...member, is_moderator: enabled }
+            ? {
+                ...member,
+                is_moderator: enabled,
+                moderator_permissions: enabled ? DEFAULT_MODERATOR_PERMISSIONS : null,
+              }
             : member
         ),
       };
@@ -4329,6 +4395,12 @@ export default function App() {
       };
     }),
   } : summary;
+  const selectedSelfMember = selectedConversationState?.members.find(
+    (member) => member.public_key === summary.identity.public_key,
+  );
+  const selectedModeratorPermissions = moderatorPermissions(selectedSelfMember);
+  const selectedIsFounder =
+    selectedConversationState?.group.owner_public_key === summary.identity.public_key;
 
   return (
     <div className={`app-shell ${appBackgroundSource ? "group-background-active" : ""}`} style={activeAccentStyle}>
@@ -4825,6 +4897,8 @@ export default function App() {
       {dialog?.type === "topic" && (
         <TopicSettingsDialog
           topic={dialog.topic}
+          canEdit={selectedIsFounder || selectedModeratorPermissions?.edit_topics === true}
+          canArchive={selectedIsFounder || selectedModeratorPermissions?.delete_topics === true}
           busy={busy}
           onClose={() => setDialog(null)}
           onSave={(name, icon, locked) => perform(async () => {
@@ -4856,6 +4930,11 @@ export default function App() {
       {dialog?.type === "group" && (
         <GroupSettingsDialog
           group={dialog.group}
+          isFounder={selectedIsFounder}
+          permissions={selectedModeratorPermissions}
+          members={selectedConversationState?.group.group_id === dialog.group.group_id
+            ? selectedConversationState.members
+            : []}
           explicitContentEnabled={summary.adult_access.explicit_content_enabled}
           bannedMembers={conversation?.group.group_id === dialog.group.group_id ? conversation.banned_members : []}
           presenceStatuses={selectedPresenceStatuses}
@@ -4871,6 +4950,15 @@ export default function App() {
             setSummary(local);
             const updatedGroup = local.groups.find((group) => group.group_id === dialog.group.group_id);
             if (updatedGroup) setDialog({ type: "group", group: updatedGroup });
+          })}
+          onSetModeratorPermissions={(member, permissions) => perform(async () => {
+            await noise({
+              action: "set_moderator_permissions",
+              member_public_key: member.public_key,
+              permissions,
+              relays,
+            });
+            await refreshCachedGroup(dialog.group.group_id);
           })}
           onSave={(name, description, accentColor, contentRating, avatar, removeAvatar, background, removeBackground, mobileBackground, removeMobileBackground, membersCanSendMessages, membersCanSendMedia) =>
             perform(async () => {
@@ -4913,7 +5001,7 @@ export default function App() {
       {dialog?.type === "rules" && (
         <RulesDialog
           group={dialog.group}
-          canEdit={dialog.group.owner_public_key === summary.identity.public_key}
+          canEdit={selectedIsFounder || selectedModeratorPermissions?.edit_group_rules === true}
           busy={busy}
           onClose={() => setDialog(null)}
           onSave={(rules) =>
@@ -5450,11 +5538,21 @@ function Sidebar({
   onSelectDirect: (direct: DirectSummary) => void;
 }) {
   const hasUnreadDirects = summary.directs.some((direct) => direct.has_unread);
-  const canManageTopics = conversation?.group.owner_public_key === summary.identity.public_key
-    || conversation?.members.some(
-      (member) => member.public_key === summary.identity.public_key && member.is_moderator,
-    ) === true;
-  const canReorderTopics = conversation?.group.owner_public_key === summary.identity.public_key;
+  const isGroupFounder =
+    conversation?.group.owner_public_key === summary.identity.public_key;
+  const selfModeratorPermissions = moderatorPermissions(
+    conversation?.members.find(
+      (member) => member.public_key === summary.identity.public_key,
+    ),
+  );
+  const canCreateTopics = isGroupFounder
+    || selfModeratorPermissions?.create_topics === true;
+  const canEditTopics = isGroupFounder
+    || selfModeratorPermissions?.edit_topics === true;
+  const canDeleteTopics = isGroupFounder
+    || selfModeratorPermissions?.delete_topics === true;
+  const canManageTopics = canEditTopics || canDeleteTopics;
+  const canReorderTopics = canEditTopics;
   const [rearrangingGroups, setRearrangingGroups] = useState(false);
   const [draggedGroupId, setDraggedGroupId] = useState<string | null>(null);
   const [groupDropTarget, setGroupDropTarget] = useState<{ groupId: string; after: boolean } | null>(null);
@@ -5744,7 +5842,7 @@ function Sidebar({
                       )}
                     </div>
                   ))}
-                  {canManageTopics && (
+                  {canCreateTopics && (
                     <button className="topic-create" onClick={() => onCreateTopic(group)}>
                       <Plus size={12} /> new topic
                     </button>
@@ -6389,12 +6487,24 @@ function ConversationPanel({
     if (messageList.atBottom && unreadCount > 0) onReachedBottom();
   }, [conversation.messages.length, messageList.atBottom, onReachedBottom, unreadCount]);
   const selfMember = conversation.members.find((member) => member.public_key === selfPublicKey);
-  const canModerate = canEditGroup || selfMember?.is_moderator === true;
-  const topicAllowsPosting = !topic?.locked || canModerate;
+  const selfPermissions = moderatorPermissions(selfMember);
+  const isModerator = selfMember?.is_moderator === true;
+  const canReviewReports = canEditGroup
+    || selfPermissions?.review_reports_and_remove_messages === true;
+  const canBanMembers = canEditGroup || selfPermissions?.ban_members === true;
+  const canEditGroupSettings = canEditGroup
+    || selfPermissions?.edit_group_identity === true
+    || selfPermissions?.edit_group_appearance === true
+    || selfPermissions?.edit_group_general_settings === true
+    || selfPermissions?.unban_members === true;
+  const canManageCurrentTopic = canEditGroup
+    || selfPermissions?.edit_topics === true
+    || selfPermissions?.delete_topics === true;
+  const topicAllowsPosting = !topic?.locked || canEditGroup || isModerator;
   const canSendMessages = topicAllowsPosting
-    && (canModerate || conversation.group.members_can_send_messages);
+    && (canEditGroup || isModerator || conversation.group.members_can_send_messages);
   const canSendMedia = topicAllowsPosting
-    && (canModerate || conversation.group.members_can_send_media);
+    && (canEditGroup || isModerator || conversation.group.members_can_send_media);
   const sortedMembers = [...conversation.members].sort((left, right) => {
     const roleRank = (member: MemberSummary) =>
       member.public_key === conversation.group.owner_public_key ? 0 : member.is_moderator ? 1 : 2;
@@ -6534,9 +6644,9 @@ function ConversationPanel({
           </span>
         </div>
         <div className="chat-header-actions">
-          {canModerate && <button className={`icon-button media-button reports-button ${conversation.reports.length ? "has-reports" : ""}`} onClick={onReports} aria-label="moderation reports" title="moderation reports"><TriangleAlert size={17} />{conversation.reports.length > 0 && <i />}</button>}
-          {canEditGroup && <button className="icon-button media-button" onClick={onGroupSettings} aria-label="group settings" title="group settings"><Settings2 size={17} /></button>}
-          {canModerate && topic && onTopicSettings && <button className="icon-button media-button" onClick={onTopicSettings} aria-label="topic settings" title="topic settings"><MessageCircle size={17} /></button>}
+          {canReviewReports && <button className={`icon-button media-button reports-button ${conversation.reports.length ? "has-reports" : ""}`} onClick={onReports} aria-label="moderation reports" title="moderation reports"><TriangleAlert size={17} />{conversation.reports.length > 0 && <i />}</button>}
+          {canEditGroupSettings && <button className="icon-button media-button" onClick={onGroupSettings} aria-label="group settings" title="group settings"><Settings2 size={17} /></button>}
+          {canManageCurrentTopic && topic && onTopicSettings && <button className="icon-button media-button" onClick={onTopicSettings} aria-label="topic settings" title="topic settings"><MessageCircle size={17} /></button>}
           <button className="icon-button media-button" onClick={onMedia} aria-label="group media" title="group media"><Images size={17} /></button>
           <button className="rules-button" onClick={onRules}>Rules</button>
           {busy && <LoaderCircle className="spinner" size={14} />}
@@ -6621,7 +6731,7 @@ function ConversationPanel({
         x={memberMenu.x}
         y={memberMenu.y}
         canDesignate={canEditGroup}
-        canBan={canModerate && memberMenu.member.public_key !== conversation.group.owner_public_key && (canEditGroup || !memberMenu.member.is_moderator)}
+        canBan={canBanMembers && memberMenu.member.public_key !== conversation.group.owner_public_key && (canEditGroup || !memberMenu.member.is_moderator)}
         onClose={() => setMemberMenu(null)}
         onMessage={() => { onMessage(memberMenu.member); setMemberMenu(null); }}
         onBlock={() => { onBlock(memberMenu.member); setMemberMenu(null); }}
@@ -6644,7 +6754,7 @@ function ConversationPanel({
         onReply={() => { setReplyingTo(messageMenu.message); setMessageMenu(null); window.setTimeout(() => composerInput.current?.focus(), 0); }}
         onForward={() => { onForward(messageMenu.message); setMessageMenu(null); }}
         onDownload={messageMenu.message.attachment ? () => onDownload(messageMenu.message) : undefined}
-        onReport={!canModerate && messageMenu.message.author_public_key !== selfPublicKey && !conversation.reported_message_event_ids.includes(messageMenu.message.event_id) ? () => { onReport(messageMenu.message); setMessageMenu(null); } : undefined}
+        onReport={!isModerator && !canEditGroup && messageMenu.message.author_public_key !== selfPublicKey && !conversation.reported_message_event_ids.includes(messageMenu.message.event_id) ? () => { onReport(messageMenu.message); setMessageMenu(null); } : undefined}
         onBlock={messageMenu.message.author_public_key !== selfPublicKey ? () => {
           onBlock({
             public_key: messageMenu.message.author_public_key,
@@ -6658,10 +6768,10 @@ function ConversationPanel({
           });
           setMessageMenu(null);
         } : undefined}
-        onDelete={(canModerate || messageMenu.message.author_public_key === selfPublicKey) ? () => { onDeleteMessage(messageMenu.message); setMessageMenu(null); } : undefined}
+        onDelete={(canReviewReports || messageMenu.message.author_public_key === selfPublicKey) ? () => { onDeleteMessage(messageMenu.message); setMessageMenu(null); } : undefined}
         onBan={(() => {
           const member = conversation.members.find((candidate) => candidate.public_key === messageMenu.message.author_public_key);
-          const canBanAuthor = member
+          const canBanAuthor = canBanMembers && member
             && member.public_key !== selfPublicKey
             && member.public_key !== conversation.group.owner_public_key
             && (canEditGroup || !member.is_moderator);
@@ -10195,8 +10305,52 @@ function SettingsDialog({ profile, adultAccess, devices, blockedPeople, busy, on
   );
 }
 
-function GroupSettingsDialog({ group, explicitContentEnabled, bannedMembers, presenceStatuses, busy, onClose, onSave, onUnban, onRotateFrequency }: { group: GroupSummary; explicitContentEnabled: boolean; bannedMembers: BannedMemberSummary[]; presenceStatuses: Map<string, PresenceStatus>; busy: boolean; onClose: () => void; onSave: (name: string, description: string, accentColor: string, contentRating: GroupContentRating, avatar: string | null, removeAvatar: boolean, background: string | null, removeBackground: boolean, mobileBackground: string | null, removeMobileBackground: boolean, membersCanSendMessages: boolean, membersCanSendMedia: boolean) => Promise<boolean>; onUnban: (member: BannedMemberSummary) => Promise<boolean>; onRotateFrequency: (revokeOnly: boolean) => Promise<boolean> }) {
-  const [tab, setTab] = useState<"identity" | "appearance" | "general" | "banned">("identity");
+function GroupSettingsDialog({
+  group,
+  isFounder,
+  permissions,
+  members,
+  explicitContentEnabled,
+  bannedMembers,
+  presenceStatuses,
+  busy,
+  onClose,
+  onSave,
+  onUnban,
+  onRotateFrequency,
+  onSetModeratorPermissions,
+}: {
+  group: GroupSummary;
+  isFounder: boolean;
+  permissions: ModeratorPermissions | null;
+  members: MemberSummary[];
+  explicitContentEnabled: boolean;
+  bannedMembers: BannedMemberSummary[];
+  presenceStatuses: Map<string, PresenceStatus>;
+  busy: boolean;
+  onClose: () => void;
+  onSave: (name: string, description: string, accentColor: string, contentRating: GroupContentRating, avatar: string | null, removeAvatar: boolean, background: string | null, removeBackground: boolean, mobileBackground: string | null, removeMobileBackground: boolean, membersCanSendMessages: boolean, membersCanSendMedia: boolean) => Promise<boolean>;
+  onUnban: (member: BannedMemberSummary) => Promise<boolean>;
+  onRotateFrequency: (revokeOnly: boolean) => Promise<boolean>;
+  onSetModeratorPermissions: (member: MemberSummary, permissions: ModeratorPermissions) => Promise<boolean>;
+}) {
+  type GroupSettingsTab = "identity" | "appearance" | "general" | "moderators" | "banned";
+  const canEditIdentity = isFounder || permissions?.edit_group_identity === true;
+  const canEditAppearance = isFounder || permissions?.edit_group_appearance === true;
+  const canEditGeneral = isFounder || permissions?.edit_group_general_settings === true;
+  const canUnban = isFounder || permissions?.unban_members === true;
+  const firstTab: GroupSettingsTab = canEditIdentity
+    ? "identity"
+    : canEditAppearance
+      ? "appearance"
+      : canEditGeneral
+        ? "general"
+        : canUnban
+          ? "banned"
+          : "identity";
+  const [tab, setTab] = useState<GroupSettingsTab>(firstTab);
+  const [permissionDrafts, setPermissionDrafts] = useState<Record<string, ModeratorPermissions>>({});
+  const [expandedModeratorKey, setExpandedModeratorKey] = useState<string | null>(null);
   const [revokeArmed, setRevokeArmed] = useState(false);
   const [name, setName] = useState(group.name);
   const [description, setDescription] = useState(group.description);
@@ -10220,14 +10374,31 @@ function GroupSettingsDialog({ group, explicitContentEnabled, bannedMembers, pre
     || background.removed
     || mobileBackground.base64 !== null
     || mobileBackground.removed;
+  const moderators = members.filter(
+    (member) => member.is_moderator && member.public_key !== group.owner_public_key,
+  );
+  const currentPermissions = (member: MemberSummary) =>
+    permissionDrafts[member.public_key] ?? moderatorPermissions(member) ?? DEFAULT_MODERATOR_PERMISSIONS;
+  const saveModeratorPermissions = (
+    member: MemberSummary,
+    next: ModeratorPermissions,
+  ) => {
+    const previous = currentPermissions(member);
+    setPermissionDrafts((current) => ({ ...current, [member.public_key]: next }));
+    void onSetModeratorPermissions(member, next).then((saved) => {
+      if (saved) return;
+      setPermissionDrafts((current) => ({ ...current, [member.public_key]: previous }));
+    });
+  };
   return (
     <Modal onClose={onClose} className="group-settings-modal">
       <DialogHeading icon={<Settings2 />} title="group settings" detail={group.name} />
       <div className="group-settings-tabs group-tabs" role="tablist" aria-label="group settings sections">
-        <button className={tab === "identity" ? "active" : ""} role="tab" aria-selected={tab === "identity"} onClick={() => setTab("identity")}>Identity</button>
-        <button className={tab === "appearance" ? "active" : ""} role="tab" aria-selected={tab === "appearance"} onClick={() => setTab("appearance")}>Appearance</button>
-        <button className={tab === "general" ? "active" : ""} role="tab" aria-selected={tab === "general"} onClick={() => setTab("general")}>General</button>
-        <button className={tab === "banned" ? "active" : ""} role="tab" aria-selected={tab === "banned"} onClick={() => setTab("banned")}>Banned{bannedMembers.length > 0 && <i>{bannedMembers.length}</i>}</button>
+        {canEditIdentity && <button className={tab === "identity" ? "active" : ""} role="tab" aria-selected={tab === "identity"} onClick={() => setTab("identity")}>Identity</button>}
+        {canEditAppearance && <button className={tab === "appearance" ? "active" : ""} role="tab" aria-selected={tab === "appearance"} onClick={() => setTab("appearance")}>Appearance</button>}
+        {canEditGeneral && <button className={tab === "general" ? "active" : ""} role="tab" aria-selected={tab === "general"} onClick={() => setTab("general")}>General</button>}
+        {isFounder && <button className={tab === "moderators" ? "active" : ""} role="tab" aria-selected={tab === "moderators"} onClick={() => setTab("moderators")}>Moderators</button>}
+        {canUnban && <button className={tab === "banned" ? "active" : ""} role="tab" aria-selected={tab === "banned"} onClick={() => setTab("banned")}>Banned{bannedMembers.length > 0 && <i>{bannedMembers.length}</i>}</button>}
       </div>
       <div className="group-settings-panel" role="tabpanel">
         {tab === "identity" && <div className="group-settings-identity">
@@ -10242,7 +10413,7 @@ function GroupSettingsDialog({ group, explicitContentEnabled, bannedMembers, pre
             <LabeledArea label="group name" count={`${name.length}/80`}><input disabled={busy} value={name} maxLength={80} onChange={(event) => setName(event.target.value)} /></LabeledArea>
           </div>
           <LabeledArea label="description" count={`${description.length}/200`}><textarea disabled={busy} value={description} maxLength={200} onChange={(event) => setDescription(event.target.value)} /></LabeledArea>
-          <section className="settings-section group-identity-frequency">
+          {isFounder && <section className="settings-section group-identity-frequency">
             <h3>frequency</h3>
             <div className="group-frequency-settings">
               <div className="group-frequency-value">
@@ -10256,7 +10427,7 @@ function GroupSettingsDialog({ group, explicitContentEnabled, bannedMembers, pre
               <p>{group.frequency ? "Anyone with this code can join the group." : "Generate one to revoke any older invitation and create a code this device can manage."}</p>
               {!group.remote_deletion_supported && <small className="legacy-frequency-note">This legacy group cannot authenticate frequency rotation.</small>}
             </div>
-          </section>
+          </section>}
         </div>}
         {tab === "appearance" && <div className="group-settings-appearance">
           <div className="group-background-pickers">
@@ -10278,8 +10449,50 @@ function GroupSettingsDialog({ group, explicitContentEnabled, bannedMembers, pre
           <h3>what can members do?</h3>
           <label className="settings-toggle-row"><span><strong>send messages</strong><small>moderators can always send messages</small></span><input type="checkbox" role="switch" checked={membersCanSendMessages} onChange={(event) => setMembersCanSendMessages(event.target.checked)} /></label>
           <label className="settings-toggle-row"><span><strong>send media</strong><small>moderators can always upload media</small></span><input type="checkbox" role="switch" checked={membersCanSendMedia} onChange={(event) => setMembersCanSendMedia(event.target.checked)} /></label>
-          <h3>content label</h3>
-          <label className="settings-toggle-row"><span><strong>sexual content or nudity</strong><small>{group.content_rating === "explicit" ? "this permanent flame marker cannot be removed" : explicitContentEnabled ? "permits sexual content or nudity, permanently marks the group, and replaces its frequency" : "enable groups with sexual content or nudity in your Content settings first"}</small></span><input type="checkbox" role="switch" checked={contentRating === "explicit"} disabled={group.content_rating === "explicit" || !explicitContentEnabled} onChange={(event) => setContentRating(event.target.checked ? "explicit" : "general")} /></label>
+          {isFounder && <><h3>content label</h3>
+          <label className="settings-toggle-row"><span><strong>sexual content or nudity</strong><small>{group.content_rating === "explicit" ? "this permanent flame marker cannot be removed" : explicitContentEnabled ? "permits sexual content or nudity, permanently marks the group, and replaces its frequency" : "enable groups with sexual content or nudity in your Content settings first"}</small></span><input type="checkbox" role="switch" checked={contentRating === "explicit"} disabled={group.content_rating === "explicit" || !explicitContentEnabled} onChange={(event) => setContentRating(event.target.checked ? "explicit" : "general")} /></label></>}
+        </section>}
+        {tab === "moderators" && isFounder && <section className="settings-section moderator-permissions-settings">
+          <div className="moderator-permissions-intro">
+            <strong>moderator permissions</strong>
+            <small>Choose what each moderator can manage. Adding or removing moderators remains founder-only.</small>
+          </div>
+          {moderators.length ? moderators.map((member) => {
+            const memberPermissions = currentPermissions(member);
+            const expanded = expandedModeratorKey === member.public_key;
+            return <article className="moderator-permission-card" key={member.public_key}>
+              <button
+                type="button"
+                className="moderator-permission-person"
+                aria-expanded={expanded}
+                onClick={() => setExpandedModeratorKey(expanded ? null : member.public_key)}
+              >
+                <PresenceAvatar name={member.username} image={member.avatar} size={34} status={presenceStatuses.get(member.public_key) ?? "offline"} />
+                <span className="moderator-permission-copy"><strong>{member.username}</strong><small>{member.bio || "group moderator"}</small></span>
+                <ChevronRight className={expanded ? "expanded" : ""} size={15} />
+              </button>
+              {expanded && <><div className="moderator-presets">
+                <button disabled={busy} onClick={() => saveModeratorPermissions(member, BASIC_MODERATOR_PERMISSIONS)}>basic</button>
+                <button disabled={busy} onClick={() => saveModeratorPermissions(member, DEFAULT_MODERATOR_PERMISSIONS)}>topics</button>
+                <button disabled={busy} onClick={() => saveModeratorPermissions(member, MANAGER_MODERATOR_PERMISSIONS)}>manager</button>
+              </div>
+              <div className="moderator-permission-list">
+                {MODERATOR_PERMISSION_OPTIONS.map((option) => <label className="settings-toggle-row" key={option.key}>
+                  <span><strong>{option.label}</strong><small>{option.detail}</small></span>
+                  <input
+                    type="checkbox"
+                    role="switch"
+                    checked={memberPermissions[option.key]}
+                    disabled={busy}
+                    onChange={(event) => saveModeratorPermissions(member, {
+                      ...memberPermissions,
+                      [option.key]: event.target.checked,
+                    })}
+                  />
+                </label>)}
+              </div></>}
+            </article>;
+          }) : <p className="empty-banned-users">no moderators yet — make someone a moderator from their member menu first</p>}
         </section>}
         {tab === "banned" && <section className="settings-section">
           {bannedMembers.length ? <div className="banned-user-list">{bannedMembers.map((member) => <div className="banned-user-row" key={member.public_key}><PresenceAvatar name={member.username} image={member.avatar} size={30} status={presenceStatuses.get(member.public_key) ?? "offline"} /><span><strong>{member.username}</strong><small>{member.bio || "banned from this group"}</small></span><button disabled={busy} onClick={() => void onUnban(member)}>unban</button></div>)}</div> : <p className="empty-banned-users">no one is banned</p>}
@@ -10646,12 +10859,16 @@ function CreateTopicDialog({
 
 function TopicSettingsDialog({
   topic,
+  canEdit,
+  canArchive,
   busy,
   onClose,
   onSave,
   onArchive,
 }: {
   topic: TopicSummary;
+  canEdit: boolean;
+  canArchive: boolean;
   busy: boolean;
   onClose: () => void;
   onSave: (name: string, icon: string, locked: boolean) => Promise<boolean>;
@@ -10668,25 +10885,26 @@ function TopicSettingsDialog({
           <span className="topic-dialog-icon">{icon}</span>
           <span><strong>topic settings</strong><small>names are encrypted; membership stays shared</small></span>
         </div>
-        <TopicIconPicker value={icon} onChange={setIcon} />
+        {canEdit && <TopicIconPicker value={icon} onChange={setIcon} />}
         <label>
           <span>name</span>
           <input
             autoFocus
+            disabled={!canEdit}
             maxLength={80}
             value={name}
             onChange={(event) => setName(event.target.value)}
           />
         </label>
-        <label className="topic-lock-toggle">
+        {canEdit && <label className="topic-lock-toggle">
           <input
             type="checkbox"
             checked={locked}
             onChange={(event) => setLocked(event.target.checked)}
           />
           <span><strong>lock topic</strong><small>only moderators can post</small></span>
-        </label>
-        <button
+        </label>}
+        {canArchive && <button
           className="topic-archive danger"
           disabled={busy}
           onClick={() => {
@@ -10698,15 +10916,15 @@ function TopicSettingsDialog({
           }}
         >
           <Trash2 size={14} /> {archiveArmed ? "click again to archive" : "archive topic"}
-        </button>
+        </button>}
         <div className="dialog-actions">
-          <button className="secondary" disabled={busy} onClick={onClose}>cancel</button>
-          <button
+          <button className="secondary" disabled={busy} onClick={onClose}>{canEdit ? "cancel" : "close"}</button>
+          {canEdit && <button
             disabled={busy || !name.trim()}
             onClick={() => void onSave(name.trim(), icon, locked)}
           >
             {busy ? <LoaderCircle className="spinner" size={14} /> : <Check size={14} />} save
-          </button>
+          </button>}
         </div>
       </div>
     </Modal>
