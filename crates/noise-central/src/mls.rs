@@ -11,8 +11,8 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use deadpool_postgres::{GenericClient, Transaction};
 use noise_core::{
-    MlsControlLog, MlsEpochRecord, MlsGroupGenesis, MlsJoinRequest, MlsRemovalReason,
-    MlsRemovalRequest,
+    MlsControlLog, MlsEpochRecord, MlsExternalJoinPackage, MlsExternalJoinRequest, MlsGroupGenesis,
+    MlsJoinRequest, MlsRemovalReason, MlsRemovalRequest,
 };
 use tokio_postgres::error::SqlState;
 
@@ -352,9 +352,40 @@ pub async fn publish_epoch(
     headers: HeaderMap,
     Json(record): Json<MlsEpochRecord>,
 ) -> Result<StatusCode, ApiError> {
+    publish_epoch_inner(state, headers, record, None, None).await
+}
+
+pub async fn publish_external_join(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<MlsExternalJoinRequest>,
+) -> Result<StatusCode, ApiError> {
+    let locator = decode_hex_32(&request.invitation_locator, "invalid_invitation_locator")?;
+    publish_epoch_inner(
+        state,
+        headers,
+        request.epoch,
+        Some(locator),
+        Some(request.next_package),
+    )
+    .await
+}
+
+async fn publish_epoch_inner(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    record: MlsEpochRecord,
+    invitation_locator: Option<[u8; 32]>,
+    next_package: Option<MlsExternalJoinPackage>,
+) -> Result<StatusCode, ApiError> {
     record
         .verify()
         .map_err(|_| ApiError::bad_request("invalid_mls_epoch"))?;
+    if record.external_join != invitation_locator.is_some()
+        || record.external_join != next_package.is_some()
+    {
+        return Err(ApiError::bad_request("invalid_mls_epoch_authorization"));
+    }
     if record.member_accounts.len() > MAX_EPOCH_MEMBERS {
         return Err(ApiError::bad_request("mls_epoch_too_many_members"));
     }
@@ -362,6 +393,18 @@ pub async fn publish_epoch(
     let decoded = DecodedEpoch::new(&record)?;
     if decoded.author_public_key != session.identity_public_key {
         return Err(ApiError::bad_request("mls_author_mismatch"));
+    }
+    if let Some(package) = next_package.as_ref() {
+        package
+            .verify()
+            .map_err(|_| ApiError::bad_request("invalid_external_join_package"))?;
+        if package.group_id != record.bundle.group_id
+            || package.epoch != record.bundle.epoch
+            || package.control_record_id != record.record_id
+            || package.publisher_public_key != record.owner_public_key
+        {
+            return Err(ApiError::bad_request("invalid_external_join_package"));
+        }
     }
     let signed_wire_record = serde_json::to_vec(&record).map_err(ApiError::database)?;
     let created_at_millis = record.created_at_millis.to_string();
@@ -375,7 +418,11 @@ pub async fn publish_epoch(
         .await
         .map_err(ApiError::database)?;
     let transaction = client.transaction().await.map_err(ApiError::database)?;
-    let group_pk = member_group(&transaction, &session, &decoded.group_id, true, true).await?;
+    let group_pk = if let Some(locator) = invitation_locator {
+        invited_group(&transaction, &locator, &decoded.group_id, true).await?
+    } else {
+        member_group(&transaction, &session, &decoded.group_id, true, true).await?
+    };
     if exact_record_retry(
         &transaction,
         "noise.mls_epochs",
@@ -497,6 +544,37 @@ pub async fn publish_epoch(
         &member_account_ids,
     )
     .await?;
+    if let Some(package) = next_package {
+        let package_id = decode_hex_32(&package.package_id, "invalid_external_join_package")?;
+        let control_record_id =
+            decode_hex_32(&package.control_record_id, "invalid_external_join_package")?;
+        let package_epoch = package.epoch.to_string();
+        let package_wire = serde_json::to_vec(&package).map_err(ApiError::database)?;
+        transaction
+            .execute(
+                "INSERT INTO noise.mls_external_join_packages (
+                    package_id, group_pk, epoch, control_record_id,
+                    publisher_account_id, signed_wire_record
+                 ) VALUES ($1, $2, $3::text::numeric, $4, $5, $6)
+                 ON CONFLICT (group_pk) DO UPDATE
+                 SET package_id = EXCLUDED.package_id,
+                     epoch = EXCLUDED.epoch,
+                     control_record_id = EXCLUDED.control_record_id,
+                     publisher_account_id = EXCLUDED.publisher_account_id,
+                     signed_wire_record = EXCLUDED.signed_wire_record,
+                     accepted_at = clock_timestamp()",
+                &[
+                    &package_id.as_slice(),
+                    &group_pk,
+                    &package_epoch,
+                    &control_record_id.as_slice(),
+                    &session.account_id,
+                    &package_wire,
+                ],
+            )
+            .await
+            .map_err(mls_conflict)?;
+    }
     insert_outbox(
         &transaction,
         "mls.epoch.accepted",
@@ -511,6 +589,170 @@ pub async fn publish_epoch(
     .await?;
     transaction.commit().await.map_err(ApiError::database)?;
     Ok(StatusCode::ACCEPTED)
+}
+
+pub async fn publish_external_join_package(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(package): Json<MlsExternalJoinPackage>,
+) -> Result<StatusCode, ApiError> {
+    package
+        .verify()
+        .map_err(|_| ApiError::bad_request("invalid_external_join_package"))?;
+    let session = authenticate_session(&state, &headers).await?;
+    let publisher = decode_canonical_array::<32>(
+        &package.publisher_public_key,
+        "invalid_external_join_package",
+    )?;
+    if publisher != session.identity_public_key {
+        return Err(ApiError::bad_request("mls_author_mismatch"));
+    }
+    let group_id = decode_hex_32(&package.group_id, "invalid_external_join_package")?;
+    let package_id = decode_hex_32(&package.package_id, "invalid_external_join_package")?;
+    let control_record_id =
+        decode_hex_32(&package.control_record_id, "invalid_external_join_package")?;
+    let epoch = package.epoch.to_string();
+    let wire = serde_json::to_vec(&package).map_err(ApiError::database)?;
+
+    let mut client = state
+        .database
+        .pool
+        .get()
+        .await
+        .map_err(ApiError::database)?;
+    let transaction = client.transaction().await.map_err(ApiError::database)?;
+    let group_pk = member_group(&transaction, &session, &group_id, true, true).await?;
+    let head = transaction
+        .query_opt(
+            "SELECT record_id, epoch::text
+             FROM noise.mls_epochs
+             WHERE group_pk = $1
+             ORDER BY epoch DESC
+             LIMIT 1",
+            &[&group_pk],
+        )
+        .await
+        .map_err(ApiError::database)?;
+    let (head_record_id, head_epoch) = if let Some(head) = head {
+        let record_id: Vec<u8> = head.get(0);
+        let epoch = head
+            .get::<_, &str>(1)
+            .parse::<u64>()
+            .map_err(ApiError::database)?;
+        (record_id, epoch)
+    } else {
+        let genesis = transaction
+            .query_one(
+                "SELECT record_id
+                 FROM noise.mls_geneses
+                 WHERE group_pk = $1",
+                &[&group_pk],
+            )
+            .await
+            .map_err(ApiError::database)?;
+        (genesis.get(0), 0)
+    };
+    if control_record_id.as_slice() != head_record_id || package.epoch != head_epoch {
+        return Err(ApiError::conflict("mls_control_head_changed"));
+    }
+    transaction
+        .execute(
+            "INSERT INTO noise.mls_external_join_packages (
+                package_id, group_pk, epoch, control_record_id,
+                publisher_account_id, signed_wire_record
+             ) VALUES ($1, $2, $3::text::numeric, $4, $5, $6)
+             ON CONFLICT (group_pk) DO UPDATE
+             SET package_id = EXCLUDED.package_id,
+                 epoch = EXCLUDED.epoch,
+                 control_record_id = EXCLUDED.control_record_id,
+                 publisher_account_id = EXCLUDED.publisher_account_id,
+                 signed_wire_record = EXCLUDED.signed_wire_record,
+                 accepted_at = clock_timestamp()",
+            &[
+                &package_id.as_slice(),
+                &group_pk,
+                &epoch,
+                &control_record_id.as_slice(),
+                &session.account_id,
+                &wire,
+            ],
+        )
+        .await
+        .map_err(mls_conflict)?;
+    transaction.commit().await.map_err(ApiError::database)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+pub async fn external_join_package_by_invite(
+    State(state): State<Arc<AppState>>,
+    Path(locator): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<MlsExternalJoinPackage>, ApiError> {
+    let _session = authenticate_session(&state, &headers).await?;
+    let locator = decode_hex_32(&locator, "invalid_invitation_locator")?;
+    let client = state
+        .database
+        .pool
+        .get()
+        .await
+        .map_err(ApiError::database)?;
+    let row = client
+        .query_opt(
+            "SELECT p.signed_wire_record
+             FROM noise.legacy_invitations i
+             JOIN noise.groups g ON g.group_pk = i.group_pk
+             JOIN noise.mls_external_join_packages p ON p.group_pk = g.group_pk
+             LEFT JOIN noise.legacy_invite_rotations r
+               ON r.rotation_id = g.protocol_group_id
+             LEFT JOIN noise.group_restrictions gr
+               ON gr.group_pk = g.group_pk
+              AND (gr.expires_at IS NULL OR gr.expires_at > clock_timestamp())
+             WHERE i.lookup_hash = $1
+               AND (r.invitation_id IS NULL OR r.invitation_id = i.invitation_id)
+               AND g.lifecycle_state = 'active'
+               AND g.safety_state = 'normal'
+               AND gr.group_pk IS NULL",
+            &[&locator.as_slice()],
+        )
+        .await
+        .map_err(ApiError::database)?
+        .ok_or_else(|| ApiError::not_found("external_join_package_unavailable"))?;
+    let wire: Vec<u8> = row.get(0);
+    let package: MlsExternalJoinPackage =
+        serde_json::from_slice(&wire).map_err(ApiError::database)?;
+    package.verify().map_err(ApiError::database)?;
+    Ok(Json(package))
+}
+
+pub async fn external_join_package_for_member(
+    State(state): State<Arc<AppState>>,
+    Path(group_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<MlsExternalJoinPackage>, ApiError> {
+    let session = authenticate_session(&state, &headers).await?;
+    let group_id = decode_hex_32(&group_id, "invalid_group_id")?;
+    let client = state
+        .database
+        .pool
+        .get()
+        .await
+        .map_err(ApiError::database)?;
+    let group_pk = member_group(&client, &session, &group_id, false, true).await?;
+    let row = client
+        .query_opt(
+            "SELECT signed_wire_record
+             FROM noise.mls_external_join_packages
+             WHERE group_pk = $1",
+            &[&group_pk],
+        )
+        .await
+        .map_err(ApiError::database)?
+        .ok_or_else(|| ApiError::not_found("external_join_package_unavailable"))?;
+    let wire: Vec<u8> = row.get(0);
+    let package: MlsExternalJoinPackage =
+        serde_json::from_slice(&wire).map_err(ApiError::database)?;
+    package.verify().map_err(ApiError::database)?;
+    Ok(Json(package))
 }
 
 pub async fn control_log(
@@ -752,6 +994,41 @@ async fn control_group<C: GenericClient + Sync>(
         .map_err(ApiError::database)?
         .map(|row| row.get(0))
         .ok_or_else(|| ApiError::not_found("group_unavailable"))
+}
+
+async fn invited_group<C: GenericClient + Sync>(
+    client: &C,
+    invitation_locator: &[u8; 32],
+    group_id: &[u8; 32],
+    lock: bool,
+) -> Result<i64, ApiError> {
+    let lock_clause = if lock { " FOR UPDATE OF g" } else { "" };
+    let statement = format!(
+        "SELECT g.group_pk
+         FROM noise.legacy_invitations i
+         JOIN noise.groups g ON g.group_pk = i.group_pk
+         JOIN noise.mls_geneses mg ON mg.group_pk = g.group_pk
+         LEFT JOIN noise.legacy_invite_rotations r
+           ON r.rotation_id = g.protocol_group_id
+         LEFT JOIN noise.group_restrictions gr
+           ON gr.group_pk = g.group_pk
+          AND (gr.expires_at IS NULL OR gr.expires_at > clock_timestamp())
+         WHERE i.lookup_hash = $1
+           AND g.protocol_group_id = $2
+           AND (r.invitation_id IS NULL OR r.invitation_id = i.invitation_id)
+           AND g.lifecycle_state = 'active'
+           AND g.safety_state = 'normal'
+           AND gr.group_pk IS NULL{lock_clause}"
+    );
+    client
+        .query_opt(
+            &statement,
+            &[&invitation_locator.as_slice(), &group_id.as_slice()],
+        )
+        .await
+        .map_err(ApiError::database)?
+        .map(|row| row.get(0))
+        .ok_or_else(|| ApiError::not_found("invitation_not_found"))
 }
 
 async fn member_group<C: GenericClient + Sync>(

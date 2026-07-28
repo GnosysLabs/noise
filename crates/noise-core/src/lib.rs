@@ -24,8 +24,8 @@ pub use central_auth::{
 };
 pub use production_e2ee::{
     HistoryKeyLink, MlsAccountState, MlsCommitBundle, MlsControlLog, MlsDeviceCredential,
-    MlsEpochRecord, MlsEpochSummary, MlsGroupGenesis, MlsJoinRequest, MlsLegacyHistoryBridge,
-    MlsRemovalReason, MlsRemovalRequest,
+    MlsEpochRecord, MlsEpochSummary, MlsExternalJoinPackage, MlsExternalJoinRequest,
+    MlsGroupGenesis, MlsJoinRequest, MlsLegacyHistoryBridge, MlsRemovalReason, MlsRemovalRequest,
 };
 pub use safety::{
     SafetyDirectiveActionV1, SafetyDirectiveSigningKeyPair, SafetyDirectiveV1,

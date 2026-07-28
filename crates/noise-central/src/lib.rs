@@ -188,6 +188,19 @@ pub async fn build_app(config: &CentralConfig) -> anyhow::Result<Router> {
         )
         .route("/v2/mls/genesis", post(mls::publish_genesis))
         .route("/v2/mls/epochs", post(mls::publish_epoch))
+        .route("/v2/mls/external-joins", post(mls::publish_external_join))
+        .route(
+            "/v2/mls/external-join-packages",
+            post(mls::publish_external_join_package),
+        )
+        .route(
+            "/v2/mls/external-join-packages/by-invite/{locator}",
+            get(mls::external_join_package_by_invite),
+        )
+        .route(
+            "/v2/mls/groups/{group_id}/external-join-package",
+            get(mls::external_join_package_for_member),
+        )
         .route("/v2/mls/join-requests", post(mls::publish_join_request))
         .route(
             "/v2/mls/removal-requests",

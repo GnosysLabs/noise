@@ -30,6 +30,10 @@ The first runnable central-service layer implements:
 | `GET /v1/direct-events/latest` | Fetch the latest visible page for one authenticated direct-thread participant |
 | `POST /v2/mls/genesis` | Verify and establish one founder-signed MLS epoch-zero control record |
 | `POST /v2/mls/epochs` | Verify and append one authorized MLS epoch transition to the current head |
+| `POST /v2/mls/external-joins` | Verify a current invitation and append the frequency holder's self-authored external commit |
+| `POST /v2/mls/external-join-packages` | Store a current member's signed, frequency-encrypted continuity package for the current head |
+| `GET /v2/mls/external-join-packages/by-invite/{locator}` | Fetch the current continuity package through the active invitation |
+| `GET /v2/mls/groups/{group_id}/external-join-package` | Let a current member check whether the current head has a continuity package |
 | `POST /v2/mls/join-requests` | Store an authenticated account's signed group-scoped KeyPackage request |
 | `POST /v2/mls/removal-requests` | Store a current member's signed self-leave or founder-reviewed ban request |
 | `GET /v2/mls/groups/{group_id}` | Fetch and reverify the complete canonical MLS control log |
@@ -139,9 +143,9 @@ revealing account metadata.
 - Every accepted epoch stores its complete signed account-membership snapshot
   and atomically opens or closes current membership intervals before the
   transaction commits.
-- Join and removal requests never change membership by themselves. Any current
-  member may author an admission epoch; only the founder may author an epoch
-  that removes an account, matching the existing MLS protocol.
+- Join requests remain inert recovery records. A current invitation authorizes
+  its holder to append an external commit that only adds that holder. Only the
+  founder may author an epoch that removes an account.
 - Each accepted MLS object creates a durable outbox record in the same
   transaction. Control-log and request reads reverify stored signed objects
   before returning them.

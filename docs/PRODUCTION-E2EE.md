@@ -42,24 +42,19 @@ can obtain.
 Membership commits are serialized by the group control log. Clients must not
 merge two competing commits for the same parent epoch.
 
-Any account already inside the parent epoch may author a commit that only
-admits accounts, so a join never waits for one specific member to be online.
+A frequency holder authors its own MLS external commit. The central service
+accepts that commit only when the authenticated account presents the current
+invitation locator, the commit extends the exact current control head, and it
+only adds the joining account. No existing group member or device participates
+in admission.
+
 Only the founder may author a commit that removes accounts: members publish
 signed self-removal requests, moderators publish signed ban requests, and a
 founder client converts valid requests into MLS removal commits.
 
-Because a relay keeps the first epoch it accepts for a head, members take
-deterministic turns rather than racing. Every member derives the same order from
-the signed head record; the first-ranked member admits immediately and later
-ranks only step in when it stays absent. Competing commits still fail closed,
-and a device that merged a superseded commit discards its local group state and
-asks to be re-admitted instead of holding an archive key nobody else derives.
-
-Relays advertise whether they accept member-authored admissions. A client keeps
-admission with the founder until every relay it uses reports that capability, so
-a partially upgraded relay set cannot leave an epoch stranded on some replicas.
-A replica that missed an earlier epoch is treated as behind rather than forked,
-and clients replay the records it is missing.
+The central transaction lock admits only one child for a control head.
+Concurrent external joins automatically refetch the winning head and create a
+new external commit; the user is not asked to retry.
 
 ## History plane: backward-readable archive roots
 
@@ -125,22 +120,22 @@ Clients accept an event only when:
 
 ## Join by frequency
 
-A 12-digit frequency is a rendezvous code, not a lasting group encryption key.
-It locates and authenticates a short-lived join capability. It never becomes an
-archive root or MLS secret.
+A 12-digit frequency is a rendezvous code, not an MLS epoch secret. It opens the
+signed invitation and its history-wrapping key locally. That key is used only
+to open the current external-join continuity package; message events remain
+encrypted by MLS-derived archive roots.
 
 The production join flow is:
 
-1. the joining client creates an MLS KeyPackage;
-2. the frequency opens an encrypted join capability;
-3. the client publishes a signed join request containing that KeyPackage;
-4. the member whose turn it is validates the capability and current ban state
-   against the group's own moderation history;
-5. that member publishes an MLS add commit and Welcome; and
-6. the joining client enters the new epoch and receives its archive root.
-
-Members admit in the background for every group they belong to, not only the
-group open on screen, so admission does not depend on where anyone is looking.
+1. the frequency opens the signed encrypted invitation locally;
+2. the client fetches the current signed external-join package by invitation
+   locator;
+3. the frequency-held wrapping key opens the current archive root locally;
+4. the joining client creates and signs its own MLS external commit;
+5. the central service verifies the current invitation and atomically appends
+   the commit; and
+6. the epoch and its next continuity package commit in the same transaction,
+   and the client is immediately active.
 
 noise automatically revokes and replaces the join capability when a member is
 banned. Otherwise a banned person who retained the old frequency could simply
@@ -153,15 +148,15 @@ space.
 
 ## Existing-group migration
 
-Migration is a coordinated hard cut because the initial network is small:
+Existing MLS groups require one upgraded current member to publish a
+current-head continuity package once. The package contains public MLS
+GroupInfo and the current archive root encrypted under the invitation's
+history-wrapping key. It is signed by that member and stored by the central
+service only after current-membership and head checks.
 
-1. upgraded clients publish MLS KeyPackages for their noise identities;
-2. the founder creates the MLS group with the existing noise group ID;
-3. the founder adds every upgraded active member;
-4. the signed epoch-zero genesis wraps the legacy group secret under the first
-   MLS-derived archive root;
-5. new clients stop publishing legacy events; and
-6. once the cutover is confirmed, relays reject newly authored legacy events.
+New groups publish this package with epoch zero. Every accepted epoch causes a
+current client to replace it for the new head. Once the package exists, future
+frequency joins are independent of member presence.
 
 The legacy secret remains able to open legacy history by design. It cannot
 decrypt any event authored after cutover.

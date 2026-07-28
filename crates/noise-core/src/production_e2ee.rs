@@ -31,15 +31,22 @@ const MLS_DEVICE_CREDENTIAL_VERSION: u32 = 1;
 const HISTORY_LINK_VERSION: u32 = 1;
 const LEGACY_HISTORY_BRIDGE_VERSION: u32 = 1;
 const MLS_CONTROL_VERSION: u32 = 1;
+const EXTERNAL_JOIN_PACKAGE_VERSION: u32 = 1;
 const ARCHIVE_EXPORT_LABEL: &str = "xyz.gnosyslabs.noise.archive-root.v1";
 const ARCHIVE_LINK_CONTEXT: &str = "xyz.gnosyslabs.noise.archive-link.v1";
 const LEGACY_BRIDGE_CONTEXT: &str = "xyz.gnosyslabs.noise.legacy-history-bridge.v1";
+const EXTERNAL_JOIN_HISTORY_CONTEXT: &str = "xyz.gnosyslabs.noise.external-join-history.v1";
+const EXTERNAL_JOIN_PACKAGE_CONTEXT: &str = "xyz.gnosyslabs.noise.external-join-package.v1";
 const DEVICE_CREDENTIAL_CONTEXT: &str = "xyz.gnosyslabs.noise.mls-device-credential.v1";
 const JOIN_REQUEST_CONTEXT: &str = "xyz.gnosyslabs.noise.mls-join-request.v1";
 const REMOVAL_REQUEST_CONTEXT: &str = "xyz.gnosyslabs.noise.mls-removal-request.v1";
 const GENESIS_CONTEXT: &str = "xyz.gnosyslabs.noise.mls-genesis.v1";
 const EPOCH_RECORD_CONTEXT: &str = "xyz.gnosyslabs.noise.mls-epoch-record.v1";
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 #[derive(Debug)]
 struct NoiseMlsProvider {
@@ -201,6 +208,170 @@ pub struct MlsCommitBundle {
     pub commit_base64: String,
     pub welcome_base64: Option<String>,
     pub history_link: HistoryKeyLink,
+}
+
+/// A current-member-signed, frequency-encrypted bridge into the public MLS
+/// group state. It lets a frequency holder create its own external commit
+/// without another group member being online at join time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MlsExternalJoinPackage {
+    pub version: u32,
+    pub package_id: String,
+    pub group_id: String,
+    pub epoch: u64,
+    pub control_record_id: String,
+    pub publisher_public_key: String,
+    pub group_info_base64: String,
+    pub history_nonce_base64: String,
+    pub history_ciphertext_base64: String,
+    pub created_at_millis: u64,
+    pub signature_base64: String,
+}
+
+#[derive(Serialize)]
+struct UnsignedMlsExternalJoinPackage<'a> {
+    version: u32,
+    group_id: &'a str,
+    epoch: u64,
+    control_record_id: &'a str,
+    publisher_public_key: &'a str,
+    group_info_base64: &'a str,
+    history_nonce_base64: &'a str,
+    history_ciphertext_base64: &'a str,
+    created_at_millis: u64,
+}
+
+impl MlsExternalJoinPackage {
+    fn create(
+        identity: &Identity,
+        group: &GroupMembership,
+        epoch: &MlsEpochSummary,
+        control_record_id: impl Into<String>,
+        group_info_base64: String,
+    ) -> Result<Self, NoiseError> {
+        if epoch.group_id != group.group_id || group_info_base64.is_empty() {
+            return Err(NoiseError::InvalidMlsState);
+        }
+        let group_key = decode_array::<32>(&group.secret_base64, "group secret")?;
+        let archive_key = decode_array::<32>(&epoch.archive_key_base64, "archive key")?;
+        let control_record_id = control_record_id.into();
+        if !valid_record_id(&control_record_id) {
+            return Err(NoiseError::InvalidMlsState);
+        }
+        let nonce: [u8; 24] = random();
+        let aad = external_join_history_aad(&group.group_id, epoch.epoch, &control_record_id);
+        let ciphertext = XChaCha20Poly1305::new((&group_key).into())
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &archive_key,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| NoiseError::Crypto)?;
+        let mut package = Self {
+            version: EXTERNAL_JOIN_PACKAGE_VERSION,
+            package_id: String::new(),
+            group_id: group.group_id.clone(),
+            epoch: epoch.epoch,
+            control_record_id,
+            publisher_public_key: identity.public_key_base64(),
+            group_info_base64,
+            history_nonce_base64: STANDARD_NO_PAD.encode(nonce),
+            history_ciphertext_base64: STANDARD_NO_PAD.encode(ciphertext),
+            created_at_millis: now_millis(),
+            signature_base64: String::new(),
+        };
+        let unsigned = package.unsigned_bytes()?;
+        package.package_id = blake3::hash(&unsigned).to_hex().to_string();
+        package.signature_base64 = identity.sign(&control_signing_bytes(
+            EXTERNAL_JOIN_PACKAGE_CONTEXT,
+            &package.package_id,
+            &unsigned,
+        ));
+        package.verify()?;
+        Ok(package)
+    }
+
+    pub fn verify(&self) -> Result<(), NoiseError> {
+        if self.version != EXTERNAL_JOIN_PACKAGE_VERSION
+            || !valid_record_id(&self.package_id)
+            || !valid_group_id(&self.group_id)
+            || !valid_record_id(&self.control_record_id)
+            || self.group_info_base64.is_empty()
+            || self.group_info_base64.len() > 1_048_576
+        {
+            return Err(NoiseError::InvalidMlsState);
+        }
+        decode_array::<32>(&self.publisher_public_key, "identity public key")?;
+        decode_array::<24>(&self.history_nonce_base64, "external join history nonce")?;
+        if decode(
+            &self.history_ciphertext_base64,
+            "external join history ciphertext",
+        )?
+        .len()
+            != 48
+        {
+            return Err(NoiseError::InvalidMlsState);
+        }
+        let unsigned = self.unsigned_bytes()?;
+        if blake3::hash(&unsigned).to_hex().as_str() != self.package_id {
+            return Err(NoiseError::InvalidMlsState);
+        }
+        verify_signature(
+            &self.publisher_public_key,
+            &self.signature_base64,
+            &control_signing_bytes(EXTERNAL_JOIN_PACKAGE_CONTEXT, &self.package_id, &unsigned),
+        )
+    }
+
+    pub fn open_history_key(&self, group: &GroupMembership) -> Result<String, NoiseError> {
+        self.verify()?;
+        if self.group_id != group.group_id {
+            return Err(NoiseError::InvalidMlsState);
+        }
+        let group_key = decode_array::<32>(&group.secret_base64, "group secret")?;
+        let nonce = decode_array::<24>(&self.history_nonce_base64, "external join history nonce")?;
+        let ciphertext = decode(
+            &self.history_ciphertext_base64,
+            "external join history ciphertext",
+        )?;
+        let aad = external_join_history_aad(&self.group_id, self.epoch, &self.control_record_id);
+        let plaintext = XChaCha20Poly1305::new((&group_key).into())
+            .decrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| NoiseError::Crypto)?;
+        if plaintext.len() != 32 {
+            return Err(NoiseError::InvalidMlsState);
+        }
+        Ok(STANDARD_NO_PAD.encode(plaintext))
+    }
+
+    fn unsigned_bytes(&self) -> Result<Vec<u8>, NoiseError> {
+        Ok(serde_json::to_vec(&UnsignedMlsExternalJoinPackage {
+            version: self.version,
+            group_id: &self.group_id,
+            epoch: self.epoch,
+            control_record_id: &self.control_record_id,
+            publisher_public_key: &self.publisher_public_key,
+            group_info_base64: &self.group_info_base64,
+            history_nonce_base64: &self.history_nonce_base64,
+            history_ciphertext_base64: &self.history_ciphertext_base64,
+            created_at_millis: self.created_at_millis,
+        })?)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MlsExternalJoinRequest {
+    pub invitation_locator: String,
+    pub epoch: MlsEpochRecord,
+    pub next_package: MlsExternalJoinPackage,
 }
 
 /// The one-time bridge that keeps pre-MLS history readable after cutover.
@@ -622,6 +793,8 @@ pub struct MlsEpochRecord {
     /// epoch may author an admission; only the founder may author a removal.
     pub owner_public_key: String,
     pub member_accounts: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub external_join: bool,
     pub bundle: MlsCommitBundle,
     pub created_at_millis: u64,
     pub signature_base64: String,
@@ -633,6 +806,8 @@ struct UnsignedMlsEpochRecord<'a> {
     previous_record_id: &'a str,
     owner_public_key: &'a str,
     member_accounts: &'a [String],
+    #[serde(skip_serializing_if = "is_false")]
+    external_join: bool,
     bundle: &'a MlsCommitBundle,
     created_at_millis: u64,
 }
@@ -652,6 +827,37 @@ impl MlsEpochRecord {
             previous_record_id: previous_record_id.into(),
             owner_public_key: identity.public_key_base64(),
             member_accounts,
+            external_join: false,
+            bundle,
+            created_at_millis: now_millis(),
+            signature_base64: String::new(),
+        };
+        let unsigned = record.unsigned_bytes()?;
+        record.record_id = blake3::hash(&unsigned).to_hex().to_string();
+        record.signature_base64 = identity.sign(&control_signing_bytes(
+            EPOCH_RECORD_CONTEXT,
+            &record.record_id,
+            &unsigned,
+        ));
+        record.verify()?;
+        Ok(record)
+    }
+
+    pub fn create_external(
+        identity: &Identity,
+        previous_record_id: impl Into<String>,
+        bundle: MlsCommitBundle,
+        mut member_accounts: Vec<String>,
+    ) -> Result<Self, NoiseError> {
+        member_accounts.sort();
+        member_accounts.dedup();
+        let mut record = Self {
+            version: MLS_CONTROL_VERSION,
+            record_id: String::new(),
+            previous_record_id: previous_record_id.into(),
+            owner_public_key: identity.public_key_base64(),
+            member_accounts,
+            external_join: true,
             bundle,
             created_at_millis: now_millis(),
             signature_base64: String::new(),
@@ -675,13 +881,16 @@ impl MlsEpochRecord {
     /// only one that validates signed self-leave and ban requests.
     #[must_use]
     pub fn authorizes_from(&self, founder_public_key: &str, parent_members: &[String]) -> bool {
-        if !parent_members.contains(&self.owner_public_key) {
-            return false;
-        }
         let removes_accounts = parent_members
             .iter()
             .any(|member| !self.member_accounts.contains(member));
-        !removes_accounts || self.owner_public_key == founder_public_key
+        if self.external_join {
+            return !parent_members.contains(&self.owner_public_key)
+                && self.member_accounts.contains(&self.owner_public_key)
+                && !removes_accounts;
+        }
+        parent_members.contains(&self.owner_public_key)
+            && (!removes_accounts || self.owner_public_key == founder_public_key)
     }
 
     pub fn verify(&self) -> Result<(), NoiseError> {
@@ -720,6 +929,7 @@ impl MlsEpochRecord {
             previous_record_id: &self.previous_record_id,
             owner_public_key: &self.owner_public_key,
             member_accounts: &self.member_accounts,
+            external_join: self.external_join,
             bundle: &self.bundle,
             created_at_millis: self.created_at_millis,
         })?)
@@ -1192,6 +1402,107 @@ impl MlsAccountState {
         Ok(current)
     }
 
+    pub fn external_join_package(
+        &self,
+        identity: &Identity,
+        group_membership: &GroupMembership,
+        control_record_id: impl Into<String>,
+    ) -> Result<MlsExternalJoinPackage, NoiseError> {
+        self.validate()?;
+        if identity.public_key_base64() != self.account_public_key
+            || group_membership.group_id.is_empty()
+        {
+            return Err(NoiseError::InvalidMlsState);
+        }
+        let provider = self.storage.clone().into_provider()?;
+        let signer = self.signer(&provider)?;
+        let group = load_group(&provider, &group_membership.group_id)?;
+        let epoch = epoch_summary(&provider, &group, &group_membership.group_id)?;
+        let group_info = group
+            .export_group_info(provider.crypto(), &signer, true)
+            .map_err(|_| NoiseError::Mls)?
+            .tls_serialize_detached()
+            .map_err(|_| NoiseError::Mls)?;
+        MlsExternalJoinPackage::create(
+            identity,
+            group_membership,
+            &epoch,
+            control_record_id,
+            STANDARD_NO_PAD.encode(group_info),
+        )
+    }
+
+    pub fn join_group_external(
+        &mut self,
+        identity: &Identity,
+        group_membership: &GroupMembership,
+        package: &MlsExternalJoinPackage,
+    ) -> Result<MlsCommitBundle, NoiseError> {
+        self.validate()?;
+        package.verify()?;
+        if identity.public_key_base64() != self.account_public_key
+            || package.group_id != group_membership.group_id
+        {
+            return Err(NoiseError::InvalidMlsState);
+        }
+        let parent_archive_key = package.open_history_key(group_membership)?;
+        let provider = self.take_provider()?;
+        let signer = self.signer(&provider)?;
+        let group_info_bytes = STANDARD_NO_PAD
+            .decode(&package.group_info_base64)
+            .map_err(|_| NoiseError::InvalidMlsState)?;
+        let group_info = match MlsMessageIn::tls_deserialize_exact(&group_info_bytes)
+            .map_err(|_| NoiseError::InvalidMlsState)?
+            .extract()
+        {
+            MlsMessageBodyIn::GroupInfo(group_info) => group_info,
+            _ => return Err(NoiseError::InvalidMlsState),
+        };
+        let config = MlsGroupJoinConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .max_past_epochs(0)
+            .build();
+        let (group, commit) = MlsGroup::external_commit_builder()
+            .with_config(config)
+            .build_group(&provider, group_info, self.credential_with_key()?)
+            .map_err(|_| NoiseError::Mls)?
+            .load_psks(provider.storage())
+            .map_err(|_| NoiseError::Mls)?
+            .build(provider.rand(), provider.crypto(), &signer, |_| true)
+            .map_err(|_| NoiseError::Mls)?
+            .finalize(&provider)
+            .map_err(|_| NoiseError::Mls)?;
+        if group.group_id().as_slice() != group_membership.group_id.as_bytes() {
+            return Err(NoiseError::InvalidMlsState);
+        }
+        let commit_base64 = STANDARD_NO_PAD.encode(
+            commit
+                .into_commit()
+                .tls_serialize_detached()
+                .map_err(|_| NoiseError::Mls)?,
+        );
+        let current = epoch_summary(&provider, &group, &group_membership.group_id)?;
+        if current.epoch != package.epoch.saturating_add(1) {
+            return Err(NoiseError::InvalidMlsState);
+        }
+        let history_link = HistoryKeyLink::create(
+            &group_membership.group_id,
+            current.epoch,
+            &current.archive_key_base64,
+            package.epoch,
+            &parent_archive_key,
+        )?;
+        self.storage = MlsStorageSnapshot::from_provider(&provider)?;
+        Ok(MlsCommitBundle {
+            group_id: group_membership.group_id.clone(),
+            parent_epoch: package.epoch,
+            epoch: current.epoch,
+            commit_base64,
+            welcome_base64: None,
+            history_link,
+        })
+    }
+
     pub fn members(&self, group_id: &str) -> Result<Vec<String>, NoiseError> {
         self.validate()?;
         let provider = self.storage.clone().into_provider()?;
@@ -1247,6 +1558,24 @@ impl MlsAccountState {
         )
     }
 
+    pub fn create_external_epoch_record(
+        &self,
+        identity: &Identity,
+        previous_record_id: impl Into<String>,
+        bundle: MlsCommitBundle,
+    ) -> Result<MlsEpochRecord, NoiseError> {
+        let current = self.epoch(&bundle.group_id)?;
+        if current.epoch != bundle.epoch {
+            return Err(NoiseError::InvalidMlsState);
+        }
+        MlsEpochRecord::create_external(
+            identity,
+            previous_record_id,
+            bundle.clone(),
+            self.members(&bundle.group_id)?,
+        )
+    }
+
     fn validate(&self) -> Result<(), NoiseError> {
         if self.version != MLS_STATE_VERSION
             || self.account_public_key.is_empty()
@@ -1295,6 +1624,10 @@ fn history_link_aad(group_id: &str, epoch: u64, previous_epoch: u64) -> Vec<u8> 
 
 fn legacy_bridge_aad(group_id: &str) -> Vec<u8> {
     format!("{LEGACY_BRIDGE_CONTEXT}:{group_id}:0").into_bytes()
+}
+
+fn external_join_history_aad(group_id: &str, epoch: u64, control_record_id: &str) -> Vec<u8> {
+    format!("{EXTERNAL_JOIN_HISTORY_CONTEXT}:{group_id}:{epoch}:{control_record_id}").into_bytes()
 }
 
 fn join_request_signing_bytes(request_id: &str, unsigned: &[u8]) -> Vec<u8> {
@@ -1596,5 +1929,53 @@ mod tests {
         }
         .verify()
         .unwrap();
+    }
+
+    #[test]
+    fn frequency_holder_can_join_without_an_online_member() {
+        let alice_identity = Identity::generate();
+        let bob_identity = Identity::generate();
+        let group =
+            GroupMembership::create_owned("self admission", alice_identity.public_key_base64());
+        let group_id = group.group_id.as_str();
+        let mut alice = MlsAccountState::create(&alice_identity).unwrap();
+        let genesis = alice.create_group_genesis(&alice_identity, &group).unwrap();
+        let epoch_zero = alice.epoch(group_id).unwrap();
+        let package = alice
+            .external_join_package(&alice_identity, &group, &genesis.record_id)
+            .unwrap();
+        assert_eq!(
+            package.open_history_key(&group).unwrap(),
+            epoch_zero.archive_key_base64
+        );
+
+        let mut bob = MlsAccountState::create(&bob_identity).unwrap();
+        let external_commit = bob
+            .join_group_external(&bob_identity, &group, &package)
+            .unwrap();
+        let external_record = bob
+            .create_external_epoch_record(
+                &bob_identity,
+                &genesis.record_id,
+                external_commit.clone(),
+            )
+            .unwrap();
+        MlsControlLog {
+            genesis,
+            epochs: vec![external_record],
+        }
+        .verify()
+        .unwrap();
+
+        let alice_epoch = alice.process_commit(&external_commit).unwrap();
+        let bob_epoch = bob.epoch(group_id).unwrap();
+        assert_eq!(alice_epoch, bob_epoch);
+        assert_eq!(
+            external_commit
+                .history_link
+                .open(&bob_epoch.archive_key_base64)
+                .unwrap(),
+            epoch_zero.archive_key_base64
+        );
     }
 }

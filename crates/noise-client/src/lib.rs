@@ -54,8 +54,9 @@ use noise_core::{
     AcceptedMessage, AcceptedTopic, AccountCredentials, AccountVault, CentralInstallationAuthKey,
     DirectPushRequest, DirectPushTrigger, EncryptedBlob, GroupDeletion, GroupEventPayload,
     GroupMembership, GroupPresence, GroupProfile, GroupState, HistoryKeyLink, Identity,
-    InviteRecord, InviteRotation, MlsAccountState, MlsControlLog, MlsEpochRecord, MlsGroupGenesis,
-    MlsJoinRequest, MlsRemovalReason, MlsRemovalRequest, Profile, PushSubscriptionRegistration,
+    InviteRecord, InviteRotation, MlsAccountState, MlsControlLog, MlsEpochRecord,
+    MlsExternalJoinPackage, MlsExternalJoinRequest, MlsGroupGenesis, MlsJoinRequest,
+    MlsRemovalReason, MlsRemovalRequest, Profile, PushSubscriptionRegistration,
     SafetyDirectiveActionV1, SafetyDirectiveV1, SafetyEncryptedObjectV1, SafetyEncryptedShardV1,
     SafetyGroupContextV1, SafetyProfileSnapshotV1, SafetyReportHumanContextV1, SafetyReportV1,
     SafetyReporterContextV1, ShardPlacement, SignedEvent, StorageManifest,
@@ -71,8 +72,7 @@ pub use noise_core::{
 pub use noise_transport::LinkPreview;
 use noise_transport::{
     GATEWAY_HEADER, LinkPreviewRequest, OHTTP_RELAY_PATH, OHTTP_REQUEST_MEDIA_TYPE,
-    OHTTP_RESPONSE_MEDIA_TYPE, PlainResponse,
-    RelayDescriptor, decode_response, encode_request,
+    OHTTP_RESPONSE_MEDIA_TYPE, PlainResponse, RelayDescriptor, decode_response, encode_request,
 };
 use ohttp::ClientRequest;
 use serde::{Deserialize, Serialize};
@@ -960,6 +960,8 @@ struct ClientState {
     #[serde(default)]
     group_frequencies: HashMap<String, String>,
     #[serde(default)]
+    group_invitation_locators: HashMap<String, String>,
+    #[serde(default)]
     next_author_sequence: u64,
     #[serde(default)]
     account: Option<AccountSession>,
@@ -1083,6 +1085,8 @@ struct AccountVaultContents {
     #[serde(default)]
     group_activity_initialized: HashSet<String>,
     group_frequencies: HashMap<String, String>,
+    #[serde(default)]
+    group_invitation_locators: HashMap<String, String>,
     next_author_sequence: u64,
 }
 
@@ -1862,6 +1866,7 @@ impl ClientState {
             .collect::<Vec<_>>();
         for group_id in removed_ids {
             self.group_frequencies.remove(&group_id);
+            self.group_invitation_locators.remove(&group_id);
             self.forget_group_activity(&group_id);
             self.group_conversation_cache.remove(&group_id);
             self.group_event_caches.remove(&group_id);
@@ -2171,6 +2176,7 @@ impl ClientState {
             topic_activity_initialized: self.topic_activity_initialized.clone(),
             group_activity_initialized: self.group_activity_initialized.clone(),
             group_frequencies: self.group_frequencies.clone(),
+            group_invitation_locators: self.group_invitation_locators.clone(),
             next_author_sequence: self.next_author_sequence,
         }
     }
@@ -2240,6 +2246,7 @@ impl ClientState {
             group_activity_initialized: contents.group_activity_initialized,
             group_conversation_cache: HashMap::new(),
             group_frequencies: contents.group_frequencies,
+            group_invitation_locators: contents.group_invitation_locators,
             next_author_sequence: contents.next_author_sequence,
             account: Some(account),
             central_installation: None,
@@ -3353,6 +3360,7 @@ impl NoiseClient {
             group_activity_initialized: HashSet::new(),
             group_conversation_cache: HashMap::new(),
             group_frequencies: HashMap::new(),
+            group_invitation_locators: HashMap::new(),
             next_author_sequence: 0,
             account: Some(AccountSession {
                 noise_id: credentials.noise_id,
@@ -4886,6 +4894,7 @@ impl NoiseClient {
             }
             let new_frequency = generate_frequency();
             let new_invite = InviteRecord::create(&identity, &new_frequency, group.clone())?;
+            let new_locator = new_invite.locator.clone();
             let rotation_sequence = state.take_sequence();
             let rotation =
                 InviteRotation::create(&identity, &group, Some(new_invite), rotation_sequence)?;
@@ -4893,6 +4902,9 @@ impl NoiseClient {
             state
                 .group_frequencies
                 .insert(group.group_id.clone(), new_frequency);
+            state
+                .group_invitation_locators
+                .insert(group.group_id.clone(), new_locator);
             // Persist the newly rotated invitation before publishing the
             // profile event. If that later write is interrupted, retrying can
             // finish the signed profile change without reviving the old,
@@ -4935,6 +4947,7 @@ impl NoiseClient {
             .as_ref()
             .map(|frequency| InviteRecord::create(&identity, frequency, group.clone()))
             .transpose()?;
+        let new_locator = new_invite.as_ref().map(|invite| invite.locator.clone());
         let sequence = state.take_sequence();
         let rotation = InviteRotation::create(&identity, &group, new_invite, sequence)?;
         self.publish_invite_rotation(&relay_list(relays)?, &rotation)
@@ -4943,8 +4956,14 @@ impl NoiseClient {
             state
                 .group_frequencies
                 .insert(group.group_id.clone(), frequency);
+            if let Some(locator) = new_locator {
+                state
+                    .group_invitation_locators
+                    .insert(group.group_id.clone(), locator);
+            }
         } else {
             state.group_frequencies.remove(&group.group_id);
+            state.group_invitation_locators.remove(&group.group_id);
         }
         save_state(path, &state)?;
         state.summary()
@@ -5699,12 +5718,22 @@ impl NoiseClient {
         let Some(control_log) = self.fetch_mls_control_log(&relays, group_id).await? else {
             return Ok(true);
         };
-        let (head_epoch, _) = control_log.head();
+        let (head_epoch, head_record_id) = control_log.head();
         if control_log
             .member_accounts_at(head_epoch)
             .is_none_or(|members| !members.contains(&self_public_key))
         {
             return Ok(false);
+        }
+        let package = self
+            .fetch_mls_external_join_package_for_member(&relays, group_id)
+            .await?;
+        if package.as_ref().is_none_or(|package| {
+            package.group_id != group_id
+                || package.epoch != head_epoch
+                || package.control_record_id != head_record_id
+        }) {
+            return Ok(true);
         }
         let known_devices = mls
             .member_devices(group_id)
@@ -5835,7 +5864,12 @@ impl NoiseClient {
         let local_has_mls_group = state
             .mls_group_state(&group.group_id)
             .is_some_and(|mls| mls.epoch(&group.group_id).is_ok());
-        if !local_has_mls_group {
+        let has_self_join_locator = state
+            .group_invitation_locators
+            .contains_key(&group.group_id);
+        let has_legacy_self_join =
+            has_self_join_locator && legacy_view.members.contains_key(&self_public_key);
+        if !local_has_mls_group && !has_self_join_locator {
             let needs_membership_proof =
                 state
                     .mls_join_requests
@@ -5878,7 +5912,10 @@ impl NoiseClient {
                 request.account_public_key == self_public_key
                     && join_request_membership_profile(request, &group).is_some()
             });
-        if !active_members.contains(&self_public_key) && !has_pending_membership_proof {
+        if !active_members.contains(&self_public_key)
+            && !has_pending_membership_proof
+            && !has_legacy_self_join
+        {
             // Erasing a group is the open group's job. A background admission
             // pass must never delete a conversation the user is not looking at.
             if admissions_only {
@@ -5898,6 +5935,7 @@ impl NoiseClient {
             state.mls_local_geneses.remove(&group.group_id);
             state.mls_control_logs.remove(&group.group_id);
             state.group_frequencies.remove(&group.group_id);
+            state.group_invitation_locators.remove(&group.group_id);
             state.forget_group_activity(&group.group_id);
             state.group_conversation_cache.remove(&group.group_id);
             state.group_event_caches.remove(&group.group_id);
@@ -5951,6 +5989,67 @@ impl NoiseClient {
         }
 
         let mut control_log = control_log.context("MLS control log is missing")?;
+        if state
+            .mls_group_state(&group.group_id)
+            .is_none_or(|mls| mls.epoch(&group.group_id).is_err())
+            && let Some(locator) = state
+                .group_invitation_locators
+                .get(&group.group_id)
+                .cloned()
+            && let Ok(package) = self
+                .fetch_mls_external_join_package(&relays, &locator)
+                .await
+        {
+            let (head_epoch, head_record_id) = control_log.head();
+            if package.group_id == group.group_id
+                && package.epoch == head_epoch
+                && package.control_record_id == head_record_id
+            {
+                let mut candidate = MlsAccountState::create(&identity)
+                    .context("could not create this identity's encrypted group state")?;
+                let bundle = candidate
+                    .join_group_external(&identity, &group, &package)
+                    .context("could not enter this encrypted group")?;
+                let record = candidate
+                    .create_external_epoch_record(&identity, head_record_id, bundle)
+                    .context("could not authorize this encrypted group entry")?;
+                let next_package = candidate
+                    .external_join_package(&identity, &group, &record.record_id)
+                    .context("could not prepare the next immediate group join")?;
+                state.mls_pending_epochs.insert(
+                    group.group_id.clone(),
+                    PendingMlsEpoch {
+                        candidate: candidate.clone(),
+                        record: record.clone(),
+                    },
+                );
+                save_state_immediately(path, &state)?;
+                let request = MlsExternalJoinRequest {
+                    invitation_locator: locator,
+                    epoch: record.clone(),
+                    next_package,
+                };
+                match self.publish_mls_external_join(&relays, &request).await? {
+                    ControlHead::Extended => {
+                        state.set_mls_group_state(&group.group_id, candidate);
+                        state.mls_pending_epochs.remove(&group.group_id);
+                        state.mls_join_requests.remove(&group.group_id);
+                        control_log.epochs.push(record);
+                        state
+                            .mls_control_logs
+                            .insert(group.group_id.clone(), control_log.clone());
+                        save_state_immediately(path, &state)?;
+                    }
+                    ControlHead::Changed => {
+                        state.mls_pending_epochs.remove(&group.group_id);
+                        control_log = self
+                            .fetch_mls_control_log(&relays, &group.group_id)
+                            .await?
+                            .context("the group encryption head disappeared")?;
+                    }
+                }
+            }
+        }
         let local_epoch = sync_mls_state_from_log(&mut state, &control_log)?;
         let (head_epoch, _) = control_log.head();
         if local_epoch.is_none()
@@ -6038,6 +6137,7 @@ impl NoiseClient {
                     {
                         let frequency = generate_frequency();
                         let invite = InviteRecord::create(&identity, &frequency, group.clone())?;
+                        let locator = invite.locator.clone();
                         let sequence = state.take_sequence();
                         let rotation =
                             InviteRotation::create(&identity, &group, Some(invite), sequence)?;
@@ -6046,6 +6146,9 @@ impl NoiseClient {
                         state
                             .group_frequencies
                             .insert(group.group_id.clone(), frequency);
+                        state
+                            .group_invitation_locators
+                            .insert(group.group_id.clone(), locator);
                         save_state(path, &state)?;
                     }
                     state.mls_pending_epochs.insert(
@@ -6174,10 +6277,26 @@ impl NoiseClient {
             .mls_control_logs
             .insert(group.group_id.clone(), control_log.clone());
         save_state(path, &state)?;
+        let (head_epoch, head_record_id) = control_log.head();
+        if local_epoch == Some(head_epoch)
+            && control_log
+                .member_accounts_at(head_epoch)
+                .is_some_and(|members| members.contains(&self_public_key))
+            && let Some(mls) = state.mls_group_state(&group.group_id)
+        {
+            let package = mls
+                .external_join_package(&identity, &group, head_record_id)
+                .context("could not prepare immediate encrypted group joining")?;
+            let package_result = self
+                .publish_mls_external_join_package(&relays, &package)
+                .await;
+            if admissions_only {
+                package_result?;
+            }
+        }
         // Do not couple an active group to the remote account-vault backup.
         // The new MLS recovery material is already saved locally and the
         // client's background account-sync lane retries the encrypted backup.
-        let (head_epoch, _) = control_log.head();
         if !admissions_only
             && local_epoch == Some(head_epoch)
             && control_log
@@ -6282,6 +6401,9 @@ impl NoiseClient {
         state
             .group_frequencies
             .insert(group.group_id.clone(), frequency.clone());
+        state
+            .group_invitation_locators
+            .insert(group.group_id.clone(), invitation.locator.clone());
         state.add_group(group);
         let sequence = state.take_sequence();
         let group = state.active_group()?.clone();
@@ -6332,33 +6454,101 @@ impl NoiseClient {
         state.ensure_group_access(&payload.group)?;
         state.add_group(payload.group);
         let group = state.active_group()?.clone();
-        let identity = state.identity()?;
-        let control_log = self.fetch_mls_control_log(&relays, &group.group_id).await?;
-        let sequence = state.take_sequence();
-        let membership_proof =
-            SignedEvent::member_joined(&identity, &group, &state.profile, sequence)?;
-        let request = {
-            let mls = state.ensure_mls_group_state(&group.group_id)?;
-            MlsJoinRequest::create_with_membership_proof(
-                &identity,
-                mls,
-                group.group_id.clone(),
-                membership_proof.clone(),
-            )
-            .context("could not create the encrypted-group join request")?
-        };
         state
-            .mls_join_requests
-            .insert(group.group_id.clone(), request.clone());
-        let has_control_log = control_log.is_some();
-        if let Some(control_log) = control_log {
-            state
-                .mls_control_logs
-                .insert(group.group_id.clone(), control_log);
-        }
-        save_state_immediately(path, &state)?;
-        self.publish_mls_join_request(&relays, &request).await?;
-        if !has_control_log {
+            .group_invitation_locators
+            .insert(group.group_id.clone(), locator.clone());
+        let identity = state.identity()?;
+        if let Some(mut control_log) = self.fetch_mls_control_log(&relays, &group.group_id).await? {
+            let mut admitted = false;
+            for _ in 0..4 {
+                let package = self
+                    .fetch_mls_external_join_package(&relays, &locator)
+                    .await?;
+                let (head_epoch, head_record_id) = control_log.head();
+                if package.group_id != group.group_id
+                    || package.epoch != head_epoch
+                    || package.control_record_id != head_record_id
+                {
+                    control_log = self
+                        .fetch_mls_control_log(&relays, &group.group_id)
+                        .await?
+                        .context("the group encryption head disappeared")?;
+                    replica_settle_delay().await;
+                    continue;
+                }
+                let mut candidate = MlsAccountState::create(&identity)
+                    .context("could not create this identity's encrypted group state")?;
+                let bundle = candidate
+                    .join_group_external(&identity, &group, &package)
+                    .context("could not enter this encrypted group")?;
+                let record = candidate
+                    .create_external_epoch_record(&identity, head_record_id, bundle)
+                    .context("could not authorize this encrypted group entry")?;
+                let next_package = candidate
+                    .external_join_package(&identity, &group, &record.record_id)
+                    .context("could not prepare the next immediate group join")?;
+                state.mls_pending_epochs.insert(
+                    group.group_id.clone(),
+                    PendingMlsEpoch {
+                        candidate: candidate.clone(),
+                        record: record.clone(),
+                    },
+                );
+                save_state_immediately(path, &state)?;
+                let request = MlsExternalJoinRequest {
+                    invitation_locator: locator.clone(),
+                    epoch: record.clone(),
+                    next_package,
+                };
+                match self.publish_mls_external_join(&relays, &request).await? {
+                    ControlHead::Extended => {
+                        state.set_mls_group_state(&group.group_id, candidate);
+                        state.mls_pending_epochs.remove(&group.group_id);
+                        control_log.epochs.push(record);
+                        state
+                            .mls_control_logs
+                            .insert(group.group_id.clone(), control_log.clone());
+                        save_state_immediately(path, &state)?;
+                        admitted = true;
+                        break;
+                    }
+                    ControlHead::Changed => {
+                        state.mls_pending_epochs.remove(&group.group_id);
+                        control_log = self
+                            .fetch_mls_control_log(&relays, &group.group_id)
+                            .await?
+                            .context("the group encryption head disappeared")?;
+                        replica_settle_delay().await;
+                    }
+                }
+            }
+            anyhow::ensure!(
+                admitted,
+                "several people joined at once; noise could not serialize this entry"
+            );
+            let sequence = state.take_sequence();
+            let joined = create_group_event(
+                &state,
+                &identity,
+                &group,
+                GroupEventPayload::MemberJoined {
+                    username: state.profile.username.clone(),
+                    bio: state.profile.bio.clone(),
+                    avatar: state.profile.avatar.clone(),
+                    album: state.profile.album.clone(),
+                    accepts_direct_messages: state.profile.effective_direct_message_policy()
+                        != DirectMessagePolicy::Nobody,
+                    direct_message_policy: state.profile.effective_direct_message_policy(),
+                },
+                sequence,
+            )?;
+            save_state_immediately(path, &state)?;
+            self.publish_event(&relays, &joined).await?;
+        } else {
+            let sequence = state.take_sequence();
+            let membership_proof =
+                SignedEvent::member_joined(&identity, &group, &state.profile, sequence)?;
+            save_state_immediately(path, &state)?;
             self.publish_event(&relays, &membership_proof).await?;
         }
         Ok(JoinResult {
@@ -8887,6 +9077,7 @@ impl NoiseClient {
         state.mls_local_geneses.remove(&group.group_id);
         state.mls_control_logs.remove(&group.group_id);
         state.group_frequencies.remove(&group.group_id);
+        state.group_invitation_locators.remove(&group.group_id);
         state.forget_group_activity(&group.group_id);
         state.group_conversation_cache.remove(&group.group_id);
         state.group_event_caches.remove(&group.group_id);
@@ -8950,6 +9141,7 @@ impl NoiseClient {
             .forget_mls_group(group_id)
             .context("could not erase this group's local encryption state")?;
         state.group_frequencies.remove(group_id);
+        state.group_invitation_locators.remove(group_id);
         state.forget_group_activity(group_id);
         state.group_conversation_cache.remove(group_id);
         state.group_event_caches.remove(group_id);
@@ -10769,6 +10961,94 @@ impl NoiseClient {
         Ok(())
     }
 
+    async fn publish_mls_external_join(
+        &self,
+        relays: &[RelayDescriptor],
+        request: &MlsExternalJoinRequest,
+    ) -> anyhow::Result<ControlHead> {
+        self.publish_mls_control_object(relays, "/v2/mls/external-joins", request)
+            .await
+    }
+
+    async fn publish_mls_external_join_package(
+        &self,
+        relays: &[RelayDescriptor],
+        package: &MlsExternalJoinPackage,
+    ) -> anyhow::Result<()> {
+        let body = serde_json::to_vec(package)?;
+        let mut accepted = 0usize;
+        for index in 0..relays.len() {
+            if let Ok(response) = self
+                .relay_request(
+                    relays,
+                    index,
+                    "POST",
+                    "/v2/mls/external-join-packages",
+                    &body,
+                )
+                .await
+                && (200..300).contains(&response.status)
+            {
+                accepted += 1;
+            }
+        }
+        if accepted != relays.len() {
+            bail!("the current group join package could not be published")
+        }
+        Ok(())
+    }
+
+    async fn fetch_mls_external_join_package(
+        &self,
+        relays: &[RelayDescriptor],
+        invitation_locator: &str,
+    ) -> anyhow::Result<MlsExternalJoinPackage> {
+        let endpoint = format!("/v2/mls/external-join-packages/by-invite/{invitation_locator}");
+        for index in 0..relays.len() {
+            let Ok(response) = self
+                .relay_request(relays, index, "GET", &endpoint, &[])
+                .await
+            else {
+                continue;
+            };
+            if (200..300).contains(&response.status) {
+                let package: MlsExternalJoinPackage = serde_json::from_slice(&response.body)
+                    .context("central service returned an invalid group join package")?;
+                package
+                    .verify()
+                    .context("central service returned an unauthenticated group join package")?;
+                return Ok(package);
+            }
+        }
+        bail!("this group still needs its one-time encryption upgrade")
+    }
+
+    async fn fetch_mls_external_join_package_for_member(
+        &self,
+        relays: &[RelayDescriptor],
+        group_id: &str,
+    ) -> anyhow::Result<Option<MlsExternalJoinPackage>> {
+        let endpoint = format!("/v2/mls/groups/{group_id}/external-join-package");
+        for index in 0..relays.len() {
+            let response = self
+                .relay_request(relays, index, "GET", &endpoint, &[])
+                .await
+                .context("could not read the current group join package")?;
+            if response.status == 404 {
+                return Ok(None);
+            }
+            if (200..300).contains(&response.status) {
+                let package: MlsExternalJoinPackage = serde_json::from_slice(&response.body)
+                    .context("central service returned an invalid group join package")?;
+                package
+                    .verify()
+                    .context("central service returned an unauthenticated group join package")?;
+                return Ok(Some(package));
+            }
+        }
+        bail!("central service rejected the current group join package")
+    }
+
     async fn publish_mls_removal_request(
         &self,
         relays: &[RelayDescriptor],
@@ -11212,6 +11492,7 @@ impl NoiseClient {
         let groups_before = state.groups.clone();
         let group_order_sequence_before = state.group_order_sequence;
         let frequencies_before = state.group_frequencies.clone();
+        let invitation_locators_before = state.group_invitation_locators.clone();
         let mut remote_memberships = contents.group_memberships.clone();
         for group in &contents.groups {
             remote_memberships
@@ -11247,6 +11528,17 @@ impl NoiseClient {
         }
         state
             .group_frequencies
+            .retain(|group_id, _| present_group_ids.contains(group_id));
+        for (group_id, locator) in &contents.group_invitation_locators {
+            if present_group_ids.contains(group_id) {
+                state
+                    .group_invitation_locators
+                    .entry(group_id.clone())
+                    .or_insert_with(|| locator.clone());
+            }
+        }
+        state
+            .group_invitation_locators
             .retain(|group_id, _| present_group_ids.contains(group_id));
         let identity_public_key = state.identity()?.public_key_base64();
         let recovery_before = state.mls_group_states.clone();
@@ -11467,7 +11759,8 @@ impl NoiseClient {
         let memberships_changed = memberships_before != state.group_memberships
             || groups_before != state.groups
             || group_order_sequence_before != state.group_order_sequence
-            || frequencies_before != state.group_frequencies;
+            || frequencies_before != state.group_frequencies
+            || invitation_locators_before != state.group_invitation_locators;
         let direct_reads_changed = state.merge_direct_read_through(&contents.direct_read_through);
         let direct_policy_rejections_changed = merge_read_markers(
             &mut state.direct_policy_rejected_through,
@@ -15963,6 +16256,7 @@ mod tests {
             group_activity_initialized: HashSet::new(),
             group_conversation_cache: HashMap::new(),
             group_frequencies: HashMap::new(),
+            group_invitation_locators: HashMap::new(),
             next_author_sequence: profile_sequence.saturating_add(1),
             account: Some(AccountSession {
                 noise_id: credentials.noise_id.clone(),

@@ -2738,13 +2738,12 @@ export default function App() {
       // signed control log instead of the group's history, and the phase this
       // identity is in keeps coming from opening and recovering the group.
       const encryption = await syncGroupEncryption(groupId);
-      // Active members may need to wait briefly for an earlier-ranked online
-      // member to take the admission turn. Keep checking during that bounded
-      // handoff window; identities still waiting to join must not poll here.
-      return encryption?.phase === "active";
+      // Legacy groups may need one background pass to publish their
+      // self-join package. Keep checking until this identity is active.
+      return encryption?.phase !== "active";
     } catch {
       // Admission retries on the next control change or when the group opens.
-      return false;
+      return true;
     }
   }, []);
 
@@ -10731,7 +10730,7 @@ function EncryptionPending({ phase }: { phase: GroupEncryptionStatus["phase"] })
       </strong>
       <span>
         {phase === "waiting_for_admission" || phase === "waiting_for_device"
-          ? "any member who is online admits this identity automatically"
+          ? "finishing this group's one-time encryption upgrade"
           : "restoring encrypted group access from your noise account"}
       </span>
       <small>nothing to approve — this screen updates on its own</small>
