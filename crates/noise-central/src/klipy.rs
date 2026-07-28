@@ -206,7 +206,7 @@ fn normalize_result(item: &Value, kind: &str) -> Option<KlipyResult> {
     let tiered = ["md", "sm", "hd"]
         .iter()
         .any(|tier| file.get(tier).is_some_and(Value::is_object));
-    let (preview_url, full_url, full_mp4_url, full_webp_url, width, height) = if tiered {
+    let (preview_url, full_url, full_mp4_url, full_webp_url, width, height, mime_type) = if tiered {
         let preview_url = first_string(
             file,
             &[
@@ -215,15 +215,31 @@ fn normalize_result(item: &Value, kind: &str) -> Option<KlipyResult> {
                 &["sm", "jpg", "url"],
             ],
         )?;
-        let full_url = match kind {
-            "sticker" => first_string(file, &[&["md", "webp", "url"], &["md", "gif", "url"]])?,
-            "clip" => string_at(file, &["md", "mp4", "url"])?,
-            _ => string_at(file, &["md", "gif", "url"])?,
-        };
-        let dimension_path = match kind {
-            "sticker" if string_at(file, &["md", "webp", "url"]).is_some() => &["md", "webp"][..],
-            "clip" => &["md", "mp4"][..],
-            _ => &["md", "gif"][..],
+        let (full_url, dimension_path, mime_type): (String, &[&str], &'static str) = match kind {
+            // iOS does not animate WebP through UIImage. Klipy provides an
+            // equivalent transparent GIF, so use that as the portable sticker
+            // payload and retain WebP only as an optional alternate URL.
+            "sticker" => {
+                if let Some(gif) = string_at(file, &["md", "gif", "url"]) {
+                    (gif, &["md", "gif"][..], "image/gif")
+                } else {
+                    (
+                        string_at(file, &["md", "webp", "url"])?,
+                        &["md", "webp"][..],
+                        "image/webp",
+                    )
+                }
+            }
+            "clip" => (
+                string_at(file, &["md", "mp4", "url"])?,
+                &["md", "mp4"][..],
+                "video/mp4",
+            ),
+            _ => (
+                string_at(file, &["md", "gif", "url"])?,
+                &["md", "gif"][..],
+                "image/gif",
+            ),
         };
         (
             preview_url,
@@ -232,19 +248,21 @@ fn normalize_result(item: &Value, kind: &str) -> Option<KlipyResult> {
             string_at(file, &["md", "webp", "url"]),
             unsigned_at(file, &[dimension_path, &["width"]].concat()),
             unsigned_at(file, &[dimension_path, &["height"]].concat()),
+            mime_type,
         )
     } else {
         let metadata = item.get("file_meta").unwrap_or(&Value::Null);
         let preview_url = first_string(file, &[&["webp"], &["gif"], &["jpg"]])?;
-        let full_url = match kind {
-            "sticker" => first_string(file, &[&["webp"], &["gif"]])?,
-            "clip" => string_at(file, &["mp4"])?,
-            _ => string_at(file, &["gif"])?,
-        };
-        let dimension_format = match kind {
-            "sticker" if string_at(file, &["webp"]).is_some() => "webp",
-            "clip" => "mp4",
-            _ => "gif",
+        let (full_url, dimension_format, mime_type): (String, &str, &'static str) = match kind {
+            "sticker" => {
+                if let Some(gif) = string_at(file, &["gif"]) {
+                    (gif, "gif", "image/gif")
+                } else {
+                    (string_at(file, &["webp"])?, "webp", "image/webp")
+                }
+            }
+            "clip" => (string_at(file, &["mp4"])?, "mp4", "video/mp4"),
+            _ => (string_at(file, &["gif"])?, "gif", "image/gif"),
         };
         (
             preview_url,
@@ -253,6 +271,7 @@ fn normalize_result(item: &Value, kind: &str) -> Option<KlipyResult> {
             string_at(file, &["webp"]),
             unsigned_at(metadata, &[dimension_format, "width"]),
             unsigned_at(metadata, &[dimension_format, "height"]),
+            mime_type,
         )
     };
     if !valid_https_url(&preview_url) || !valid_https_url(&full_url) {
@@ -280,11 +299,7 @@ fn normalize_result(item: &Value, kind: &str) -> Option<KlipyResult> {
         full_webp_url: full_webp_url.filter(|url| valid_https_url(url)),
         width,
         height,
-        mime_type: match kind {
-            "sticker" => "image/webp",
-            "clip" => "video/mp4",
-            _ => "image/gif",
-        },
+        mime_type,
     })
 }
 

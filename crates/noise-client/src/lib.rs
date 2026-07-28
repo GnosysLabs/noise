@@ -5616,7 +5616,9 @@ impl NoiseClient {
                     || result.height > 20_000
                     || match kind {
                         "gif" => result.mime_type != "image/gif",
-                        "sticker" => result.mime_type != "image/webp",
+                        "sticker" => {
+                            result.mime_type != "image/gif" && result.mime_type != "image/webp"
+                        }
                         "clip" => result.mime_type != "video/mp4",
                         _ => true,
                     }
