@@ -5,7 +5,7 @@ use std::{
     fs,
     path::Path,
     path::PathBuf,
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -482,6 +482,81 @@ async fn optimize_video_upload(
     source_path: String,
 ) -> Result<OptimizedMediaUpload, String> {
     prepare_media_upload(app, source_path).await
+}
+
+#[tauri::command]
+async fn convert_cached_image_for_display(
+    app: tauri::AppHandle,
+    source_path: String,
+) -> Result<String, String> {
+    let cache_directory = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?;
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        convert_cached_image_for_display_blocking(&source_path, &cache_directory)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    app.asset_protocol_scope()
+        .allow_file(&output)
+        .map_err(|error| error.to_string())?;
+    Ok(output.to_string_lossy().into_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn convert_cached_image_for_display_blocking(
+    source_path: &str,
+    cache_directory: &Path,
+) -> Result<PathBuf, String> {
+    let source = fs::canonicalize(source_path).map_err(|error| error.to_string())?;
+    let cache = fs::canonicalize(cache_directory).map_err(|error| error.to_string())?;
+    if !source.starts_with(&cache) {
+        return Err("noise can only convert media from its private cache".to_owned());
+    }
+    let metadata = source.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 100 * 1024 * 1024 {
+        return Err("cached image has an invalid size".to_owned());
+    }
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("noise-photo");
+    let output = source.with_file_name(format!("{stem}.render.jpg"));
+    if output
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+    {
+        return Ok(output);
+    }
+    let temporary = source.with_file_name(format!(".{stem}.render-{}.jpg", unix_millis()));
+    let status = Command::new("/usr/bin/sips")
+        .args(["-s", "format", "jpeg"])
+        .arg(&source)
+        .arg("--out")
+        .arg(&temporary)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| error.to_string())?;
+    if !status.success()
+        || !temporary
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err("macOS could not decode this cached image".to_owned());
+    }
+    fs::rename(&temporary, &output).map_err(|error| error.to_string())?;
+    Ok(output)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn convert_cached_image_for_display_blocking(
+    _source_path: &str,
+    _cache_directory: &Path,
+) -> Result<PathBuf, String> {
+    Err("native cached-image conversion is unavailable on this platform".to_owned())
 }
 
 #[tauri::command]
@@ -1375,6 +1450,7 @@ fn main() {
             switch_local_account,
             register_media_stream,
             optimize_video_upload,
+            convert_cached_image_for_display,
             inspect_media_upload,
             prepare_media_upload,
             read_prepared_media,

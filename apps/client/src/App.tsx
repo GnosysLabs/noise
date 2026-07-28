@@ -687,6 +687,7 @@ const mediaDimensionCache = loadStoredMediaDimensions();
 const sentMediaPreviewCache = new Map<string, NonNullable<MessageSummary["local_attachment"]>>();
 const imagePosterCache = new Map<string, string>();
 const videoPosterCache = new Map<string, string>();
+const convertedMediaObjectUrls = new Set<string>();
 const renderedMessageCounts = new Map<string, number>();
 let mediaCacheGeneration = 0;
 
@@ -788,6 +789,8 @@ function mediaFailureIsPermanent(cause: unknown) {
     || detail.includes("invalid blob")
     || detail.includes("invalid size")
     || detail.includes("does not match")
+    || detail.includes("could not decode this cached image")
+    || detail.includes("native cached-image conversion is unavailable")
     || detail.includes("belongs to a different conversation")
     || detail.includes("does not belong to a known conversation");
 }
@@ -799,6 +802,8 @@ function clearMediaMemoryCache() {
   );
   for (const preview of previews) URL.revokeObjectURL(preview);
   sentMediaPreviewCache.clear();
+  for (const source of convertedMediaObjectUrls) URL.revokeObjectURL(source);
+  convertedMediaObjectUrls.clear();
   imagePosterCache.clear();
   videoPosterCache.clear();
   decodedImageCache.clear();
@@ -1228,6 +1233,45 @@ async function convertHeicFile(file: File) {
     type: "image/jpeg",
     lastModified: file.lastModified,
   });
+}
+
+function imageSourceDecodes(source: string) {
+  return new Promise<boolean>((resolve) => {
+    const image = new Image();
+    let settled = false;
+    const finish = (decoded: boolean) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      image.onload = null;
+      image.onerror = null;
+      resolve(decoded);
+    };
+    const timeout = window.setTimeout(() => finish(false), 5_000);
+    image.onload = () => finish(Boolean(image.naturalWidth && image.naturalHeight));
+    image.onerror = () => finish(false);
+    image.src = source;
+  });
+}
+
+async function renderableImageSource(
+  source: string,
+  nativePath: string | undefined,
+  attachment: MediaAttachment,
+) {
+  if (isTauri && nativePath) {
+    if (await imageSourceDecodes(source)) return source;
+    const { convertFileSrc, invoke } = await import("@tauri-apps/api/core");
+    const convertedPath = await invoke<string>("convert_cached_image_for_display", {
+      sourcePath: nativePath,
+    });
+    return convertFileSrc(convertedPath);
+  }
+  if (!isHeicMedia(attachment.mime_type, attachment.file_name)) return source;
+  const response = await fetch(source);
+  if (!response.ok) throw new Error("the HEIC photo could not be read");
+  const converted = await convertHeicBlob(await response.blob());
+  return URL.createObjectURL(converted);
 }
 
 async function optimizeOutgoingVideo(file: File) {
@@ -7523,8 +7567,16 @@ function requestMediaSource(
         const next = isTauri
           ? (await import("@tauri-apps/api/core")).convertFileSrc(data.file_path)
           : data.file_path;
-        if (generation === mediaCacheGeneration) mediaCache.set(cacheKey, next);
-        return next;
+        const renderable = isHeicMedia(attachment.mime_type, attachment.file_name)
+          ? await renderableImageSource(next, isTauri ? data.file_path : undefined, attachment)
+          : next;
+        if (generation === mediaCacheGeneration) {
+          mediaCache.set(cacheKey, renderable);
+          if (renderable.startsWith("blob:")) convertedMediaObjectUrls.add(renderable);
+        } else if (renderable.startsWith("blob:")) {
+          URL.revokeObjectURL(renderable);
+        }
+        return renderable;
       } catch (cause) {
         if (
           isSupersededLoading(cause)
