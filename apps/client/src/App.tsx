@@ -9345,15 +9345,15 @@ function ProfileAlbumDialog({
       {error && <p className="profile-album-error">{error}</p>}
       {!onPick && selected && data ? (
         <div className="gallery-view">
-          <button className="gallery-back" onClick={() => setSelectedId(null)}><ArrowLeft size={14} /> {albumButtonLabel(album)}</button>
+          <div className="profile-album-detail-toolbar">
+            <button className="gallery-back" onClick={() => setSelectedId(null)}><ArrowLeft size={14} /> {albumButtonLabel(album)}</button>
+            <small>{selectedIndex + 1} of {media.length} · {formatGalleryDate(selected.created_at_millis)}</small>
+            {editable && <button className="danger" onClick={() => void removeSelected()}><Trash2 size={13} /> remove</button>}
+          </div>
           <div className="gallery-viewer">
             <button className="gallery-nav previous" disabled={!showPrevious} onClick={() => showPrevious && setSelectedId(media[selectedIndex - 1].event_id)} aria-label="previous media"><ChevronLeft size={25} /></button>
             <MessageMedia key={selected.event_id} attachment={selected.attachment} scopeId={data.scope_id} autoplayVideo />
             <button className="gallery-nav next" disabled={!showNext} onClick={() => showNext && setSelectedId(media[selectedIndex + 1].event_id)} aria-label="next media"><ChevronRight size={25} /></button>
-          </div>
-          <div className="profile-album-meta">
-            <small>{selectedIndex + 1} of {media.length} · {formatGalleryDate(selected.created_at_millis)}</small>
-            {editable && <button className="danger" onClick={() => void removeSelected()}><Trash2 size={13} /> remove</button>}
           </div>
         </div>
       ) : data ? (
