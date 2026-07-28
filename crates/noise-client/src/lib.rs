@@ -71,7 +71,7 @@ pub use noise_core::{
 pub use noise_transport::LinkPreview;
 use noise_transport::{
     GATEWAY_HEADER, LinkPreviewRequest, OHTTP_RELAY_PATH, OHTTP_REQUEST_MEDIA_TYPE,
-    OHTTP_RESPONSE_MEDIA_TYPE, PlainResponse, RELAY_CAPABILITIES_PATH, RelayCapabilities,
+    OHTTP_RESPONSE_MEDIA_TYPE, PlainResponse,
     RelayDescriptor, decode_response, encode_request,
 };
 use ohttp::ClientRequest;
@@ -6108,9 +6108,7 @@ impl NoiseClient {
                             rank,
                         )
                     });
-            if is_this_members_turn
-                && (is_owner || self.relays_accept_member_admission(&relays).await)
-            {
+            if is_this_members_turn {
                 // Banned accounts can still sign a fresh membership proof, so
                 // the member taking this turn checks the group's own moderation
                 // history rather than a cached summary of it.
@@ -10850,31 +10848,6 @@ impl NoiseClient {
             bail!("the group encryption head changed on another device; sync and retry")
         }
         bail!("every configured relay must confirm a group encryption update")
-    }
-
-    /// Whether every configured relay accepts an epoch authored by a member who
-    /// did not found the group.
-    ///
-    /// One relay refusing an epoch the others stored would stall this group's
-    /// membership until it is upgraded, so admission stays with the founder
-    /// until the whole set is ready. This runs only when an admission is
-    /// actually pending.
-    async fn relays_accept_member_admission(&self, relays: &[RelayDescriptor]) -> bool {
-        for index in 0..relays.len() {
-            let accepted = self
-                .relay_request(relays, index, "GET", RELAY_CAPABILITIES_PATH, &[])
-                .await
-                .ok()
-                .filter(|response| (200..300).contains(&response.status))
-                .and_then(|response| {
-                    serde_json::from_slice::<RelayCapabilities>(&response.body).ok()
-                })
-                .is_some_and(|capabilities| capabilities.member_admission);
-            if !accepted {
-                return false;
-            }
-        }
-        true
     }
 
     /// Replay control records a replica is missing.
