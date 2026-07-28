@@ -18,7 +18,9 @@ use tokio_postgres::error::SqlState;
 
 use super::{
     AppState, AuthenticatedSession, authenticate_session, decode_canonical_array, decode_hex_32,
+    encode_hex,
     error::ApiError,
+    watch::{WatchChange, record_watch_change},
 };
 
 const MAX_EPOCH_MEMBERS: usize = 10_000;
@@ -180,7 +182,9 @@ pub async fn publish_genesis(
         }),
     )
     .await?;
+    let watch_scope = record_group_control_change(&transaction, &decoded.group_id).await?;
     transaction.commit().await.map_err(ApiError::database)?;
+    state.watch.wake(&watch_scope).await;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -248,7 +252,9 @@ pub async fn publish_join_request(
         }),
     )
     .await?;
+    let watch_scope = record_group_control_change(&transaction, &decoded.group_id).await?;
     transaction.commit().await.map_err(ApiError::database)?;
+    state.watch.wake(&watch_scope).await;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -343,7 +349,9 @@ pub async fn publish_removal_request(
         }),
     )
     .await?;
+    let watch_scope = record_group_control_change(&transaction, &decoded.group_id).await?;
     transaction.commit().await.map_err(ApiError::database)?;
+    state.watch.wake(&watch_scope).await;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -587,7 +595,9 @@ async fn publish_epoch_inner(
         }),
     )
     .await?;
+    let watch_scope = record_group_control_change(&transaction, &decoded.group_id).await?;
     transaction.commit().await.map_err(ApiError::database)?;
+    state.watch.wake(&watch_scope).await;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -656,9 +666,7 @@ pub async fn publish_external_join_package(
         eprintln!(
             "[noise-central] external join package head mismatch: \
              group={} package_epoch={} head_epoch={}",
-            package.group_id,
-            package.epoch,
-            head_epoch,
+            package.group_id, package.epoch, head_epoch,
         );
         return Err(ApiError::conflict("mls_control_head_changed"));
     }
@@ -686,7 +694,11 @@ pub async fn publish_external_join_package(
         )
         .await
         .map_err(mls_conflict)?;
+    // A published KeyPackage is what lets founders admit a joining member, so
+    // it must wake the group watch like any other control change.
+    let watch_scope = record_group_control_change(&transaction, &group_id).await?;
     transaction.commit().await.map_err(ApiError::database)?;
+    state.watch.wake(&watch_scope).await;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -1274,6 +1286,27 @@ async fn insert_outbox(
         .await
         .map_err(ApiError::database)?;
     Ok(())
+}
+
+/// Records an MLS operation as a control change on the group's watch scope and
+/// returns the scope so the caller can wake watchers after committing. Members
+/// react to control changes by reconciling encryption state and pending
+/// admissions, so every MLS write must reach the group watch.
+async fn record_group_control_change(
+    transaction: &Transaction<'_>,
+    group_id: &[u8; 32],
+) -> Result<String, ApiError> {
+    let scope_id = encode_hex(group_id);
+    record_watch_change(
+        transaction,
+        WatchChange {
+            scope_id: &scope_id,
+            stream_locator: None,
+            control: true,
+        },
+    )
+    .await?;
+    Ok(scope_id)
 }
 
 fn decode_records<T>(rows: Vec<tokio_postgres::Row>) -> Result<Vec<T>, ApiError>

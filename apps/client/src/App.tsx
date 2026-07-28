@@ -752,6 +752,8 @@ const videoPosterCache = new Map<string, string>();
 const convertedMediaObjectUrls = new Set<string>();
 const renderedMessageCounts = new Map<string, number>();
 let mediaCacheGeneration = 0;
+let mediaResumeGeneration = 0;
+const mediaResumeListeners = new Set<(generation: number) => void>();
 
 const INITIAL_MESSAGE_COUNT = 24;
 const MESSAGE_PAGE_SIZE = 40;
@@ -1786,6 +1788,40 @@ export default function App() {
     observedAt: number;
     statuses: Map<string, PresenceStatus>;
   }>());
+
+  useEffect(() => {
+    let inactive = document.visibilityState !== "visible" || !document.hasFocus();
+    let lastResumeAt = 0;
+    const resumeMedia = () => {
+      if (!inactive || document.visibilityState !== "visible") return;
+      inactive = false;
+      const now = window.performance.now();
+      // Desktop WebViews commonly emit both visibilitychange and focus for
+      // the same activation. Treat them as one resume so media remounts once.
+      if (now - lastResumeAt < 250) return;
+      lastResumeAt = now;
+      mediaResumeGeneration += 1;
+      for (const notify of mediaResumeListeners) notify(mediaResumeGeneration);
+    };
+    const visibilityChanged = () => {
+      if (document.visibilityState === "hidden") {
+        inactive = true;
+      } else {
+        resumeMedia();
+      }
+    };
+    const markInactive = () => {
+      inactive = true;
+    };
+    document.addEventListener("visibilitychange", visibilityChanged);
+    window.addEventListener("blur", markInactive);
+    window.addEventListener("focus", resumeMedia);
+    return () => {
+      document.removeEventListener("visibilitychange", visibilityChanged);
+      window.removeEventListener("blur", markInactive);
+      window.removeEventListener("focus", resumeMedia);
+    };
+  }, []);
   const dirtyGroupIds = useRef(new Set<string>());
   const groupWatchRevisions = useRef(new Map<string, number>());
   const directConversationCache = useRef(new Map<string, DirectConversation>());
@@ -2404,7 +2440,7 @@ export default function App() {
       relays,
       interruptible,
     });
-    if (!inbox) return;
+    if (!inbox) return false;
     clearRecoveredRelayError();
     // The Rust client has already fetched and decrypted these messages. Keep them
     // even if another UI selection changed while that work was in flight, so an
@@ -2412,12 +2448,15 @@ export default function App() {
     for (const item of inbox.conversations) {
       directConversationCache.current.set(item.contact.public_key, item);
     }
-    if (generation !== refreshGeneration.current) return;
+    // A navigation superseded this snapshot; report it unapplied so the watch
+    // loop retries instead of advancing past the change.
+    if (generation !== refreshGeneration.current) return false;
     applyDirectInbox(inbox);
     const activePublicKey = desiredDirectPublicKeyRef.current
       ?? inbox.summary.directs.find((direct) => direct.is_active)?.public_key;
     const active = inbox.summary.directs.find((direct) => direct.public_key === activePublicKey);
     if (markActiveRead && active?.has_unread) await markDirectRead(active.public_key);
+    return true;
   }, [applyDirectInbox, clearRecoveredRelayError, markDirectRead]);
 
   const refresh = useCallback(async (authenticatedLocal?: LocalSummary) => {
@@ -2989,7 +3028,6 @@ export default function App() {
       if (activity.conversation) {
         topicSource = activity.conversation;
         groupConversationCache.current.set(groupId, activity.conversation);
-        dirtyGroupIds.current.delete(groupId);
         if (desiredGroupIdRef.current === groupId) {
           setConversation(activity.conversation);
         }
@@ -2999,7 +3037,17 @@ export default function App() {
     const topics = (topicSource?.topics ?? []).filter((topic) => !topic.archived);
     const allTopicIds = topics.map((topic) => topic.topic_id);
     const hintedLocators = new Set(change.changed_stream_locators ?? []);
-    const hintedTopicIds = hintsComplete
+    // A hinted stream this client cannot map to any known topic (for example a
+    // topic defined by a control event this device has not applied yet) means
+    // the hints cannot safely scope the catch-up: reconcile every topic rather
+    // than silently skipping the unknown stream and advancing the revision.
+    const knownLocators = new Set(
+      (topicSource?.topics ?? []).map((topic) => topic.stream_locator),
+    );
+    const hintsCoverKnownTopics = [...hintedLocators].every(
+      (locator) => knownLocators.has(locator),
+    );
+    const hintedTopicIds = hintsComplete && hintsCoverKnownTopics
       ? topics
         .filter((topic) => hintedLocators.has(topic.stream_locator))
         .map((topic) => topic.topic_id)
@@ -3007,11 +3055,12 @@ export default function App() {
     const openTopicId = preferredTopicId && allTopicIds.includes(preferredTopicId)
       ? preferredTopicId
       : null;
-    const immediateTopicIds = hintsComplete
-      ? hintedTopicIds
-      : openTopicId
-        ? [openTopicId]
-        : [];
+    // An initial watch is a catch-up barrier, not just a subscription setup.
+    // When the server cannot provide a complete stream-level delta, every
+    // topic must be reconciled before this revision is considered processed.
+    const immediateTopicIds = initial || !hintsComplete
+      ? [...allTopicIds]
+      : hintedTopicIds;
     immediateTopicIds.sort((left, right) => {
       if (left === openTopicId) return -1;
       if (right === openTopicId) return 1;
@@ -3024,8 +3073,7 @@ export default function App() {
           topicId,
           isVisibleGroup && activeTopicIdRef.current === topicId,
         );
-        if (isStopped()) return false;
-        if (!topicActivity) continue;
+        if (isStopped() || !topicActivity) return false;
         setSummary(topicActivity.summary);
         if (topicActivity.conversation) {
           topicSource = topicActivity.conversation;
@@ -3035,7 +3083,9 @@ export default function App() {
           }
         }
       } catch {
-        // This exact stream retries on its next revision or when opened.
+        // Never advance the group revision past a stream that was not applied.
+        // The queued watch change remains pending and retries this exact catch-up.
+        return false;
       }
     }
 
@@ -3051,11 +3101,23 @@ export default function App() {
       .filter((group) => !group.safety_restriction)
       .filter((group) => sidebarMode !== "groups" || group.group_id !== activeGroupId);
     let stopped = false;
-    let initialSyncQueue = Promise.resolve();
-    const syncInitialGroup = (groupId: string) => {
-      const task = initialSyncQueue.then(() => syncGroupActivity(groupId));
-      initialSyncQueue = task.then(() => undefined, () => undefined);
-      return task;
+    // Initial catch-ups are bounded (not serialized one group at a time) so an
+    // account with many groups becomes live in a few round trips instead of
+    // minutes, without stampeding the relay on sign-in.
+    let initialSyncActive = 0;
+    const initialSyncWaiters: Array<() => void> = [];
+    const syncInitialGroup = async (groupId: string) => {
+      while (!stopped && initialSyncActive >= 3) {
+        await new Promise<void>((resolve) => initialSyncWaiters.push(resolve));
+      }
+      if (stopped) return null;
+      initialSyncActive += 1;
+      try {
+        return await syncGroupActivity(groupId);
+      } finally {
+        initialSyncActive -= 1;
+        initialSyncWaiters.shift()?.();
+      }
     };
     const watch = async (group: GroupSummary) => {
       let revision: number | null = groupWatchRevisions.current.get(group.group_id) ?? null;
@@ -3091,6 +3153,10 @@ export default function App() {
                 continue;
               }
               groupWatchRevisions.current.set(group.group_id, item.change.revision);
+              // A newer watch response may have arrived while this revision
+              // was applying. Only advertise the cache as caught up when no
+              // later revision remains queued behind it.
+              if (!pending) dirtyGroupIds.current.delete(group.group_id);
               if (item.initial) {
                 scheduleAccountCacheSync();
                 if (!group.read_state_initialized) {
@@ -3163,6 +3229,7 @@ export default function App() {
     }
     return () => {
       stopped = true;
+      for (const resolve of initialSyncWaiters.splice(0)) resolve();
     };
   }, [
     activeGroupId,
@@ -3209,6 +3276,7 @@ export default function App() {
                 continue;
               }
               groupWatchRevisions.current.set(activeGroupId, item.change.revision);
+              if (!pending) dirtyGroupIds.current.delete(activeGroupId);
             } catch {
               requeue(item);
               await new Promise((resolve) => window.setTimeout(resolve, 1500));
@@ -3280,18 +3348,22 @@ export default function App() {
           const initial = revision === null;
           const change: GroupWatch | null = await noise<GroupWatch>({ action: "watch_direct", since: revision, relays });
           if (stopped || !change) return;
-          revision = change.revision;
           updatePresenceScope("directs", presenceStatusesFromWatch(change));
-          if (initial) {
-            await syncDirectInbox(
+          if (initial || change.changed) {
+            const applied = await syncDirectInbox(
               sidebarModeRef.current === "directs",
               true,
             );
-          } else if (change.changed) {
-            await syncDirectInbox(
-              sidebarModeRef.current === "directs",
-              true,
-            );
+            if (applied) {
+              revision = change.revision;
+            } else if (!stopped) {
+              // The inbox snapshot was superseded mid-navigation. Keep the old
+              // revision so the next poll redelivers this change, and give the
+              // navigation a moment to settle first.
+              await new Promise((resolve) => window.setTimeout(resolve, 750));
+            }
+          } else {
+            revision = change.revision;
           }
         } catch {
           await new Promise((resolve) => window.setTimeout(resolve, 1500));
@@ -3717,11 +3789,13 @@ export default function App() {
     const generation = ++refreshGeneration.current;
     groupSelectionInFlight.current = true;
     setPendingGroupId(group.group_id);
+    setLoadingTopicId(GENERAL_TOPIC_LOADING_KEY);
     setError(null);
     setGroupEncryption(null);
 
     try {
-      await cancelBackgroundLoading();
+      // Navigation must not abort the background watch drains: cancelling them
+      // here is what used to leave other groups' topics stale until focused.
       if (previousGroupId !== group.group_id) {
         await cancelMediaDownloads();
         await cancelGroupLoading();
@@ -3753,6 +3827,15 @@ export default function App() {
       if (cached) {
         desiredGroupIdRef.current = group.group_id;
         setConversation(cached);
+        // A cache with an applied watch revision is already live. Otherwise
+        // keep the brief catch-up indicator until the selected stream has
+        // reconciled rather than showing stale content as current.
+        if (
+          groupWatchRevisions.current.has(group.group_id)
+          && !dirtyGroupIds.current.has(group.group_id)
+        ) {
+          setLoadingTopicId(null);
+        }
         setSummary((current) => current ? {
           ...current,
           groups: current.groups.map((candidate) => ({
@@ -3791,6 +3874,9 @@ export default function App() {
       if (generation === refreshGeneration.current) {
         groupSelectionInFlight.current = false;
         setPendingGroupId(null);
+        if (desiredGroupIdRef.current !== group.group_id) {
+          setLoadingTopicId(null);
+        }
       }
     }
   }
@@ -3800,15 +3886,15 @@ export default function App() {
     const topicId = topic?.topic_id ?? null;
     const loadingKey = topicId ?? GENERAL_TOPIC_LOADING_KEY;
     const generation = ++topicSelectionGeneration.current;
+    const groupIsCaughtUp = groupWatchRevisions.current.has(activeGroupId)
+      && !dirtyGroupIds.current.has(activeGroupId);
     const hasCachedMessages = conversation.messages.some(
       (item) => (item.topic_id ?? null) === topicId,
     );
     setActiveTopicId(topicId);
-    // Cached topic navigation is complete immediately. Relay reconciliation
-    // continues below without dimming an already-usable topic.
     setPendingTopicId(null);
     setError(null);
-    setLoadingTopicId(hasCachedMessages ? null : loadingKey);
+    setLoadingTopicId(hasCachedMessages && groupIsCaughtUp ? null : loadingKey);
     try {
       // Record the navigation locally before relay reconciliation. A slow or
       // failed topic refresh must not keep an already-open topic unread.
@@ -3817,7 +3903,6 @@ export default function App() {
       } else {
         await markActiveGroupRead(activeGroupId);
       }
-      await cancelBackgroundLoading();
       const activity = topicId
         ? await syncTopicActivity(activeGroupId, topicId, true)
         : await syncGroupActivity(activeGroupId, { topicId: null });
@@ -3884,7 +3969,6 @@ export default function App() {
         setSummary(activity.summary);
         if (activity.conversation) {
           groupConversationCache.current.set(group.group_id, activity.conversation);
-          dirtyGroupIds.current.delete(group.group_id);
           setConversation(activity.conversation);
         }
       } else if (!hasCachedConversation) {
@@ -3923,6 +4007,13 @@ export default function App() {
       if (generation === refreshGeneration.current && !isSupersededLoading(cause)) {
         setError(message(cause));
       }
+    } finally {
+      if (
+        generation === refreshGeneration.current
+        && desiredGroupIdRef.current === group.group_id
+      ) {
+        setLoadingTopicId(null);
+      }
     }
   }
 
@@ -3933,7 +4024,6 @@ export default function App() {
     setError(null);
     await cancelMediaDownloads();
     await cancelGroupLoading();
-    await cancelBackgroundLoading();
     const cached = directConversationCache.current.get(direct.public_key);
     if (cached) setDirectConversation(cached);
     setSummary((current) => current ? {
@@ -4632,7 +4722,27 @@ export default function App() {
                   sentMediaPreviewCache.set(confirmed.event_id, optimistic.local_attachment);
                 }
                 confirmOptimisticGroupMessage(groupId, optimistic.event_id, confirmed, confirmedAttachment);
-                void refresh().catch((cause) => setError(message(cause)));
+                // The send already applied the message to the local cache; a
+                // single targeted activity sync reconciles unread counts and
+                // interleaved messages without the full refresh pipeline.
+                void syncGroupActivity(groupId, {
+                  topicId: desiredGroupIdRef.current === groupId
+                    ? activeTopicIdRef.current
+                    : null,
+                })
+                  .then((activity) => {
+                    if (!activity) return;
+                    setSummary(activity.summary);
+                    if (activity.conversation) {
+                      groupConversationCache.current.set(groupId, activity.conversation);
+                      if (desiredGroupIdRef.current === groupId) {
+                        setConversation(activity.conversation);
+                      }
+                    }
+                  })
+                  .catch(() => {
+                    // The group watch redelivers anything this pass missed.
+                  });
                 void noise({
                   action: "sync_account",
                   relays,
@@ -6657,26 +6767,30 @@ function ConversationPanel({
         </div>
       </header>
       <div className="messages" ref={messageList.ref} onScroll={messageList.onScroll}>
-        {conversation.messages.length === 0 && (
-          loadingTopic
-            ? <MediaLoadStatus prominent />
-            : <div className="quiet">{topic ? "this topic is quiet" : "the group is quiet"}</div>
+        {loadingTopic ? (
+          <MediaLoadStatus prominent />
+        ) : (
+          <>
+            {conversation.messages.length === 0 && (
+              <div className="quiet">{topic ? "this topic is quiet" : "the group is quiet"}</div>
+            )}
+            {messageList.canLoadOlder && (
+              <OlderMessagesSentinel
+                loading={messageList.loadingOlder}
+                sentinel={messageList.olderSentinel}
+              />
+            )}
+            {messageList.visibleMessages.map((item, index) => (
+              <Fragment key={item.event_id}>
+                {(index === 0 || !sameLocalDay(
+                  messageList.visibleMessages[index - 1].created_at_millis,
+                  item.created_at_millis,
+                )) && <MessageDateSeparator millis={item.created_at_millis} />}
+                <MessageRow message={item} own={item.author_public_key === selfPublicKey} presence={presenceStatuses.get(item.author_public_key) ?? "offline"} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onNavigateToMessage={messageList.navigateToMessage} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onToggleReaction={(emoji) => void onReaction(item, emoji)} reactionPeople={reactionPeople} onPerson={onPerson} mediaScopeId={conversation.group.group_id} />
+              </Fragment>
+            ))}
+          </>
         )}
-        {messageList.canLoadOlder && (
-          <OlderMessagesSentinel
-            loading={messageList.loadingOlder}
-            sentinel={messageList.olderSentinel}
-          />
-        )}
-        {messageList.visibleMessages.map((item, index) => (
-          <Fragment key={item.event_id}>
-            {(index === 0 || !sameLocalDay(
-              messageList.visibleMessages[index - 1].created_at_millis,
-              item.created_at_millis,
-            )) && <MessageDateSeparator millis={item.created_at_millis} />}
-            <MessageRow message={item} own={item.author_public_key === selfPublicKey} presence={presenceStatuses.get(item.author_public_key) ?? "offline"} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onNavigateToMessage={messageList.navigateToMessage} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onToggleReaction={(emoji) => void onReaction(item, emoji)} reactionPeople={reactionPeople} onPerson={onPerson} mediaScopeId={conversation.group.group_id} />
-          </Fragment>
-        ))}
       </div>
       {selfMember && (canSendMessages || canSendMedia) ? <div className="composer">
         {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.group.group_id} onClose={() => setReplyingTo(null)} />}
@@ -7475,7 +7589,7 @@ function ReplyMediaThumbnail({ message, scopeId }: { message: MessageSummary & {
   const embeddedPreview = mediaPoster(attachment);
   const image = attachment.mime_type.startsWith("image/");
   const video = attachment.mime_type.startsWith("video/");
-  const { source, failed } = useMediaSource(
+  const { source, failed, resumeGeneration } = useMediaSource(
     attachment,
     scopeId,
     !video && !localAttachment && !embeddedPreview ? "background" : null,
@@ -7485,7 +7599,7 @@ function ReplyMediaThumbnail({ message, scopeId }: { message: MessageSummary & {
   if (image) {
     const imageSource = localAttachment?.preview_url ?? poster ?? source;
     const loading = !localAttachment && !embeddedPreview && !source;
-    return <span className="reply-media-thumbnail">{imageSource && <img src={imageSource} alt="" />}{loading && <MediaLoadStatus failed={failed} compact />}</span>;
+    return <span className="reply-media-thumbnail">{imageSource && <img key={resumeGeneration} src={imageSource} alt="" />}{loading && <MediaLoadStatus failed={failed} compact />}</span>;
   }
   if (video) {
     return <span className="reply-media-thumbnail video">{poster ? <img src={poster} alt="" /> : <span className="reply-video-placeholder"><NoiseMark size={16} monochrome /></span>}<i><Play size={9} fill="currentColor" /></i></span>;
@@ -7511,7 +7625,7 @@ function MessageMedia({ attachment, scopeId, autoplayVideo = false }: { attachme
     ) return;
     void prewarmMediaBootstrap(attachment, scopeId, visibility.priority);
   }, [attachment, scopeId, video, videoRequested, visibility.priority]);
-  const { source, failed, retry: retrySource } = useMediaSource(
+  const { source, failed, retry: retrySource, resumeGeneration } = useMediaSource(
     attachment,
     scopeId,
     video
@@ -7528,6 +7642,7 @@ function MessageMedia({ attachment, scopeId, autoplayVideo = false }: { attachme
     <div className="message-media" ref={visibility.ref}>
       {image ? (
         <ChatImage
+          key={`${posterCacheKey}:${resumeGeneration}`}
           source={source ?? undefined}
           preview={sticker ? undefined : poster}
           cacheKey={posterCacheKey}
@@ -7538,6 +7653,7 @@ function MessageMedia({ attachment, scopeId, autoplayVideo = false }: { attachme
         />
       ) : video ? (
         <ChatVideo
+          key={`${posterCacheKey}:${resumeGeneration}`}
           source={source ?? undefined}
           poster={poster}
           posterCacheKey={posterCacheKey}
@@ -7550,7 +7666,7 @@ function MessageMedia({ attachment, scopeId, autoplayVideo = false }: { attachme
           failed={failed}
         />
       ) : source ? (
-        <audio src={source} controls preload="metadata" />
+        <audio key={resumeGeneration} src={source} controls preload="metadata" />
       ) : (
         <div className="media-loading"><MediaLoadStatus failed={failed} /></div>
       )}
@@ -7981,6 +8097,7 @@ function useMediaSource(
   priority: MediaLoadPriority | null = "visible",
 ) {
   const cacheKey = mediaCacheKey(attachment);
+  const [resumeGeneration, setResumeGeneration] = useState(mediaResumeGeneration);
   const [loaded, setLoaded] = useState<{ cacheKey: string; source: string } | null>(() => {
     const source = mediaCache.get(cacheKey);
     return source ? { cacheKey, source } : null;
@@ -8001,6 +8118,7 @@ function useMediaSource(
     let active = true;
     let retryTimer: number | undefined;
     let retryRound = 0;
+    let supersededRound = 0;
     setFailedKey(null);
     const load = () => {
       setFailedKey(null);
@@ -8010,7 +8128,15 @@ function useMediaSource(
         })
         .catch((cause) => {
           if (!active) return;
-          if (isSupersededLoading(cause)) return;
+          if (isSupersededLoading(cause)) {
+            // A navigation cancelled this download mid-flight. The media is
+            // still on screen and still wanted — retry shortly instead of
+            // leaving the placeholder spinning forever.
+            const delay = Math.min(600 * 1.5 ** supersededRound, 5_000);
+            supersededRound += 1;
+            retryTimer = window.setTimeout(load, delay);
+            return;
+          }
           setFailedKey(cacheKey);
           if (mediaFailureIsPermanent(cause)) return;
           const delay = Math.min(5_000 * 1.7 ** retryRound, 30_000);
@@ -8024,6 +8150,12 @@ function useMediaSource(
       if (retryTimer !== undefined) window.clearTimeout(retryTimer);
     };
   }, [attachment, cacheKey, priority, scopeId]);
+  useEffect(() => {
+    mediaResumeListeners.add(setResumeGeneration);
+    return () => {
+      mediaResumeListeners.delete(setResumeGeneration);
+    };
+  }, []);
   const retry = useCallback(() => {
     if (retryRequest.current) return retryRequest.current;
     mediaCache.delete(cacheKey);
@@ -8044,7 +8176,7 @@ function useMediaSource(
     retryRequest.current = request;
     return request;
   }, [attachment, cacheKey, scopeId]);
-  return { source, failed: failedKey === cacheKey, retry };
+  return { source, failed: failedKey === cacheKey, retry, resumeGeneration };
 }
 
 function useMediaPriority<T extends HTMLElement>() {
@@ -9410,7 +9542,7 @@ function GalleryTile({
   const visibility = useMediaPriority<HTMLButtonElement>();
   const image = attachment.mime_type.startsWith("image/");
   const video = attachment.mime_type.startsWith("video/");
-  const { source, failed } = useMediaSource(
+  const { source, failed, resumeGeneration } = useMediaSource(
     attachment,
     scopeId,
     video ? null : visibility.priority,
@@ -9421,7 +9553,7 @@ function GalleryTile({
     : !source || (image && !thumbnail);
   return (
     <button ref={visibility.ref} className={`gallery-tile ${image ? "image" : video ? "video" : "audio"}`} disabled={disabled} onClick={onOpen} aria-label={actionLabel ?? `open media shared by ${message.username}`}>
-      {(image || video) && thumbnail && <img src={thumbnail} alt="" />}
+      {(image || video) && thumbnail && <img key={resumeGeneration} src={thumbnail} alt="" />}
       {video && !thumbnail && <span className="gallery-video-placeholder"><NoiseMark size={28} monochrome /></span>}
       {!image && !video && source && <span className="gallery-audio"><AudioWaveform size={30} /><small>audio</small></span>}
       {loading && <span className="gallery-loading"><MediaLoadStatus failed={failed} /></span>}

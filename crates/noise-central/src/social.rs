@@ -8,7 +8,9 @@ use axum::{
 use noise_core::{GroupDeletion, InviteRecord, InviteRotation, SignedEvent};
 
 use super::{
-    AppState, authenticate_session, decode_canonical_array, decode_hex_32, error::ApiError,
+    AppState, authenticate_session, decode_canonical_array, decode_hex_32, encode_hex,
+    error::ApiError,
+    watch::{WatchChange, record_watch_change},
 };
 
 pub async fn publish_invite(
@@ -315,7 +317,18 @@ pub async fn publish_group_deletion(
         )
         .await
         .map_err(ApiError::database)?;
+    let watch_scope = encode_hex(&group_id);
+    record_watch_change(
+        &transaction,
+        WatchChange {
+            scope_id: &watch_scope,
+            stream_locator: None,
+            control: true,
+        },
+    )
+    .await?;
     transaction.commit().await.map_err(ApiError::database)?;
+    state.watch.wake(&watch_scope).await;
     Ok(StatusCode::ACCEPTED)
 }
 

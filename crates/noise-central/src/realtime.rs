@@ -9,10 +9,18 @@ use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use noise_core::{GroupPresence, direct_mailbox_id};
 use serde::Serialize;
 
-use super::{AppState, AuthenticatedSession, authenticate_session, decode_hex_32, error::ApiError};
+use super::{
+    AppState, AuthenticatedSession, authenticate_session, decode_hex_32, encode_hex,
+    error::ApiError,
+};
 
 const WATCH_TIMEOUT: Duration = Duration::from_secs(20);
-const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
+// In-process writers wake watchers instantly through WatchNotifier; this poll
+// only covers writes from other processes and missed wakeups.
+const WATCH_FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(2);
+// One more row than a full retained history window, so a response that fills
+// the window is recognizably incomplete.
+const WATCH_CHANGE_PAGE: i64 = 513;
 const MAX_GROUP_PRESENCE_MILLIS: u64 = 5 * 60_000;
 const RECENT_GROUP_PRESENCE_MILLIS: u64 = 15 * 60_000;
 const MAX_GROUP_PRESENCES: usize = 10_000;
@@ -37,8 +45,11 @@ pub async fn account_watch(
     let session = authenticate_session(&state, &headers).await?;
     let locator = decode_hex_32(&locator, "invalid_vault_locator")?;
     let since = parse_revision(&since)?;
+    let notify = state.watch.handle(&vault_watch_scope(&locator)).await;
     let started = tokio::time::Instant::now();
     loop {
+        let mut notified = Box::pin(notify.notified());
+        notified.as_mut().enable();
         let client = state
             .database
             .pool
@@ -57,6 +68,7 @@ pub async fn account_watch(
             )
             .await
             .map_err(ApiError::database)?;
+        drop(client);
         if let Some(row) = row {
             let revision = row
                 .get::<_, &str>(0)
@@ -71,7 +83,7 @@ pub async fn account_watch(
         } else if started.elapsed() >= WATCH_TIMEOUT {
             return Ok(Json(empty_watch(since, false)));
         }
-        tokio::time::sleep(WATCH_POLL_INTERVAL).await;
+        wait_for_change(notified, started.elapsed()).await;
     }
 }
 
@@ -81,23 +93,157 @@ pub async fn group_watch(
     headers: HeaderMap,
 ) -> Result<Json<GroupWatchResponse>, ApiError> {
     let session = authenticate_session(&state, &headers).await?;
-    decode_hex_32(&group_id, "invalid_group_id")?;
+    let scope_id = encode_hex(&decode_hex_32(&group_id, "invalid_group_id")?);
     authorize_watch_scope(&state, &session, &group_id).await?;
+    let initial = since == "initial";
     let since = parse_revision(&since)?;
+    let since_id = i64::try_from(since).unwrap_or(i64::MAX);
+    let notify = state.watch.handle(&scope_id).await;
     let started = tokio::time::Instant::now();
     loop {
-        let revision = global_revision(&state).await?;
-        if revision > since || started.elapsed() >= WATCH_TIMEOUT {
+        let mut notified = Box::pin(notify.notified());
+        notified.as_mut().enable();
+        let changes = scope_changes(&state, &scope_id, since_id).await?;
+        if !changes.is_empty() {
+            return Ok(Json(
+                changed_watch(&state, &scope_id, since_id, changes).await?,
+            ));
+        }
+        // "initial" is a catch-up barrier, not a long-poll. Return
+        // immediately even when this scope has not changed since the scoped
+        // watch table was introduced, so the client can reconcile its local
+        // streams before beginning the steady-state watch.
+        if initial {
             return Ok(Json(GroupWatchResponse {
-                revision,
-                changed: revision > since,
-                presences: active_presences(&state, &group_id).await,
+                revision: since,
+                changed: false,
+                presences: active_presences(&state, &scope_id).await,
                 changed_stream_locators: Vec::new(),
-                control_changed: revision > since,
+                control_changed: false,
                 change_hints_complete: false,
             }));
         }
-        tokio::time::sleep(WATCH_POLL_INTERVAL).await;
+        if started.elapsed() >= WATCH_TIMEOUT {
+            return Ok(Json(GroupWatchResponse {
+                revision: since,
+                changed: false,
+                presences: active_presences(&state, &scope_id).await,
+                changed_stream_locators: Vec::new(),
+                control_changed: false,
+                change_hints_complete: true,
+            }));
+        }
+        wait_for_change(notified, started.elapsed()).await;
+    }
+}
+
+struct ScopeChange {
+    change_id: i64,
+    stream_locator: Option<String>,
+    control: bool,
+}
+
+async fn scope_changes(
+    state: &AppState,
+    scope_id: &str,
+    since_id: i64,
+) -> Result<Vec<ScopeChange>, ApiError> {
+    let client = state
+        .database
+        .pool
+        .get()
+        .await
+        .map_err(ApiError::database)?;
+    let rows = client
+        .query(
+            "SELECT change_id, stream_locator, control
+             FROM noise.watch_changes
+             WHERE scope_id = $1 AND change_id > $2
+             ORDER BY change_id
+             LIMIT $3",
+            &[&scope_id, &since_id, &WATCH_CHANGE_PAGE],
+        )
+        .await
+        .map_err(ApiError::database)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ScopeChange {
+            change_id: row.get(0),
+            stream_locator: row.get(1),
+            control: row.get(2),
+        })
+        .collect())
+}
+
+async fn changed_watch(
+    state: &AppState,
+    scope_id: &str,
+    since_id: i64,
+    changes: Vec<ScopeChange>,
+) -> Result<GroupWatchResponse, ApiError> {
+    let revision = changes
+        .last()
+        .map(|change| change.change_id)
+        .unwrap_or(since_id);
+    // Hints are complete only when the watcher's last-seen change is still
+    // inside the retained history window, so nothing can have been pruned out
+    // of the gap, and the page itself did not overflow.
+    let overflowed = changes.len() >= WATCH_CHANGE_PAGE as usize;
+    let covered = if since_id > 0 && !overflowed {
+        let client = state
+            .database
+            .pool
+            .get()
+            .await
+            .map_err(ApiError::database)?;
+        let oldest: Option<i64> = client
+            .query_one(
+                "SELECT min(change_id) FROM noise.watch_changes WHERE scope_id = $1",
+                &[&scope_id],
+            )
+            .await
+            .map_err(ApiError::database)?
+            .get(0);
+        oldest.is_some_and(|oldest| since_id >= oldest)
+    } else {
+        false
+    };
+    let control_changed = changes
+        .iter()
+        .any(|change| change.control || change.stream_locator.is_none());
+    let mut changed_stream_locators: Vec<String> = changes
+        .iter()
+        .filter_map(|change| change.stream_locator.clone())
+        .collect();
+    changed_stream_locators.sort();
+    changed_stream_locators.dedup();
+    Ok(GroupWatchResponse {
+        revision: u64::try_from(revision).map_err(ApiError::database)?,
+        changed: true,
+        presences: active_presences(state, scope_id).await,
+        changed_stream_locators,
+        control_changed,
+        change_hints_complete: covered,
+    })
+}
+
+pub fn vault_watch_scope(locator: &[u8; 32]) -> String {
+    // Vault locators and group ids share the 32-byte hex namespace; the prefix
+    // keeps an account watch from ever aliasing a group watch scope.
+    format!("vault:{}", encode_hex(locator))
+}
+
+async fn wait_for_change(
+    notified: std::pin::Pin<Box<tokio::sync::futures::Notified<'_>>>,
+    elapsed: Duration,
+) {
+    let remaining = WATCH_TIMEOUT.saturating_sub(elapsed);
+    let poll = WATCH_FALLBACK_POLL_INTERVAL
+        .min(remaining)
+        .max(Duration::from_millis(50));
+    tokio::select! {
+        _ = notified => {}
+        _ = tokio::time::sleep(poll) => {}
     }
 }
 
@@ -221,24 +367,6 @@ async fn authorize_presence_scope(
         return Ok(());
     }
     Err(ApiError::forbidden())
-}
-
-async fn global_revision(state: &AppState) -> Result<u64, ApiError> {
-    let client = state
-        .database
-        .pool
-        .get()
-        .await
-        .map_err(ApiError::database)?;
-    let revision: i64 = client
-        .query_one(
-            "SELECT COALESCE(max(outbox_id), 0) FROM noise.outbox_events",
-            &[],
-        )
-        .await
-        .map_err(ApiError::database)?
-        .get(0);
-    u64::try_from(revision).map_err(ApiError::database)
 }
 
 async fn active_presences(state: &AppState, group_id: &str) -> Vec<GroupPresence> {

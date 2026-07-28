@@ -229,6 +229,10 @@ pub async fn put_account_vault(
             .map_err(ApiError::database)?;
     }
     transaction.commit().await.map_err(ApiError::database)?;
+    state
+        .watch
+        .wake(&super::realtime::vault_watch_scope(&locator_bytes))
+        .await;
     vault_response(
         if is_new_locator {
             StatusCode::CREATED

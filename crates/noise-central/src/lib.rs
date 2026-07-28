@@ -10,6 +10,7 @@ mod mls;
 mod realtime;
 mod social;
 mod vaults;
+mod watch;
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -52,6 +53,7 @@ struct AppState {
     klipy: Option<klipy::KlipyProxy>,
     media: Option<media::MediaStore>,
     presences: Arc<RwLock<HashMap<String, HashMap<String, GroupPresence>>>>,
+    watch: Arc<watch::WatchNotifier>,
 }
 
 struct AuthenticatedSession {
@@ -105,6 +107,7 @@ pub async fn build_app(config: &CentralConfig) -> anyhow::Result<Router> {
         klipy,
         media,
         presences: Arc::new(RwLock::new(HashMap::new())),
+        watch: Arc::new(watch::WatchNotifier::default()),
     });
 
     let mut app = Router::new()

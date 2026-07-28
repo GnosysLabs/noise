@@ -13,7 +13,9 @@ use tokio_postgres::error::SqlState;
 
 use super::{
     AppState, AuthenticatedSession, authenticate_session, decode_canonical_array, decode_hex_32,
+    encode_hex,
     error::ApiError,
+    watch::{WatchChange, record_watch_change, record_watch_change_at},
 };
 
 const DEFAULT_PAGE_SIZE: u16 = 100;
@@ -253,7 +255,23 @@ pub async fn publish_group_event(
         )
         .await
         .map_err(ApiError::database)?;
+    let watch_scope = encode_hex(&decoded.group_id);
+    let stream_locator_hex = decoded
+        .stream_locator
+        .as_ref()
+        .map(|value| encode_hex(value));
+    record_watch_change_at(
+        &transaction,
+        canonical_cursor,
+        WatchChange {
+            scope_id: &watch_scope,
+            stream_locator: stream_locator_hex.as_deref(),
+            control: false,
+        },
+    )
+    .await?;
     transaction.commit().await.map_err(ApiError::database)?;
+    state.watch.wake(&watch_scope).await;
 
     Ok((
         StatusCode::CREATED,
@@ -754,7 +772,34 @@ pub async fn publish_direct_event(
         )
         .await
         .map_err(ApiError::database)?;
+    // The recipient watches their own mailbox (the event's group id); the
+    // author's other devices watch the author's mailbox. Record both so a sent
+    // message reaches every device without a server-wide wakeup.
+    let recipient_mailbox = encode_hex(&decoded.group_id);
+    let author_mailbox = direct_mailbox_id(&request.event.author_public_key)
+        .map_err(|_| ApiError::bad_request("invalid_event"))?;
+    record_watch_change_at(
+        &transaction,
+        canonical_cursor,
+        WatchChange {
+            scope_id: &recipient_mailbox,
+            stream_locator: None,
+            control: false,
+        },
+    )
+    .await?;
+    record_watch_change(
+        &transaction,
+        WatchChange {
+            scope_id: &author_mailbox,
+            stream_locator: None,
+            control: false,
+        },
+    )
+    .await?;
     transaction.commit().await.map_err(ApiError::database)?;
+    state.watch.wake(&recipient_mailbox).await;
+    state.watch.wake(&author_mailbox).await;
 
     Ok((
         StatusCode::CREATED,
@@ -892,7 +937,7 @@ pub async fn client_direct_history(
         return Err(ApiError::bad_request("invalid_event_cursor"));
     }
     let session = authenticate_session(&state, &headers).await?;
-    let client = state
+    let mut client = state
         .database
         .pool
         .get()
@@ -955,7 +1000,30 @@ pub async fn client_direct_history(
             events.remove(0);
         }
     }
-    record_direct_delivery(&client, &session, &events).await?;
+    let watch_scopes = direct_watch_scopes(&session, &query.peer_public_key)?;
+    let transaction = client.transaction().await.map_err(ApiError::database)?;
+    let delivery_recorded = record_direct_delivery(&transaction, &session, &events).await?;
+    if delivery_recorded {
+        for mailbox in &watch_scopes {
+            record_watch_change(
+                &transaction,
+                WatchChange {
+                    scope_id: mailbox,
+                    stream_locator: None,
+                    control: false,
+                },
+            )
+            .await?;
+        }
+    }
+    transaction.commit().await.map_err(ApiError::database)?;
+    if delivery_recorded {
+        // Delivery ticks render on the sender's devices as soon as the
+        // receipt and its matching watch changes are durably committed.
+        for mailbox in &watch_scopes {
+            state.watch.wake(mailbox).await;
+        }
+    }
     let receipts = direct_receipts_for_stream(&client, &session, stream.stream_pk).await?;
     Ok(Json(ClientEventPage {
         events: events.into_iter().map(|event| event.event).collect(),
@@ -970,17 +1038,19 @@ pub async fn mark_direct_read(
     Json(request): Json<DirectReadReceiptRequest>,
 ) -> Result<StatusCode, ApiError> {
     let session = authenticate_session(&state, &headers).await?;
-    let client = state
+    let mut client = state
         .database
         .pool
         .get()
         .await
         .map_err(ApiError::database)?;
-    let stream = find_direct_stream(&client, &session, &request.peer_public_key)
+    let watch_scopes = direct_watch_scopes(&session, &request.peer_public_key)?;
+    let transaction = client.transaction().await.map_err(ApiError::database)?;
+    let stream = find_direct_stream(&transaction, &session, &request.peer_public_key)
         .await?
         .ok_or_else(|| ApiError::not_found("direct_thread_unavailable"))?;
     let through_event_id = decode_hex_32(&request.through_event_id, "invalid_event")?;
-    let boundary = client
+    let boundary = transaction
         .query_opt(
             "SELECT canonical_cursor
              FROM noise.events
@@ -997,7 +1067,7 @@ pub async fn mark_direct_read(
         .map_err(ApiError::database)?
         .map(|row| row.get::<_, i64>(0))
         .ok_or_else(|| ApiError::bad_request("invalid_read_boundary"))?;
-    let rows = client
+    let rows = transaction
         .query(
             "UPDATE noise.direct_event_receipts receipt
              SET delivered_at = COALESCE(receipt.delivered_at, clock_timestamp()),
@@ -1021,13 +1091,14 @@ pub async fn mark_direct_read(
         )
         .await
         .map_err(ApiError::database)?;
+    let receipts_recorded = !rows.is_empty();
     for row in rows {
         let event_id: Vec<u8> = row.get(0);
         let payload = serde_json::to_vec(&serde_json::json!({
             "through_event_id": request.through_event_id,
         }))
         .map_err(ApiError::database)?;
-        client
+        transaction
             .execute(
                 "INSERT INTO noise.outbox_events (
                     topic, aggregate_kind, aggregate_id, payload
@@ -1037,7 +1108,43 @@ pub async fn mark_direct_read(
             .await
             .map_err(ApiError::database)?;
     }
+    if receipts_recorded {
+        for mailbox in &watch_scopes {
+            record_watch_change(
+                &transaction,
+                WatchChange {
+                    scope_id: mailbox,
+                    stream_locator: None,
+                    control: false,
+                },
+            )
+            .await?;
+        }
+    }
+    transaction.commit().await.map_err(ApiError::database)?;
+    if receipts_recorded {
+        // Read receipts render on the sender's devices; the reader's other
+        // devices clear their unread markers after the receipt and both watch
+        // changes are one durable commit.
+        for mailbox in &watch_scopes {
+            state.watch.wake(mailbox).await;
+        }
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Both watch scopes of a direct thread: the authenticated account's own
+/// mailbox and the peer's mailbox.
+fn direct_watch_scopes(
+    session: &AuthenticatedSession,
+    peer_public_key: &str,
+) -> Result<[String; 2], ApiError> {
+    let self_public_key = STANDARD_NO_PAD.encode(session.identity_public_key);
+    let self_mailbox =
+        direct_mailbox_id(&self_public_key).map_err(|_| ApiError::bad_request("invalid_event"))?;
+    let peer_mailbox = direct_mailbox_id(peer_public_key)
+        .map_err(|_| ApiError::bad_request("invalid_recipient_key"))?;
+    Ok([self_mailbox, peer_mailbox])
 }
 
 struct DecodedEvent {
@@ -1341,7 +1448,8 @@ async fn record_direct_delivery<C: GenericClient + Sync>(
     client: &C,
     session: &AuthenticatedSession,
     events: &[CanonicalEvent],
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
+    let mut recorded = false;
     for event in events.iter().filter(|event| {
         event.event.author_public_key != STANDARD_NO_PAD.encode(session.identity_public_key)
     }) {
@@ -1360,6 +1468,7 @@ async fn record_direct_delivery<C: GenericClient + Sync>(
         if updated == 0 {
             continue;
         }
+        recorded = true;
         let payload = serde_json::to_vec(&serde_json::json!({
             "event_id": event.event.event_id,
         }))
@@ -1374,7 +1483,7 @@ async fn record_direct_delivery<C: GenericClient + Sync>(
             .await
             .map_err(ApiError::database)?;
     }
-    Ok(())
+    Ok(recorded)
 }
 
 async fn direct_receipts_for_stream<C: GenericClient + Sync>(
