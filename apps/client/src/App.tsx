@@ -6507,19 +6507,21 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
         {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => primeVideoFrame(event.currentTarget)} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}{uploadProgress !== null && <div className="attachment-progress"><i style={{ width: `${uploadProgress}%` }} /><span>{uploadProgress === 0 && attachment.mimeType.startsWith("video/") ? "preparing video" : `${uploadProgress}%`}</span></div>}<button onClick={() => { uploadController?.abort(); setUploadController(null); setAttachment(null); setUploadProgress(null); }} aria-label={uploadProgress !== null ? "cancel upload" : "remove attachment"}><X size={14} /></button></div>}
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
         <button className="attach-button" disabled={busy} onClick={() => void chooseMediaFromDevice()} aria-label="attach media"><Paperclip size={17} /></button>
-        <button
-          className={`timer-button ${conversation.disappearing_after_read_seconds ? "active" : ""}`}
-          disabled={busy}
-          onClick={() => setShowDisappearingMessages(true)}
-          aria-label="disappearing messages"
-          title={conversation.disappearing_after_read_seconds
-            ? `disappearing after ${formatDisappearingDuration(conversation.disappearing_after_read_seconds)}`
-            : "disappearing messages off"}
-        >
-          <TimerReset size={17} />
-        </button>
         <input ref={fileInput} hidden type="file" accept="image/*,video/*,audio/*" onChange={(event) => void chooseMedia(event.target.files?.[0])} />
-        <textarea ref={composerInput} rows={1} value={draft} placeholder={`message ${contact.username}`} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); } }} />
+        <div className="direct-composer-input">
+          <textarea ref={composerInput} rows={1} value={draft} placeholder={`message ${contact.username}`} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); } }} />
+          <button
+            className={`timer-button ${conversation.disappearing_after_read_seconds ? "active" : ""}`}
+            disabled={busy}
+            onClick={() => setShowDisappearingMessages(true)}
+            aria-label="disappearing messages"
+            title={conversation.disappearing_after_read_seconds
+              ? `disappearing after ${formatDisappearingDuration(conversation.disappearing_after_read_seconds)}`
+              : "disappearing messages off"}
+          >
+            <TimerReset size={17} />
+          </button>
+        </div>
         <button className="send-button" disabled={(!draft.trim() && !attachment) || busy} onClick={() => void submit()}><ArrowUp size={17} /></button>
       </div> : <div className="membership-revoked"><MessageCircle size={16} /> {contact.username} isn’t accepting DMs</div>}
       <aside className="member-sidebar direct-profile-sidebar">
