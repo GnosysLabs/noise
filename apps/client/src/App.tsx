@@ -12,6 +12,7 @@ import {
   Download,
   Eraser,
   EyeOff,
+  FileUp,
   Flame,
   Forward,
   GripVertical,
@@ -4280,7 +4281,7 @@ export default function App() {
                 && (messageJump.topicId ?? null) === (effectiveTopicId ?? null)
                 ? messageJump
                 : null}
-              selfPublicKey={summary.identity.public_key}
+              self={summary.identity}
               presenceStatuses={selectedPresenceStatuses}
               onGroupSettings={() => setDialog({ type: "group", group: selectedConversation.group })}
               onTopicSettings={selectedTopic
@@ -6078,6 +6079,90 @@ function useAutosizeComposer(
   }, [ref, value]);
 }
 
+function ComposerAttachmentPicker({
+  disabled,
+  self,
+  onFiles,
+  onAttachment,
+}: {
+  disabled: boolean;
+  self: IdentitySummary;
+  onFiles: () => void | Promise<void>;
+  onAttachment: (attachment: PendingMedia) => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [albumOpen, setAlbumOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const closeOutside = (event: PointerEvent) => {
+      if (!root.current?.contains(event.target as Node)) setMenuOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMenuOpen(false);
+    };
+    window.addEventListener("pointerdown", closeOutside);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeOutside);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [menuOpen]);
+
+  return (
+    <>
+      <div className="composer-attachment-picker" ref={root}>
+        <button
+          className={`attach-button ${menuOpen ? "active" : ""}`}
+          disabled={disabled}
+          onClick={() => setMenuOpen((current) => !current)}
+          aria-label="attach media"
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+        >
+          <Paperclip size={17} />
+        </button>
+        {menuOpen && (
+          <div className="composer-attachment-menu" role="menu">
+            <button
+              role="menuitem"
+              onClick={() => {
+                setMenuOpen(false);
+                void onFiles();
+              }}
+            >
+              <FileUp size={16} />
+              <span><strong>files</strong><small>choose from this device</small></span>
+            </button>
+            <button
+              role="menuitem"
+              onClick={() => {
+                setMenuOpen(false);
+                setAlbumOpen(true);
+              }}
+            >
+              <Images size={16} />
+              <span><strong>noise album</strong><small>choose from your album</small></span>
+            </button>
+          </div>
+        )}
+      </div>
+      {albumOpen && (
+        <ProfileAlbumDialog
+          person={self}
+          editable={false}
+          onClose={() => setAlbumOpen(false)}
+          onSummary={() => undefined}
+          onPick={async (item, scopeId) => {
+            onAttachment(await pendingMediaFromAttachment(item.attachment, scopeId));
+          }}
+        />
+      )}
+    </>
+  );
+}
+
 function ConversationPanel({
   conversation,
   topic,
@@ -6088,7 +6173,7 @@ function ConversationPanel({
   canEditGroup,
   unreadCount,
   messageJump,
-  selfPublicKey,
+  self,
   presenceStatuses,
   onGroupSettings,
   onTopicSettings,
@@ -6118,7 +6203,7 @@ function ConversationPanel({
   canEditGroup: boolean;
   unreadCount: number;
   messageJump: { eventId: string; nonce: number } | null;
-  selfPublicKey: string;
+  self: IdentitySummary;
   presenceStatuses: Map<string, PresenceStatus>;
   onGroupSettings: () => void;
   onTopicSettings?: () => void;
@@ -6143,6 +6228,7 @@ function ConversationPanel({
     replyToMessageId: string | null,
   ) => Promise<boolean>;
 }) {
+  const selfPublicKey = self.public_key;
   const [draft, setDraft] = useState("");
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const composerUploadKey = `group:${conversation.group.group_id}:${topic?.topic_id ?? "general"}`;
@@ -6366,7 +6452,15 @@ function ConversationPanel({
         {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => { const video = event.currentTarget; if (Number.isFinite(video.duration) && video.duration > 0) video.currentTime = Math.min(0.25, video.duration / 2); }} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}<button onClick={() => setAttachment(null)} aria-label="remove attachment"><X size={14} /></button></div>}
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
         <div className="composer-media-actions">
-          <button className="attach-button" disabled={busy || !canSendMedia} onClick={() => void chooseMediaFromDevice()} aria-label="attach media" title={canSendMedia ? "attach media" : "members cannot send media"}><Paperclip size={17} /></button>
+          <ComposerAttachmentPicker
+            disabled={busy || !canSendMedia}
+            self={self}
+            onFiles={chooseMediaFromDevice}
+            onAttachment={(pending) => {
+              setAttachmentError(null);
+              setAttachment(pending);
+            }}
+          />
           <KlipyPicker disabled={busy || !canSendMedia} onPick={sendKlipy} />
         </div>
         <input ref={fileInput} hidden type="file" accept="image/*,video/*,audio/*" onChange={(event) => void chooseMedia(event.target.files?.[0])} />
@@ -6664,7 +6758,15 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
         {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => primeVideoFrame(event.currentTarget)} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}{uploadProgress !== null && <div className="attachment-progress"><i style={{ width: `${uploadProgress}%` }} /><span>{uploadProgress === 0 && attachment.mimeType.startsWith("video/") ? "preparing video" : `${uploadProgress}%`}</span></div>}<button onClick={() => { uploadController?.abort(); setUploadController(null); setAttachment(null); setUploadProgress(null); }} aria-label={uploadProgress !== null ? "cancel upload" : "remove attachment"}><X size={14} /></button></div>}
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
         <div className="composer-media-actions">
-          <button className="attach-button" disabled={busy || uploadProgress !== null} onClick={() => void chooseMediaFromDevice()} aria-label="attach media"><Paperclip size={17} /></button>
+          <ComposerAttachmentPicker
+            disabled={busy || uploadProgress !== null}
+            self={self}
+            onFiles={chooseMediaFromDevice}
+            onAttachment={(pending) => {
+              setAttachmentError(null);
+              setAttachment(pending);
+            }}
+          />
           <KlipyPicker disabled={busy || uploadProgress !== null} onPick={sendKlipy} />
         </div>
         <input ref={fileInput} hidden type="file" accept="image/*,video/*,audio/*" onChange={(event) => void chooseMedia(event.target.files?.[0])} />
@@ -8647,12 +8749,14 @@ function ProfileAlbumDialog({
   editable,
   onClose,
   onSummary,
+  onPick,
   embedded = false,
 }: {
   person: PersonSummary;
   editable: boolean;
   onClose?: () => void;
   onSummary: (summary: LocalSummary) => void;
+  onPick?: (item: ProfileAlbumItem, scopeId: string) => Promise<void>;
   embedded?: boolean;
 }) {
   const cached = person.album ? profileAlbumCache.get(person.album.blob_id) ?? null : null;
@@ -8665,6 +8769,7 @@ function ProfileAlbumDialog({
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [uploadIndex, setUploadIndex] = useState(0);
   const [clearing, setClearing] = useState(false);
+  const [pickingId, setPickingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const uploadController = useRef<AbortController | null>(null);
@@ -8911,12 +9016,26 @@ function ProfileAlbumDialog({
     }
   }
 
+  async function pickAlbumItem(item: ProfileAlbumItem) {
+    if (!onPick || !data || pickingId) return;
+    setPickingId(item.id);
+    setError(null);
+    try {
+      await onPick(item, data.scope_id);
+      onClose?.();
+    } catch (cause) {
+      setError(message(cause));
+    } finally {
+      setPickingId(null);
+    }
+  }
+
   const displayedItemCount = data ? items.length : album?.item_count ?? 0;
   const content = (
     <>
       {!embedded && <DialogHeading
         icon={<Images />}
-        title={`${person.username}'s album`}
+        title={onPick ? "choose from your noise album" : `${person.username}'s album`}
         detail={`${displayedItemCount} of 48 ${displayedItemCount === 1 ? "item" : "items"}`}
       />}
       {editable && (
@@ -8973,7 +9092,7 @@ function ProfileAlbumDialog({
         </section>
       )}
       {error && <p className="profile-album-error">{error}</p>}
-      {selected && data ? (
+      {!onPick && selected && data ? (
         <div className="gallery-view">
           <button className="gallery-back" onClick={() => setSelectedId(null)}><ArrowLeft size={14} /> {albumButtonLabel(album)}</button>
           <div className="gallery-viewer">
@@ -8989,10 +9108,24 @@ function ProfileAlbumDialog({
       ) : data ? (
         media.length ? (
           <div className="media-gallery">
-            {media.map((item) => <GalleryTile key={item.event_id} message={item} scopeId={data.scope_id} onOpen={() => setSelectedId(item.event_id)} />)}
+            {media.map((item, index) => <GalleryTile
+              key={item.event_id}
+              message={item}
+              scopeId={data.scope_id}
+              disabled={pickingId !== null}
+              busy={pickingId === item.event_id}
+              actionLabel={onPick ? `attach album item ${index + 1}` : undefined}
+              onOpen={() => {
+                if (onPick) {
+                  void pickAlbumItem(items[index]);
+                } else {
+                  setSelectedId(item.event_id);
+                }
+              }}
+            />)}
           </div>
         ) : (
-          <div className="empty-gallery"><Images size={27} /><span>{editable ? "add photos and videos to your album" : "this album is empty"}</span></div>
+          <div className="empty-gallery"><Images size={27} /><span>{editable ? "add photos and videos to your album" : onPick ? "your noise album is empty" : "this album is empty"}</span></div>
         )
       ) : (
         <div className="empty-gallery"><LoaderCircle className="spinner" size={25} /><span>loading album</span></div>
@@ -9003,7 +9136,21 @@ function ProfileAlbumDialog({
   return <Modal onClose={onClose ?? (() => undefined)} wide className="profile-album-modal"><div className="profile-album-content">{content}</div></Modal>;
 }
 
-function GalleryTile({ message, scopeId, onOpen }: { message: MediaMessage; scopeId: string; onOpen: () => void }) {
+function GalleryTile({
+  message,
+  scopeId,
+  onOpen,
+  disabled = false,
+  busy = false,
+  actionLabel,
+}: {
+  message: MediaMessage;
+  scopeId: string;
+  onOpen: () => void;
+  disabled?: boolean;
+  busy?: boolean;
+  actionLabel?: string;
+}) {
   const { attachment } = message;
   const visibility = useMediaPriority<HTMLButtonElement>();
   const image = attachment.mime_type.startsWith("image/");
@@ -9018,12 +9165,13 @@ function GalleryTile({ message, scopeId, onOpen }: { message: MediaMessage; scop
     ? false
     : !source || (image && !thumbnail);
   return (
-    <button ref={visibility.ref} className={`gallery-tile ${image ? "image" : video ? "video" : "audio"}`} onClick={onOpen} aria-label={`open media shared by ${message.username}`}>
+    <button ref={visibility.ref} className={`gallery-tile ${image ? "image" : video ? "video" : "audio"}`} disabled={disabled} onClick={onOpen} aria-label={actionLabel ?? `open media shared by ${message.username}`}>
       {(image || video) && thumbnail && <img src={thumbnail} alt="" />}
       {video && !thumbnail && <span className="gallery-video-placeholder"><NoiseMark size={28} monochrome /></span>}
       {!image && !video && source && <span className="gallery-audio"><AudioWaveform size={30} /><small>audio</small></span>}
       {loading && <span className="gallery-loading"><MediaLoadStatus failed={failed} /></span>}
       {video && !loading && <i className="gallery-play"><Play size={15} fill="currentColor" /></i>}
+      {busy && <span className="gallery-picking"><LoaderCircle className="spinner" size={22} /><small>attaching</small></span>}
     </button>
   );
 }
