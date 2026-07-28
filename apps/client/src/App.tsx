@@ -9618,12 +9618,13 @@ function GroupSettingsDialog({ group, explicitContentEnabled, bannedMembers, pre
               <div className="group-frequency-value">
                 <span>{group.frequency ?? "not stored on this device"}</span>
                 {group.frequency && <CopyButton value={group.frequency} label="copy frequency" iconOnly disabled={busy} />}
+                {group.remote_deletion_supported && <div className="group-frequency-inline-actions">
+                  {group.frequency && <button className={revokeArmed ? "confirm" : "danger"} disabled={busy} onClick={() => { if (revokeArmed) { setRevokeArmed(false); void onRotateFrequency(true); } else { setRevokeArmed(true); } }}><Trash2 size={13} /> {revokeArmed ? "confirm revoke" : "revoke"}</button>}
+                  <button disabled={busy} onClick={() => { setRevokeArmed(false); void onRotateFrequency(false); }}><Radio size={13} /> {group.frequency ? "generate new" : "generate frequency"}</button>
+                </div>}
               </div>
               <p>{group.frequency ? "Anyone with this code can join the group." : "Generate one to revoke any older invitation and create a code this device can manage."}</p>
-              {group.remote_deletion_supported ? <div className="group-frequency-actions">
-                {group.frequency && <button className={revokeArmed ? "confirm" : "danger"} disabled={busy} onClick={() => { if (revokeArmed) { setRevokeArmed(false); void onRotateFrequency(true); } else { setRevokeArmed(true); } }}><Trash2 size={13} /> {revokeArmed ? "confirm revoke" : "revoke"}</button>}
-                <button disabled={busy} onClick={() => { setRevokeArmed(false); void onRotateFrequency(false); }}><Radio size={13} /> {group.frequency ? "generate new" : "generate frequency"}</button>
-              </div> : <small className="legacy-frequency-note">This legacy group cannot authenticate frequency rotation.</small>}
+              {!group.remote_deletion_supported && <small className="legacy-frequency-note">This legacy group cannot authenticate frequency rotation.</small>}
             </div>
           </section>
         </div>}
