@@ -11,6 +11,7 @@ import {
   Crown,
   Download,
   EyeOff,
+  Flame,
   Forward,
   GripVertical,
   Images,
@@ -554,6 +555,19 @@ function NoiseMark({ size, className, monochrome = false }: { size: number; clas
         strokeLinejoin="round"
       />
     </svg>
+  );
+}
+
+function ExplicitContentMarker() {
+  return (
+    <i
+      className="explicit-content-marker"
+      role="img"
+      aria-label="sexually explicit content"
+      title="sexually explicit content"
+    >
+      <Flame aria-hidden="true" />
+    </i>
   );
 }
 
@@ -5305,7 +5319,7 @@ function Sidebar({
                 {group.safety_restriction
                   ? <span className="restricted-group-icon"><ShieldOff size={15} /></span>
                   : <Avatar name={group.name} image={group.avatar} size={27} square />}
-                <span>{group.name}{group.content_rating === "explicit" && <i className="explicit-badge">EXPLICIT</i>}</span>
+                <span>{group.name}{group.content_rating === "explicit" && <ExplicitContentMarker />}</span>
                 {group.unread_count > 0 && (
                   <span
                     className="group-unread-count"
@@ -6145,7 +6159,7 @@ function ConversationPanel({
         <div className="group-identity static" data-tauri-drag-region>
           <Avatar name={conversation.group.name} image={conversation.group.avatar} size={36} square />
           <span>
-            <strong>{conversation.group.name}{conversation.group.content_rating === "explicit" && <i className="explicit-badge">EXPLICIT</i>}{topic ? ` / ${topic.name}` : ""}</strong>
+            <strong>{conversation.group.name}{conversation.group.content_rating === "explicit" && <ExplicitContentMarker />}{topic ? ` / ${topic.name}` : ""}</strong>
             <small>{topic?.locked ? "locked topic" : conversation.group.description || "group"}</small>
           </span>
         </div>
@@ -9372,7 +9386,7 @@ function GlobalSearchModal({
 function MakeDialog({ busy, explicitContentEnabled, onClose, onSubmit }: { busy: boolean; explicitContentEnabled: boolean; onClose: () => void; onSubmit: (name: string, contentRating: GroupContentRating) => Promise<boolean> }) {
   const [name, setName] = useState("");
   const [explicit, setExplicit] = useState(false);
-  return <Modal onClose={onClose}><DialogHeading icon={<UsersRound />} title="create group" detail="give the group a name" /><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="group name" /><label className="settings-toggle-row make-explicit-group"><span><strong>sexually explicit content</strong><small>{explicitContentEnabled ? "permits explicit sexual content or nudity and adds a permanent EXPLICIT label" : "enable explicit groups in Settings → Content first"}</small></span><input type="checkbox" role="switch" checked={explicit} disabled={!explicitContentEnabled} onChange={(event) => setExplicit(event.target.checked)} /></label><DialogButtons onClose={onClose}><button className="primary" disabled={!name.trim() || busy} onClick={() => void onSubmit(name.trim(), explicit ? "explicit" : "general")}>create group</button></DialogButtons></Modal>;
+  return <Modal onClose={onClose}><DialogHeading icon={<UsersRound />} title="create group" detail="give the group a name" /><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="group name" /><label className="settings-toggle-row make-explicit-group"><span><strong>sexually explicit content</strong><small>{explicitContentEnabled ? "permits explicit sexual content or nudity and adds a permanent flame marker" : "enable explicit groups in Settings → Content first"}</small></span><input type="checkbox" role="switch" checked={explicit} disabled={!explicitContentEnabled} onChange={(event) => setExplicit(event.target.checked)} /></label><DialogButtons onClose={onClose}><button className="primary" disabled={!name.trim() || busy} onClick={() => void onSubmit(name.trim(), explicit ? "explicit" : "general")}>create group</button></DialogButtons></Modal>;
 }
 
 function JoinDialog({ busy, onClose, onSubmit }: { busy: boolean; onClose: () => void; onSubmit: (frequency: string) => Promise<boolean> }) {
@@ -9620,7 +9634,7 @@ function GroupSettingsDialog({ group, explicitContentEnabled, bannedMembers, pre
           <label className="settings-toggle-row"><span><strong>send messages</strong><small>moderators can always send messages</small></span><input type="checkbox" role="switch" checked={membersCanSendMessages} onChange={(event) => setMembersCanSendMessages(event.target.checked)} /></label>
           <label className="settings-toggle-row"><span><strong>send media</strong><small>moderators can always upload media</small></span><input type="checkbox" role="switch" checked={membersCanSendMedia} onChange={(event) => setMembersCanSendMedia(event.target.checked)} /></label>
           <h3>content label</h3>
-          <label className="settings-toggle-row"><span><strong>sexually explicit content</strong><small>{group.content_rating === "explicit" ? "this permanent EXPLICIT label cannot be removed" : explicitContentEnabled ? "permits explicit sexual content or nudity, permanently labels the group, and replaces its frequency" : "enable explicit groups in your Content settings first"}</small></span><input type="checkbox" role="switch" checked={contentRating === "explicit"} disabled={group.content_rating === "explicit" || !explicitContentEnabled} onChange={(event) => setContentRating(event.target.checked ? "explicit" : "general")} /></label>
+          <label className="settings-toggle-row"><span><strong>sexually explicit content</strong><small>{group.content_rating === "explicit" ? "this permanent flame marker cannot be removed" : explicitContentEnabled ? "permits explicit sexual content or nudity, permanently marks the group, and replaces its frequency" : "enable explicit groups in your Content settings first"}</small></span><input type="checkbox" role="switch" checked={contentRating === "explicit"} disabled={group.content_rating === "explicit" || !explicitContentEnabled} onChange={(event) => setContentRating(event.target.checked ? "explicit" : "general")} /></label>
           <h3 className="frequency-heading">frequency</h3>
           <div className="group-frequency-settings">
             <div className="group-frequency-value">

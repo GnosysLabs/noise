@@ -660,7 +660,8 @@ button:disabled { cursor: default; opacity: 0.48; }
 .settings-toggle-row input[role="switch"]:checked { background: var(--accent); }
 .settings-toggle-row input[role="switch"]:checked::before { background: #fff; transform: translateX(14px); }
 .settings-toggle-row input[role="switch"]:focus-visible { outline: 2px solid rgba(167,142,255,.65); outline-offset: 2px; }
-.explicit-badge { display: inline-flex; align-items: center; margin-left: 6px; padding: 1px 4px; border: 1px solid rgba(255,148,164,.38); border-radius: 4px; color: #ff9aaa; font-size: 8px; font-style: normal; font-weight: 750; letter-spacing: .35px; vertical-align: 1px; }
+.explicit-content-marker { display: inline-grid; width: 13px; height: 13px; place-items: center; margin-left: 4px; color: #ff9aaa; font-style: normal; vertical-align: -2px; }
+.explicit-content-marker > svg { width: 11px; height: 11px; stroke-width: 2.3; }
 .settings-danger { border: 1px solid rgba(255,105,115,.12); background: rgba(160,53,64,.08); }
 .settings-danger button { padding: 7px 9px; border-radius: 8px; background: rgba(160,53,64,.15); color: #ff959b; font-size: 11px; }
 .settings-danger button:hover { background: rgba(160,53,64,.24); }
