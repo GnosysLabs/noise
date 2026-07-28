@@ -602,8 +602,7 @@ button:disabled { cursor: default; opacity: 0.48; }
 .group-settings-modal .group-settings-panel { min-height: 0; flex: 1; overflow-x: hidden; overflow-y: auto; padding: 2px 3px 4px 0; }
 .group-settings-modal .dialog-buttons { flex: none; }
 .group-settings-identity { display: flex; flex-direction: column; gap: 18px; }
-.group-identity-profile-row { padding: 3px 0 1px; }
-.group-identity-frequency { gap: 8px; }
+.group-identity-images { display: flex; align-items: start; justify-content: center; gap: 26px; padding: 3px 0 1px; }
 .group-settings-appearance { display: flex; width: 100%; min-width: 0; max-width: 100%; overflow: hidden; flex-direction: column; gap: 18px; }
 .group-background-pickers { display: grid; min-width: 0; grid-template-columns: minmax(0, 1.8fr) minmax(104px, .72fr); align-items: start; gap: 12px; }
 .group-settings-appearance .background-picker { width: 100%; min-width: 0; align-items: stretch; }
@@ -641,6 +640,7 @@ button:disabled { cursor: default; opacity: 0.48; }
 .user-block-settings { padding-top: 3px; }
 .user-account-settings { display: flex; flex-direction: column; gap: 16px; padding-top: 3px; }
 .group-general-settings { padding-top: 3px; }
+.group-general-settings .frequency-heading { margin-top: 10px; }
 .group-frequency-settings { display: flex; flex-direction: column; gap: 8px; padding: 11px; border-radius: 11px; background: rgba(255,255,255,.045); }
 .group-frequency-value { display: flex; align-items: center; gap: 8px; }
 .group-frequency-value > span { flex: 1; font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; color: #eeeaf2; font-size: 14px; font-weight: 650; letter-spacing: .7px; }
