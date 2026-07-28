@@ -1,3 +1,4 @@
+mod canonical_media;
 mod config;
 mod discovery;
 mod identity;
@@ -50,6 +51,7 @@ use tokio::{
 };
 use tower_http::cors::CorsLayer;
 
+use canonical_media::CanonicalMediaClient;
 use config::RelayConfig;
 use discovery::{
     AnnouncementLimiter, RelayDirectory, announce_relay, client_for_verified_relay,
@@ -109,6 +111,12 @@ struct ServerOverrides {
     discovery_interval_seconds: Option<u64>,
     #[arg(long, env = "NOISE_STORAGE_LIMIT_BYTES")]
     storage_limit_bytes: Option<u64>,
+    #[arg(long, env = "NOISE_CANONICAL_MEDIA_URL")]
+    canonical_media_url: Option<String>,
+    #[arg(long, env = "NOISE_CANONICAL_MEDIA_PROVIDER")]
+    canonical_media_provider: Option<String>,
+    #[arg(long, env = "NOISE_CANONICAL_MEDIA_TOKEN", hide_env_values = true)]
+    canonical_media_token: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -133,7 +141,7 @@ enum RelayCommand {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct ServerSettings {
     listen: SocketAddr,
     peer: Vec<String>,
@@ -144,6 +152,7 @@ struct ServerSettings {
     discovery_interval_seconds: u64,
     storage_limit_bytes: u64,
     push_notifications: Option<config::PushNotificationConfig>,
+    canonical_media: Option<CanonicalMediaClient>,
 }
 
 #[derive(Clone)]
@@ -170,6 +179,7 @@ struct AppState {
     client: reqwest::Client,
     store: DurableStore,
     shard_store: ShardStore,
+    canonical_media: Option<CanonicalMediaClient>,
     privacy: PrivacyGateway,
     relay_identity: RelayIdentity,
     relay_directory: RelayDirectory,
@@ -228,6 +238,7 @@ struct Health {
     deleted_groups: usize,
     peers: usize,
     privacy_gateway: bool,
+    canonical_media: bool,
     mask_targets: usize,
 }
 
@@ -303,6 +314,11 @@ fn resolve_server_settings(args: &Args) -> anyhow::Result<ServerSettings> {
         config.storage_limit_bytes = limit;
     }
     config.validate()?;
+    let canonical_media = CanonicalMediaClient::from_parts(
+        args.server.canonical_media_url.as_deref(),
+        args.server.canonical_media_provider.as_deref(),
+        args.server.canonical_media_token.as_deref(),
+    )?;
     Ok(ServerSettings {
         listen: config.listen,
         peer: config.peers,
@@ -313,6 +329,7 @@ fn resolve_server_settings(args: &Args) -> anyhow::Result<ServerSettings> {
         discovery_interval_seconds: config.discovery_interval_seconds,
         storage_limit_bytes: config.storage_limit_bytes,
         push_notifications: config.push_notifications,
+        canonical_media,
     })
 }
 
@@ -351,6 +368,7 @@ fn print_status(settings: &ServerSettings, json: bool) -> anyhow::Result<()> {
         "storage_limit_bytes": (settings.storage_limit_bytes != 0).then_some(settings.storage_limit_bytes),
         "storage_backend": std::env::var("NOISE_STORAGE_BACKEND").unwrap_or_else(|_| "local".into()),
         "push_notifications": settings.push_notifications.is_some(),
+        "canonical_media": settings.canonical_media.is_some(),
     });
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
@@ -629,6 +647,7 @@ async fn main() -> anyhow::Result<()> {
         client,
         store,
         shard_store,
+        canonical_media: args.canonical_media,
         privacy,
         relay_identity,
         relay_directory,
@@ -768,6 +787,7 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         deleted_groups: state.deletions.read().await.len(),
         peers: state.peers.len(),
         privacy_gateway: true,
+        canonical_media: state.canonical_media.is_some(),
         mask_targets: state.mask_targets.len(),
     })
 }
@@ -1457,27 +1477,13 @@ async fn get_shard(
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
-    match state
-        .shard_store
-        .get_shard(
-            &shard_id,
-            &metadata.payload_hash,
-            &metadata.delete_token_hash,
-            metadata.byte_length,
+    match read_shard_payload(&state, &shard_id, &metadata).await {
+        Ok(Some(payload)) => Ok((
+            StatusCode::OK,
+            [(CONTENT_TYPE, "application/octet-stream")],
+            payload,
         )
-        .await
-    {
-        Ok(Some(shard)) => {
-            let payload = shard
-                .payload()
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            Ok((
-                StatusCode::OK,
-                [(CONTENT_TYPE, "application/octet-stream")],
-                payload,
-            )
-                .into_response())
-        }
+            .into_response()),
         Ok(None) => {
             eprintln!("indexed storage shard {shard_id} is missing from object storage");
             Err(StatusCode::NOT_FOUND)
@@ -1487,6 +1493,39 @@ async fn get_shard(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+async fn read_shard_payload(
+    state: &AppState,
+    shard_id: &str,
+    metadata: &ShardMetadata,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    if let Some(canonical) = state.canonical_media.as_ref() {
+        match canonical
+            .get_shard(shard_id, &metadata.payload_hash, metadata.byte_length)
+            .await
+        {
+            Ok(Some(payload)) => return Ok(Some(payload)),
+            Ok(None) => {}
+            Err(_) => {
+                // Keep released clients online if the central read path is
+                // unavailable or fails validation. The local relay copy
+                // remains the rollback source during the compatibility phase.
+                eprintln!("canonical media read failed; using the relay fallback");
+            }
+        }
+    }
+    state
+        .shard_store
+        .get_shard(
+            shard_id,
+            &metadata.payload_hash,
+            &metadata.delete_token_hash,
+            metadata.byte_length,
+        )
+        .await?
+        .map(|shard| shard.payload().map_err(anyhow::Error::from))
+        .transpose()
 }
 
 async fn delete_shard(
@@ -2205,26 +2244,8 @@ async fn dispatch_private_request(
                     );
                 }
             };
-            match state
-                .shard_store
-                .get_shard(
-                    shard_id,
-                    &metadata.payload_hash,
-                    &metadata.delete_token_hash,
-                    metadata.byte_length,
-                )
-                .await
-            {
-                Ok(Some(shard)) => match shard.payload() {
-                    Ok(payload) => (StatusCode::OK, payload),
-                    Err(error) => {
-                        eprintln!("could not decode storage shard {shard_id}: {error:#}");
-                        private_error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "shard storage is unavailable",
-                        )
-                    }
-                },
+            match read_shard_payload(state, shard_id, &metadata).await {
+                Ok(Some(payload)) => (StatusCode::OK, payload),
                 Ok(None) => {
                     eprintln!("indexed storage shard {shard_id} is missing from object storage");
                     private_error(StatusCode::NOT_FOUND, "shard is unavailable")

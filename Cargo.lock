@@ -4342,6 +4342,7 @@ dependencies = [
  "deadpool-postgres",
  "ed25519-dalek",
  "noise-core",
+ "object_store",
  "rand 0.9.5",
  "reqwest 0.12.28",
  "serde",
@@ -4481,7 +4482,7 @@ dependencies = [
 
 [[package]]
 name = "noise-relay"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "a2",
  "anyhow",
