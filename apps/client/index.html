@@ -7,9 +7,49 @@
     <meta name="description" content="Private groups and encrypted DMs without phone numbers, email addresses, or personal information." />
     <link rel="icon" type="image/png" href="/src-tauri/icons/32x32.png" />
     <title>noise</title>
+    <style>
+      html, body, #root {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: #1c1b1e;
+        color-scheme: dark;
+      }
+      #noise-boot {
+        display: flex;
+        width: 100%;
+        height: 100%;
+        align-items: center;
+        justify-content: center;
+      }
+      #noise-boot svg {
+        transform-origin: center;
+        animation: noise-boot-throb .9s ease-in-out infinite alternate;
+      }
+      @keyframes noise-boot-throb {
+        from { transform: scale(.96); opacity: .64; }
+        to { transform: scale(1.04); opacity: 1; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #noise-boot svg { animation: none; opacity: 1; transform: none; }
+      }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div id="noise-boot" role="status" aria-label="loading noise">
+        <svg aria-hidden="true" width="44" height="44" viewBox="160 220 704 584" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="noise-boot-gradient" x1="214" y1="512" x2="810" y2="512" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#a995ff" />
+              <stop offset="1" stop-color="#5d40d2" />
+            </linearGradient>
+          </defs>
+          <path d="M206 512h72l55-144 94 296 91-390 91 476 86-382 53 144h70" stroke="url(#noise-boot-gradient)" stroke-width="64" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

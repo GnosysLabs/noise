@@ -23,7 +23,7 @@
 *:hover { scrollbar-color: rgba(var(--accent-rgb),.52) transparent; }
 *:hover::-webkit-scrollbar-thumb { background: rgba(var(--accent-rgb),.52); }
 *::-webkit-scrollbar-thumb:hover { background: rgba(var(--accent-rgb),.82); }
-html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #1c1b1e; color-scheme: dark; }
 button, input, textarea { font: inherit; color: inherit; }
 button { border: 0; cursor: pointer; }
 button:disabled { cursor: default; opacity: 0.48; }
