@@ -11529,12 +11529,24 @@ impl NoiseClient {
             .iter()
             .map(|group| group.group_id.clone())
             .collect::<HashSet<_>>();
+        let remote_account_is_newer = remote.revision > local_account_revision;
         for (group_id, frequency) in &contents.group_frequencies {
             if present_group_ids.contains(group_id) {
-                state
-                    .group_frequencies
-                    .entry(group_id.clone())
-                    .or_insert_with(|| frequency.clone());
+                match state.group_frequencies.entry(group_id.clone()) {
+                    std::collections::hash_map::Entry::Occupied(mut local)
+                        if remote_account_is_newer =>
+                    {
+                        // Frequencies are revocable credentials. Keeping the
+                        // first value seen made every device permanently retain
+                        // whatever code it had before a rotation, even after a
+                        // newer account vault reached the server.
+                        local.insert(frequency.clone());
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
+                    std::collections::hash_map::Entry::Vacant(local) => {
+                        local.insert(frequency.clone());
+                    }
+                }
             }
         }
         state
@@ -11542,10 +11554,17 @@ impl NoiseClient {
             .retain(|group_id, _| present_group_ids.contains(group_id));
         for (group_id, locator) in &contents.group_invitation_locators {
             if present_group_ids.contains(group_id) {
-                state
-                    .group_invitation_locators
-                    .entry(group_id.clone())
-                    .or_insert_with(|| locator.clone());
+                match state.group_invitation_locators.entry(group_id.clone()) {
+                    std::collections::hash_map::Entry::Occupied(mut local)
+                        if remote_account_is_newer =>
+                    {
+                        local.insert(locator.clone());
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
+                    std::collections::hash_map::Entry::Vacant(local) => {
+                        local.insert(locator.clone());
+                    }
+                }
             }
         }
         state
@@ -12445,7 +12464,7 @@ impl NoiseClient {
                 return Ok(invitation);
             }
         }
-        bail!("nothing here")
+        bail!("that frequency is no longer active; ask a group member for the current frequency")
     }
 
     async fn fetch_events(
@@ -16588,6 +16607,55 @@ mod tests {
                 .map(|group| group.group_id.as_str())
                 .collect::<Vec<_>>(),
             vec![third_id.as_str(), hidden_id.as_str(), first_id.as_str()]
+        );
+    }
+
+    #[test]
+    fn newer_account_vault_replaces_a_stale_group_frequency() {
+        let identity = Identity::generate();
+        let credentials = AccountCredentials {
+            noise_id: "123456789012".to_owned(),
+            locator: "ab".repeat(32),
+            vault_key_base64: STANDARD_NO_PAD.encode([7_u8; 32]),
+        };
+        let group = GroupMembership::create_owned("group", identity.public_key_base64());
+        let group_id = group.group_id.clone();
+        let mut remote_state =
+            account_state(&identity, &credentials, test_profile(None), 1, 1);
+        remote_state.add_group(group.clone());
+        remote_state
+            .group_frequencies
+            .insert(group_id.clone(), "222222222222".to_owned());
+        let remote = AccountVault::seal(
+            &identity,
+            &credentials,
+            2,
+            &serde_json::to_vec(&remote_state.vault_contents()).unwrap(),
+        )
+        .unwrap();
+
+        let mut stale_local =
+            account_state(&identity, &credentials, test_profile(None), 1, 1);
+        stale_local.add_group(group.clone());
+        stale_local
+            .group_frequencies
+            .insert(group_id.clone(), "111111111111".to_owned());
+        NoiseClient::merge_remote_account_state(&mut stale_local, &credentials, &remote).unwrap();
+        assert_eq!(
+            stale_local.group_frequencies.get(&group_id).map(String::as_str),
+            Some("222222222222")
+        );
+
+        let mut newer_local =
+            account_state(&identity, &credentials, test_profile(None), 1, 3);
+        newer_local.add_group(group);
+        newer_local
+            .group_frequencies
+            .insert(group_id.clone(), "333333333333".to_owned());
+        NoiseClient::merge_remote_account_state(&mut newer_local, &credentials, &remote).unwrap();
+        assert_eq!(
+            newer_local.group_frequencies.get(&group_id).map(String::as_str),
+            Some("333333333333")
         );
     }
 

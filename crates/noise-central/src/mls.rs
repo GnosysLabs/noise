@@ -457,7 +457,7 @@ async fn publish_epoch_inner(
             "SELECT record_id, epoch::text
              FROM noise.mls_epochs
              WHERE group_pk = $1
-             ORDER BY epoch DESC
+             ORDER BY noise.mls_epochs.epoch DESC
              LIMIT 1",
             &[&group_pk],
         )
@@ -627,7 +627,7 @@ pub async fn publish_external_join_package(
             "SELECT record_id, epoch::text
              FROM noise.mls_epochs
              WHERE group_pk = $1
-             ORDER BY epoch DESC
+             ORDER BY noise.mls_epochs.epoch DESC
              LIMIT 1",
             &[&group_pk],
         )
@@ -653,6 +653,13 @@ pub async fn publish_external_join_package(
         (genesis.get(0), 0)
     };
     if control_record_id.as_slice() != head_record_id || package.epoch != head_epoch {
+        eprintln!(
+            "[noise-central] external join package head mismatch: \
+             group={} package_epoch={} head_epoch={}",
+            package.group_id,
+            package.epoch,
+            head_epoch,
+        );
         return Err(ApiError::conflict("mls_control_head_changed"));
     }
     transaction
