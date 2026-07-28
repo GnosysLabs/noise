@@ -10600,7 +10600,10 @@ function TopicIconPicker({ value, onChange }: { value: string; onChange: (icon: 
 }
 
 function Modal({ children, onClose, compact = false, wide = false, closeDisabled = false, className = "" }: { children: React.ReactNode; onClose: () => void; compact?: boolean; wide?: boolean; closeDisabled?: boolean; className?: string }) {
-  return <div className="modal-backdrop" onMouseDown={closeDisabled ? undefined : onClose}><section className={`modal ${compact ? "compact" : ""} ${wide ? "wide" : ""} ${className}`.trim()} onMouseDown={(event) => event.stopPropagation()}><button className="modal-close" disabled={closeDisabled} onClick={onClose} aria-label={closeDisabled ? "saving settings" : "close"}>{closeDisabled ? <LoaderCircle className="spinner" size={14} /> : <X size={15} />}</button>{children}</section></div>;
+  return createPortal(
+    <div className="modal-backdrop" onMouseDown={closeDisabled ? undefined : onClose}><section className={`modal ${compact ? "compact" : ""} ${wide ? "wide" : ""} ${className}`.trim()} onMouseDown={(event) => event.stopPropagation()}><button className="modal-close" disabled={closeDisabled} onClick={onClose} aria-label={closeDisabled ? "saving settings" : "close"}>{closeDisabled ? <LoaderCircle className="spinner" size={14} /> : <X size={15} />}</button>{children}</section></div>,
+    document.body,
+  );
 }
 
 function DialogHeading({ icon, title, detail }: { icon: React.ReactNode; title: string; detail: string }) {
