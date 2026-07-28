@@ -2,7 +2,6 @@ mod config;
 mod database;
 mod error;
 mod events;
-mod media;
 mod mls;
 mod vaults;
 
@@ -41,7 +40,6 @@ const MAX_BODY_BYTES: usize = 3_000_000;
 struct AppState {
     database: Database,
     token_hash_key: [u8; 32],
-    legacy_media: Option<media::LegacyMediaStore>,
 }
 
 struct AuthenticatedSession {
@@ -87,11 +85,9 @@ struct HealthResponse {
 
 pub async fn build_app(config: &CentralConfig) -> anyhow::Result<Router> {
     config.validate()?;
-    let legacy_media = media::LegacyMediaStore::open(config)?;
     let state = Arc::new(AppState {
         database: Database::connect(config).await?,
         token_hash_key: config.token_hash_key()?,
-        legacy_media,
     });
 
     let mut app = Router::new()
@@ -133,10 +129,6 @@ pub async fn build_app(config: &CentralConfig) -> anyhow::Result<Router> {
             post(mls::publish_removal_request),
         )
         .route("/v2/mls/groups/{group_id}", get(mls::control_log))
-        .route(
-            "/internal/compat/v1/providers/{provider}/shards/{shard_id}",
-            get(media::get_legacy_shard),
-        )
         .route(
             "/v2/mls/groups/{group_id}/join-requests",
             get(mls::join_requests),

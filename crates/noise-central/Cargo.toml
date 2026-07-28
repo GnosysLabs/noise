@@ -14,7 +14,6 @@ clap.workspace = true
 deadpool-postgres.workspace = true
 ed25519-dalek.workspace = true
 noise-core = { path = "../noise-core" }
-object_store.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
