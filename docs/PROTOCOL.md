@@ -36,7 +36,7 @@ These are product constraints, not implementation details.
 11. **Groups have signed identities.** A frequency has a name, short
     description, content rating, and encrypted icon reference. Updates are
     events in the same replicated history rather than mutable relay-owned
-    records. Once a group is marked for sexually explicit content, signed
+    records. Once a group is marked for sexual content or nudity, signed
     history prevents it from returning to the general rating.
 
 ## Profiles and constellation storage

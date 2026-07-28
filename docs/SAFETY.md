@@ -23,7 +23,7 @@ to the group founder and moderators:
 - group rules;
 - harassment or hateful behavior;
 - spam, scam, or impersonation;
-- sexually explicit content in a group that is not properly labeled; and
+- sexual content or nudity in a group that is not properly labeled; and
 - something else.
 
 These go privately to noise safety:
@@ -35,13 +35,13 @@ These go privately to noise safety:
 The threat screen tells the reporter to contact local emergency services when
 anyone is in immediate danger. noise safety is not an emergency service.
 
-Consensual sexually explicit material and groups labeled for it are allowed.
+Consensual sexual content or nudity and groups labeled for it are allowed.
 They are not a noise-level violation merely because they contain intimate or
-explicit content. The sexual-safety category is deliberately limited to
-exploitation and non-consensual content. Correctly labeled consensual explicit
-content is not reportable merely for being explicit. Sexually explicit content
-in a general group is reportable because it bypasses the member's content
-choice.
+sexual content or nudity. The sexual-safety category is deliberately limited to
+exploitation and non-consensual content. Correctly labeled consensual sexual
+content or nudity is not reportable merely because it is sexual. Sexual content
+or nudity in a general group is reportable because it bypasses the member's
+content choice.
 
 ## Adult access at launch
 
@@ -49,22 +49,23 @@ noise launches for adults aged 18 and older. New official-client accounts
 enter a birth date before identity keys are generated or any relay request is
 made. The client computes only whether the person is at least 18 and discards
 the exact date. The encrypted account vault stores the successful attestation
-and the explicit-content preference.
+and the sexual-content visibility preference.
 
 The small set of accounts created before this gate is deliberately
-grandfathered as known adults. They are not asked to re-enter a date. Explicit
-groups still begin hidden for every account, including grandfathered ones.
+grandfathered as known adults. They are not asked to re-enter a date. Groups
+labeled for sexual content or nudity still begin hidden for every account,
+including grandfathered ones.
 
-Adult access and explicit-content visibility are separate:
+Adult access and sexual-content visibility are separate:
 
 - an account must pass the 18+ gate;
-- explicit groups are hidden by default;
-- the member must explicitly enable them in Content settings;
-- explicit groups carry a visible **EXPLICIT** label;
-- a founder may permanently upgrade a general group to explicit; doing so revokes
-  its previous unlabeled invitation and generates a replacement frequency, and
-  no client accepts a later downgrade; and
-- official clients refuse to join, open, search, or display explicit groups while
+- groups labeled for sexual content or nudity are hidden by default;
+- the member must enable them in Content settings;
+- groups labeled for sexual content or nudity carry a visible flame marker;
+- a founder may permanently mark a general group for sexual content or nudity;
+  doing so revokes its previous unlabeled invitation and generates a replacement
+  frequency, and no client accepts a later downgrade; and
+- official clients refuse to join, open, search, or display those groups while
   the preference is off.
 
 The preference is account-synced so each official client can honor it.

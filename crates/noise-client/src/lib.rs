@@ -422,7 +422,8 @@ impl Default for AdultAccessSettings {
     fn default() -> Self {
         // noise had a handful of known-adult accounts before this setting
         // existed. Missing legacy data is deliberately migrated once as
-        // attested, while sexually explicit groups remain hidden by default.
+        // attested, while groups labeled for sexual content or nudity remain
+        // hidden by default.
         Self {
             age_attested: true,
             explicit_content_enabled: false,
@@ -1627,7 +1628,9 @@ impl ClientState {
         if group.content_rating == GroupContentRating::Explicit
             && !self.adult_access.explicit_content_enabled
         {
-            bail!("enable explicit groups in settings before opening this group")
+            bail!(
+                "enable groups with sexual content or nudity in settings before opening this group"
+            )
         }
         Ok(())
     }
@@ -3360,7 +3363,7 @@ impl NoiseClient {
         let path = path.as_ref();
         let mut state = load_state(path)?;
         if !state.adult_access.age_attested {
-            bail!("explicit content requires an 18+ age attestation")
+            bail!("sexual content or nudity requires an 18+ age attestation")
         }
         if state.adult_access.explicit_content_enabled == enabled {
             return state.summary();
@@ -3381,7 +3384,8 @@ impl NoiseClient {
             state.active_group_id = None;
         }
         // Content visibility is a local safety boundary. Commit it before
-        // returning so relay latency can never delay hiding explicit groups.
+        // returning so transport latency can never delay hiding groups labeled
+        // for sexual content or nudity.
         // The app publishes the encrypted cross-device account state after
         // applying this local result.
         save_state_immediately(path, &state)?;
@@ -4656,12 +4660,14 @@ impl NoiseClient {
         if current_profile.content_rating == GroupContentRating::Explicit
             && content_rating != GroupContentRating::Explicit
         {
-            bail!("an explicit group cannot be changed back to general")
+            bail!("a group marked for sexual content or nudity cannot be changed back to general")
         }
         if content_rating == GroupContentRating::Explicit
             && !state.adult_access.explicit_content_enabled
         {
-            bail!("enable explicit groups in settings before marking this group explicit")
+            bail!(
+                "enable groups with sexual content or nudity in settings before changing this group's content rating"
+            )
         }
         let accent_color = normalize_group_accent_color(
             accent_color.unwrap_or_else(|| current_profile.accent_color.clone()),
@@ -6079,7 +6085,9 @@ impl NoiseClient {
         if content_rating == GroupContentRating::Explicit
             && !state.adult_access.explicit_content_enabled
         {
-            bail!("enable explicit groups in settings before creating an explicit group")
+            bail!(
+                "enable groups with sexual content or nudity in settings before creating this group"
+            )
         }
         let identity = state.identity()?;
         let relays = relay_list(relays)?;

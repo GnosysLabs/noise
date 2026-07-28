@@ -201,8 +201,8 @@ const REPORT_CATEGORIES: Array<{
   },
   {
     value: "explicit_content_not_properly_labeled",
-    label: "unlabeled sexually explicit content",
-    detail: "sexually explicit content posted in a general group",
+    label: "unlabeled sexual content or nudity",
+    detail: "sexual content or nudity posted in a general group",
     destination: "group_staff",
   },
   {
@@ -563,8 +563,8 @@ function ExplicitContentMarker() {
     <i
       className="explicit-content-marker"
       role="img"
-      aria-label="sexually explicit content"
-      title="sexually explicit content"
+      aria-label="sexual content or nudity"
+      title="sexual content or nudity"
     >
       <Flame aria-hidden="true" />
     </i>
@@ -5283,7 +5283,7 @@ function Sidebar({
             <EyeOff size={16} aria-hidden="true" />
             <span>
               <strong>
-                {summary.adult_access.hidden_explicit_group_count} explicit{" "}
+                {summary.adult_access.hidden_explicit_group_count} sexual-content{" "}
                 {summary.adult_access.hidden_explicit_group_count === 1 ? "group" : "groups"} hidden
               </strong>
               <small>names, artwork, previews, and unread counts are hidden</small>
@@ -9386,7 +9386,7 @@ function GlobalSearchModal({
 function MakeDialog({ busy, explicitContentEnabled, onClose, onSubmit }: { busy: boolean; explicitContentEnabled: boolean; onClose: () => void; onSubmit: (name: string, contentRating: GroupContentRating) => Promise<boolean> }) {
   const [name, setName] = useState("");
   const [explicit, setExplicit] = useState(false);
-  return <Modal onClose={onClose}><DialogHeading icon={<UsersRound />} title="create group" detail="give the group a name" /><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="group name" /><label className="settings-toggle-row make-explicit-group"><span><strong>sexually explicit content</strong><small>{explicitContentEnabled ? "permits explicit sexual content or nudity and adds a permanent flame marker" : "enable explicit groups in Settings → Content first"}</small></span><input type="checkbox" role="switch" checked={explicit} disabled={!explicitContentEnabled} onChange={(event) => setExplicit(event.target.checked)} /></label><DialogButtons onClose={onClose}><button className="primary" disabled={!name.trim() || busy} onClick={() => void onSubmit(name.trim(), explicit ? "explicit" : "general")}>create group</button></DialogButtons></Modal>;
+  return <Modal onClose={onClose}><DialogHeading icon={<UsersRound />} title="create group" detail="give the group a name" /><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="group name" /><label className="settings-toggle-row make-explicit-group"><span><strong>sexual content or nudity</strong><small>{explicitContentEnabled ? "permits sexual content or nudity and adds a permanent flame marker" : "enable groups with sexual content or nudity in Settings → Content first"}</small></span><input type="checkbox" role="switch" checked={explicit} disabled={!explicitContentEnabled} onChange={(event) => setExplicit(event.target.checked)} /></label><DialogButtons onClose={onClose}><button className="primary" disabled={!name.trim() || busy} onClick={() => void onSubmit(name.trim(), explicit ? "explicit" : "general")}>create group</button></DialogButtons></Modal>;
 }
 
 function JoinDialog({ busy, onClose, onSubmit }: { busy: boolean; onClose: () => void; onSubmit: (frequency: string) => Promise<boolean> }) {
@@ -9500,11 +9500,11 @@ function SettingsDialog({ profile, adultAccess, devices, blockedPeople, busy, on
           </div>
         </section>}
         {tab === "content" && <section className="settings-section user-content-settings">
-          <h3>explicit content</h3>
+          <h3>sexual content or nudity</h3>
           <label className="settings-toggle-row">
             <span>
-              <strong>show explicit groups</strong>
-              <small>show groups labeled for sexually explicit content or nudity. They stay hidden unless you turn this on.</small>
+              <strong>show sexual-content groups</strong>
+              <small>show groups labeled for sexual content or nudity. They stay hidden unless you turn this on.</small>
             </span>
             <input
               type="checkbox"
@@ -9518,7 +9518,7 @@ function SettingsDialog({ profile, adultAccess, devices, blockedPeople, busy, on
               }}
             />
           </label>
-          <p>Your birth date is not stored. noise is already 18+; this separate preference controls whether sexually explicit groups appear.</p>
+          <p>Your birth date is not stored. noise is already 18+; this separate preference controls whether sexual-content groups appear.</p>
         </section>}
         {tab === "blocks" && <section className="settings-section user-block-settings">
           <h3>blocked users</h3>
@@ -9634,7 +9634,7 @@ function GroupSettingsDialog({ group, explicitContentEnabled, bannedMembers, pre
           <label className="settings-toggle-row"><span><strong>send messages</strong><small>moderators can always send messages</small></span><input type="checkbox" role="switch" checked={membersCanSendMessages} onChange={(event) => setMembersCanSendMessages(event.target.checked)} /></label>
           <label className="settings-toggle-row"><span><strong>send media</strong><small>moderators can always upload media</small></span><input type="checkbox" role="switch" checked={membersCanSendMedia} onChange={(event) => setMembersCanSendMedia(event.target.checked)} /></label>
           <h3>content label</h3>
-          <label className="settings-toggle-row"><span><strong>sexually explicit content</strong><small>{group.content_rating === "explicit" ? "this permanent flame marker cannot be removed" : explicitContentEnabled ? "permits explicit sexual content or nudity, permanently marks the group, and replaces its frequency" : "enable explicit groups in your Content settings first"}</small></span><input type="checkbox" role="switch" checked={contentRating === "explicit"} disabled={group.content_rating === "explicit" || !explicitContentEnabled} onChange={(event) => setContentRating(event.target.checked ? "explicit" : "general")} /></label>
+          <label className="settings-toggle-row"><span><strong>sexual content or nudity</strong><small>{group.content_rating === "explicit" ? "this permanent flame marker cannot be removed" : explicitContentEnabled ? "permits sexual content or nudity, permanently marks the group, and replaces its frequency" : "enable groups with sexual content or nudity in your Content settings first"}</small></span><input type="checkbox" role="switch" checked={contentRating === "explicit"} disabled={group.content_rating === "explicit" || !explicitContentEnabled} onChange={(event) => setContentRating(event.target.checked ? "explicit" : "general")} /></label>
           <h3 className="frequency-heading">frequency</h3>
           <div className="group-frequency-settings">
             <div className="group-frequency-value">
