@@ -19,6 +19,8 @@ CREATE TABLE noise.watch_changes (
 CREATE INDEX watch_changes_scope_idx
     ON noise.watch_changes (scope_id, change_id);
 
+ALTER TABLE noise.watch_changes OWNER TO noise_app;
+
 -- Watch revisions now come from the shared cursor clock. Jump it past the
 -- legacy global watch revision domain (max outbox_id) so already-connected
 -- clients holding legacy revisions keep observing strictly increasing values
