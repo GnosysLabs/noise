@@ -444,27 +444,57 @@ CREATE TABLE noise.legacy_media_providers (
         CHECK (compatibility_origin ~ '^https://[A-Za-z0-9.-]+$')
 );
 
+CREATE TABLE noise.legacy_media_objects (
+    media_object_id bytea PRIMARY KEY CHECK (octet_length(media_object_id) = 32),
+    storage_key text NOT NULL UNIQUE
+        CHECK (storage_key ~ '^legacy/objects/[0-9a-f]{2}/[0-9a-f]{64}[.]nsb2$'),
+    storage_byte_length bigint NOT NULL CHECK (storage_byte_length > 0),
+    storage_payload_hash bytea NOT NULL
+        CHECK (octet_length(storage_payload_hash) = 32),
+    state text NOT NULL DEFAULT 'available'
+        CHECK (state IN ('available', 'deleting', 'deleted', 'failed')),
+    imported_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    deleted_at timestamptz,
+    CHECK ((state IN ('available', 'deleting', 'failed') AND deleted_at IS NULL)
+        OR (state = 'deleted' AND deleted_at IS NOT NULL))
+);
+
 CREATE TABLE noise.legacy_media_shards (
     provider_id smallint NOT NULL
         REFERENCES noise.legacy_media_providers(provider_id),
     shard_id bytea NOT NULL CHECK (octet_length(shard_id) = 32),
-    payload_hash bytea NOT NULL CHECK (octet_length(payload_hash) = 32),
-    ciphertext_length bigint NOT NULL CHECK (ciphertext_length > 0),
-    storage_key text
-        CHECK (storage_key IS NULL
-            OR storage_key ~ '^legacy/[A-Za-z0-9/_-]+$'),
+    state text NOT NULL CHECK (state IN ('live', 'deleted')),
+    payload_hash bytea
+        CHECK (payload_hash IS NULL OR octet_length(payload_hash) = 32),
+    ciphertext_length bigint
+        CHECK (ciphertext_length IS NULL OR ciphertext_length > 0),
+    canonical_object_id bytea
+        REFERENCES noise.legacy_media_objects(media_object_id),
+    payload_encoding text
+        CHECK (payload_encoding IS NULL OR payload_encoding IN ('nsb2', 'legacy_json')),
     deletion_capability_hash bytea
         CHECK (deletion_capability_hash IS NULL
             OR octet_length(deletion_capability_hash) = 32),
     tombstoned_at timestamptz,
     accepted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (provider_id, shard_id),
-    CHECK ((tombstoned_at IS NULL AND storage_key IS NOT NULL)
-        OR tombstoned_at IS NOT NULL)
+    CHECK ((state = 'live'
+            AND payload_hash IS NOT NULL
+            AND ciphertext_length IS NOT NULL
+            AND canonical_object_id IS NOT NULL
+            AND payload_encoding IS NOT NULL
+            AND deletion_capability_hash IS NOT NULL
+            AND tombstoned_at IS NULL)
+        OR (state = 'deleted' AND canonical_object_id IS NULL))
 );
 
 CREATE INDEX legacy_media_payload_idx
-    ON noise.legacy_media_shards (payload_hash, ciphertext_length);
+    ON noise.legacy_media_shards (payload_hash, ciphertext_length)
+    WHERE state = 'live';
+
+CREATE INDEX legacy_media_object_alias_idx
+    ON noise.legacy_media_shards (canonical_object_id)
+    WHERE state = 'live';
 
 CREATE TABLE noise.push_subscriptions (
     push_subscription_pk bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

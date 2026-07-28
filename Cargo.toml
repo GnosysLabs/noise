@@ -3,6 +3,7 @@ members = [
     "apps/client/src-tauri",
     "crates/noise-core",
     "crates/noise-central",
+    "crates/noise-migration-importer",
     "crates/noise-migration-verifier",
     "crates/noise-client",
     "crates/noise-transport",

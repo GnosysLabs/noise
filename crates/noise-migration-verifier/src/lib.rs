@@ -149,6 +149,18 @@ pub struct InvariantCount {
     pub count: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegacyPayloadEncoding {
+    Nsb2,
+    LegacyJson,
+}
+
+pub struct NormalizedLegacyMediaObject {
+    pub object_id: String,
+    pub storage_bytes: Vec<u8>,
+    pub source_encoding: LegacyPayloadEncoding,
+}
+
 #[derive(Clone)]
 struct StoredObject {
     raw_payload: Vec<u8>,
@@ -1135,13 +1147,13 @@ fn verify_shard_files(
             && blake3::hash(&payload).to_hex().as_str() == shard.payload_hash;
         if valid {
             shard.file_state = ShardFileState::Valid;
-            if let Some((blob, legacy_json_encoding)) = canonical_encrypted_blob(&payload) {
-                let storage_bytes = blob.storage_bytes()?;
+            if let Ok(normalized) = normalize_legacy_media_payload(&payload) {
                 shard.canonical_storage_hash =
-                    Some(blake3::hash(&storage_bytes).to_hex().to_string());
-                shard.canonical_storage_length = Some(storage_bytes.len() as u64);
-                shard.canonical_object_id = Some(blob.blob_id);
-                shard.legacy_json_encoding = legacy_json_encoding;
+                    Some(blake3::hash(&normalized.storage_bytes).to_hex().to_string());
+                shard.canonical_storage_length = Some(normalized.storage_bytes.len() as u64);
+                shard.canonical_object_id = Some(normalized.object_id);
+                shard.legacy_json_encoding =
+                    normalized.source_encoding == LegacyPayloadEncoding::LegacyJson;
             }
         } else {
             inventory.invalid += 1;
@@ -1156,13 +1168,28 @@ fn verify_shard_files(
     Ok(inventory)
 }
 
-fn canonical_encrypted_blob(payload: &[u8]) -> Option<(EncryptedBlob, bool)> {
+pub fn normalize_legacy_media_payload(
+    payload: &[u8],
+) -> anyhow::Result<NormalizedLegacyMediaObject> {
     if let Ok(blob) = EncryptedBlob::from_storage_bytes(payload) {
-        return Some((blob, false));
+        return Ok(NormalizedLegacyMediaObject {
+            object_id: blob.blob_id,
+            storage_bytes: payload.to_vec(),
+            source_encoding: LegacyPayloadEncoding::Nsb2,
+        });
     }
-    let blob = serde_json::from_slice::<EncryptedBlob>(payload).ok()?;
-    blob.verify().ok()?;
-    (serde_json::to_vec(&blob).ok()?.as_slice() == payload).then_some((blob, true))
+    let blob = serde_json::from_slice::<EncryptedBlob>(payload)
+        .context("legacy media payload is not a recognized encrypted object")?;
+    blob.verify()
+        .context("legacy JSON media object failed integrity verification")?;
+    if serde_json::to_vec(&blob)?.as_slice() != payload {
+        bail!("legacy JSON media object is not in its canonical wire encoding");
+    }
+    Ok(NormalizedLegacyMediaObject {
+        object_id: blob.blob_id.clone(),
+        storage_bytes: blob.storage_bytes()?,
+        source_encoding: LegacyPayloadEncoding::LegacyJson,
+    })
 }
 
 fn verify_relay_descriptors(connection: &Connection) -> anyhow::Result<(u64, u64)> {

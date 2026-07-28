@@ -4446,6 +4446,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "noise-migration-importer"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "futures-util",
+ "noise-core",
+ "noise-migration-verifier",
+ "object_store",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+ "url",
+]
+
+[[package]]
 name = "noise-migration-verifier"
 version = "0.2.1"
 dependencies = [
