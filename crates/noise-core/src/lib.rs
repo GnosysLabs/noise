@@ -762,7 +762,7 @@ impl EncryptedBlob {
             .map_err(|_| NoiseError::Crypto)
     }
 
-    fn streaming_bytes(&self) -> Result<Vec<u8>, NoiseError> {
+    pub fn storage_bytes(&self) -> Result<Vec<u8>, NoiseError> {
         self.verify()?;
         let group_id = self.group_id.as_deref().unwrap_or_default().as_bytes();
         let group_id_length: u16 = group_id
@@ -781,7 +781,7 @@ impl EncryptedBlob {
         Ok(encoded)
     }
 
-    fn from_streaming_bytes(object_id: &str, encoded: &[u8]) -> Result<Self, NoiseError> {
+    pub fn from_storage_bytes(encoded: &[u8]) -> Result<Self, NoiseError> {
         if encoded.len() < 4 + 2 + 24 + 16 || &encoded[..4] != STREAMING_BLOB_MAGIC {
             return Err(NoiseError::InvalidStorageManifest);
         }
@@ -804,11 +804,15 @@ impl EncryptedBlob {
                     .to_owned(),
             )
         };
+        let nonce: [u8; 24] = encoded[nonce_start..ciphertext_start]
+            .try_into()
+            .map_err(|_| NoiseError::InvalidStorageManifest)?;
+        let ciphertext = &encoded[ciphertext_start..];
         let blob = Self {
-            blob_id: object_id.to_owned(),
+            blob_id: blob_id(group_id.as_deref(), &nonce, ciphertext),
             group_id,
-            nonce_base64: STANDARD_NO_PAD.encode(&encoded[nonce_start..ciphertext_start]),
-            ciphertext_base64: STANDARD_NO_PAD.encode(&encoded[ciphertext_start..]),
+            nonce_base64: STANDARD_NO_PAD.encode(nonce),
+            ciphertext_base64: STANDARD_NO_PAD.encode(ciphertext),
         };
         blob.verify()?;
         Ok(blob)
@@ -926,7 +930,7 @@ pub fn encode_blob_for_storage(
     // converges on the target 8-of-12 profile without changing the protocol.
     let data_shards = (total_shards * 2 / 3).max(1);
     let parity_shards = total_shards - data_shards;
-    let encoded = blob.streaming_bytes()?;
+    let encoded = blob.storage_bytes()?;
     let shard_byte_length = encoded.len().div_ceil(data_shards);
     let mut shards = vec![vec![0_u8; shard_byte_length]; total_shards];
     for (index, chunk) in encoded.chunks(shard_byte_length).enumerate() {
@@ -1020,7 +1024,11 @@ pub fn reconstruct_blob_from_storage_payloads(
         );
     }
     encoded.truncate(manifest.encoded_byte_length as usize);
-    EncryptedBlob::from_streaming_bytes(&manifest.object_id, &encoded)
+    let blob = EncryptedBlob::from_storage_bytes(&encoded)?;
+    if blob.blob_id != manifest.object_id {
+        return Err(NoiseError::BlobMismatch);
+    }
+    Ok(blob)
 }
 
 pub fn shard_deletion_bytes(key_base64: &str, shard_id: &str) -> Result<Vec<u8>, NoiseError> {

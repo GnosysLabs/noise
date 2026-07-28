@@ -499,16 +499,18 @@ objects while writing them into the target database and object store.
 - Reject conflicting immutable objects instead of silently choosing one.
 - Preserve group IDs, identity keys, event IDs, author sequences, timestamps,
   stream locators, MLS records, and signatures.
-- Import every legacy media shard and tombstone into private R2 namespaces
-  without changing its shard ID, payload hash, deletion-capability hash, or
-  deleted state.
+- Normalize each verified complete legacy encrypted object to canonical `NSB2`
+  bytes and store it once in private R2.
+- Preserve every legacy provider/shard ID, payload hash,
+  deletion-capability hash, payload encoding, and deleted state as a
+  compatibility alias to that canonical object.
 - Preserve the two existing relay domains as compatibility aliases backed by
   the central service.
 
 Keeping the old domains matters because existing signed media manifests contain
-their provider addresses. The central compatibility layer must continue to
-serve those `/v4/shards` paths until all referenced media has a durable central
-resolution path.
+their provider addresses. The central compatibility layer reconstructs the
+exact legacy `NSB2` or JSON wire bytes from the canonical encrypted object and
+continues serving those `/v4/shards` paths for already released clients.
 
 Exit condition: a copied current client can restore every test account, open
 every group/topic/DM, paginate history, and retrieve representative media using
@@ -540,16 +542,17 @@ compatibility boundary without duplicate or missing events.
 - Validate direct encrypted-block PUT, HEAD, GET, deletion, interrupted upload,
   checksum failure, expired capability, and browser CORS behavior.
 - Keep legacy `/v4/shards` reads available.
-- Allow an upgraded authorized client to reconstruct old encrypted objects and
-  register a central encrypted copy without revealing plaintext.
-- Map the immutable object ID to the central copy so old signed message events
-  do not need to be rewritten.
+- Have upgraded clients request the canonical object ID for both migrated and
+  new media. Legacy provider/shard balancing remains entirely inside the
+  compatibility service.
+- Keep the immutable object-ID mapping so old signed message events do not need
+  to be rewritten.
 - Verify images, audio range playback, video bootstrap ranges, deletion, cache
   purge, and interrupted-upload garbage collection.
 
-Exit condition: new media no longer depends on shard placement, and every
-existing referenced object remains retrievable or is explicitly recorded as
-already missing before migration.
+Exit condition: the upgraded client has one canonical media-read path, new
+media no longer depends on shard placement, and every existing referenced
+object remains retrievable.
 
 ### Phase 4: safety cutover
 
@@ -715,8 +718,9 @@ Before implementation:
 5. Specify the canonical event and cursor schema.
 6. Specify legacy media compatibility and central R2 object resolution.
 7. Implemented 2026-07-27: build the read-only migration verifier before
-   writing the importer. A clean production database-only run passed all
-   signed-object and reconciliation checks; its final complete run remains
-   gated on immutable database/media backups and an isolated restore.
+   writing the importer. The complete isolated production database and media
+   run passed every signed-object, reconciliation, integrity, and canonical
+   encrypted-object check. Durable backup and final cutover capture remain
+   operational gates.
 8. Review this document and explicitly approve any change to the privacy
    boundary before code changes begin.

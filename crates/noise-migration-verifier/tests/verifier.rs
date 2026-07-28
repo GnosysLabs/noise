@@ -5,7 +5,8 @@ use std::{
 };
 
 use noise_core::{
-    AccountVault, DirectMessagePolicy, GroupMembership, Identity, Profile, SignedEvent,
+    AccountVault, DirectMessagePolicy, EncryptedBlob, GroupMembership, Identity, Profile,
+    SignedEvent,
 };
 use noise_migration_verifier::{SourceInput, verify};
 use rusqlite::{Connection, params};
@@ -32,6 +33,9 @@ fn valid_snapshots_merge_without_exposing_duplicate_direct_copies() {
     assert_eq!(report.media.provider_scoped_live_shards, 2);
     assert_eq!(report.media.unique_payloads, 1);
     assert_eq!(report.media.duplicate_payload_references, 1);
+    assert_eq!(report.media.canonical_encrypted_objects, 1);
+    assert_eq!(report.media.canonicalizable_references, 2);
+    assert_eq!(report.media.noncanonical_payloads, 0);
 }
 
 #[test]
@@ -101,6 +105,81 @@ fn filesystem_orphan_blocks_until_it_is_classified() {
     let report = verify(fixture.inputs(), "primary").unwrap();
     assert_eq!(report.status, "blocked");
     assert_blocker(&report, "unclassified_orphan_shard_file", 1);
+}
+
+#[test]
+fn valid_shard_bytes_that_are_not_complete_encrypted_objects_block_conversion() {
+    let fixture = Fixture::new();
+    let payload = b"validly hashed but noncanonical legacy bytes";
+    let payload_hash = blake3::hash(payload).to_hex().to_string();
+    let shard_id = "c".repeat(64);
+    for (database_path, media_root) in [
+        (&fixture.primary_database, &fixture.primary_media),
+        (&fixture.secondary_database, &fixture.secondary_media),
+    ] {
+        let database = Connection::open(database_path).unwrap();
+        database
+            .execute(
+                "UPDATE relay_shards
+                 SET payload_hash = ?1, byte_length = ?2
+                 WHERE shard_id = ?3",
+                params![payload_hash, payload.len() as i64, shard_id],
+            )
+            .unwrap();
+        fs::write(
+            media_root
+                .join("shards")
+                .join("cc")
+                .join(format!("{shard_id}.bin")),
+            payload,
+        )
+        .unwrap();
+    }
+
+    let report = verify(fixture.inputs(), "primary").unwrap();
+    assert_eq!(report.status, "blocked");
+    assert_blocker(
+        &report,
+        "legacy_payload_is_not_complete_encrypted_object",
+        1,
+    );
+}
+
+#[test]
+fn legacy_json_encrypted_objects_are_canonicalized_without_decryption() {
+    let fixture = Fixture::new();
+    let (blob, _) = EncryptedBlob::create(b"legacy encrypted object").unwrap();
+    let payload = serde_json::to_vec(&blob).unwrap();
+    let payload_hash = blake3::hash(&payload).to_hex().to_string();
+    let shard_id = "c".repeat(64);
+    for (database_path, media_root) in [
+        (&fixture.primary_database, &fixture.primary_media),
+        (&fixture.secondary_database, &fixture.secondary_media),
+    ] {
+        let database = Connection::open(database_path).unwrap();
+        database
+            .execute(
+                "UPDATE relay_shards
+                 SET payload_hash = ?1, byte_length = ?2
+                 WHERE shard_id = ?3",
+                params![payload_hash, payload.len() as i64, shard_id],
+            )
+            .unwrap();
+        fs::write(
+            media_root
+                .join("shards")
+                .join("cc")
+                .join(format!("{shard_id}.bin")),
+            &payload,
+        )
+        .unwrap();
+    }
+
+    let report = verify(fixture.inputs(), "primary").unwrap();
+    assert_eq!(report.status, "pass");
+    assert_eq!(report.media.canonical_encrypted_objects, 1);
+    assert_eq!(report.media.legacy_json_encrypted_objects, 1);
+    assert_eq!(report.media.noncanonical_payloads, 0);
 }
 
 fn assert_blocker(report: &noise_migration_verifier::VerificationReport, code: &str, count: u64) {
@@ -187,9 +266,10 @@ impl Fixture {
             2,
         )
         .unwrap();
-        let shard_payload = b"opaque encrypted fixture bytes";
+        let (shard_blob, _) = EncryptedBlob::create(b"opaque encrypted fixture bytes").unwrap();
+        let shard_payload = shard_blob.storage_bytes().unwrap();
         let shard_id = "c".repeat(64);
-        let payload_hash = blake3::hash(shard_payload).to_hex().to_string();
+        let payload_hash = blake3::hash(&shard_payload).to_hex().to_string();
 
         create_snapshot(
             &primary_database,
@@ -198,7 +278,7 @@ impl Fixture {
             [&group_event, &receiver_copy, &sender_copy],
             &shard_id,
             &payload_hash,
-            shard_payload,
+            &shard_payload,
         );
         create_snapshot(
             &secondary_database,
@@ -207,7 +287,7 @@ impl Fixture {
             [&group_event, &receiver_copy, &sender_copy],
             &shard_id,
             &payload_hash,
-            shard_payload,
+            &shard_payload,
         );
 
         Self {

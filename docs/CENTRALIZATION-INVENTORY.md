@@ -184,13 +184,24 @@ Shard IDs are provider-specific:
 - 4 payloads, totaling 4,894,076 bytes, exist only on the secondary.
 
 The union is 3,119 distinct encrypted payloads totaling 2,158,838,143 bytes,
-approximately 2.01 GiB. This is the minimum current R2 ciphertext capacity,
-before database backups, temporary uploads, lifecycle headroom, and growth.
+approximately 2.01 GiB in its original mixed encodings. Canonical normalization
+reduces the initial R2 object bytes as recorded below; capacity planning still
+needs temporary-upload, lifecycle, backup, and growth headroom.
 
-The compatibility importer must preserve `(legacy provider, shard ID)` as the
-lookup identity. It may avoid storing duplicate ciphertext bytes internally
-when the verified payload hash and length match, but both old provider URLs and
-both old shard IDs must continue to resolve correctly.
+The complete media-backed verifier proved that all 3,119 payloads are complete
+encrypted objects rather than partial erasure fragments:
+
+- 2,905 are already in canonical `NSB2` storage encoding;
+- 214 use an exact legacy JSON encoding that round-trips byte-for-byte and
+  normalizes to `NSB2` without decryption;
+- all 6,233 legacy references are canonicalizable;
+- no canonical object ID resolves to conflicting normalized bytes; and
+- normalized canonical R2 storage is 2,099,946,593 bytes.
+
+The compatibility importer must preserve `(legacy provider, shard ID)` as an
+alias while storing one normalized R2 object per canonical encrypted object.
+Both old provider URLs and shard IDs continue to resolve server-side, but
+upgraded clients use the canonical object ID for old and new media.
 
 ### Filesystem reconciliation
 
@@ -199,11 +210,11 @@ both old shard IDs must continue to resolve correctly.
 | Primary | 3,116 | 3,115 | 1 | 0 |
 | Secondary | 3,118 | 3,118 | 0 | 0 |
 
-The primary has one unreferenced 1,048,686-byte file. It must not be imported as
-live media merely because it exists on disk. Before final capture, the
-migration verifier should classify it as an interrupted upload, failed
-publication, or other orphan using metadata and logs without opening the
-encrypted bytes. No orphan was found on the secondary.
+The primary has one unreferenced 1,048,686-byte file dated July 25. It was
+preserved separately in quarantine. No corresponding database metadata or
+retained relay journal entry exists, so it is conservatively classified as an
+unreferenced interrupted-or-uncommitted upload and is not imported as live
+media. No orphan was found on the secondary.
 
 ## Required importer rules
 
@@ -218,21 +229,21 @@ The production evidence fixes the following rules:
    one canonical account.
 5. Preserve deleted-account and group-deletion records.
 6. Namespace legacy shard IDs and tombstones by original relay provider.
-7. Reconcile encrypted media by verified payload hash and byte length while
-   preserving every legacy lookup path.
+7. Normalize every verified complete encrypted object to canonical `NSB2`,
+   store it once in R2, and preserve every legacy lookup as a server-side
+   alias.
 8. Import push state from the primary without logging tokens.
 9. Exclude filesystem orphans unless a verified database reference exists.
 10. Run a final frozen capture or journal every accepted write between capture
     and cutover.
 
-The implemented read-only verifier has also been run against clean standalone
-copies of both production databases. The signed union, account revisions, MLS
-chains, and direct-message reconciliation passed. It confirmed eight
+The implemented read-only verifier has been run against clean standalone
+copies of both production databases and every referenced encrypted media file.
+The complete run passed. It confirmed eight
 identity-level recovery-locator alias sets, seven byte-identically shared
 legacy group-sequence duplicates that the current client already reduces
-deterministically, and three valid legacy APNs `sandbox` registrations. A full
-passing run remains pending because that database-only check intentionally did
-not copy the encrypted shard trees.
+deterministically, three valid legacy APNs `sandbox` registrations, and 3,119
+conflict-free canonical encrypted media objects.
 
 ## Phase 0 work still open
 
@@ -240,15 +251,16 @@ No production service change should begin until these gaps are closed:
 
 - create durable, access-controlled, immutable backups of both clean database
   snapshots;
-- capture both complete encrypted shard stores without opening media;
+- create durable protected copies of both verified encrypted media stores and
+  the quarantined orphan;
 - capture service configuration into protected secret storage, excluding
   secrets from migration reports and Git;
 - record DNS, TLS, systemd, firewall, and deployment recovery information;
 - build an isolated restore environment and prove both database snapshots open;
 - verify representative legacy shard retrieval from restored copies;
 - classify the single primary filesystem orphan;
-- run the signed-object migration verifier against the final clean restored
-  snapshots and resolve every blocker;
+- reproduce the passing migration-verifier report from the final cutover
+  capture;
   and
 - establish the final write freeze or accepted-write journal.
 
@@ -268,9 +280,8 @@ uses one existing receiver-mailbox envelope per logical event, authorizes both
 bound participants without decrypting it, and applies server-side safety
 hiding. The read-only migration verifier is now implemented with deterministic
 union, account revision, direct-copy, MLS-chain, and encrypted-shard checks.
-Its disposable fixtures cover both passing and blocked migrations, and its
-database-only production snapshot run passed every check except the
-intentionally absent encrypted shard files. The next step is durable production
-database/media backups and a complete isolated restored run. The importer
-should be built only after that report passes and reproduces the aggregates and
-digests in this document.
+Its disposable fixtures cover both passing and blocked migrations. The complete
+isolated production database and media run passed and reproduced the
+aggregates in this document. The compatibility importer can now be built
+against that contract. Durable protected backups and a final cutover capture
+remain required before production traffic moves.

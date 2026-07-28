@@ -122,6 +122,12 @@ pub struct MediaMergeReport {
     pub unique_payloads: u64,
     pub unique_payload_bytes: u64,
     pub duplicate_payload_references: u64,
+    pub canonical_encrypted_objects: u64,
+    pub canonical_storage_bytes: u64,
+    pub legacy_json_encrypted_objects: u64,
+    pub canonicalizable_references: u64,
+    pub noncanonical_payloads: u64,
+    pub conflicting_canonical_object_ids: u64,
     pub cross_source_shared_shard_ids: u64,
     pub missing_files: u64,
     pub invalid_files: u64,
@@ -170,6 +176,10 @@ struct ShardRow {
     payload_hash: String,
     byte_length: u64,
     file_state: ShardFileState,
+    canonical_object_id: Option<String>,
+    canonical_storage_hash: Option<String>,
+    canonical_storage_length: Option<u64>,
+    legacy_json_encoding: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -894,6 +904,9 @@ fn reconcile_events(
 fn reconcile_media(sources: &[SourceData], findings: &mut Findings) -> MediaMergeReport {
     let mut report = MediaMergeReport::default();
     let mut payloads = BTreeMap::<(&str, u64), u64>::new();
+    let mut valid_payloads = BTreeSet::<(&str, u64)>::new();
+    let mut canonical_payloads = BTreeMap::<(&str, u64), (&str, &str, u64)>::new();
+    let mut legacy_json_object_ids = BTreeSet::<&str>::new();
     let mut shard_sources = BTreeMap::<&str, u64>::new();
     for source in sources {
         report.provider_scoped_live_shards += source.shards.len() as u64;
@@ -905,7 +918,26 @@ fn reconcile_media(sources: &[SourceData], findings: &mut Findings) -> MediaMerg
                 .or_default() += 1;
             *shard_sources.entry(shard_id.as_str()).or_default() += 1;
             match shard.file_state {
-                ShardFileState::Valid => {}
+                ShardFileState::Valid => {
+                    let payload_key = (shard.payload_hash.as_str(), shard.byte_length);
+                    valid_payloads.insert(payload_key);
+                    if let (Some(object_id), Some(storage_hash), Some(storage_length)) = (
+                        shard.canonical_object_id.as_deref(),
+                        shard.canonical_storage_hash.as_deref(),
+                        shard.canonical_storage_length,
+                    ) {
+                        report.canonicalizable_references += 1;
+                        if shard.legacy_json_encoding {
+                            legacy_json_object_ids.insert(object_id);
+                        }
+                        if let Some(existing) = canonical_payloads
+                            .insert(payload_key, (object_id, storage_hash, storage_length))
+                            && existing != (object_id, storage_hash, storage_length)
+                        {
+                            findings.block("canonical_payload_object_id_conflict", 1);
+                        }
+                    }
+                }
                 ShardFileState::Missing => report.missing_files += 1,
                 ShardFileState::Invalid => report.invalid_files += 1,
             }
@@ -915,6 +947,28 @@ fn reconcile_media(sources: &[SourceData], findings: &mut Findings) -> MediaMerg
     report.unique_payloads = payloads.len() as u64;
     report.unique_payload_bytes = payloads.keys().map(|(_, length)| *length).sum();
     report.duplicate_payload_references = payloads.values().map(|count| count - 1).sum();
+    report.noncanonical_payloads = valid_payloads
+        .iter()
+        .filter(|payload| !canonical_payloads.contains_key(*payload))
+        .count() as u64;
+    let mut object_payloads = BTreeMap::<&str, BTreeSet<(&str, u64)>>::new();
+    for (_, (object_id, storage_hash, storage_length)) in canonical_payloads {
+        object_payloads
+            .entry(object_id)
+            .or_default()
+            .insert((storage_hash, storage_length));
+    }
+    report.canonical_encrypted_objects = object_payloads.len() as u64;
+    report.canonical_storage_bytes = object_payloads
+        .values()
+        .filter_map(|payloads| payloads.first())
+        .map(|(_, length)| *length)
+        .sum();
+    report.legacy_json_encrypted_objects = legacy_json_object_ids.len() as u64;
+    report.conflicting_canonical_object_ids = object_payloads
+        .values()
+        .filter(|payloads| payloads.len() > 1)
+        .count() as u64;
     report.cross_source_shared_shard_ids = shard_sources
         .values()
         .filter(|sources| **sources > 1)
@@ -925,6 +979,14 @@ fn reconcile_media(sources: &[SourceData], findings: &mut Findings) -> MediaMerg
     );
     findings.block("missing_referenced_shard_file", report.missing_files);
     findings.block("invalid_referenced_shard_file", report.invalid_files);
+    findings.block(
+        "legacy_payload_is_not_complete_encrypted_object",
+        report.noncanonical_payloads,
+    );
+    findings.block(
+        "canonical_object_id_has_conflicting_payloads",
+        report.conflicting_canonical_object_ids,
+    );
     findings.block("unclassified_orphan_shard_file", report.orphan_files);
     report
 }
@@ -988,6 +1050,10 @@ fn read_shards(
                 payload_hash,
                 byte_length: byte_length as u64,
                 file_state: ShardFileState::Missing,
+                canonical_object_id: None,
+                canonical_storage_hash: None,
+                canonical_storage_length: None,
+                legacy_json_encoding: false,
             },
         );
     }
@@ -1064,11 +1130,19 @@ fn verify_shard_files(
         let path = shard_root
             .join(&shard_id[..2])
             .join(format!("{shard_id}.bin"));
-        let metadata = fs::metadata(&path)?;
-        let valid =
-            metadata.len() == shard.byte_length && blake3_file(&path)? == shard.payload_hash;
+        let payload = fs::read(&path)?;
+        let valid = payload.len() as u64 == shard.byte_length
+            && blake3::hash(&payload).to_hex().as_str() == shard.payload_hash;
         if valid {
             shard.file_state = ShardFileState::Valid;
+            if let Some((blob, legacy_json_encoding)) = canonical_encrypted_blob(&payload) {
+                let storage_bytes = blob.storage_bytes()?;
+                shard.canonical_storage_hash =
+                    Some(blake3::hash(&storage_bytes).to_hex().to_string());
+                shard.canonical_storage_length = Some(storage_bytes.len() as u64);
+                shard.canonical_object_id = Some(blob.blob_id);
+                shard.legacy_json_encoding = legacy_json_encoding;
+            }
         } else {
             inventory.invalid += 1;
             shard.file_state = ShardFileState::Invalid;
@@ -1080,6 +1154,15 @@ fn verify_shard_files(
         .count() as u64;
     findings.block("invalid_media_directory_entry", inventory.invalid);
     Ok(inventory)
+}
+
+fn canonical_encrypted_blob(payload: &[u8]) -> Option<(EncryptedBlob, bool)> {
+    if let Ok(blob) = EncryptedBlob::from_storage_bytes(payload) {
+        return Some((blob, false));
+    }
+    let blob = serde_json::from_slice::<EncryptedBlob>(payload).ok()?;
+    blob.verify().ok()?;
+    (serde_json::to_vec(&blob).ok()?.as_slice() == payload).then_some((blob, true))
 }
 
 fn verify_relay_descriptors(connection: &Connection) -> anyhow::Result<(u64, u64)> {
@@ -1213,21 +1296,6 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(hex_digest(hasher.finalize().as_slice()))
-}
-
-fn blake3_file(path: &Path) -> anyhow::Result<String> {
-    let mut reader =
-        BufReader::new(fs::File::open(path).with_context(|| "could not open shard for hashing")?);
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn digest_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> String {

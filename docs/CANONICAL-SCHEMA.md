@@ -119,9 +119,11 @@ lengths and hashes, generated private R2 keys, and lifecycle state. No key
 contains an account ID, group ID, filename, username, or plaintext MIME type.
 
 Legacy provider/shard tables preserve every old signed lookup identity while
-allowing duplicate ciphertext payloads to point at one private stored object.
-Deleting an object is a state transition plus durable job, never an
-uncoordinated row deletion.
+allowing duplicate aliases to point at one normalized private R2 object.
+Upgraded clients address that object canonically; only the compatibility
+service reproduces legacy `NSB2` or exact JSON shard responses. Deleting an
+object is a state transition plus durable job, never an uncoordinated row
+deletion.
 
 ## Safety
 

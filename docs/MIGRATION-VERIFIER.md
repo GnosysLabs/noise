@@ -1,7 +1,8 @@
 # noise migration verifier
 
-Status: implemented, fixture-validated, and run against clean production
-database snapshots; complete encrypted-media capture still pending
+Status: implemented, fixture-validated, and passed against isolated copies of
+both complete production databases and every referenced encrypted media file;
+durable backup and cutover capture still pending
 
 Updated: 2026-07-27
 
@@ -123,12 +124,18 @@ For every `relay_shards` row, the verifier checks:
 - exact file length; and
 - the BLAKE3 hash of the opaque ciphertext bytes.
 
-It never decrypts or interprets those bytes. Missing or corrupt referenced
-files block migration. Files without metadata are reported as unclassified
-orphans and also block migration until they are investigated. Live shard IDs
-and tombstones remain provider-scoped; matching payload hash and byte length
-identify ciphertext that can be stored once while retaining every legacy
-lookup path.
+It never decrypts those bytes. After integrity verification it also validates
+that every unique payload is a complete identity-addressed encrypted blob.
+Current `NSB2` storage bytes are accepted directly. The older exact JSON
+encoding is parsed, cryptographically verified, round-tripped byte-for-byte for
+legacy compatibility, and normalized to `NSB2` without opening its ciphertext.
+An object ID resolving to different normalized bytes is a blocker.
+
+Missing or corrupt referenced files block migration. Files without metadata
+are reported as unclassified orphans and also block migration until they are
+investigated. Live shard IDs and tombstones remain provider-scoped; each
+legacy lookup maps to one verified canonical object so upgraded clients do not
+need a separate shard-reading path.
 
 ## Digests
 
@@ -151,6 +158,8 @@ Focused disposable SQLite/media fixtures cover:
 - exact immutable deduplication;
 - conversion of two legacy direct mailbox copies into one canonical event;
 - duplicate encrypted media payload reconciliation;
+- current and legacy-JSON encrypted-object normalization;
+- rejection of validly hashed bytes that are not complete encrypted objects;
 - conflicting bytes for one immutable ID;
 - shared legacy events duplicating one author sequence;
 - a cross-source author-sequence conflict; and
@@ -158,13 +167,20 @@ Focused disposable SQLite/media fixtures cover:
 
 The fixtures verify both passing and deliberately blocked reports.
 
-A database-only run against clean standalone snapshots of both current
-production relays verified the complete signed-object union, account revisions,
-MLS chains, direct-message reconciliation, and push-row compatibility. It
-confirmed eight identities with signed recovery-locator aliases, seven shared
-legacy group-sequence duplicates, and three valid legacy APNs `sandbox`
-registrations. After applying the rules above, none is a migration blocker.
-That run intentionally used empty media roots, so its only remaining blockers
-were the expected missing encrypted shard files. The final passing production
-run still requires durable complete database and encrypted-media backups in an
-isolated restore environment.
+The complete isolated production run passed with no blockers. It verified
+6,233 provider-scoped references and 4,311,733,524 referenced bytes as 3,119
+canonical encrypted objects. Of those, 214 use the exact older JSON encoding;
+all normalize without decryption or conflict. Canonical `NSB2` storage totals
+2,099,946,593 bytes. No referenced file was missing or corrupt.
+
+The primary store's one unreferenced 1,048,686-byte file was preserved in a
+separate quarantine copy and excluded from live import. Its July 25 timestamp
+has no retained relay journal entry, so it is classified conservatively as an
+unreferenced interrupted-or-uncommitted upload rather than guessed to be live
+media.
+
+The run also confirmed eight identities with signed recovery-locator aliases,
+seven shared legacy group-sequence duplicates, and three valid legacy APNs
+`sandbox` registrations. The next operational gate is a durable,
+access-controlled backup and final cutover capture; the conversion contract
+itself now passes against the complete current dataset.
