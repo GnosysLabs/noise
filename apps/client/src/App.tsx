@@ -6031,6 +6031,22 @@ function useChunkedMessageList<T extends { event_id: string }>(
     return true;
   }, [conversationKey, messages]);
 
+  const navigateToMessage = useCallback((messageId: string) => {
+    if (!revealMessage(messageId)) return false;
+    window.setTimeout(() => {
+      const row = ref.current?.querySelector<HTMLElement>(
+        `[data-message-id="${CSS.escape(messageId)}"]`,
+      );
+      if (!row) return;
+      row.scrollIntoView({ block: "center", behavior: "smooth" });
+      row.classList.remove("search-highlight");
+      void row.offsetWidth;
+      row.classList.add("search-highlight");
+      window.setTimeout(() => row.classList.remove("search-highlight"), 1900);
+    }, 0);
+    return true;
+  }, [revealMessage]);
+
   return {
     ref,
     olderSentinel,
@@ -6041,6 +6057,7 @@ function useChunkedMessageList<T extends { event_id: string }>(
     canLoadOlder,
     loadingOlder: loadingOlderHistory,
     revealMessage,
+    navigateToMessage,
   };
 }
 
@@ -6334,7 +6351,7 @@ function ConversationPanel({
               messageList.visibleMessages[index - 1].created_at_millis,
               item.created_at_millis,
             )) && <MessageDateSeparator millis={item.created_at_millis} />}
-            <MessageRow message={item} own={item.author_public_key === selfPublicKey} presence={presenceStatuses.get(item.author_public_key) ?? "offline"} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onToggleReaction={(emoji) => void onReaction(item, emoji)} reactionPeople={reactionPeople} onPerson={onPerson} mediaScopeId={conversation.group.group_id} />
+            <MessageRow message={item} own={item.author_public_key === selfPublicKey} presence={presenceStatuses.get(item.author_public_key) ?? "offline"} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onNavigateToMessage={messageList.navigateToMessage} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onToggleReaction={(emoji) => void onReaction(item, emoji)} reactionPeople={reactionPeople} onPerson={onPerson} mediaScopeId={conversation.group.group_id} />
           </Fragment>
         ))}
       </div>
@@ -6628,7 +6645,7 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
           return (
             <Fragment key={item.event_id}>
               {startsDay && <MessageDateSeparator millis={item.created_at_millis} />}
-              <MessageRow message={item} own={item.author_public_key === self.public_key} presence={item.author_public_key === self.public_key ? selfPresence : contactPresence} replyTo={replyTo} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} mediaScopeId={conversation.media_scope_id} />
+              <MessageRow message={item} own={item.author_public_key === self.public_key} presence={item.author_public_key === self.public_key ? selfPresence : contactPresence} replyTo={replyTo} onNavigateToMessage={messageList.navigateToMessage} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} mediaScopeId={conversation.media_scope_id} />
             </Fragment>
           );
         })}
@@ -6821,6 +6838,7 @@ function MessageRow({
   own,
   presence,
   replyTo,
+  onNavigateToMessage,
   onContextMenu,
   onToggleReaction,
   reactionPeople,
@@ -6831,6 +6849,7 @@ function MessageRow({
   own: boolean;
   presence?: PresenceStatus;
   replyTo?: MessageSummary;
+  onNavigateToMessage: (eventId: string) => void;
   onContextMenu?: (event: React.MouseEvent<HTMLElement>) => void;
   onToggleReaction?: (emoji: string) => void;
   reactionPeople?: Map<string, PersonSummary>;
@@ -6869,7 +6888,9 @@ function MessageRow({
       <div className="message-body">
         <div className="message-meta"><button onClick={() => onPerson(person)}>{message.username}</button></div>
         {forwardedPerson && <div className="message-forwarded"><Forward size={13} /><span>Forwarded from</span><button onClick={() => onPerson(forwardedPerson)}>{forwardedPerson.username}</button></div>}
-        {message.reply_to_message_id && <div className="message-reply-reference">{replyTo ? <>{replyTo.attachment && <ReplyMediaThumbnail message={replyTo as MessageSummary & { attachment: MediaAttachment }} scopeId={mediaScopeId} />}<span className="message-reply-copy"><strong>{replyTo.username}</strong><span>{replyPreview(replyTo)}</span></span></> : <span>original message unavailable</span>}</div>}
+        {message.reply_to_message_id && (replyTo
+          ? <button type="button" className="message-reply-reference navigable" onClick={() => onNavigateToMessage(replyTo.event_id)}>{replyTo.attachment && <ReplyMediaThumbnail message={replyTo as MessageSummary & { attachment: MediaAttachment }} scopeId={mediaScopeId} />}<span className="message-reply-copy"><strong>{replyTo.username}</strong><span>{replyPreview(replyTo)}</span></span></button>
+          : <div className="message-reply-reference"><span>original message unavailable</span></div>)}
         {message.text && <p className={jumboEmojiCount ? `emoji-only emoji-only-${jumboEmojiCount}` : undefined}>{linkify(message.text)}</p>}
         {previewUrl && <LinkPreviewCard url={previewUrl} />}
         {localAttachment
