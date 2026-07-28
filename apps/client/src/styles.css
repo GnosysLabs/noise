@@ -178,10 +178,14 @@ button:disabled { cursor: default; opacity: 0.48; }
 .message-date-separator::before, .message-date-separator::after { height: 1px; flex: 1; background: rgba(255,255,255,.075); content: ""; }
 .message-date-separator span { flex: none; padding: 4px 9px; border: 1px solid rgba(255,255,255,.07); border-radius: 999px; background: rgba(31,29,35,.72); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); }
 .group-conversation.has-background .message-date-separator span { background: rgba(30,28,33,.7); }
-.message-row.search-highlight::after { position: absolute; z-index: 5; inset: -6px; border: 1px solid rgba(var(--accent-rgb),.4); border-radius: 14px; box-shadow: 0 0 16px rgba(var(--accent-rgb),.72); content: ""; opacity: 0; pointer-events: none; will-change: opacity; animation: search-message-highlight 2.4s linear forwards; }
+.message-row.search-highlight p,
+.message-row.search-highlight .chat-image,
+.message-row.search-highlight .chat-video,
+.message-row.search-highlight .message-media audio,
+.message-row.search-highlight .media-loading { animation: search-message-highlight 2.4s linear forwards; }
 @keyframes search-message-highlight {
-  0%, 15% { opacity: 1; }
-  100% { opacity: 0; }
+  0%, 15% { box-shadow: 0 0 0 1px rgba(var(--accent-rgb),.4), 0 0 16px rgba(var(--accent-rgb),.72); }
+  100% { box-shadow: 0 0 0 1px rgba(var(--accent-rgb),0), 0 0 16px rgba(var(--accent-rgb),0); }
 }
 .message-row > button { align-self: start; padding: 0; background: transparent; }
 .message-meta { display: flex; align-items: baseline; gap: 7px; height: 18px; }
