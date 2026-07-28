@@ -75,6 +75,13 @@ impl ApiError {
         }
     }
 
+    pub const fn service_unavailable() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "service_unavailable",
+        }
+    }
+
     pub fn database(_error: impl std::fmt::Display) -> Self {
         // Database error details can contain values supplied by a request.
         // Keep the runtime log deliberately generic.

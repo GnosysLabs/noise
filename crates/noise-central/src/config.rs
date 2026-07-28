@@ -37,6 +37,18 @@ pub struct CentralConfig {
 
     #[arg(long, env = "NOISE_ALLOWED_ORIGIN")]
     pub allowed_origin: Option<String>,
+
+    #[arg(long, env = "NOISE_R2_ENDPOINT")]
+    pub(crate) r2_endpoint: Option<String>,
+
+    #[arg(long, env = "NOISE_R2_BUCKET")]
+    pub(crate) r2_bucket: Option<String>,
+
+    #[arg(long, env = "NOISE_R2_ACCESS_KEY_ID", hide_env_values = true)]
+    pub(crate) r2_access_key_id: Option<String>,
+
+    #[arg(long, env = "NOISE_R2_SECRET_ACCESS_KEY", hide_env_values = true)]
+    pub(crate) r2_secret_access_key: Option<String>,
 }
 
 impl CentralConfig {
@@ -54,10 +66,14 @@ impl CentralConfig {
         if self.listen.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) && !self.listen.ip().is_loopback() {
             bail!("noise-central must listen on loopback behind the TLS reverse proxy");
         }
-        if let Some(origin) = self.allowed_origin.as_deref() {
+        for origin in self.allowed_origins()? {
             let parsed =
-                url::Url::parse(origin).context("allowed origin must be a valid HTTPS origin")?;
-            if parsed.scheme() != "https"
+                url::Url::parse(&origin).context("allowed origin must be a valid origin")?;
+            let local_http = parsed.scheme() == "http"
+                && parsed
+                    .host_str()
+                    .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost" | "::1"));
+            if (parsed.scheme() != "https" && !local_http)
                 || parsed.host_str().is_none()
                 || !parsed.username().is_empty()
                 || parsed.password().is_some()
@@ -66,10 +82,11 @@ impl CentralConfig {
                 || parsed.fragment().is_some()
                 || origin.ends_with('/')
             {
-                bail!("allowed origin must be an exact HTTPS origin without a trailing slash");
+                bail!("allowed origins must be exact HTTPS origins or local development origins");
             }
         }
         self.token_hash_key()?;
+        self.media_config()?;
         Ok(())
     }
 
@@ -85,4 +102,84 @@ impl CentralConfig {
         }
         Ok(key)
     }
+
+    pub(crate) fn allowed_origins(&self) -> anyhow::Result<Vec<String>> {
+        let Some(configured) = self.allowed_origin.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let origins = configured
+            .split(',')
+            .map(str::trim)
+            .filter(|origin| !origin.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if origins.is_empty() || origins.len() > 8 {
+            bail!("NOISE_ALLOWED_ORIGIN must contain between one and eight origins");
+        }
+        Ok(origins)
+    }
+
+    pub(crate) fn media_config(&self) -> anyhow::Result<Option<MediaConfig>> {
+        let configured = [
+            self.r2_endpoint.as_deref(),
+            self.r2_bucket.as_deref(),
+            self.r2_access_key_id.as_deref(),
+            self.r2_secret_access_key.as_deref(),
+        ];
+        if configured.iter().all(|value| value.is_none()) {
+            return Ok(None);
+        }
+        if configured
+            .iter()
+            .any(|value| value.is_none_or(|value| value.trim().is_empty()))
+        {
+            bail!("central media requires the R2 endpoint, bucket, access key, and secret key");
+        }
+        let endpoint = self.r2_endpoint.as_deref().expect("checked above").trim();
+        let parsed = url::Url::parse(endpoint).context("NOISE_R2_ENDPOINT is invalid")?;
+        let host = parsed.host_str().unwrap_or_default();
+        if parsed.scheme() != "https"
+            || !host.ends_with(".r2.cloudflarestorage.com")
+            || host == "r2.cloudflarestorage.com"
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.port().is_some()
+            || parsed.path() != "/"
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            bail!("NOISE_R2_ENDPOINT must be an account-specific R2 HTTPS endpoint");
+        }
+        let bucket = self.r2_bucket.as_deref().expect("checked above").trim();
+        if !(3..=63).contains(&bucket.len())
+            || !bucket
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            bail!("NOISE_R2_BUCKET is invalid");
+        }
+        Ok(Some(MediaConfig {
+            endpoint: endpoint.to_owned(),
+            bucket: bucket.to_owned(),
+            access_key_id: self
+                .r2_access_key_id
+                .as_deref()
+                .expect("checked above")
+                .trim()
+                .to_owned(),
+            secret_access_key: self
+                .r2_secret_access_key
+                .as_deref()
+                .expect("checked above")
+                .trim()
+                .to_owned(),
+        }))
+    }
+}
+
+pub(crate) struct MediaConfig {
+    pub endpoint: String,
+    pub bucket: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
 }

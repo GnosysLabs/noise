@@ -186,8 +186,7 @@ fn update_active_account_metadata(account_id: &str, response: &Value) -> Result<
         .lock()
         .map_err(|_| "local account list is unavailable".to_owned())?;
     let mut registry = read_account_registry()?;
-    let response_is_for_active_account =
-        registry.active_account_id.as_deref() == Some(account_id);
+    let response_is_for_active_account = registry.active_account_id.as_deref() == Some(account_id);
     let account_is_still_registered = registry
         .accounts
         .iter()

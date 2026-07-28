@@ -331,7 +331,7 @@ CREATE TABLE noise.events (
     stream_pk bigint NOT NULL REFERENCES noise.streams(stream_pk),
     author_account_id bigint NOT NULL REFERENCES noise.accounts(account_id),
     author_sequence numeric(20, 0) NOT NULL
-        CHECK (author_sequence > 0
+        CHECK (author_sequence >= 0
             AND author_sequence <= 18446744073709551615),
     created_at_millis numeric(20, 0) NOT NULL
         CHECK (created_at_millis >= 0

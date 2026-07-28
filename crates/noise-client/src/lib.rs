@@ -51,17 +51,17 @@ use base64::{
 };
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use noise_core::{
-    AcceptedMessage, AcceptedTopic, AccountCredentials, AccountVault, DirectPushRequest,
-    DirectPushTrigger, EncryptedBlob, GroupDeletion, GroupEventPayload, GroupMembership,
-    GroupPresence, GroupProfile, GroupState, HistoryKeyLink, Identity, InviteRecord,
-    InviteRotation, MlsAccountState, MlsControlLog, MlsEpochRecord, MlsGroupGenesis,
+    AcceptedMessage, AcceptedTopic, AccountCredentials, AccountVault, CentralInstallationAuthKey,
+    DirectPushRequest, DirectPushTrigger, EncryptedBlob, GroupDeletion, GroupEventPayload,
+    GroupMembership, GroupPresence, GroupProfile, GroupState, HistoryKeyLink, Identity,
+    InviteRecord, InviteRotation, MlsAccountState, MlsControlLog, MlsEpochRecord, MlsGroupGenesis,
     MlsJoinRequest, MlsRemovalReason, MlsRemovalRequest, Profile, PushSubscriptionRegistration,
     SafetyDirectiveActionV1, SafetyDirectiveV1, SafetyEncryptedObjectV1, SafetyEncryptedShardV1,
     SafetyGroupContextV1, SafetyProfileSnapshotV1, SafetyReportHumanContextV1, SafetyReportV1,
-    SafetyReporterContextV1, SignedEvent, StorageManifest, derive_account_credentials,
-    direct_mailbox_id, direct_message_id, display_frequency, display_noise_id,
-    encode_blob_for_storage, frequency_locator, generate_frequency, generate_noise_id,
-    media_preview_is_valid, normalize_frequency, profile_media_scope_id,
+    SafetyReporterContextV1, ShardPlacement, SignedEvent, StorageManifest,
+    derive_account_credentials, direct_mailbox_id, direct_message_id, display_frequency,
+    display_noise_id, encode_blob_for_storage, frequency_locator, generate_frequency,
+    generate_noise_id, media_preview_is_valid, normalize_frequency, profile_media_scope_id,
     reconstruct_blob_from_storage_payloads, valid_reaction_emoji,
 };
 pub use noise_core::{
@@ -78,6 +78,7 @@ use ohttp::ClientRequest;
 use serde::{Deserialize, Serialize};
 use time::{Date, Month, OffsetDateTime};
 
+mod central;
 #[cfg(not(target_arch = "wasm32"))]
 mod relay_pool;
 
@@ -111,6 +112,7 @@ const DEVICE_LAST_SEEN_REFRESH_MILLIS: u64 = 5 * 60_000;
 pub struct NoiseClient {
     http: reqwest::Client,
     mask_relays: Vec<RelayDescriptor>,
+    central: Option<central::CentralTransport>,
 }
 
 pub struct GroupActivityUpdate {
@@ -157,6 +159,7 @@ impl Default for NoiseClient {
         Self {
             http,
             mask_relays: Vec::new(),
+            central: None,
         }
     }
 }
@@ -914,6 +917,40 @@ struct ClientState {
     next_author_sequence: u64,
     #[serde(default)]
     account: Option<AccountSession>,
+    /// Installation-local credentials for the central service. They are
+    /// deliberately excluded from `AccountVaultContents`.
+    #[serde(default)]
+    central_installation: Option<CentralInstallationState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct CentralInstallationState {
+    installation_id_base64: String,
+    auth_secret_base64: String,
+    #[serde(default = "central_registration_version")]
+    registration_version: u64,
+    #[serde(default)]
+    registered: bool,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    access_token_expires_at_millis: u64,
+}
+
+fn central_registration_version() -> u64 {
+    1
+}
+
+#[derive(Deserialize)]
+struct CentralChallengeResponse {
+    challenge_id_base64: String,
+    challenge_nonce_base64: String,
+}
+
+#[derive(Deserialize)]
+struct CentralSessionResponse {
+    access_token: String,
+    expires_at_millis: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1039,6 +1076,8 @@ struct DirectEventCache {
     latest_cursor: Option<GroupEventCursor>,
     #[serde(default)]
     has_older_events: bool,
+    #[serde(default)]
+    central_peer_latest_event_ids: HashMap<String, String>,
 }
 
 fn control_hydration_needed() -> bool {
@@ -2126,6 +2165,7 @@ impl ClientState {
             group_frequencies: contents.group_frequencies,
             next_author_sequence: contents.next_author_sequence,
             account: Some(account),
+            central_installation: None,
         };
         state.ensure_group_membership_records();
         state.identity()?;
@@ -2927,6 +2967,13 @@ impl ClientState {
 
 impl NoiseClient {
     pub fn with_mask_relays(relays: Vec<String>) -> anyhow::Result<Self> {
+        Self::with_central_url(relays, None)
+    }
+
+    pub fn with_central_url(
+        relays: Vec<String>,
+        central_url: Option<String>,
+    ) -> anyhow::Result<Self> {
         let mut client = Self::default();
         for value in relays.into_iter().take(16) {
             let relay = RelayDescriptor::parse(&value)?;
@@ -2938,7 +2985,138 @@ impl NoiseClient {
                 client.mask_relays.push(relay);
             }
         }
+        client.central = central_url
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(central::CentralTransport::new)
+            .transpose()?;
         Ok(client)
+    }
+
+    pub async fn bind_central_state(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        if self.central.is_none() || !state_exists(path.as_ref()) {
+            return Ok(());
+        }
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        let previous = state.central_installation.clone();
+        self.ensure_central_session(&mut state).await?;
+        if state.central_installation != previous {
+            save_state_immediately(path, &state)?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_central_session(&self, state: &mut ClientState) -> anyhow::Result<()> {
+        let Some(central) = self.central.as_ref() else {
+            return Ok(());
+        };
+        let identity = state.identity()?;
+        let account_public_key = identity.public_key_base64();
+        if state.central_installation.is_none() {
+            let auth_key = CentralInstallationAuthKey::generate();
+            let installation_id = blake3::hash(
+                format!(
+                    "noise.central.installation.v1:{}",
+                    auth_key.public_key_base64()
+                )
+                .as_bytes(),
+            );
+            state.central_installation = Some(CentralInstallationState {
+                installation_id_base64: STANDARD_NO_PAD.encode(installation_id.as_bytes()),
+                auth_secret_base64: auth_key.secret_base64(),
+                registration_version: 1,
+                registered: false,
+                access_token: None,
+                access_token_expires_at_millis: 0,
+            });
+        }
+
+        let installation = state
+            .central_installation
+            .as_mut()
+            .context("central installation state is unavailable")?;
+        let auth_key =
+            CentralInstallationAuthKey::from_secret_base64(&installation.auth_secret_base64)
+                .context("central installation key is invalid")?;
+        if !installation.registered {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "account_public_key": account_public_key,
+            }))?;
+            let response = central
+                .require_success(
+                    reqwest::Method::POST,
+                    "/v1/auth/challenges/registration",
+                    &body,
+                    false,
+                )
+                .await?;
+            let challenge: CentralChallengeResponse = serde_json::from_slice(&response.body)
+                .context("central registration challenge is invalid")?;
+            let issued_at_millis = current_millis().max(1);
+            let registration = identity.central_installation_registration(
+                installation.installation_id_base64.clone(),
+                auth_key.public_key_base64(),
+                challenge.challenge_id_base64,
+                challenge.challenge_nonce_base64,
+                issued_at_millis,
+                installation.registration_version,
+            )?;
+            central
+                .require_success(
+                    reqwest::Method::POST,
+                    "/v1/devices/register",
+                    &serde_json::to_vec(&registration)?,
+                    false,
+                )
+                .await?;
+            installation.registered = true;
+            installation.access_token = None;
+            installation.access_token_expires_at_millis = 0;
+        }
+
+        let now = current_millis();
+        if installation.access_token.is_none()
+            || installation.access_token_expires_at_millis <= now.saturating_add(5 * 60_000)
+        {
+            let challenge_body = serde_json::to_vec(&serde_json::json!({
+                "account_public_key": account_public_key,
+                "installation_id_base64": installation.installation_id_base64,
+            }))?;
+            let response = central
+                .require_success(
+                    reqwest::Method::POST,
+                    "/v1/auth/challenges/session",
+                    &challenge_body,
+                    false,
+                )
+                .await?;
+            let challenge: CentralChallengeResponse = serde_json::from_slice(&response.body)
+                .context("central session challenge is invalid")?;
+            let proof = auth_key.session_proof(
+                account_public_key,
+                installation.installation_id_base64.clone(),
+                challenge.challenge_id_base64,
+                challenge.challenge_nonce_base64,
+                now.max(1),
+            )?;
+            let response = central
+                .require_success(
+                    reqwest::Method::POST,
+                    "/v1/auth/sessions",
+                    &serde_json::to_vec(&proof)?,
+                    false,
+                )
+                .await?;
+            let session: CentralSessionResponse = serde_json::from_slice(&response.body)
+                .context("central session response is invalid")?;
+            installation.access_token = Some(session.access_token);
+            installation.access_token_expires_at_millis = session.expires_at_millis;
+        }
+        central
+            .set_access_token(installation.access_token.clone())
+            .await;
+        Ok(())
     }
 
     pub async fn discover_relay_masks(
@@ -2980,6 +3158,7 @@ impl NoiseClient {
         let credentials = derive_account_credentials(&noise_id, &password)?;
         let relays = relay_list(relays)?;
         let identity = Identity::generate();
+        let mut pending_central_avatar = None;
         let avatar = if let Some(encoded) = avatar_data_base64 {
             let mime_type = avatar_mime_type.context("avatar media type is missing")?;
             if !matches!(
@@ -2995,13 +3174,23 @@ impl NoiseClient {
                 bail!("avatar images must contain between 1 byte and 256 KiB")
             }
             let (blob, key_base64) = EncryptedBlob::create(&data)?;
-            let storage = self.store_blob_shards(&relays, &blob, &key_base64).await?;
+            let storage = if self.central.is_some() {
+                pending_central_avatar = Some((
+                    blob.clone(),
+                    key_base64.clone(),
+                    mime_type.clone(),
+                    data.len() as u32,
+                ));
+                None
+            } else {
+                Some(self.store_blob_shards(&relays, &blob, &key_base64).await?)
+            };
             Some(ProfileImage {
                 blob_id: blob.blob_id,
                 key_base64,
                 mime_type,
                 byte_length: data.len() as u32,
-                storage: Some(storage),
+                storage,
             })
         } else {
             None
@@ -3073,7 +3262,19 @@ impl NoiseClient {
                 revision: 0,
                 read_state_revision: 0,
             }),
+            central_installation: None,
         };
+        self.ensure_central_session(&mut state).await?;
+        if let Some((blob, key_base64, mime_type, byte_length)) = pending_central_avatar {
+            let storage = self.store_blob_shards(&relays, &blob, &key_base64).await?;
+            state.profile.avatar = Some(ProfileImage {
+                blob_id: blob.blob_id,
+                key_base64,
+                mime_type,
+                byte_length,
+                storage: Some(storage),
+            });
+        }
         self.publish_account_state(&mut state, &relays).await?;
         self.publish_read_state_for_state(&mut state, &relays)
             .await?;
@@ -3130,6 +3331,7 @@ impl NoiseClient {
         if state.identity()?.public_key_base64() != vault.identity_public_key {
             bail!("noise ID or password is incorrect")
         }
+        self.ensure_central_session(&mut state).await?;
         let read_credentials = state.account_read_state_credentials()?;
         let has_read_state = if let Ok(read_vault) = self
             .fetch_account_vault(&relays, &read_credentials.locator)
@@ -3153,7 +3355,7 @@ impl NoiseClient {
         &self,
         path: impl AsRef<Path>,
         enabled: bool,
-        relays: Vec<String>,
+        _relays: Vec<String>,
     ) -> anyhow::Result<LocalSummary> {
         let path = path.as_ref();
         let mut state = load_state(path)?;
@@ -3178,9 +3380,11 @@ impl NoiseClient {
         {
             state.active_group_id = None;
         }
-        self.publish_account_state(&mut state, &relay_list(relays)?)
-            .await?;
-        save_state(path, &state)?;
+        // Content visibility is a local safety boundary. Commit it before
+        // returning so relay latency can never delay hiding explicit groups.
+        // The app publishes the encrypted cross-device account state after
+        // applying this local result.
+        save_state_immediately(path, &state)?;
         state.summary()
     }
 
@@ -6099,7 +6303,18 @@ impl NoiseClient {
             state.profile_sequence
         };
         let event = SignedEvent::profile_updated(&identity, &membership, &state.profile, sequence)?;
-        self.publish_event(relays, &event).await?;
+        if let Some(central) = self.central.as_ref() {
+            central
+                .require_success(
+                    reqwest::Method::POST,
+                    "/v1/contact-signals",
+                    &serde_json::to_vec(&event)?,
+                    true,
+                )
+                .await?;
+        } else {
+            self.publish_event(relays, &event).await?;
+        }
         state.contact_signal_published_sequence = sequence;
         Ok(signature)
     }
@@ -6111,9 +6326,21 @@ impl NoiseClient {
     ) -> anyhow::Result<DirectSummary> {
         let normalized = normalize_contact_signal(signature)?;
         let membership = contact_signal_membership(&normalized)?;
-        let events = self
-            .fetch_events_for_id(&membership.group_id, relay_list(relays)?)
-            .await?;
+        let events = if let Some(central) = self.central.as_ref() {
+            let response = central
+                .require_success(
+                    reqwest::Method::GET,
+                    &format!("/v1/contact-signals/{}", membership.group_id),
+                    &[],
+                    false,
+                )
+                .await?;
+            serde_json::from_slice::<Vec<SignedEvent>>(&response.body)
+                .context("central service returned an invalid contact signal")?
+        } else {
+            self.fetch_events_for_id(&membership.group_id, relay_list(relays)?)
+                .await?
+        };
         let mut profiles = HashMap::<String, (u64, Profile)>::new();
         for event in events {
             if normalize_contact_signal(&contact_signal_for_public_key(&event.author_public_key)?)?
@@ -6219,7 +6446,8 @@ impl NoiseClient {
             blocked,
             sequence,
         )?;
-        self.publish_event(&relay_list(relays)?, &notice).await?;
+        self.publish_direct_event(&relay_list(relays)?, public_key, &notice)
+            .await?;
         let changed_at_millis = notice.created_at_millis;
         state.block_states.insert(
             public_key.to_owned(),
@@ -6830,21 +7058,34 @@ impl NoiseClient {
             recipient_event.created_at_millis,
         )?;
         let sent = SentMessageResult {
-            event_id: sender_event.event_id.clone(),
+            event_id: if self.central.is_some() {
+                recipient_event.event_id.clone()
+            } else {
+                sender_event.event_id.clone()
+            },
             message_id: direct_message_id(&self_public_key, sequence),
-            created_at_millis: sender_event.created_at_millis,
+            created_at_millis: recipient_event.created_at_millis,
         };
         let relays = relay_list(relays)?;
-        self.publish_event(&relays, &recipient_event).await?;
-        self.publish_event(&relays, &sender_event).await?;
+        self.publish_direct_event(&relays, &contact.public_key, &recipient_event)
+            .await?;
+        if self.central.is_none() {
+            self.publish_event(&relays, &sender_event).await?;
+        }
         // Push delivery is best effort. A notification outage must never turn a
         // successfully persisted encrypted message into a send failure.
-        let _ = self
-            .publish_direct_push(&relays, &push_trigger, &recipient_event)
-            .await;
+        if self.central.is_none() {
+            let _ = self
+                .publish_direct_push(&relays, &push_trigger, &recipient_event)
+                .await;
+        }
         let marker = DirectMessageMarker {
-            created_at_millis: sender_event.created_at_millis,
-            event_id: sender_event.event_id,
+            created_at_millis: recipient_event.created_at_millis,
+            event_id: if self.central.is_some() {
+                recipient_event.event_id
+            } else {
+                sender_event.event_id
+            },
         };
         state
             .direct_latest_activity
@@ -6980,35 +7221,64 @@ impl NoiseClient {
                 sequence,
             )?;
             let relays = relay_list(relays)?;
-            self.publish_event(&relays, &recipient_event).await?;
-            self.publish_event(&relays, &sender_event).await?;
-            let cleanup_client = self.clone();
-            let cleanup_relays = relays.clone();
-            let cleanup = async move {
-                let mut storage = match cleanup_client
-                    .fetch_events(&recipient_mailbox, cleanup_relays.clone())
-                    .await
-                {
-                    Ok(events) => direct_storage_references(&recipient_mailbox, &events),
-                    Err(_) => Vec::new(),
+            if self.central.is_some() {
+                let complete = self
+                    .fetch_central_direct_event_cache(
+                        &identity,
+                        state.direct_event_cache.clone(),
+                        true,
+                    )
+                    .await?;
+                let storage = complete
+                    .events
+                    .iter()
+                    .filter_map(|event| decrypt_direct_event(&identity, &state, event))
+                    .filter_map(|event| match event {
+                        DecryptedDirectEvent::Message(message)
+                            if message.counterparty_public_key == contact.public_key
+                                && message.message.author_public_key == self_public_key =>
+                        {
+                            message.message.attachment
+                        }
+                        _ => None,
+                    })
+                    .flat_map(|attachment| attachment_storage_references(&attachment))
+                    .collect();
+                self.publish_direct_event(&relays, &contact.public_key, &recipient_event)
+                    .await?;
+                self.erase_storage_references(storage, true).await?;
+                deleted_at_millis = deleted_at_millis.max(recipient_event.created_at_millis);
+            } else {
+                self.publish_event(&relays, &recipient_event).await?;
+                self.publish_event(&relays, &sender_event).await?;
+                let cleanup_client = self.clone();
+                let cleanup_relays = relays.clone();
+                let cleanup = async move {
+                    let mut storage = match cleanup_client
+                        .fetch_events(&recipient_mailbox, cleanup_relays.clone())
+                        .await
+                    {
+                        Ok(events) => direct_storage_references(&recipient_mailbox, &events),
+                        Err(_) => Vec::new(),
+                    };
+                    if let Ok(events) = cleanup_client
+                        .fetch_events(&sender_mailbox, cleanup_relays)
+                        .await
+                    {
+                        storage.extend(direct_storage_references(&sender_mailbox, &events));
+                    }
+                    if !storage.is_empty() {
+                        let _ = cleanup_client.erase_storage_references(storage, true).await;
+                    }
                 };
-                if let Ok(events) = cleanup_client
-                    .fetch_events(&sender_mailbox, cleanup_relays)
-                    .await
-                {
-                    storage.extend(direct_storage_references(&sender_mailbox, &events));
-                }
-                if !storage.is_empty() {
-                    let _ = cleanup_client.erase_storage_references(storage, true).await;
-                }
-            };
-            #[cfg(not(target_arch = "wasm32"))]
-            tokio::spawn(cleanup);
-            #[cfg(target_arch = "wasm32")]
-            wasm_bindgen_futures::spawn_local(cleanup);
-            deleted_at_millis = deleted_at_millis
-                .max(recipient_event.created_at_millis)
-                .max(sender_event.created_at_millis);
+                #[cfg(not(target_arch = "wasm32"))]
+                tokio::spawn(cleanup);
+                #[cfg(target_arch = "wasm32")]
+                wasm_bindgen_futures::spawn_local(cleanup);
+                deleted_at_millis = deleted_at_millis
+                    .max(recipient_event.created_at_millis)
+                    .max(sender_event.created_at_millis);
+            }
         }
         let scope_id = identity.direct_scope_id(&contact.public_key)?;
         purge_scope_cache(cache_path.as_ref(), &scope_id)?;
@@ -8308,6 +8578,19 @@ impl NoiseClient {
         }
 
         if delete_direct_threads {
+            let central_direct_events = if self.central.is_some() {
+                Some(
+                    self.fetch_central_direct_event_cache(
+                        &identity,
+                        state.direct_event_cache.clone(),
+                        true,
+                    )
+                    .await?
+                    .events,
+                )
+            } else {
+                None
+            };
             for contact in state.direct_contacts.clone() {
                 let recipient_mailbox =
                     identity.direct_mailbox(&contact.public_key, &contact.public_key)?;
@@ -8326,18 +8609,39 @@ impl NoiseClient {
                     &contact.public_key,
                     sequence,
                 )?;
-                let mut storage = direct_storage_references(
-                    &recipient_mailbox,
-                    &self
-                        .fetch_events(&recipient_mailbox, relays.clone())
-                        .await?,
-                );
-                storage.extend(direct_storage_references(
-                    &sender_mailbox,
-                    &self.fetch_events(&sender_mailbox, relays.clone()).await?,
-                ));
-                self.publish_event(&relays, &recipient_event).await?;
-                self.publish_event(&relays, &sender_event).await?;
+                let storage = if let Some(events) = central_direct_events.as_ref() {
+                    events
+                        .iter()
+                        .filter_map(|event| decrypt_direct_event(&identity, &state, event))
+                        .filter_map(|event| match event {
+                            DecryptedDirectEvent::Message(message)
+                                if message.counterparty_public_key == contact.public_key
+                                    && message.message.author_public_key == self_public_key =>
+                            {
+                                message.message.attachment
+                            }
+                            _ => None,
+                        })
+                        .flat_map(|attachment| attachment_storage_references(&attachment))
+                        .collect()
+                } else {
+                    let mut storage = direct_storage_references(
+                        &recipient_mailbox,
+                        &self
+                            .fetch_events(&recipient_mailbox, relays.clone())
+                            .await?,
+                    );
+                    storage.extend(direct_storage_references(
+                        &sender_mailbox,
+                        &self.fetch_events(&sender_mailbox, relays.clone()).await?,
+                    ));
+                    storage
+                };
+                self.publish_direct_event(&relays, &contact.public_key, &recipient_event)
+                    .await?;
+                if self.central.is_none() {
+                    self.publish_event(&relays, &sender_event).await?;
+                }
                 self.erase_storage_references(storage, true).await?;
             }
         }
@@ -8789,6 +9093,18 @@ impl NoiseClient {
         if !cache.has_older_events {
             return Ok(false);
         }
+        let relay_descriptors = relay_list(relays)?;
+        if self.central.is_some() {
+            cache = self
+                .fetch_central_direct_event_cache(&identity, cache, true)
+                .await?;
+            let events = cache.events.clone();
+            let has_older_events = cache.has_older_events;
+            state.direct_event_cache = cache;
+            self.apply_direct_events(path, cache_path, state, events, relay_descriptors, true)
+                .await?;
+            return Ok(has_older_events);
+        }
         let cursor = cache
             .events
             .iter()
@@ -8796,7 +9112,6 @@ impl NoiseClient {
             .map(GroupEventCursor::from_event)
             .min_by(|left, right| left.key().cmp(&right.key()))
             .context("direct-message history cursor is unavailable")?;
-        let relay_descriptors = relay_list(relays)?;
         let page = self
             .fetch_group_event_page(
                 &mailbox_id,
@@ -9599,9 +9914,13 @@ impl NoiseClient {
         let self_public_key = identity.public_key_base64();
         let mailbox_id = direct_mailbox_id(&self_public_key)?;
         let previous_cache = state.direct_event_cache.clone();
-        let cache = self
-            .fetch_direct_event_cache(&mailbox_id, previous_cache.clone(), &relays)
-            .await?;
+        let cache = if self.central.is_some() {
+            self.fetch_central_direct_event_cache(&identity, previous_cache.clone(), false)
+                .await?
+        } else {
+            self.fetch_direct_event_cache(&mailbox_id, previous_cache.clone(), &relays)
+                .await?
+        };
         let events = cache.events.clone();
         state.direct_event_cache = cache;
         let cache_changed = previous_cache != state.direct_event_cache;
@@ -9618,11 +9937,17 @@ impl NoiseClient {
         let mut state = load_state(path)?;
         let identity = state.identity()?;
         let mailbox_id = direct_mailbox_id(&identity.public_key_base64())?;
-        let events = self
-            .fetch_events_for_id(&mailbox_id, relays.clone())
-            .await?;
         let previous_cache = state.direct_event_cache.clone();
-        state.direct_event_cache = compact_direct_event_cache(&mailbox_id, events.clone(), false);
+        state.direct_event_cache = if self.central.is_some() {
+            self.fetch_central_direct_event_cache(&identity, previous_cache.clone(), true)
+                .await?
+        } else {
+            let events = self
+                .fetch_events_for_id(&mailbox_id, relays.clone())
+                .await?;
+            compact_direct_event_cache(&mailbox_id, events, false)
+        };
+        let events = state.direct_event_cache.events.clone();
         let cache_changed = previous_cache != state.direct_event_cache;
         self.apply_direct_events(path, cache_path, state, events, relays, cache_changed)
             .await
@@ -10786,6 +11111,25 @@ impl NoiseClient {
             .map_err(anyhow::Error::new)
     }
 
+    async fn publish_direct_event(
+        &self,
+        relays: &[RelayDescriptor],
+        recipient_public_key: &str,
+        event: &SignedEvent,
+    ) -> anyhow::Result<()> {
+        let Some(central) = self.central.as_ref() else {
+            return self.publish_event(relays, event).await;
+        };
+        let body = serde_json::to_vec(&serde_json::json!({
+            "recipient_public_key": recipient_public_key,
+            "event": event,
+        }))?;
+        central
+            .require_success(reqwest::Method::POST, "/v1/direct-events", &body, true)
+            .await?;
+        Ok(())
+    }
+
     async fn publish_direct_push(
         &self,
         relays: &[RelayDescriptor],
@@ -10915,6 +11259,32 @@ impl NoiseClient {
         references: Vec<(StorageManifest, String)>,
         require_all: bool,
     ) -> anyhow::Result<()> {
+        if let Some(central) = self.central.as_ref() {
+            let mut failed = 0usize;
+            let mut seen = HashSet::new();
+            for (manifest, _) in references {
+                if !seen.insert(manifest.object_id.clone()) {
+                    continue;
+                }
+                let response = central
+                    .json(
+                        reqwest::Method::DELETE,
+                        &format!("/v1/media/{}", manifest.object_id),
+                        &[],
+                        true,
+                    )
+                    .await;
+                if !response.is_ok_and(|response| {
+                    (200..300).contains(&response.status) || response.status == 404
+                }) {
+                    failed += 1;
+                }
+            }
+            if require_all && failed != 0 {
+                bail!("{failed} encrypted media objects could not be erased; try again")
+            }
+            return Ok(());
+        }
         let mut deletions = FuturesUnordered::new();
         let mut seen = HashSet::new();
         for (manifest, key_base64) in references {
@@ -10962,6 +11332,48 @@ impl NoiseClient {
         blob: &EncryptedBlob,
         key_base64: &str,
     ) -> anyhow::Result<StorageManifest> {
+        if let Some(central) = self.central.as_ref() {
+            let encoded = blob.storage_bytes()?;
+            central
+                .request(
+                    reqwest::Method::PUT,
+                    &format!("/v1/media/{}", blob.blob_id),
+                    &encoded,
+                    true,
+                    &[],
+                    Some("application/octet-stream"),
+                )
+                .await
+                .and_then(|response| {
+                    if (200..300).contains(&response.status) {
+                        Ok(response)
+                    } else {
+                        bail!("central service rejected encrypted media")
+                    }
+                })?;
+            let length: u32 = encoded
+                .len()
+                .try_into()
+                .context("encrypted media object is too large")?;
+            let payload_hash = blake3::hash(&encoded).to_hex().to_string();
+            let manifest = StorageManifest {
+                version: noise_core::STREAMING_STORAGE_VERSION,
+                object_id: blob.blob_id.clone(),
+                encoded_byte_length: length,
+                shard_byte_length: length,
+                data_shards: 1,
+                total_shards: 1,
+                placements: vec![ShardPlacement {
+                    shard_index: 0,
+                    shard_id: blob.blob_id.clone(),
+                    payload_hash,
+                    relay: central.base_url().to_owned(),
+                }],
+            };
+            manifest.verify(&blob.blob_id)?;
+            let _ = key_base64;
+            return Ok(manifest);
+        }
         let storage_relays = self.storage_relays(relays, key_base64);
         let relay_addresses = storage_relays.iter().map(relay_address).collect::<Vec<_>>();
         let (manifest, shards) = encode_blob_for_storage(blob, key_base64, &relay_addresses)?;
@@ -11031,6 +11443,31 @@ impl NoiseClient {
         key_base64: &str,
     ) -> anyhow::Result<EncryptedBlob> {
         manifest.verify(&manifest.object_id)?;
+        if let Some(central) = self.central.as_ref() {
+            let response = central
+                .json(
+                    reqwest::Method::GET,
+                    &format!("/v1/media/{}", manifest.object_id),
+                    &[],
+                    false,
+                )
+                .await?;
+            anyhow::ensure!(
+                (200..300).contains(&response.status),
+                "encrypted media is unavailable"
+            );
+            anyhow::ensure!(
+                response.body.len() == manifest.encoded_byte_length as usize,
+                "central media response has the wrong length"
+            );
+            let blob = EncryptedBlob::from_storage_bytes(&response.body)?;
+            anyhow::ensure!(
+                blob.blob_id == manifest.object_id,
+                "central media response has the wrong identity"
+            );
+            let _ = key_base64;
+            return Ok(blob);
+        }
         anyhow::ensure!(
             manifest.version == noise_core::STREAMING_STORAGE_VERSION,
             "this attachment uses the retired alpha media format"
@@ -11097,6 +11534,9 @@ impl NoiseClient {
         manifest: &StorageManifest,
         healthy_shard_ids: &HashSet<String>,
     ) {
+        if self.central.is_some() {
+            return;
+        }
         if manifest.placements.len() != usize::from(manifest.total_shards) {
             return;
         }
@@ -11174,6 +11614,99 @@ impl NoiseClient {
         self.fetch_events_for_id(&group.group_id, relays).await
     }
 
+    async fn fetch_central_direct_event_cache(
+        &self,
+        identity: &Identity,
+        existing: DirectEventCache,
+        complete: bool,
+    ) -> anyhow::Result<DirectEventCache> {
+        let central = self
+            .central
+            .as_ref()
+            .context("central service transport is unavailable")?;
+        let peers_response = central
+            .require_success(reqwest::Method::GET, "/v1/direct-peers", &[], true)
+            .await?;
+        let peers: Vec<String> = serde_json::from_slice(&peers_response.body)
+            .context("central service returned invalid direct peers")?;
+        let self_public_key = identity.public_key_base64();
+        let mut events = existing.events;
+        let mut latest_event_ids = existing.central_peer_latest_event_ids;
+        let mut has_older_events = if complete {
+            false
+        } else {
+            existing.has_older_events
+        };
+
+        for peer in peers {
+            direct_mailbox_id(&peer).context("central service returned an invalid direct peer")?;
+            let prior_cursor = (!complete)
+                .then(|| latest_event_ids.get(&peer).cloned())
+                .flatten();
+            let mut endpoint =
+                central_direct_history_endpoint(&peer, None, prior_cursor.as_deref());
+            let mut page = central_direct_history_page(central, &endpoint).await?;
+            validate_central_direct_page(&self_public_key, &peer, &page.events)?;
+            if let Some(last) = page.events.last() {
+                latest_event_ids.insert(peer.clone(), last.event_id.clone());
+            }
+            let first_page_had_more = page.has_more;
+            events.extend(page.events.clone());
+
+            if complete {
+                while page.has_more {
+                    let cursor = page
+                        .events
+                        .first()
+                        .map(|event| event.event_id.as_str())
+                        .context("central direct history has no backward cursor")?;
+                    endpoint = central_direct_history_endpoint(&peer, Some(cursor), None);
+                    let next = central_direct_history_page(central, &endpoint).await?;
+                    validate_central_direct_page(&self_public_key, &peer, &next.events)?;
+                    anyhow::ensure!(
+                        next.events
+                            .first()
+                            .is_none_or(|event| event.event_id != cursor),
+                        "central direct history did not advance"
+                    );
+                    events.extend(next.events.clone());
+                    page = next;
+                }
+            } else {
+                if prior_cursor.is_none() && first_page_had_more {
+                    has_older_events = true;
+                }
+                while page.has_more {
+                    let cursor = page
+                        .events
+                        .last()
+                        .map(|event| event.event_id.as_str())
+                        .context("central direct history has no forward cursor")?;
+                    endpoint = central_direct_history_endpoint(&peer, None, Some(cursor));
+                    let next = central_direct_history_page(central, &endpoint).await?;
+                    validate_central_direct_page(&self_public_key, &peer, &next.events)?;
+                    anyhow::ensure!(
+                        next.events
+                            .last()
+                            .is_none_or(|event| event.event_id != cursor),
+                        "central direct history did not advance"
+                    );
+                    if let Some(last) = next.events.last() {
+                        latest_event_ids.insert(peer.clone(), last.event_id.clone());
+                    }
+                    events.extend(next.events.clone());
+                    page = next;
+                }
+            }
+        }
+
+        Ok(compact_central_direct_event_cache(
+            events,
+            has_older_events,
+            latest_event_ids,
+        ))
+    }
+
     async fn fetch_direct_event_cache(
         &self,
         mailbox_id: &str,
@@ -11236,6 +11769,46 @@ impl NoiseClient {
         request: GroupEventPageRequest<'_>,
         relays: &[RelayDescriptor],
     ) -> anyhow::Result<Option<GroupEventPage>> {
+        if let Some(central) = self.central.as_ref() {
+            let position = match request {
+                GroupEventPageRequest::Latest => "latest".to_owned(),
+                GroupEventPageRequest::Before(cursor) => {
+                    format!("before/{}", cursor.event_id)
+                }
+                GroupEventPageRequest::After(cursor) => format!("after/{}", cursor.event_id),
+            };
+            let mut endpoint = format!("/v1/groups/{group_id}/history/{position}");
+            if let Some(stream_locator) = stream_locator {
+                endpoint.push_str("?stream_locator=");
+                endpoint.push_str(stream_locator);
+            }
+            let response = central
+                .json(reqwest::Method::GET, &endpoint, &[], true)
+                .await?;
+            if response.status == 404 {
+                return Ok(None);
+            }
+            anyhow::ensure!(
+                (200..300).contains(&response.status),
+                "central service rejected group history"
+            );
+            let mut page: GroupEventPage = serde_json::from_slice(&response.body)
+                .context("central service returned invalid group history")?;
+            anyhow::ensure!(
+                page.events.len() <= GROUP_EVENT_PAGE_SIZE
+                    && page.events.iter().all(|event| event.group_id == group_id
+                        && event.stream_locator.as_deref() == stream_locator),
+                "central service returned mismatched group history"
+            );
+            page.continuation_cursor = match request {
+                GroupEventPageRequest::Latest | GroupEventPageRequest::Before(_) => {
+                    page.events.first()
+                }
+                GroupEventPageRequest::After(_) => page.events.last(),
+            }
+            .map(GroupEventCursor::from_event);
+            return Ok(Some(page));
+        }
         let endpoint = match (stream_locator, request) {
             (None, GroupEventPageRequest::Latest) => {
                 format!("/v2/groups/{group_id}/events/latest")
@@ -11451,6 +12024,9 @@ impl NoiseClient {
         path: &str,
         body: &[u8],
     ) -> anyhow::Result<PlainResponse> {
+        if self.central.is_some() {
+            return self.central_request(method, path, body).await;
+        }
         let storage = relays
             .get(storage_index)
             .context("relay index is invalid")?;
@@ -11478,6 +12054,62 @@ impl NoiseClient {
             }
         }
         self.direct_request(storage, method, path, body).await
+    }
+
+    async fn central_request(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> anyhow::Result<PlainResponse> {
+        let central = self
+            .central
+            .as_ref()
+            .context("central service transport is unavailable")?;
+        let method = reqwest::Method::from_bytes(method.as_bytes())?;
+        let mut target = path.to_owned();
+        let mut headers = Vec::new();
+        let mut authenticated = true;
+
+        if method == reqwest::Method::GET
+            && path.starts_with("/v1/accounts/")
+            && path.contains("/watch/")
+        {
+            // Account watches are authenticated central operations and retain
+            // their existing request shape.
+        } else if method == reqwest::Method::GET
+            && let Some(locator) = path.strip_prefix("/v1/accounts/")
+        {
+            target = format!("/v1/account-vaults/{locator}");
+            authenticated = false;
+        } else if method == reqwest::Method::POST && path == "/v1/accounts" {
+            let vault: AccountVault =
+                serde_json::from_slice(body).context("account vault request is invalid")?;
+            target = format!("/v1/account-vaults/{}", vault.locator);
+            headers.push(("if-match", vault.revision.saturating_sub(1).to_string()));
+            let response = central
+                .request(reqwest::Method::PUT, &target, body, true, &headers, None)
+                .await?;
+            return Ok(PlainResponse {
+                status: response.status,
+                body: response.body,
+            });
+        } else if method == reqwest::Method::GET
+            && (path.starts_with("/v1/invites/")
+                || path.starts_with("/v1/contact-signals/")
+                || path.starts_with("/v1/media/")
+                || path == "/v1/link-preview")
+        {
+            authenticated = false;
+        }
+
+        let response = central
+            .request(method, &target, body, authenticated, &headers, None)
+            .await?;
+        Ok(PlainResponse {
+            status: response.status,
+            body: response.body,
+        })
     }
 
     async fn oblivious_request(
@@ -11607,18 +12239,29 @@ fn decrypt_direct_event(
     event: &SignedEvent,
 ) -> Option<DecryptedDirectEvent> {
     let self_public_key = identity.public_key_base64();
-    if event.group_id != direct_mailbox_id(&self_public_key).ok()? {
-        return None;
-    }
     if event.author_public_key == self_public_key {
         for contact in state
             .direct_contacts
             .iter()
             .chain(state.known_people.iter())
         {
-            let mailbox = identity
-                .direct_mailbox(&contact.public_key, &self_public_key)
-                .ok()?;
+            let mailbox = if event.group_id == direct_mailbox_id(&contact.public_key).ok()? {
+                // Canonical central history retains the receiver-mailbox
+                // envelope. The sender can derive the same shared key and
+                // decrypt that envelope without a second server-side copy.
+                identity
+                    .direct_mailbox(&contact.public_key, &contact.public_key)
+                    .ok()?
+            } else if event.group_id == direct_mailbox_id(&self_public_key).ok()? {
+                // Existing device caches and the retired relays contain a
+                // sender-mailbox envelope as well. Keep it readable so the
+                // central cutover never erases the sender's visible history.
+                identity
+                    .direct_mailbox(&contact.public_key, &self_public_key)
+                    .ok()?
+            } else {
+                continue;
+            };
             match event.decrypt(&mailbox) {
                 Ok(GroupEventPayload::DirectMessage {
                     recipient_public_key,
@@ -11673,6 +12316,9 @@ fn decrypt_direct_event(
         return None;
     }
 
+    if event.group_id != direct_mailbox_id(&self_public_key).ok()? {
+        return None;
+    }
     let mailbox = identity
         .direct_mailbox(&event.author_public_key, &self_public_key)
         .ok()?;
@@ -12561,7 +13207,97 @@ fn compact_direct_event_cache(
         events,
         latest_cursor,
         has_older_events: has_older_hint || was_truncated,
+        central_peer_latest_event_ids: HashMap::new(),
     }
+}
+
+fn compact_central_direct_event_cache(
+    events: Vec<SignedEvent>,
+    has_older_hint: bool,
+    central_peer_latest_event_ids: HashMap<String, String>,
+) -> DirectEventCache {
+    let mut merged = HashMap::<(String, u64), SignedEvent>::new();
+    for event in events {
+        if event.verify().is_ok() && event.epoch.is_none() && event.stream_locator.is_none() {
+            // Retired relays stored a sender-mailbox and receiver-mailbox
+            // envelope for one logical DM. Central history stores only the
+            // receiver envelope. Both carry the same signed author sequence,
+            // so replace the local legacy view when the canonical copy arrives
+            // instead of rendering the message twice.
+            merged.insert(
+                (event.author_public_key.clone(), event.author_sequence),
+                event,
+            );
+        }
+    }
+    let mut events = merged.into_values().collect::<Vec<_>>();
+    events.sort_by(|left, right| {
+        left.created_at_millis
+            .cmp(&right.created_at_millis)
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
+    let latest_cursor = max_group_event_cursor(None, &events, None);
+    let was_truncated = events.len() > DIRECT_EVENT_CACHE_LIMIT;
+    if was_truncated {
+        let retained_start = events.len() - DIRECT_EVENT_CACHE_LIMIT;
+        events.drain(..retained_start);
+    }
+    DirectEventCache {
+        events,
+        latest_cursor,
+        has_older_events: has_older_hint || was_truncated,
+        central_peer_latest_event_ids,
+    }
+}
+
+fn central_direct_history_endpoint(
+    peer_public_key: &str,
+    before_event_id: Option<&str>,
+    after_event_id: Option<&str>,
+) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("peer_public_key", peer_public_key);
+    if let Some(event_id) = before_event_id {
+        query.append_pair("before_event_id", event_id);
+    }
+    if let Some(event_id) = after_event_id {
+        query.append_pair("after_event_id", event_id);
+    }
+    format!("/v1/direct-history?{}", query.finish())
+}
+
+async fn central_direct_history_page(
+    central: &central::CentralTransport,
+    endpoint: &str,
+) -> anyhow::Result<GroupEventPage> {
+    let response = central
+        .require_success(reqwest::Method::GET, endpoint, &[], true)
+        .await?;
+    serde_json::from_slice(&response.body)
+        .context("central service returned invalid direct history")
+}
+
+fn validate_central_direct_page(
+    self_public_key: &str,
+    peer_public_key: &str,
+    events: &[SignedEvent],
+) -> anyhow::Result<()> {
+    let self_mailbox = direct_mailbox_id(self_public_key)?;
+    let peer_mailbox = direct_mailbox_id(peer_public_key)?;
+    anyhow::ensure!(
+        events.len() <= GROUP_EVENT_PAGE_SIZE
+            && events.iter().all(|event| {
+                event.verify().is_ok()
+                    && event.epoch.is_none()
+                    && event.stream_locator.is_none()
+                    && ((event.author_public_key == self_public_key
+                        && event.group_id == peer_mailbox)
+                        || (event.author_public_key == peer_public_key
+                            && event.group_id == self_mailbox))
+            }),
+        "central service returned mismatched direct history"
+    );
+    Ok(())
 }
 
 fn cached_direct_messages(state: &ClientState) -> anyhow::Result<Vec<DecryptedDirectMessage>> {
@@ -14561,6 +15297,7 @@ mod tests {
                 revision,
                 read_state_revision: 0,
             }),
+            central_installation: None,
         }
     }
 

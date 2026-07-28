@@ -35,6 +35,11 @@ pub struct LatestEventsQuery {
 }
 
 #[derive(Deserialize)]
+pub struct ClientHistoryQuery {
+    stream_locator: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct DirectEventsAfterQuery {
     peer_public_key: String,
     #[serde(default)]
@@ -46,6 +51,13 @@ pub struct DirectEventsAfterQuery {
 pub struct LatestDirectEventsQuery {
     peer_public_key: String,
     limit: Option<u16>,
+}
+
+#[derive(Deserialize)]
+pub struct DirectClientHistoryQuery {
+    peer_public_key: String,
+    before_event_id: Option<String>,
+    after_event_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +83,12 @@ pub struct CanonicalEvent {
 pub struct CanonicalEventPage {
     events: Vec<CanonicalEvent>,
     next_cursor: i64,
+    has_more: bool,
+}
+
+#[derive(Serialize)]
+pub struct ClientEventPage {
+    events: Vec<SignedEvent>,
     has_more: bool,
 }
 
@@ -318,6 +336,146 @@ pub async fn latest_group_events(
     Ok(Json(CanonicalEventPage {
         events,
         next_cursor: stream.latest_cursor,
+        has_more,
+    }))
+}
+
+pub async fn latest_client_group_events(
+    state: State<Arc<AppState>>,
+    group_id: Path<String>,
+    query: Query<ClientHistoryQuery>,
+    headers: HeaderMap,
+) -> Result<Json<ClientEventPage>, ApiError> {
+    client_group_events(state, group_id, query, headers, ClientPagePosition::Latest).await
+}
+
+pub async fn client_group_events_before(
+    state: State<Arc<AppState>>,
+    Path((group_id, event_id)): Path<(String, String)>,
+    query: Query<ClientHistoryQuery>,
+    headers: HeaderMap,
+) -> Result<Json<ClientEventPage>, ApiError> {
+    client_group_events(
+        state,
+        Path(group_id),
+        query,
+        headers,
+        ClientPagePosition::Before(event_id),
+    )
+    .await
+}
+
+pub async fn client_group_events_after(
+    state: State<Arc<AppState>>,
+    Path((group_id, event_id)): Path<(String, String)>,
+    query: Query<ClientHistoryQuery>,
+    headers: HeaderMap,
+) -> Result<Json<ClientEventPage>, ApiError> {
+    client_group_events(
+        state,
+        Path(group_id),
+        query,
+        headers,
+        ClientPagePosition::After(event_id),
+    )
+    .await
+}
+
+enum ClientPagePosition {
+    Latest,
+    Before(String),
+    After(String),
+}
+
+async fn client_group_events(
+    State(state): State<Arc<AppState>>,
+    Path(group_id): Path<String>,
+    Query(query): Query<ClientHistoryQuery>,
+    headers: HeaderMap,
+    position: ClientPagePosition,
+) -> Result<Json<ClientEventPage>, ApiError> {
+    let session = authenticate_session(&state, &headers).await?;
+    let group_id = decode_hex_32(&group_id, "invalid_group_id")?;
+    let stream_locator = query
+        .stream_locator
+        .as_deref()
+        .map(|value| decode_hex_32(value, "invalid_stream_locator"))
+        .transpose()?;
+    let client = state
+        .database
+        .pool
+        .get()
+        .await
+        .map_err(ApiError::database)?;
+    let group = authorize_group(&client, &session, &group_id, false).await?;
+    let Some(stream) = find_stream(&client, group.group_pk, stream_locator.as_ref()).await? else {
+        return Ok(Json(ClientEventPage {
+            events: Vec::new(),
+            has_more: false,
+        }));
+    };
+    let boundary = match &position {
+        ClientPagePosition::Latest => None,
+        ClientPagePosition::Before(event_id) | ClientPagePosition::After(event_id) => {
+            let event_id = decode_hex_32(event_id, "invalid_event")?;
+            Some(
+                client
+                    .query_opt(
+                        "SELECT canonical_cursor
+                         FROM noise.events
+                         WHERE event_id = $1 AND stream_pk = $2",
+                        &[&event_id.as_slice(), &stream.stream_pk],
+                    )
+                    .await
+                    .map_err(ApiError::database)?
+                    .map(|row| row.get::<_, i64>(0))
+                    .ok_or_else(|| ApiError::bad_request("invalid_event_cursor"))?,
+            )
+        }
+    };
+    let mut events = match &position {
+        ClientPagePosition::Latest => {
+            read_latest_events(
+                &client,
+                stream.stream_pk,
+                stream.latest_cursor,
+                MAX_PAGE_SIZE + 1,
+            )
+            .await?
+        }
+        ClientPagePosition::Before(_) => {
+            read_latest_events(
+                &client,
+                stream.stream_pk,
+                boundary.unwrap_or(1).saturating_sub(1),
+                MAX_PAGE_SIZE + 1,
+            )
+            .await?
+        }
+        ClientPagePosition::After(_) => {
+            read_events_after(
+                &client,
+                stream.stream_pk,
+                boundary.unwrap_or_default(),
+                stream.latest_cursor,
+                MAX_PAGE_SIZE + 1,
+            )
+            .await?
+        }
+    };
+    let has_more = events.len() > MAX_PAGE_SIZE as usize;
+    if has_more {
+        match &position {
+            ClientPagePosition::After(_) => {
+                events.pop();
+            }
+            ClientPagePosition::Latest | ClientPagePosition::Before(_) => {
+                events.remove(0);
+            }
+        }
+    }
+    Ok(Json(ClientEventPage {
+        events: events.into_iter().map(|event| event.event).collect(),
         has_more,
     }))
 }
@@ -643,6 +801,117 @@ pub async fn latest_direct_events(
     }))
 }
 
+pub async fn direct_peers(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<String>>, ApiError> {
+    let session = authenticate_session(&state, &headers).await?;
+    let client = state
+        .database
+        .pool
+        .get()
+        .await
+        .map_err(ApiError::database)?;
+    let rows = client
+        .query(
+            "SELECT peer.identity_public_key
+             FROM noise.direct_threads thread
+             JOIN noise.accounts peer
+               ON peer.account_id = CASE
+                   WHEN thread.account_low_id = $1 THEN thread.account_high_id
+                   ELSE thread.account_low_id
+               END
+             WHERE $1 IN (thread.account_low_id, thread.account_high_id)
+               AND peer.status = 'active'
+             ORDER BY peer.identity_public_key",
+            &[&session.account_id],
+        )
+        .await
+        .map_err(ApiError::database)?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| STANDARD_NO_PAD.encode(row.get::<_, Vec<u8>>(0)))
+            .collect(),
+    ))
+}
+
+pub async fn client_direct_history(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DirectClientHistoryQuery>,
+    headers: HeaderMap,
+) -> Result<Json<ClientEventPage>, ApiError> {
+    if query.before_event_id.is_some() && query.after_event_id.is_some() {
+        return Err(ApiError::bad_request("invalid_event_cursor"));
+    }
+    let session = authenticate_session(&state, &headers).await?;
+    let client = state
+        .database
+        .pool
+        .get()
+        .await
+        .map_err(ApiError::database)?;
+    let Some(stream) = find_direct_stream(&client, &session, &query.peer_public_key).await? else {
+        return Ok(Json(ClientEventPage {
+            events: Vec::new(),
+            has_more: false,
+        }));
+    };
+    let boundary_id = query
+        .before_event_id
+        .as_deref()
+        .or(query.after_event_id.as_deref());
+    let boundary = if let Some(event_id) = boundary_id {
+        let event_id = decode_hex_32(event_id, "invalid_event")?;
+        Some(
+            client
+                .query_opt(
+                    "SELECT canonical_cursor
+                     FROM noise.events
+                     WHERE event_id = $1 AND stream_pk = $2",
+                    &[&event_id.as_slice(), &stream.stream_pk],
+                )
+                .await
+                .map_err(ApiError::database)?
+                .map(|row| row.get::<_, i64>(0))
+                .ok_or_else(|| ApiError::bad_request("invalid_event_cursor"))?,
+        )
+    } else {
+        None
+    };
+    let mut events = if query.after_event_id.is_some() {
+        read_events_after(
+            &client,
+            stream.stream_pk,
+            boundary.unwrap_or_default(),
+            stream.latest_cursor,
+            MAX_PAGE_SIZE + 1,
+        )
+        .await?
+    } else {
+        read_latest_events(
+            &client,
+            stream.stream_pk,
+            boundary
+                .map(|cursor| cursor.saturating_sub(1))
+                .unwrap_or(stream.latest_cursor),
+            MAX_PAGE_SIZE + 1,
+        )
+        .await?
+    };
+    let has_more = events.len() > MAX_PAGE_SIZE as usize;
+    if has_more {
+        if query.after_event_id.is_some() {
+            events.pop();
+        } else {
+            events.remove(0);
+        }
+    }
+    Ok(Json(ClientEventPage {
+        events: events.into_iter().map(|event| event.event).collect(),
+        has_more,
+    }))
+}
+
 struct DecodedEvent {
     event_id: [u8; 32],
     group_id: [u8; 32],
@@ -655,9 +924,6 @@ struct DecodedEvent {
 
 impl DecodedEvent {
     fn new(event: &SignedEvent) -> Result<Self, ApiError> {
-        if event.author_sequence == 0 {
-            return Err(ApiError::bad_request("invalid_event"));
-        }
         let event_id = decode_hex_32(&event.event_id, "invalid_event")?;
         let group_id = decode_hex_32(&event.group_id, "invalid_event")?;
         let author_public_key =

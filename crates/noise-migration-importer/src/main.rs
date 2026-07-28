@@ -3,7 +3,8 @@ use std::{collections::BTreeMap, path::PathBuf};
 use anyhow::{Context, bail};
 use clap::{Parser, ValueEnum};
 use noise_migration_importer::{
-    ImportSource, build_plan, execute_plan, local_object_store, r2_object_store_from_env,
+    ImportSource, build_plan, execute_database_plan, execute_plan, local_object_store,
+    r2_object_store_from_env,
 };
 use noise_migration_verifier::SourceInput;
 
@@ -55,6 +56,10 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     upload_concurrency: usize,
 
+    /// Reuse the already verified R2 import and write only PostgreSQL data.
+    #[arg(long)]
+    reuse_verified_objects: bool,
+
     /// Write the sanitized JSON result here instead of stdout.
     #[arg(long)]
     output: Option<PathBuf>,
@@ -98,24 +103,34 @@ async fn main() -> anyhow::Result<()> {
             .database_url
             .as_deref()
             .context("--execute requires NOISE_DATABASE_URL or --database-url")?;
-        let store = match args.object_store {
-            ObjectStoreKind::R2 => {
-                if args.local_object_root.is_some() {
-                    bail!("--local-object-root cannot be used with the R2 object store");
+        if args.reuse_verified_objects {
+            if args.local_object_root.is_some() {
+                bail!("--reuse-verified-objects cannot use --local-object-root");
+            }
+            execute_database_plan(&plan, database_url).await?
+        } else {
+            let store = match args.object_store {
+                ObjectStoreKind::R2 => {
+                    if args.local_object_root.is_some() {
+                        bail!("--local-object-root cannot be used with the R2 object store");
+                    }
+                    r2_object_store_from_env()?
                 }
-                r2_object_store_from_env()?
-            }
-            ObjectStoreKind::Local => {
-                let root = args
-                    .local_object_root
-                    .as_deref()
-                    .context("local execution requires --local-object-root")?;
-                local_object_store(root)?
-            }
-        };
-        execute_plan(&plan, store, database_url, args.upload_concurrency).await?
+                ObjectStoreKind::Local => {
+                    let root = args
+                        .local_object_root
+                        .as_deref()
+                        .context("local execution requires --local-object-root")?;
+                    local_object_store(root)?
+                }
+            };
+            execute_plan(&plan, store, database_url, args.upload_concurrency).await?
+        }
     } else {
-        if args.database_url.is_some() || args.local_object_root.is_some() {
+        if args.database_url.is_some()
+            || args.local_object_root.is_some()
+            || args.reuse_verified_objects
+        {
             bail!("database and object-store destinations require --execute");
         }
         plan.summary.clone()

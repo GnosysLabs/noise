@@ -16,17 +16,14 @@ type Envelope<T> = {
   error?: string;
 };
 
-const defaultRelays = [
-  "https://noiserelay.gnosyslabs.xyz#ohttp=AQAgZEyD0P-eAYiQd9F8r4_4ah2EoI_nWvs4QtUSTbVse1sABAABAAM",
-  "https://noiserelay.irisirc.chat#ohttp=AQAggzUeerBJnmwbryX5FUuHI5N7DLozSUnf2kYKnfMmkl8ABAABAAM",
-];
+export const centralUrl =
+  import.meta.env.VITE_NOISE_CENTRAL_URL?.trim()
+  || (import.meta.env.DEV ? "http://127.0.0.1:4302" : "https://api.makenoise.chat");
 
-const configuredRelays = import.meta.env.VITE_NOISE_RELAYS
-  ?.split(",")
-  .map((relay: string) => relay.trim().replace(/\/$/, ""))
-  .filter(Boolean);
-
-export const relays = configuredRelays?.length ? configuredRelays : defaultRelays;
+// Retain the field name until the cross-platform request schema is renamed,
+// but there is exactly one transport endpoint and no runtime override or
+// fallback to the retired relay network.
+export const relays = [centralUrl];
 export const noiseSafetyUrl = import.meta.env.VITE_NOISE_SAFETY_URL?.trim()
   || (import.meta.env.DEV ? "http://127.0.0.1:4310" : null);
 export const noiseSafetyPublicKey =
@@ -37,9 +34,6 @@ export const noiseSafetyDirectiveSigningPublicKey =
 export const isTauri = "__TAURI_INTERNALS__" in window;
 document.documentElement.dataset.runtime = isTauri ? "tauri" : "browser";
 
-let relayDiscoveryStarted = false;
-let maskRelays: string[] = [];
-let maskRelayOffset = 0;
 type BrowserAdapter = {
   default(): Promise<unknown>;
   clear_session(): void;
@@ -98,7 +92,7 @@ async function invokeBrowser<T>(request: NoiseRequest): Promise<T | null> {
     const adapter = await browserAdapter();
     const response = await adapter.noise_invoke({
       ...request,
-      mask_relays: rotateMaskRelays(),
+      central_url: centralUrl,
     }) as Envelope<T>;
     if (!response.ok) throw new Error(response.error ?? "unknown noise core error");
     if (accountGeneration !== browserAccountGeneration) return null;
@@ -131,28 +125,6 @@ function enqueueBrowserMutation<T>(operation: () => Promise<T>): Promise<T> {
   return queued;
 }
 
-function rotateMaskRelays() {
-  if (maskRelays.length < 2) return maskRelays;
-  const offset = maskRelayOffset++ % maskRelays.length;
-  return [...maskRelays.slice(offset), ...maskRelays.slice(0, offset)];
-}
-
-function startRelayDiscovery() {
-  if (!isTauri || relayDiscoveryStarted) return;
-  relayDiscoveryStarted = true;
-  void (async () => {
-    try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      const response = await invoke<Envelope<string[]>>("noise_invoke", {
-        request: { action: "discover_relay_masks", relays },
-      });
-      if (response.ok && response.data) maskRelays = response.data;
-    } catch {
-      // The pinned seed relays remain the privacy fallback.
-    }
-  })();
-}
-
 export async function noise<T>(request: NoiseRequest): Promise<T | null> {
   if (localAccountTransitioning) {
     throw new Error("local account transition in progress");
@@ -160,10 +132,9 @@ export async function noise<T>(request: NoiseRequest): Promise<T | null> {
   if (!isTauri) {
     return invokeBrowser<T>(request);
   }
-  startRelayDiscovery();
   const { invoke } = await import("@tauri-apps/api/core");
   const response = await invoke<Envelope<T>>("noise_invoke", {
-    request: { ...request, mask_relays: rotateMaskRelays() },
+    request: { ...request, central_url: centralUrl },
   });
   if (!response.ok) throw new Error(response.error ?? "unknown noise core error");
   return response.data ?? null;
@@ -243,13 +214,12 @@ async function runLocalAccountTransition(operation: () => Promise<void>) {
 
 export async function registerMediaStream(request: NoiseRequest) {
   if (!isTauri) return null;
-  startRelayDiscovery();
   const { invoke } = await import("@tauri-apps/api/core");
   return invoke<string>("register_media_stream", {
     request: {
       ...request,
       relays,
-      mask_relays: rotateMaskRelays(),
+      central_url: centralUrl,
     },
   });
 }

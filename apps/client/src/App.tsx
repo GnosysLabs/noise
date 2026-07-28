@@ -3185,6 +3185,17 @@ export default function App() {
       });
       if (!local) throw new Error("the content preference was not updated");
       setSummary(local);
+      void noise<LocalSummary>({
+        action: "sync_account",
+        relays,
+        interruptible: true,
+      })
+        .then((synced) => {
+          if (synced) setSummary(synced);
+        })
+        .catch(() => {
+          setError("content visibility was saved on this device; cross-device sync will retry");
+        });
     }, false);
   }
 

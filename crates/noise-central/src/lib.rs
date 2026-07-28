@@ -2,10 +2,15 @@ mod config;
 mod database;
 mod error;
 mod events;
+#[path = "../../noise-relay/src/link_preview.rs"]
+mod link_preview;
+mod media;
 mod mls;
+mod realtime;
+mod social;
 mod vaults;
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -21,11 +26,14 @@ use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use ed25519_dalek::VerifyingKey;
 use noise_core::{
     CentralInstallationRegistrationV1, CentralInstallationRevocationV1, CentralSessionProofV1,
+    GroupPresence,
 };
+use noise_transport::{LinkPreview, LinkPreviewRequest};
 use rand::random;
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 use tokio_postgres::error::SqlState;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 pub use config::CentralConfig;
 use database::Database;
@@ -40,6 +48,8 @@ const MAX_BODY_BYTES: usize = 3_000_000;
 struct AppState {
     database: Database,
     token_hash_key: [u8; 32],
+    media: Option<media::MediaStore>,
+    presences: Arc<RwLock<HashMap<String, HashMap<String, GroupPresence>>>>,
 }
 
 struct AuthenticatedSession {
@@ -85,9 +95,12 @@ struct HealthResponse {
 
 pub async fn build_app(config: &CentralConfig) -> anyhow::Result<Router> {
     config.validate()?;
+    let media = media::MediaStore::open(config)?;
     let state = Arc::new(AppState {
         database: Database::connect(config).await?,
         token_hash_key: config.token_hash_key()?,
+        media,
+        presences: Arc::new(RwLock::new(HashMap::new())),
     });
 
     let mut app = Router::new()
@@ -104,7 +117,30 @@ pub async fn build_app(config: &CentralConfig) -> anyhow::Result<Router> {
             "/v1/account-vaults/{locator}",
             get(vaults::get_account_vault).put(vaults::put_account_vault),
         )
+        .route(
+            "/v1/accounts/{locator}/watch/{since}",
+            get(realtime::account_watch),
+        )
+        .route("/v1/invites", post(social::publish_invite))
+        .route("/v1/invites/{locator}", get(social::get_invite))
+        .route(
+            "/v1/invite-rotations",
+            post(social::publish_invite_rotation),
+        )
+        .route("/v1/group-deletions", post(social::publish_group_deletion))
+        .route("/v1/contact-signals", post(social::publish_contact_signal))
+        .route(
+            "/v1/contact-signals/{group_id}",
+            get(social::get_contact_signal),
+        )
+        .route("/v1/link-preview", post(fetch_link_preview))
         .route("/v1/events", post(events::publish_group_event))
+        .route(
+            "/v1/media/{object_id}",
+            get(media::get_media)
+                .put(media::put_media)
+                .delete(media::delete_media),
+        )
         .route(
             "/v1/direct-events",
             get(events::direct_events_after).post(events::publish_direct_event),
@@ -113,13 +149,35 @@ pub async fn build_app(config: &CentralConfig) -> anyhow::Result<Router> {
             "/v1/direct-events/latest",
             get(events::latest_direct_events),
         )
+        .route("/v1/direct-peers", get(events::direct_peers))
+        .route("/v1/direct-history", get(events::client_direct_history))
         .route(
             "/v1/groups/{group_id}/events",
             get(events::group_events_after),
         )
         .route(
+            "/v1/groups/{group_id}/watch/{since}",
+            get(realtime::group_watch),
+        )
+        .route(
+            "/v1/groups/{group_id}/presence",
+            post(realtime::publish_presence),
+        )
+        .route(
             "/v1/groups/{group_id}/events/latest",
             get(events::latest_group_events),
+        )
+        .route(
+            "/v1/groups/{group_id}/history/latest",
+            get(events::latest_client_group_events),
+        )
+        .route(
+            "/v1/groups/{group_id}/history/before/{event_id}",
+            get(events::client_group_events_before),
+        )
+        .route(
+            "/v1/groups/{group_id}/history/after/{event_id}",
+            get(events::client_group_events_after),
         )
         .route("/v2/mls/genesis", post(mls::publish_genesis))
         .route("/v2/mls/epochs", post(mls::publish_epoch))
@@ -144,10 +202,15 @@ pub async fn build_app(config: &CentralConfig) -> anyhow::Result<Router> {
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state);
 
-    if let Some(origin) = config.allowed_origin.as_deref() {
+    let allowed_origins = config.allowed_origins()?;
+    if !allowed_origins.is_empty() {
+        let allowed_origins = allowed_origins
+            .iter()
+            .map(|origin| HeaderValue::from_str(origin))
+            .collect::<Result<Vec<_>, _>>()?;
         app = app.layer(
             CorsLayer::new()
-                .allow_origin(HeaderValue::from_str(origin)?)
+                .allow_origin(AllowOrigin::list(allowed_origins))
                 .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
                 .allow_headers([CONTENT_TYPE, AUTHORIZATION, IF_MATCH])
                 .expose_headers([ETAG]),
@@ -175,6 +238,19 @@ async fn health(State(state): State<Arc<AppState>>) -> Result<Json<HealthRespons
         status: "ok",
         schema_version: row.get(0),
     }))
+}
+
+async fn fetch_link_preview(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<LinkPreviewRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate_session(&state, &headers).await?;
+    match link_preview::fetch(&request).await {
+        Ok(Some(preview)) => Ok((StatusCode::OK, Json(Some(preview)))),
+        Ok(None) => Ok((StatusCode::NO_CONTENT, Json(None::<LinkPreview>))),
+        Err(_) => Err(ApiError::bad_request("link_preview_unavailable")),
+    }
 }
 
 async fn issue_registration_challenge(

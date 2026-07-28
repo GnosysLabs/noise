@@ -38,7 +38,15 @@ fn data<T: serde::Serialize>(value: T) -> Result<Value, String> {
 async fn dispatch(request: Value) -> Result<Value, String> {
     let action = required::<String>(&request, "action")?;
     let mask_relays = optional::<Vec<String>>(&request, "mask_relays")?.unwrap_or_default();
-    let client = NoiseClient::with_mask_relays(mask_relays).map_err(|error| error.to_string())?;
+    let client =
+        NoiseClient::with_central_url(mask_relays, optional::<String>(&request, "central_url")?)
+            .map_err(|error| error.to_string())?;
+    if request.get("relays").is_some() && client.has_local_state(STATE_PATH) {
+        client
+            .bind_central_state(STATE_PATH)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
 
     match action.as_str() {
         "discover_relay_masks" => data(

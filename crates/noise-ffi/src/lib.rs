@@ -792,6 +792,15 @@ fn request_loading_ticket(request: &Request) -> Option<LoadingTicket> {
 fn invoke(request_json: &str) -> Result<Value, String> {
     let request_value =
         serde_json::from_str::<Value>(request_json).map_err(|error| error.to_string())?;
+    let central_url = request_value
+        .get("central_url")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let state_path = request_value
+        .get("state_path")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let has_network = request_value.get("relays").is_some();
     let mask_relays = request_value
         .get("mask_relays")
         .and_then(Value::as_array)
@@ -905,7 +914,16 @@ fn invoke(request_json: &str) -> Result<Value, String> {
     }) {
         return Err("loading superseded".to_owned());
     }
-    let client = NoiseClient::with_mask_relays(mask_relays).map_err(|error| error.to_string())?;
+    let client = NoiseClient::with_central_url(mask_relays, central_url)
+        .map_err(|error| error.to_string())?;
+    if has_network
+        && let Some(state_path) = state_path.as_deref()
+        && Path::new(state_path).exists()
+    {
+        runtime()?
+            .block_on(client.bind_central_state(state_path))
+            .map_err(|error| error.to_string())?;
+    }
 
     match request {
         Request::DiscoverRelayMasks { cache_path, relays } => serde_json::to_value(
@@ -2145,6 +2163,14 @@ fn invoke(request_json: &str) -> Result<Value, String> {
 async fn invoke_async_watch(request_json: String) -> Result<Value, String> {
     let request_value =
         serde_json::from_str::<Value>(&request_json).map_err(|error| error.to_string())?;
+    let central_url = request_value
+        .get("central_url")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let state_path = request_value
+        .get("state_path")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let mask_relays = request_value
         .get("mask_relays")
         .and_then(Value::as_array)
@@ -2163,7 +2189,16 @@ async fn invoke_async_watch(request_json: String) -> Result<Value, String> {
         return Err("session ended".to_owned());
     }
 
-    let client = NoiseClient::with_mask_relays(mask_relays).map_err(|error| error.to_string())?;
+    let client = NoiseClient::with_central_url(mask_relays, central_url)
+        .map_err(|error| error.to_string())?;
+    if let Some(state_path) = state_path.as_deref()
+        && Path::new(state_path).exists()
+    {
+        client
+            .bind_central_state(state_path)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     match request {
         Request::WatchAccount {
             state_path,
