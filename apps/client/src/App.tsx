@@ -8955,7 +8955,13 @@ function ProfileAlbumDialog({
             {pendingUploads.map((pending, index) => (
               <div className={`profile-album-queue-item ${uploadProgress !== null && index === uploadIndex ? "uploading" : ""} ${pending.attachment ? "uploaded" : ""}`} key={pending.id}>
                 {pending.file.type.startsWith("video/")
-                  ? <video src={pending.previewUrl} muted playsInline preload="metadata" />
+                  ? <video
+                      src={pending.previewUrl}
+                      muted
+                      playsInline
+                      preload="metadata"
+                      onLoadedMetadata={(event) => primeVideoFrame(event.currentTarget)}
+                    />
                   : <img src={pending.previewUrl} alt="" />}
                 {pending.file.type.startsWith("video/") && <i><Play size={12} fill="currentColor" /></i>}
                 {pending.attachment && <em><Check size={12} /></em>}
