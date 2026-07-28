@@ -6353,6 +6353,8 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
   } = useComposerUpload(composerUploadKey);
   const [messageMenu, setMessageMenu] = useState<{ message: MessageSummary; x: number; y: number } | null>(null);
   const [replyingTo, setReplyingTo] = useState<MessageSummary | null>(null);
+  const [showDisappearingMessages, setShowDisappearingMessages] = useState(false);
+  const [savingDisappearingMessages, setSavingDisappearingMessages] = useState(false);
   const [expiryClock, setExpiryClock] = useState(() => Date.now());
   const fileInput = useRef<HTMLInputElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
@@ -6500,11 +6502,22 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
           );
         })}
       </div>
-      {contact.accepts_direct_messages ? <div className="composer">
+      {contact.accepts_direct_messages ? <div className="composer direct-composer">
         {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.media_scope_id} onClose={() => setReplyingTo(null)} />}
         {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => primeVideoFrame(event.currentTarget)} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}{uploadProgress !== null && <div className="attachment-progress"><i style={{ width: `${uploadProgress}%` }} /><span>{uploadProgress === 0 && attachment.mimeType.startsWith("video/") ? "preparing video" : `${uploadProgress}%`}</span></div>}<button onClick={() => { uploadController?.abort(); setUploadController(null); setAttachment(null); setUploadProgress(null); }} aria-label={uploadProgress !== null ? "cancel upload" : "remove attachment"}><X size={14} /></button></div>}
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
         <button className="attach-button" disabled={busy} onClick={() => void chooseMediaFromDevice()} aria-label="attach media"><Paperclip size={17} /></button>
+        <button
+          className={`timer-button ${conversation.disappearing_after_read_seconds ? "active" : ""}`}
+          disabled={busy}
+          onClick={() => setShowDisappearingMessages(true)}
+          aria-label="disappearing messages"
+          title={conversation.disappearing_after_read_seconds
+            ? `disappearing after ${formatDisappearingDuration(conversation.disappearing_after_read_seconds)}`
+            : "disappearing messages off"}
+        >
+          <TimerReset size={17} />
+        </button>
         <input ref={fileInput} hidden type="file" accept="image/*,video/*,audio/*" onChange={(event) => void chooseMedia(event.target.files?.[0])} />
         <textarea ref={composerInput} rows={1} value={draft} placeholder={`message ${contact.username}`} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); } }} />
         <button className="send-button" disabled={(!draft.trim() && !attachment) || busy} onClick={() => void submit()}><ArrowUp size={17} /></button>
@@ -6516,25 +6529,6 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
         </button>
         <div className="noise-signature"><small>noise signature</small><strong>{noiseSignature(contact.public_key)}</strong></div>
         <p>{contact.bio || "no bio yet"}</p>
-        <label className="direct-disappearing-setting">
-          <span><TimerReset size={14} /><strong>disappearing messages</strong></span>
-          <select
-            disabled={busy}
-            value={conversation.disappearing_after_read_seconds ?? ""}
-            onChange={(event) => {
-              const value = event.target.value;
-              void onSetDisappearing(value ? Number(value) : null);
-            }}
-          >
-            <option value="">off</option>
-            <option value="300">5 minutes after read</option>
-            <option value="3600">1 hour after read</option>
-            <option value="86400">1 day after read</option>
-            <option value="604800">1 week after read</option>
-            <option value="2419200">4 weeks after read</option>
-          </select>
-          <small>Applies to new messages you send.</small>
-        </label>
         <div className="direct-profile-actions">
           <button className="profile-album" onClick={() => onAlbum(person)}><Images size={14} /> {albumButtonLabel(contact.album)}</button>
           <button className="profile-block" onClick={() => onBlock(person)}><ShieldOff size={14} /> block</button>
@@ -6543,7 +6537,61 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
       </aside>
       <AppVersionFooter />
       {messageMenu && <MessageContextMenu x={messageMenu.x} y={messageMenu.y} busy={busy} onClose={() => setMessageMenu(null)} onReply={() => { setReplyingTo(messageMenu.message); setMessageMenu(null); window.setTimeout(() => composerInput.current?.focus(), 0); }} onForward={() => { onForward(messageMenu.message); setMessageMenu(null); }} onDownload={messageMenu.message.attachment ? () => onDownload(messageMenu.message) : undefined} />}
+      {showDisappearingMessages && (
+        <DisappearingMessagesDialog
+          currentSeconds={conversation.disappearing_after_read_seconds ?? null}
+          busy={busy || savingDisappearingMessages}
+          onClose={() => setShowDisappearingMessages(false)}
+          onSelect={async (seconds) => {
+            if (seconds === (conversation.disappearing_after_read_seconds ?? null)) {
+              setShowDisappearingMessages(false);
+              return;
+            }
+            setSavingDisappearingMessages(true);
+            const saved = await onSetDisappearing(seconds);
+            setSavingDisappearingMessages(false);
+            if (saved) setShowDisappearingMessages(false);
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+const disappearingMessageChoices = [
+  { label: "off", seconds: null, detail: "New messages stay in the conversation." },
+  { label: "5 minutes", seconds: 300, detail: "Disappear 5 minutes after they are read." },
+  { label: "1 hour", seconds: 3600, detail: "Disappear 1 hour after they are read." },
+  { label: "1 day", seconds: 86400, detail: "Disappear 1 day after they are read." },
+  { label: "1 week", seconds: 604800, detail: "Disappear 1 week after they are read." },
+  { label: "4 weeks", seconds: 2419200, detail: "Disappear 4 weeks after they are read." },
+] satisfies Array<{ label: string; seconds: number | null; detail: string }>;
+
+function DisappearingMessagesDialog({ currentSeconds, busy, onClose, onSelect }: { currentSeconds: number | null; busy: boolean; onClose: () => void; onSelect: (seconds: number | null) => Promise<void> }) {
+  return (
+    <Modal onClose={onClose} closeDisabled={busy} compact className="disappearing-messages-modal">
+      <DialogHeading
+        icon={<TimerReset />}
+        title="disappearing messages"
+        detail="Choose when new messages you send disappear after they are read."
+      />
+      <div className="disappearing-message-options">
+        {disappearingMessageChoices.map((choice) => {
+          const selected = choice.seconds === currentSeconds;
+          return (
+            <button
+              key={choice.label}
+              className={selected ? "selected" : ""}
+              disabled={busy}
+              onClick={() => void onSelect(choice.seconds)}
+            >
+              <span><strong>{choice.label}</strong><small>{choice.detail}</small></span>
+              {selected && <Check size={16} />}
+            </button>
+          );
+        })}
+      </div>
+    </Modal>
   );
 }
 
