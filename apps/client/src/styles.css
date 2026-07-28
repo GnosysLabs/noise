@@ -200,7 +200,13 @@ button:disabled { cursor: default; opacity: 0.48; }
 .link-preview-copy > span { display: -webkit-box; overflow: hidden; color: var(--muted); font-size: 11px; line-height: 1.35; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .link-preview > img { display: block; width: 100%; aspect-ratio: 1.91 / 1; object-fit: cover; }
 .message-row.own .link-preview { margin-left: auto; background: color-mix(in srgb, var(--accent) 14%, rgba(28,26,31,.94)); }
-.message-time { display: block; margin-top: 4px; color: var(--faint); font-size: 10px; }
+.message-footer { display: flex; align-items: center; gap: 4px; margin-top: 4px; color: var(--faint); }
+.message-row.own .message-footer { justify-content: flex-end; }
+.message-time { display: block; color: var(--faint); font-size: 10px; }
+.message-expiry { display: inline-flex; align-items: center; color: var(--faint); }
+.direct-receipt { display: inline-flex; height: 12px; align-items: center; color: var(--muted); }
+.direct-receipt.read { color: #69d99e; }
+.direct-receipt.read svg + svg { margin-left: -5px; }
 .message-reactions { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 6px; }
 .message-row.own .message-reactions { justify-content: flex-end; }
 .reaction-chip-wrap { display: inline-flex; }
@@ -383,6 +389,13 @@ button:disabled { cursor: default; opacity: 0.48; }
 .direct-profile-sidebar .noise-signature { margin: 10px 0 12px; }
 .direct-profile-sidebar .noise-signature strong { font-size: 10.5px; }
 .direct-profile-sidebar > p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.direct-disappearing-setting { display: flex; width: 100%; align-items: stretch; flex-direction: column; gap: 7px; margin-top: 18px; padding: 10px; border-radius: 10px; background: rgba(255,255,255,.045); text-align: left; }
+.direct-disappearing-setting > span { display: flex; align-items: center; gap: 6px; color: #e9e4ec; }
+.direct-disappearing-setting > span svg { color: var(--muted); }
+.direct-disappearing-setting strong { font-size: 11px; }
+.direct-disappearing-setting select { width: 100%; height: 32px; padding: 0 8px; border: 1px solid rgba(255,255,255,.09); border-radius: 8px; outline: none; background: #2d2a32; color: #eeeaf2; font-size: 10.5px; }
+.direct-disappearing-setting select:focus { border-color: rgba(var(--accent-rgb),.58); }
+.direct-disappearing-setting small { color: var(--faint); font-size: 9.5px; line-height: 1.35; }
 .direct-profile-actions { display: grid; width: 100%; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 7px; margin-top: 18px; }
 .direct-profile-actions button { display: inline-flex; min-width: 0; align-items: center; justify-content: center; gap: 6px; padding: 8px 9px; border-radius: 9px; font-size: 11px; font-weight: 600; white-space: nowrap; }
 .direct-profile-actions .profile-album { border: 1px solid rgba(var(--accent-rgb),.22); background: rgba(var(--accent-rgb),.13); color: var(--accent-light); }

@@ -415,6 +415,13 @@ enum Request {
     MarkDirectRead {
         state_path: String,
         public_key: String,
+        relays: Vec<String>,
+    },
+    SetDirectDisappearingAfterRead {
+        state_path: String,
+        public_key: String,
+        seconds: Option<u32>,
+        relays: Vec<String>,
     },
     WatchDirect {
         state_path: String,
@@ -1854,9 +1861,26 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         Request::MarkDirectRead {
             state_path,
             public_key,
+            relays,
         } => serde_json::to_value(
-            client
-                .mark_direct_read(state_path, &public_key)
+            runtime()?
+                .block_on(client.mark_direct_read(state_path, &public_key, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::SetDirectDisappearingAfterRead {
+            state_path,
+            public_key,
+            seconds,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.set_direct_disappearing_after_read(
+                    state_path,
+                    &public_key,
+                    seconds,
+                    relays,
+                ))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),

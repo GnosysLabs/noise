@@ -149,6 +149,7 @@ pub async fn build_app(config: &CentralConfig) -> anyhow::Result<Router> {
             "/v1/direct-events/latest",
             get(events::latest_direct_events),
         )
+        .route("/v1/direct-receipts/read", post(events::mark_direct_read))
         .route("/v1/direct-peers", get(events::direct_peers))
         .route("/v1/direct-history", get(events::client_direct_history))
         .route(

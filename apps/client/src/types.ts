@@ -186,6 +186,10 @@ export type MessageSummary = {
   topic_id?: string | null;
   created_at_millis: number;
   reactions?: ReactionSummary[];
+  expires_after_read_seconds?: number | null;
+  delivered_at_millis?: number | null;
+  read_at_millis?: number | null;
+  expires_at_millis?: number | null;
   optimistic?: boolean;
   upload_progress?: number;
   upload_error?: string;
@@ -284,6 +288,10 @@ export type DirectMessageSummary = {
     username: string;
   } | null;
   created_at_millis: number;
+  expires_after_read_seconds?: number | null;
+  delivered_at_millis?: number | null;
+  read_at_millis?: number | null;
+  expires_at_millis?: number | null;
   optimistic?: boolean;
   local_attachment?: {
     preview_url: string;
@@ -304,6 +312,7 @@ export type DirectConversation = {
   contact: DirectSummary;
   media_scope_id: string;
   messages: DirectMessageSummary[];
+  disappearing_after_read_seconds?: number | null;
 };
 
 export type DirectInbox = {

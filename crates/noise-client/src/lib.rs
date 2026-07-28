@@ -595,6 +595,14 @@ pub struct DirectMessageSummary {
     #[serde(default)]
     pub forwarded_from: Option<ForwardedFrom>,
     pub created_at_millis: u64,
+    #[serde(default)]
+    pub expires_after_read_seconds: Option<u32>,
+    #[serde(default)]
+    pub delivered_at_millis: Option<u64>,
+    #[serde(default)]
+    pub read_at_millis: Option<u64>,
+    #[serde(default)]
+    pub expires_at_millis: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -602,6 +610,8 @@ pub struct DirectConversation {
     pub contact: DirectSummary,
     pub media_scope_id: String,
     pub messages: Vec<DirectMessageSummary>,
+    #[serde(default)]
+    pub disappearing_after_read_seconds: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -890,6 +900,8 @@ struct ClientState {
     #[serde(default)]
     direct_read_through: HashMap<String, DirectMessageMarker>,
     #[serde(default)]
+    direct_disappearing_after_read_seconds: HashMap<String, u32>,
+    #[serde(default)]
     group_latest_incoming: HashMap<String, MessageMarker>,
     #[serde(default)]
     group_latest_activity: HashMap<String, MessageMarker>,
@@ -1016,6 +1028,8 @@ struct AccountVaultContents {
     direct_deleted_before: HashMap<String, u64>,
     #[serde(default)]
     direct_policy_rejected_through: HashMap<String, DirectMessageMarker>,
+    #[serde(default)]
+    direct_disappearing_after_read_seconds: HashMap<String, u32>,
     direct_closed_periods: Vec<DirectClosedPeriod>,
     #[serde(default)]
     direct_read_through: HashMap<String, DirectMessageMarker>,
@@ -1079,6 +1093,8 @@ struct DirectEventCache {
     has_older_events: bool,
     #[serde(default)]
     central_peer_latest_event_ids: HashMap<String, String>,
+    #[serde(default)]
+    receipts: HashMap<String, DirectEventReceipt>,
 }
 
 fn control_hydration_needed() -> bool {
@@ -1120,8 +1136,21 @@ impl GroupEventCursor {
 struct GroupEventPage {
     events: Vec<SignedEvent>,
     has_more: bool,
+    #[serde(default)]
+    receipts: Vec<DirectEventReceipt>,
     #[serde(default, skip)]
     continuation_cursor: Option<GroupEventCursor>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct DirectEventReceipt {
+    event_id: String,
+    #[serde(default)]
+    delivered_at_millis: Option<u64>,
+    #[serde(default)]
+    read_at_millis: Option<u64>,
+    #[serde(default)]
+    expires_at_millis: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -2091,6 +2120,9 @@ impl ClientState {
             active_direct_public_key: self.active_direct_public_key.clone(),
             direct_deleted_before: self.direct_deleted_before.clone(),
             direct_policy_rejected_through: self.direct_policy_rejected_through.clone(),
+            direct_disappearing_after_read_seconds: self
+                .direct_disappearing_after_read_seconds
+                .clone(),
             direct_closed_periods: self.direct_closed_periods.clone(),
             direct_read_through: self.direct_read_through.clone(),
             direct_latest_activity: self.direct_latest_activity.clone(),
@@ -2151,6 +2183,7 @@ impl ClientState {
             active_direct_public_key: contents.active_direct_public_key,
             direct_deleted_before: contents.direct_deleted_before,
             direct_policy_rejected_through: contents.direct_policy_rejected_through,
+            direct_disappearing_after_read_seconds: contents.direct_disappearing_after_read_seconds,
             direct_closed_periods: contents.direct_closed_periods,
             direct_latest_incoming: HashMap::new(),
             direct_latest_activity: contents.direct_latest_activity,
@@ -3242,6 +3275,7 @@ impl NoiseClient {
             active_direct_public_key: None,
             direct_deleted_before: HashMap::new(),
             direct_policy_rejected_through: HashMap::new(),
+            direct_disappearing_after_read_seconds: HashMap::new(),
             direct_closed_periods: Vec::new(),
             direct_latest_incoming: HashMap::new(),
             direct_latest_activity: HashMap::new(),
@@ -6870,10 +6904,11 @@ impl NoiseClient {
         Ok(())
     }
 
-    pub fn mark_direct_read(
+    pub async fn mark_direct_read(
         &self,
         path: impl AsRef<Path>,
         public_key: &str,
+        _relays: Vec<String>,
     ) -> anyhow::Result<LocalSummary> {
         let path = path.as_ref();
         let mut state = load_state(path)?;
@@ -6884,14 +6919,46 @@ impl NoiseClient {
         {
             bail!("unknown direct conversation")
         }
-        if let Some(latest) = state.direct_latest_incoming.get(public_key).cloned()
-            && state.direct_read_through.get(public_key) != Some(&latest)
-        {
-            state
-                .direct_read_through
-                .insert(public_key.to_owned(), latest);
+        if self.mark_latest_direct_read(&mut state, public_key).await? {
             save_state(path, &state)?;
         }
+        state.summary()
+    }
+
+    pub async fn set_direct_disappearing_after_read(
+        &self,
+        path: impl AsRef<Path>,
+        public_key: &str,
+        seconds: Option<u32>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<LocalSummary> {
+        if seconds.is_some_and(|seconds| !(60..=28 * 24 * 60 * 60).contains(&seconds)) {
+            bail!("disappearing messages must use a duration from 1 minute to 4 weeks")
+        }
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        if !state
+            .direct_contacts
+            .iter()
+            .any(|contact| contact.public_key == public_key)
+        {
+            bail!("unknown direct conversation")
+        }
+        match seconds {
+            Some(seconds) => {
+                state
+                    .direct_disappearing_after_read_seconds
+                    .insert(public_key.to_owned(), seconds);
+            }
+            None => {
+                state
+                    .direct_disappearing_after_read_seconds
+                    .remove(public_key);
+            }
+        }
+        self.publish_account_state(&mut state, &relay_list(relays)?)
+            .await?;
+        save_state(path, &state)?;
         state.summary()
     }
 
@@ -6903,7 +6970,7 @@ impl NoiseClient {
     ) -> anyhow::Result<DirectConversation> {
         let path = path.as_ref();
         let relays = relay_list(relays)?;
-        let (mut state, messages) = self
+        let (mut state, _) = self
             .sync_complete_direct_inbox(path, cache_path.as_ref(), relays.clone())
             .await?;
         let public_key = state
@@ -6919,15 +6986,15 @@ impl NoiseClient {
             .find(|contact| contact.public_key == public_key)
             .cloned()
             .context("active direct conversation is missing")?;
-        if let Some(latest) = state.direct_latest_incoming.get(&public_key).cloned()
-            && state.direct_read_through.get(&public_key) != Some(&latest)
+        if self
+            .mark_latest_direct_read(&mut state, &public_key)
+            .await?
         {
-            state.direct_read_through.insert(public_key.clone(), latest);
             save_state(path, &state)?;
         }
         let identity = state.identity()?;
         let self_public_key = identity.public_key_base64();
-        let mut messages = messages
+        let mut messages = cached_direct_messages(&state)?
             .into_iter()
             .filter(|message| message.counterparty_public_key == public_key)
             .map(|message| message.message)
@@ -6937,7 +7004,75 @@ impl NoiseClient {
             contact: direct_summary(&contact, true, false),
             media_scope_id: identity.direct_scope_id(&contact.public_key)?,
             messages,
+            disappearing_after_read_seconds: state
+                .direct_disappearing_after_read_seconds
+                .get(&contact.public_key)
+                .copied(),
         })
+    }
+
+    async fn mark_latest_direct_read(
+        &self,
+        state: &mut ClientState,
+        public_key: &str,
+    ) -> anyhow::Result<bool> {
+        let Some(latest) = state.direct_latest_incoming.get(public_key).cloned() else {
+            return Ok(false);
+        };
+        let server_read_is_known = state
+            .direct_event_cache
+            .receipts
+            .get(&latest.event_id)
+            .is_some_and(|receipt| receipt.read_at_millis.is_some());
+        if state.direct_read_through.get(public_key) == Some(&latest)
+            && (self.central.is_none() || server_read_is_known)
+        {
+            return Ok(false);
+        }
+
+        if let Some(central) = self.central.as_ref() {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "peer_public_key": public_key,
+                "through_event_id": latest.event_id,
+            }))?;
+            central
+                .require_success(
+                    reqwest::Method::POST,
+                    "/v1/direct-receipts/read",
+                    &body,
+                    true,
+                )
+                .await?;
+            let now = current_millis();
+            for event in state.direct_event_cache.events.iter().filter(|event| {
+                event.author_public_key == public_key
+                    && DirectMessageMarker {
+                        created_at_millis: event.created_at_millis,
+                        event_id: event.event_id.clone(),
+                    } <= latest
+            }) {
+                let receipt = state
+                    .direct_event_cache
+                    .receipts
+                    .entry(event.event_id.clone())
+                    .or_insert_with(|| DirectEventReceipt {
+                        event_id: event.event_id.clone(),
+                        ..DirectEventReceipt::default()
+                    });
+                receipt.delivered_at_millis.get_or_insert(now);
+                receipt.read_at_millis.get_or_insert(now);
+                if receipt.expires_at_millis.is_none() {
+                    receipt.expires_at_millis = event
+                        .expires_after_read_seconds
+                        .map(|seconds| now.saturating_add(u64::from(seconds) * 1000));
+                }
+            }
+        }
+
+        state
+            .direct_read_through
+            .insert(public_key.to_owned(), latest);
+        Ok(true)
     }
 
     pub async fn watch_direct(
@@ -7037,8 +7172,12 @@ impl NoiseClient {
         let recipient_mailbox =
             identity.direct_mailbox(&contact.public_key, &contact.public_key)?;
         let sender_mailbox = identity.direct_mailbox(&contact.public_key, &self_public_key)?;
+        let expires_after_read_seconds = state
+            .direct_disappearing_after_read_seconds
+            .get(&contact.public_key)
+            .copied();
         let sequence = state.take_sequence();
-        let recipient_event = SignedEvent::direct_message_forwarded(
+        let recipient_event = SignedEvent::direct_message_forwarded_expiring(
             &identity,
             &recipient_mailbox,
             &contact.public_key,
@@ -7047,9 +7186,10 @@ impl NoiseClient {
             attachment.clone(),
             reply_to_message_id.clone(),
             forwarded_from.clone(),
+            expires_after_read_seconds,
             sequence,
         )?;
-        let sender_event = SignedEvent::direct_message_forwarded(
+        let sender_event = SignedEvent::direct_message_forwarded_expiring(
             &identity,
             &sender_mailbox,
             &contact.public_key,
@@ -7058,6 +7198,7 @@ impl NoiseClient {
             attachment,
             reply_to_message_id,
             forwarded_from,
+            expires_after_read_seconds,
             sequence,
         )?;
         let push_trigger = identity.direct_push_trigger(
@@ -9983,6 +10124,47 @@ impl NoiseClient {
             .iter()
             .filter_map(|event| decrypt_direct_event(&identity, &state, event))
             .collect::<Vec<_>>();
+        let now = current_millis();
+        let expired_event_ids = decoded
+            .iter()
+            .filter_map(|event| match event {
+                DecryptedDirectEvent::Message(message)
+                    if message
+                        .message
+                        .expires_at_millis
+                        .is_some_and(|expires_at| expires_at <= now) =>
+                {
+                    Some(message.message.event_id.clone())
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        for event in &decoded {
+            let DecryptedDirectEvent::Message(message) = event else {
+                continue;
+            };
+            if !expired_event_ids.contains(&message.message.event_id) {
+                continue;
+            }
+            if let Some(attachment) = message.message.attachment.as_ref() {
+                purge_attachment_cache(
+                    cache_path,
+                    &identity.direct_scope_id(&message.counterparty_public_key)?,
+                    attachment,
+                )?;
+            }
+        }
+        let expired_cache_changed = !expired_event_ids.is_empty();
+        if expired_cache_changed {
+            state
+                .direct_event_cache
+                .events
+                .retain(|event| !expired_event_ids.contains(&event.event_id));
+            state
+                .direct_event_cache
+                .receipts
+                .retain(|event_id, _| !expired_event_ids.contains(event_id));
+        }
         if state.profile.effective_direct_message_policy() == DirectMessagePolicy::SharedGroups {
             for event in &decoded {
                 let DecryptedDirectEvent::Message(message) = event else {
@@ -10084,6 +10266,10 @@ impl NoiseClient {
                             .copied()
                             .unwrap_or_default()
                         && !state.is_content_hidden(&message.counterparty_public_key)
+                        && message
+                            .message
+                            .expires_at_millis
+                            .is_none_or(|expires_at| expires_at > current_millis())
                         && (message.message.author_public_key == self_public_key
                             || state
                                 .direct_policy_rejected_through
@@ -10164,6 +10350,7 @@ impl NoiseClient {
             let _ = self.publish_account_state(&mut state, &relays).await;
         }
         if cache_changed
+            || expired_cache_changed
             || state.direct_contacts != contacts_before
             || state.active_direct_public_key != active_before
             || state.direct_deleted_before != deletions_before
@@ -10950,6 +11137,12 @@ impl NoiseClient {
             &mut state.direct_policy_rejected_through,
             &contents.direct_policy_rejected_through,
         );
+        let direct_disappearing_changed = state.direct_disappearing_after_read_seconds
+            != contents.direct_disappearing_after_read_seconds;
+        if direct_disappearing_changed {
+            state.direct_disappearing_after_read_seconds =
+                contents.direct_disappearing_after_read_seconds.clone();
+        }
         let group_reads_changed = state.merge_group_read_through(&contents.group_read_through);
         let topic_reads_changed = state.merge_topic_read_through(&contents.topic_read_through);
         let blocks_changed = merge_block_states(&mut state.block_states, &contents.block_states);
@@ -10980,6 +11173,7 @@ impl NoiseClient {
         account.revision = account.revision.max(remote.revision);
         Ok(direct_reads_changed
             || direct_policy_rejections_changed
+            || direct_disappearing_changed
             || profile_changed
             || adult_access_changed
             || contact_signal_changed
@@ -11639,6 +11833,7 @@ impl NoiseClient {
             .context("central service returned invalid direct peers")?;
         let self_public_key = identity.public_key_base64();
         let mut events = existing.events;
+        let mut receipts = existing.receipts;
         let mut latest_event_ids = existing.central_peer_latest_event_ids;
         let mut has_older_events = if complete {
             false
@@ -11655,6 +11850,9 @@ impl NoiseClient {
                 central_direct_history_endpoint(&peer, None, prior_cursor.as_deref());
             let mut page = central_direct_history_page(central, &endpoint).await?;
             validate_central_direct_page(&self_public_key, &peer, &page.events)?;
+            for receipt in &page.receipts {
+                receipts.insert(receipt.event_id.clone(), receipt.clone());
+            }
             if let Some(last) = page.events.last() {
                 latest_event_ids.insert(peer.clone(), last.event_id.clone());
             }
@@ -11671,6 +11869,9 @@ impl NoiseClient {
                     endpoint = central_direct_history_endpoint(&peer, Some(cursor), None);
                     let next = central_direct_history_page(central, &endpoint).await?;
                     validate_central_direct_page(&self_public_key, &peer, &next.events)?;
+                    for receipt in &next.receipts {
+                        receipts.insert(receipt.event_id.clone(), receipt.clone());
+                    }
                     anyhow::ensure!(
                         next.events
                             .first()
@@ -11693,6 +11894,9 @@ impl NoiseClient {
                     endpoint = central_direct_history_endpoint(&peer, None, Some(cursor));
                     let next = central_direct_history_page(central, &endpoint).await?;
                     validate_central_direct_page(&self_public_key, &peer, &next.events)?;
+                    for receipt in &next.receipts {
+                        receipts.insert(receipt.event_id.clone(), receipt.clone());
+                    }
                     anyhow::ensure!(
                         next.events
                             .last()
@@ -11712,6 +11916,7 @@ impl NoiseClient {
             events,
             has_older_events,
             latest_event_ids,
+            receipts,
         ))
     }
 
@@ -11922,6 +12127,7 @@ impl NoiseClient {
         Ok(Some(GroupEventPage {
             events: merge_group_events(group_id, merged),
             has_more,
+            receipts: Vec::new(),
             continuation_cursor,
         }))
     }
@@ -12285,6 +12491,7 @@ fn decrypt_direct_event(
                     && validate_reply_reference(reply_to_message_id.as_deref()).is_ok() =>
                 {
                     let direct_message_policy = sender_profile.effective_direct_message_policy();
+                    let receipt = state.direct_event_cache.receipts.get(&event.event_id);
                     return Some(DecryptedDirectEvent::Message(DecryptedDirectMessage {
                         counterparty_public_key: contact.public_key.clone(),
                         contact: contact.clone(),
@@ -12307,6 +12514,12 @@ fn decrypt_direct_event(
                             reply_to_message_id,
                             forwarded_from,
                             created_at_millis: event.created_at_millis,
+                            expires_after_read_seconds: event.expires_after_read_seconds,
+                            delivered_at_millis: receipt
+                                .and_then(|receipt| receipt.delivered_at_millis),
+                            read_at_millis: receipt.and_then(|receipt| receipt.read_at_millis),
+                            expires_at_millis: receipt
+                                .and_then(|receipt| receipt.expires_at_millis),
                         },
                     }));
                 }
@@ -12345,6 +12558,7 @@ fn decrypt_direct_event(
             && validate_reply_reference(reply_to_message_id.as_deref()).is_ok() =>
         {
             let direct_message_policy = sender_profile.effective_direct_message_policy();
+            let receipt = state.direct_event_cache.receipts.get(&event.event_id);
             let contact = DirectContact {
                 public_key: event.author_public_key.clone(),
                 username: sender_profile.username.clone(),
@@ -12373,6 +12587,10 @@ fn decrypt_direct_event(
                     reply_to_message_id,
                     forwarded_from,
                     created_at_millis: event.created_at_millis,
+                    expires_after_read_seconds: event.expires_after_read_seconds,
+                    delivered_at_millis: receipt.and_then(|receipt| receipt.delivered_at_millis),
+                    read_at_millis: receipt.and_then(|receipt| receipt.read_at_millis),
+                    expires_at_millis: receipt.and_then(|receipt| receipt.expires_at_millis),
                 },
             }))
         }
@@ -13216,6 +13434,7 @@ fn compact_direct_event_cache(
         latest_cursor,
         has_older_events: has_older_hint || was_truncated,
         central_peer_latest_event_ids: HashMap::new(),
+        receipts: HashMap::new(),
     }
 }
 
@@ -13223,6 +13442,7 @@ fn compact_central_direct_event_cache(
     events: Vec<SignedEvent>,
     has_older_hint: bool,
     central_peer_latest_event_ids: HashMap<String, String>,
+    mut receipts: HashMap<String, DirectEventReceipt>,
 ) -> DirectEventCache {
     let mut merged = HashMap::<(String, u64), SignedEvent>::new();
     for event in events {
@@ -13250,11 +13470,17 @@ fn compact_central_direct_event_cache(
         let retained_start = events.len() - DIRECT_EVENT_CACHE_LIMIT;
         events.drain(..retained_start);
     }
+    let retained_event_ids = events
+        .iter()
+        .map(|event| event.event_id.as_str())
+        .collect::<HashSet<_>>();
+    receipts.retain(|event_id, _| retained_event_ids.contains(event_id.as_str()));
     DirectEventCache {
         events,
         latest_cursor,
         has_older_events: has_older_hint || was_truncated,
         central_peer_latest_event_ids,
+        receipts,
     }
 }
 
@@ -13311,6 +13537,7 @@ fn validate_central_direct_page(
 fn cached_direct_messages(state: &ClientState) -> anyhow::Result<Vec<DecryptedDirectMessage>> {
     let identity = state.identity()?;
     let self_public_key = identity.public_key_base64();
+    let now = current_millis();
     let mut messages = state
         .direct_event_cache
         .events
@@ -13325,6 +13552,10 @@ fn cached_direct_messages(state: &ClientState) -> anyhow::Result<Vec<DecryptedDi
                         .copied()
                         .unwrap_or_default()
                     && !state.is_content_hidden(&message.counterparty_public_key)
+                    && message
+                        .message
+                        .expires_at_millis
+                        .is_none_or(|expires_at| expires_at > now)
                     && (message.message.author_public_key == self_public_key
                         || !state
                             .direct_messages_blocked_at(message.message.created_at_millis)) =>
@@ -13373,6 +13604,10 @@ fn direct_inbox_from_messages(
                 ),
                 media_scope_id: identity.direct_scope_id(&contact.public_key)?,
                 messages,
+                disappearing_after_read_seconds: state
+                    .direct_disappearing_after_read_seconds
+                    .get(&contact.public_key)
+                    .copied(),
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -14682,6 +14917,54 @@ fn purge_group_cache(cache_path: &Path, group_id: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn purge_attachment_cache(
+    cache_path: &Path,
+    scope_id: &str,
+    attachment: &MediaAttachment,
+) -> anyhow::Result<()> {
+    if scope_id.len() != 64 || !scope_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("conversation has an invalid local cache identifier")
+    }
+    advance_media_cache_generation(scope_id);
+    if let Some(first_chunk) = attachment.chunks.first() {
+        let complete_file = cache_path.join("media").join(scope_id).join(format!(
+            "{}.{}",
+            first_chunk.blob_id,
+            media_extension(&attachment.mime_type)
+        ));
+        if complete_file.exists() {
+            fs::remove_file(&complete_file)
+                .with_context(|| format!("could not erase {}", complete_file.display()))?;
+        }
+    }
+    for chunk in &attachment.chunks {
+        let chunk_file = cache_path
+            .join("media-chunks")
+            .join(scope_id)
+            .join(format!("{}.chunk", chunk.blob_id));
+        if chunk_file.exists() {
+            fs::remove_file(&chunk_file)
+                .with_context(|| format!("could not erase {}", chunk_file.display()))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn purge_attachment_cache(
+    _cache_path: &Path,
+    scope_id: &str,
+    _attachment: &MediaAttachment,
+) -> anyhow::Result<()> {
+    if scope_id.len() != 64 || !scope_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("conversation has an invalid local cache identifier")
+    }
+    advance_media_cache_generation(scope_id);
+    WEB_MEDIA_CHUNKS.with(|cache| cache.borrow_mut().clear());
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn purge_profile_image_cache(cache_path: &Path) -> anyhow::Result<()> {
     let directory = cache_path.join("profile-blobs");
     if directory.exists() {
@@ -15282,6 +15565,7 @@ mod tests {
             active_direct_public_key: None,
             direct_deleted_before: HashMap::new(),
             direct_policy_rejected_through: HashMap::new(),
+            direct_disappearing_after_read_seconds: HashMap::new(),
             direct_closed_periods: Vec::new(),
             direct_latest_incoming: HashMap::new(),
             direct_latest_activity: HashMap::new(),

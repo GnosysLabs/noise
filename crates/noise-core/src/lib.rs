@@ -1704,6 +1704,8 @@ pub struct SignedEvent {
     pub author_public_key: String,
     pub author_sequence: u64,
     pub created_at_millis: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_after_read_seconds: Option<u32>,
     #[serde(default = "default_event_encryption_version")]
     pub encryption_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1725,6 +1727,17 @@ struct UnsignedEventV1<'a> {
     author_public_key: &'a str,
     author_sequence: u64,
     created_at_millis: u64,
+    nonce_base64: &'a str,
+    ciphertext_base64: &'a str,
+}
+
+#[derive(Serialize)]
+struct UnsignedExpiringEventV1<'a> {
+    group_id: &'a str,
+    author_public_key: &'a str,
+    author_sequence: u64,
+    created_at_millis: u64,
+    expires_after_read_seconds: u32,
     nonce_base64: &'a str,
     ciphertext_base64: &'a str,
 }
@@ -2014,7 +2027,34 @@ impl SignedEvent {
         forwarded_from: Option<ForwardedFrom>,
         author_sequence: u64,
     ) -> Result<Self, NoiseError> {
-        Self::create_legacy(
+        Self::direct_message_forwarded_expiring(
+            identity,
+            mailbox,
+            recipient_public_key,
+            sender_profile,
+            text,
+            attachment,
+            reply_to_message_id,
+            forwarded_from,
+            None,
+            author_sequence,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn direct_message_forwarded_expiring(
+        identity: &Identity,
+        mailbox: &GroupMembership,
+        recipient_public_key: impl Into<String>,
+        sender_profile: &Profile,
+        text: impl Into<String>,
+        attachment: Option<MediaAttachment>,
+        reply_to_message_id: Option<String>,
+        forwarded_from: Option<ForwardedFrom>,
+        expires_after_read_seconds: Option<u32>,
+        author_sequence: u64,
+    ) -> Result<Self, NoiseError> {
+        let mut event = Self::create_legacy(
             identity,
             mailbox,
             GroupEventPayload::DirectMessage {
@@ -2026,7 +2066,12 @@ impl SignedEvent {
                 forwarded_from,
             },
             author_sequence,
-        )
+        )?;
+        event.expires_after_read_seconds = expires_after_read_seconds;
+        let signing_bytes = event.signing_bytes()?;
+        event.signature_base64 = identity.sign(&signing_bytes);
+        event.event_id = event.calculate_id(&signing_bytes)?;
+        Ok(event)
     }
 
     pub fn direct_thread_deleted(
@@ -2151,6 +2196,7 @@ impl SignedEvent {
             author_public_key,
             author_sequence,
             created_at_millis: now_millis(),
+            expires_after_read_seconds: None,
             encryption_version: 1,
             epoch: None,
             stream_locator: None,
@@ -2203,6 +2249,7 @@ impl SignedEvent {
             author_public_key,
             author_sequence,
             created_at_millis,
+            expires_after_read_seconds: None,
             encryption_version: 2,
             epoch: Some(epoch),
             stream_locator: None,
@@ -2258,6 +2305,7 @@ impl SignedEvent {
             author_public_key,
             author_sequence,
             created_at_millis,
+            expires_after_read_seconds: None,
             encryption_version: 3,
             epoch: Some(epoch),
             stream_locator: Some(stream_locator),
@@ -2355,8 +2403,20 @@ impl SignedEvent {
             self.encryption_version,
             self.epoch,
             self.stream_locator.as_deref(),
+            self.expires_after_read_seconds,
         ) {
-            (1, None, None) => Ok(serde_json::to_vec(&UnsignedEventV1 {
+            (1, None, None, Some(expires_after_read_seconds)) => {
+                Ok(serde_json::to_vec(&UnsignedExpiringEventV1 {
+                    group_id: &self.group_id,
+                    author_public_key: &self.author_public_key,
+                    author_sequence: self.author_sequence,
+                    created_at_millis: self.created_at_millis,
+                    expires_after_read_seconds,
+                    nonce_base64: &self.nonce_base64,
+                    ciphertext_base64: &self.ciphertext_base64,
+                })?)
+            }
+            (1, None, None, None) => Ok(serde_json::to_vec(&UnsignedEventV1 {
                 group_id: &self.group_id,
                 author_public_key: &self.author_public_key,
                 author_sequence: self.author_sequence,
@@ -2364,7 +2424,7 @@ impl SignedEvent {
                 nonce_base64: &self.nonce_base64,
                 ciphertext_base64: &self.ciphertext_base64,
             })?),
-            (2, Some(epoch), None) => Ok(serde_json::to_vec(&UnsignedEventV2 {
+            (2, Some(epoch), None, None) => Ok(serde_json::to_vec(&UnsignedEventV2 {
                 encryption_version: self.encryption_version,
                 epoch,
                 group_id: &self.group_id,
@@ -2374,7 +2434,7 @@ impl SignedEvent {
                 nonce_base64: &self.nonce_base64,
                 ciphertext_base64: &self.ciphertext_base64,
             })?),
-            (3, Some(epoch), Some(stream_locator)) if valid_hex_id(stream_locator) => {
+            (3, Some(epoch), Some(stream_locator), None) if valid_hex_id(stream_locator) => {
                 Ok(serde_json::to_vec(&UnsignedEventV3 {
                     encryption_version: self.encryption_version,
                     epoch,
@@ -3986,11 +4046,40 @@ mod tests {
         assert_eq!(recipient_public_key, bob_public_key);
         assert_eq!(text, "secret hello");
 
+        let expiring = SignedEvent::direct_message_forwarded_expiring(
+            &alice,
+            &alice_view_of_bob_mailbox,
+            &bob_public_key,
+            &Profile {
+                username: "alice".into(),
+                bio: String::new(),
+                avatar: None,
+                album: None,
+                accepts_direct_messages: true,
+                direct_message_policy: DirectMessagePolicy::Everyone,
+            },
+            "temporary secret",
+            None,
+            None,
+            None,
+            Some(300),
+            1,
+        )
+        .unwrap();
+        assert_eq!(expiring.expires_after_read_seconds, Some(300));
+        expiring.verify().unwrap();
+        let round_trip: SignedEvent =
+            serde_json::from_slice(&serde_json::to_vec(&expiring).unwrap()).unwrap();
+        round_trip.verify().unwrap();
+        let mut tampered = round_trip;
+        tampered.expires_after_read_seconds = Some(301);
+        assert!(tampered.verify().is_err());
+
         let deletion = SignedEvent::direct_thread_deleted(
             &alice,
             &alice_view_of_bob_mailbox,
             &bob_public_key,
-            1,
+            2,
         )
         .unwrap();
         assert!(matches!(
@@ -4011,7 +4100,7 @@ mod tests {
                 direct_message_policy: DirectMessagePolicy::Everyone,
             },
             true,
-            2,
+            3,
         )
         .unwrap();
         assert!(matches!(

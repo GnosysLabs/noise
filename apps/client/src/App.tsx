@@ -36,6 +36,7 @@ import {
   Shield,
   ShieldOff,
   SmilePlus,
+  TimerReset,
   Trash2,
   TriangleAlert,
   UserPlus,
@@ -2069,6 +2070,7 @@ export default function App() {
     const marked = await noise<LocalSummary>({
       action: "mark_direct_read",
       public_key: publicKey,
+      relays,
     });
     if (marked) setSummary(marked);
     void noise({ action: "publish_read_state", relays }).catch(() => {
@@ -3754,11 +3756,8 @@ export default function App() {
     try {
       const local = await noise<LocalSummary>({ action: "select_direct", public_key: direct.public_key });
       if (generation !== refreshGeneration.current) return;
-      const marked = direct.has_unread
-        ? await noise<LocalSummary>({ action: "mark_direct_read", public_key: direct.public_key })
-        : local;
       if (generation !== refreshGeneration.current) return;
-      setSummary(marked);
+      setSummary(local);
       const fresh = await noise<DirectConversation>({ action: "direct_conversation", relays });
       const reconciled = await noise<LocalSummary>({ action: "status" });
       if (generation !== refreshGeneration.current) return;
@@ -4487,6 +4486,45 @@ export default function App() {
                 message: item,
                 sourceScopeId: selectedDirectConversation.media_scope_id,
               })}
+              onSetDisappearing={async (seconds) => {
+                const publicKey = selectedDirectConversation.contact.public_key;
+                return perform(async () => {
+                  const local = await noise<LocalSummary>({
+                    action: "set_direct_disappearing_after_read",
+                    public_key: publicKey,
+                    seconds,
+                    relays,
+                  });
+                  if (!local) throw new Error("disappearing-message settings could not be saved");
+                  setSummary(local);
+                  const update = (current: DirectConversation): DirectConversation => ({
+                    ...current,
+                    disappearing_after_read_seconds: seconds,
+                  });
+                  const cached = directConversationCache.current.get(publicKey);
+                  if (cached) directConversationCache.current.set(publicKey, update(cached));
+                  setDirectConversation((current) =>
+                    current?.contact.public_key === publicKey ? update(current) : current
+                  );
+                }, false);
+              }}
+              onMessagesExpired={async () => {
+                const publicKey = selectedDirectConversation.contact.public_key;
+                try {
+                  const fresh = await noise<DirectConversation>({
+                    action: "direct_conversation",
+                    relays,
+                  });
+                  if (!fresh || fresh.contact.public_key !== publicKey) return;
+                  directConversationCache.current.set(publicKey, fresh);
+                  setDirectConversation((current) =>
+                    current?.contact.public_key === publicKey ? fresh : current
+                  );
+                } catch {
+                  // The message is already hidden by its authoritative expiry
+                  // timestamp. The normal sync loop retries local cache purging.
+                }
+              }}
               onSend={async (text, pending, onProgress, replyToMessageId, signal) => {
                 const publicKey = selectedDirectConversation.contact.public_key;
                 let optimistic = pending
@@ -6301,7 +6339,7 @@ function ConversationPanel({
   );
 }
 
-function DirectConversationPanel({ conversation, contact, active, busy, self, selfPresence, contactPresence, messageJump, onPerson, onAlbum, onBlock, onDelete, onDownload, onForward, onSend }: { conversation: DirectConversation; contact: DirectSummary; active: boolean; busy: boolean; self: IdentitySummary; selfPresence: PresenceStatus; contactPresence: PresenceStatus; messageJump: { eventId: string; nonce: number } | null; onPerson: (person: PersonSummary) => void; onAlbum: (person: PersonSummary) => void; onBlock: (person: PersonSummary) => void; onDelete: () => void; onDownload: (message: MessageSummary) => Promise<boolean>; onForward: (message: MessageSummary) => void; onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null, signal: AbortSignal) => Promise<boolean> }) {
+function DirectConversationPanel({ conversation, contact, active, busy, self, selfPresence, contactPresence, messageJump, onPerson, onAlbum, onBlock, onDelete, onDownload, onForward, onSetDisappearing, onMessagesExpired, onSend }: { conversation: DirectConversation; contact: DirectSummary; active: boolean; busy: boolean; self: IdentitySummary; selfPresence: PresenceStatus; contactPresence: PresenceStatus; messageJump: { eventId: string; nonce: number } | null; onPerson: (person: PersonSummary) => void; onAlbum: (person: PersonSummary) => void; onBlock: (person: PersonSummary) => void; onDelete: () => void; onDownload: (message: MessageSummary) => Promise<boolean>; onForward: (message: MessageSummary) => void; onSetDisappearing: (seconds: number | null) => Promise<boolean>; onMessagesExpired: () => Promise<void>; onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null, signal: AbortSignal) => Promise<boolean> }) {
   const [draft, setDraft] = useState("");
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const composerUploadKey = `direct:${contact.public_key}`;
@@ -6315,13 +6353,37 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
   } = useComposerUpload(composerUploadKey);
   const [messageMenu, setMessageMenu] = useState<{ message: MessageSummary; x: number; y: number } | null>(null);
   const [replyingTo, setReplyingTo] = useState<MessageSummary | null>(null);
+  const [expiryClock, setExpiryClock] = useState(() => Date.now());
   const fileInput = useRef<HTMLInputElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
+  const onMessagesExpiredRef = useRef(onMessagesExpired);
+  useEffect(() => {
+    onMessagesExpiredRef.current = onMessagesExpired;
+  }, [onMessagesExpired]);
   useAutosizeComposer(composerInput, draft);
+  const visibleMessages = conversation.messages.filter(
+    (message) => !message.expires_at_millis || message.expires_at_millis > expiryClock,
+  );
   const messageList = useChunkedMessageList(
     contact.public_key,
-    conversation.messages,
+    visibleMessages,
   );
+  useEffect(() => {
+    const nextExpiry = conversation.messages.reduce<number | null>((next, message) => {
+      const expiry = message.expires_at_millis;
+      if (!expiry || expiry <= expiryClock) return next;
+      return next === null ? expiry : Math.min(next, expiry);
+    }, null);
+    if (nextExpiry === null) return;
+    const timer = window.setTimeout(
+      () => {
+        setExpiryClock(Date.now());
+        void onMessagesExpiredRef.current();
+      },
+      Math.max(25, Math.min(2_147_000_000, nextExpiry - Date.now() + 25)),
+    );
+    return () => window.clearTimeout(timer);
+  }, [conversation.messages, expiryClock]);
   useEffect(() => {
     if (!messageJump || !messageList.revealMessage(messageJump.eventId)) return;
     const timer = window.setTimeout(() => {
@@ -6413,7 +6475,7 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
         <div className="chat-header-actions"><button className="icon-button media-button delete-direct-button" onClick={onDelete} aria-label="delete conversation" title="delete conversation"><Trash2 size={16} /></button>{busy && <LoaderCircle className="spinner" size={14} />}</div>
       </header>
       <div className="messages" ref={messageList.ref} onScroll={messageList.onScroll}>
-        {conversation.messages.length === 0 && <div className="quiet">start the conversation</div>}
+        {visibleMessages.length === 0 && <div className="quiet">start the conversation</div>}
         {messageList.canLoadOlder && (
           <OlderMessagesSentinel
             loading={messageList.loadingOlder}
@@ -6426,7 +6488,7 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
             messageList.visibleMessages[index - 1].created_at_millis,
             rawItem.created_at_millis,
           );
-          const rawReply = conversation.messages.find(
+          const rawReply = visibleMessages.find(
             (candidate) => candidate.message_id === item.reply_to_message_id,
           );
           const replyTo = rawReply ? withCurrentDirectProfile(rawReply, self, contact) : undefined;
@@ -6454,6 +6516,25 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
         </button>
         <div className="noise-signature"><small>noise signature</small><strong>{noiseSignature(contact.public_key)}</strong></div>
         <p>{contact.bio || "no bio yet"}</p>
+        <label className="direct-disappearing-setting">
+          <span><TimerReset size={14} /><strong>disappearing messages</strong></span>
+          <select
+            disabled={busy}
+            value={conversation.disappearing_after_read_seconds ?? ""}
+            onChange={(event) => {
+              const value = event.target.value;
+              void onSetDisappearing(value ? Number(value) : null);
+            }}
+          >
+            <option value="">off</option>
+            <option value="300">5 minutes after read</option>
+            <option value="3600">1 hour after read</option>
+            <option value="86400">1 day after read</option>
+            <option value="604800">1 week after read</option>
+            <option value="2419200">4 weeks after read</option>
+          </select>
+          <small>Applies to new messages you send.</small>
+        </label>
         <div className="direct-profile-actions">
           <button className="profile-album" onClick={() => onAlbum(person)}><Images size={14} /> {albumButtonLabel(contact.album)}</button>
           <button className="profile-block" onClick={() => onBlock(person)}><ShieldOff size={14} /> block</button>
@@ -6610,11 +6691,45 @@ function MessageRow({
         {localAttachment
           ? <LocalMessageMedia attachment={localAttachment} manifest={message.attachment} scopeId={mediaScopeId} uploadProgress={message.upload_progress} uploadError={message.upload_error} />
           : message.attachment && <MessageMedia attachment={message.attachment} scopeId={mediaScopeId} />}
-        <time className="message-time">{formatTime(message.created_at_millis)}</time>
+        <div className="message-footer">
+          <time className="message-time">{formatTime(message.created_at_millis)}</time>
+          {message.expires_after_read_seconds && (
+            <span className="message-expiry" title={`disappears ${formatDisappearingDuration(message.expires_after_read_seconds)} after it is read`} aria-label={`disappears ${formatDisappearingDuration(message.expires_after_read_seconds)} after it is read`}>
+              <TimerReset size={11} />
+            </span>
+          )}
+          {own && message.read_at_millis ? (
+            <span className="direct-receipt read" title="read" aria-label="read">
+              <Check size={11} />
+              <Check size={11} />
+            </span>
+          ) : own && message.delivered_at_millis ? (
+            <span className="direct-receipt delivered" title="delivered" aria-label="delivered">
+              <Check size={11} />
+            </span>
+          ) : null}
+        </div>
         {message.reactions && message.reactions.length > 0 && <MessageReactions reactions={message.reactions} people={reactionPeople} onToggle={onToggleReaction} onPerson={onPerson} />}
       </div>
     </article>
   );
+}
+
+function formatDisappearingDuration(seconds: number) {
+  if (seconds % 604800 === 0) {
+    const weeks = seconds / 604800;
+    return `${weeks} ${weeks === 1 ? "week" : "weeks"}`;
+  }
+  if (seconds % 86400 === 0) {
+    const days = seconds / 86400;
+    return `${days} ${days === 1 ? "day" : "days"}`;
+  }
+  if (seconds % 3600 === 0) {
+    const hours = seconds / 3600;
+    return `${hours} ${hours === 1 ? "hour" : "hours"}`;
+  }
+  const minutes = Math.max(1, Math.round(seconds / 60));
+  return `${minutes} ${minutes === 1 ? "minute" : "minutes"}`;
 }
 
 function MessageDateSeparator({ millis }: { millis: number }) {

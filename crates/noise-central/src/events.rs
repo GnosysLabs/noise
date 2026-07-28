@@ -19,6 +19,8 @@ use super::{
 const DEFAULT_PAGE_SIZE: u16 = 100;
 const MAX_PAGE_SIZE: u16 = 128;
 const MAX_EVENT_CIPHERTEXT_BYTES: usize = 2_000_016;
+const MIN_DISAPPEARING_SECONDS: u32 = 60;
+const MAX_DISAPPEARING_SECONDS: u32 = 28 * 24 * 60 * 60;
 
 #[derive(Deserialize)]
 pub struct EventsAfterQuery {
@@ -66,6 +68,12 @@ pub struct DirectEventPublication {
     event: SignedEvent,
 }
 
+#[derive(Deserialize)]
+pub struct DirectReadReceiptRequest {
+    peer_public_key: String,
+    through_event_id: String,
+}
+
 #[derive(Serialize)]
 pub struct EventAcceptance {
     status: &'static str,
@@ -90,6 +98,16 @@ pub struct CanonicalEventPage {
 pub struct ClientEventPage {
     events: Vec<SignedEvent>,
     has_more: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    receipts: Vec<DirectEventReceipt>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct DirectEventReceipt {
+    event_id: String,
+    delivered_at_millis: Option<i64>,
+    read_at_millis: Option<i64>,
+    expires_at_millis: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -105,6 +123,11 @@ pub async fn publish_group_event(
     headers: HeaderMap,
     Json(event): Json<SignedEvent>,
 ) -> Result<(StatusCode, Json<EventAcceptance>), ApiError> {
+    if event.expires_after_read_seconds.is_some() {
+        return Err(ApiError::bad_request(
+            "group_event_cannot_expire_after_read",
+        ));
+    }
     event
         .verify()
         .map_err(|_| ApiError::bad_request("invalid_event"))?;
@@ -412,6 +435,7 @@ async fn client_group_events(
         return Ok(Json(ClientEventPage {
             events: Vec::new(),
             has_more: false,
+            receipts: Vec::new(),
         }));
     };
     let boundary = match &position {
@@ -477,6 +501,7 @@ async fn client_group_events(
     Ok(Json(ClientEventPage {
         events: events.into_iter().map(|event| event.event).collect(),
         has_more,
+        receipts: Vec::new(),
     }))
 }
 
@@ -494,6 +519,15 @@ pub async fn publish_direct_event(
         || request.event.stream_locator.is_some()
     {
         return Err(ApiError::bad_request("invalid_direct_event"));
+    }
+    if request
+        .event
+        .expires_after_read_seconds
+        .is_some_and(|seconds| {
+            !(MIN_DISAPPEARING_SECONDS..=MAX_DISAPPEARING_SECONDS).contains(&seconds)
+        })
+    {
+        return Err(ApiError::bad_request("invalid_disappearing_duration"));
     }
     let session = authenticate_session(&state, &headers).await?;
     let decoded = DecodedEvent::new(&request.event)?;
@@ -654,16 +688,20 @@ pub async fn publish_direct_event(
     let canonical_cursor: i64 = cursor_row.get(0);
     let author_sequence = request.event.author_sequence.to_string();
     let created_at_millis = request.event.created_at_millis.to_string();
+    let expires_after_read_seconds = request
+        .event
+        .expires_after_read_seconds
+        .map(|seconds| seconds as i32);
     transaction
         .execute(
             "INSERT INTO noise.events (
                 event_id, canonical_cursor, scope_kind, protocol_scope_id,
                 direct_thread_pk, stream_pk, author_account_id, author_sequence,
                 created_at_millis, encryption_version, nonce, ciphertext,
-                signature, signed_wire_record
+                signature, signed_wire_record, expires_after_read_seconds
              ) VALUES (
                 $1, $2, 'direct', $3, $4, $5, $6, $7::text::numeric,
-                $8::text::numeric, 1, $9, $10, $11, $12
+                $8::text::numeric, 1, $9, $10, $11, $12, $13
              )",
             &[
                 &decoded.event_id.as_slice(),
@@ -678,10 +716,20 @@ pub async fn publish_direct_event(
                 &decoded.ciphertext,
                 &decoded.signature.as_slice(),
                 &signed_wire_record,
+                &expires_after_read_seconds,
             ],
         )
         .await
         .map_err(event_conflict)?;
+    transaction
+        .execute(
+            "INSERT INTO noise.direct_event_receipts (
+                event_id, recipient_account_id
+             ) VALUES ($1, $2)",
+            &[&decoded.event_id.as_slice(), &recipient_account_id],
+        )
+        .await
+        .map_err(ApiError::database)?;
     transaction
         .execute(
             "UPDATE noise.streams
@@ -854,6 +902,7 @@ pub async fn client_direct_history(
         return Ok(Json(ClientEventPage {
             events: Vec::new(),
             has_more: false,
+            receipts: Vec::new(),
         }));
     };
     let boundary_id = query
@@ -906,10 +955,89 @@ pub async fn client_direct_history(
             events.remove(0);
         }
     }
+    record_direct_delivery(&client, &session, &events).await?;
+    let receipts = direct_receipts_for_stream(&client, &session, stream.stream_pk).await?;
     Ok(Json(ClientEventPage {
         events: events.into_iter().map(|event| event.event).collect(),
         has_more,
+        receipts,
     }))
+}
+
+pub async fn mark_direct_read(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<DirectReadReceiptRequest>,
+) -> Result<StatusCode, ApiError> {
+    let session = authenticate_session(&state, &headers).await?;
+    let client = state
+        .database
+        .pool
+        .get()
+        .await
+        .map_err(ApiError::database)?;
+    let stream = find_direct_stream(&client, &session, &request.peer_public_key)
+        .await?
+        .ok_or_else(|| ApiError::not_found("direct_thread_unavailable"))?;
+    let through_event_id = decode_hex_32(&request.through_event_id, "invalid_event")?;
+    let boundary = client
+        .query_opt(
+            "SELECT canonical_cursor
+             FROM noise.events
+             WHERE event_id = $1
+               AND stream_pk = $2
+               AND author_account_id <> $3",
+            &[
+                &through_event_id.as_slice(),
+                &stream.stream_pk,
+                &session.account_id,
+            ],
+        )
+        .await
+        .map_err(ApiError::database)?
+        .map(|row| row.get::<_, i64>(0))
+        .ok_or_else(|| ApiError::bad_request("invalid_read_boundary"))?;
+    let rows = client
+        .query(
+            "UPDATE noise.direct_event_receipts receipt
+             SET delivered_at = COALESCE(receipt.delivered_at, clock_timestamp()),
+                 read_at = COALESCE(receipt.read_at, clock_timestamp()),
+                 expires_at = CASE
+                     WHEN receipt.read_at IS NULL
+                       AND event.expires_after_read_seconds IS NOT NULL
+                     THEN clock_timestamp()
+                        + (event.expires_after_read_seconds * interval '1 second')
+                     ELSE receipt.expires_at
+                 END
+             FROM noise.events event
+             WHERE receipt.event_id = event.event_id
+               AND receipt.recipient_account_id = $1
+               AND event.stream_pk = $2
+               AND event.author_account_id <> $1
+               AND event.canonical_cursor <= $3
+               AND receipt.read_at IS NULL
+             RETURNING event.event_id",
+            &[&session.account_id, &stream.stream_pk, &boundary],
+        )
+        .await
+        .map_err(ApiError::database)?;
+    for row in rows {
+        let event_id: Vec<u8> = row.get(0);
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "through_event_id": request.through_event_id,
+        }))
+        .map_err(ApiError::database)?;
+        client
+            .execute(
+                "INSERT INTO noise.outbox_events (
+                    topic, aggregate_kind, aggregate_id, payload
+                 ) VALUES ('direct.read', 'event', $1, $2)",
+                &[&event_id, &payload],
+            )
+            .await
+            .map_err(ApiError::database)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 struct DecodedEvent {
@@ -1209,6 +1337,80 @@ async fn find_stream<C: GenericClient + Sync>(
     }))
 }
 
+async fn record_direct_delivery<C: GenericClient + Sync>(
+    client: &C,
+    session: &AuthenticatedSession,
+    events: &[CanonicalEvent],
+) -> Result<(), ApiError> {
+    for event in events.iter().filter(|event| {
+        event.event.author_public_key != STANDARD_NO_PAD.encode(session.identity_public_key)
+    }) {
+        let event_id = decode_hex_32(&event.event.event_id, "invalid_event")?;
+        let updated = client
+            .execute(
+                "UPDATE noise.direct_event_receipts
+                 SET delivered_at = clock_timestamp()
+                 WHERE event_id = $1
+                   AND recipient_account_id = $2
+                   AND delivered_at IS NULL",
+                &[&event_id.as_slice(), &session.account_id],
+            )
+            .await
+            .map_err(ApiError::database)?;
+        if updated == 0 {
+            continue;
+        }
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "event_id": event.event.event_id,
+        }))
+        .map_err(ApiError::database)?;
+        client
+            .execute(
+                "INSERT INTO noise.outbox_events (
+                    topic, aggregate_kind, aggregate_id, payload
+                 ) VALUES ('direct.delivered', 'event', $1, $2)",
+                &[&event_id.as_slice(), &payload],
+            )
+            .await
+            .map_err(ApiError::database)?;
+    }
+    Ok(())
+}
+
+async fn direct_receipts_for_stream<C: GenericClient + Sync>(
+    client: &C,
+    session: &AuthenticatedSession,
+    stream_pk: i64,
+) -> Result<Vec<DirectEventReceipt>, ApiError> {
+    let rows = client
+        .query(
+            "SELECT encode(event.event_id, 'hex'),
+                    (extract(epoch FROM receipt.delivered_at) * 1000)::bigint,
+                    (extract(epoch FROM receipt.read_at) * 1000)::bigint,
+                    (extract(epoch FROM receipt.expires_at) * 1000)::bigint
+             FROM noise.events event
+             JOIN noise.direct_event_receipts receipt
+               ON receipt.event_id = event.event_id
+             WHERE event.stream_pk = $1
+               AND (event.author_account_id = $2
+                    OR receipt.recipient_account_id = $2)
+             ORDER BY event.canonical_cursor DESC
+             LIMIT 1024",
+            &[&stream_pk, &session.account_id],
+        )
+        .await
+        .map_err(ApiError::database)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| DirectEventReceipt {
+            event_id: row.get(0),
+            delivered_at_millis: row.get(1),
+            read_at_millis: row.get(2),
+            expires_at_millis: row.get(3),
+        })
+        .collect())
+}
+
 async fn read_events_after<C: GenericClient + Sync>(
     client: &C,
     stream_pk: i64,
@@ -1223,11 +1425,14 @@ async fn read_events_after<C: GenericClient + Sync>(
              LEFT JOIN noise.event_restrictions er
                ON er.event_id = e.event_id
               AND (er.expires_at IS NULL OR er.expires_at > clock_timestamp())
+             LEFT JOIN noise.direct_event_receipts dr
+               ON dr.event_id = e.event_id
              WHERE e.stream_pk = $1
                AND e.canonical_cursor > $2
                AND e.canonical_cursor <= $3
                AND e.hidden_at IS NULL
                AND er.event_id IS NULL
+               AND (dr.expires_at IS NULL OR dr.expires_at > clock_timestamp())
              ORDER BY e.canonical_cursor ASC
              LIMIT $4",
             &[&stream_pk, &after, &high_water, &(limit as i64)],
@@ -1252,10 +1457,13 @@ async fn read_latest_events<C: GenericClient + Sync>(
                 LEFT JOIN noise.event_restrictions er
                   ON er.event_id = e.event_id
                  AND (er.expires_at IS NULL OR er.expires_at > clock_timestamp())
+                LEFT JOIN noise.direct_event_receipts dr
+                  ON dr.event_id = e.event_id
                 WHERE e.stream_pk = $1
                   AND e.canonical_cursor <= $2
                   AND e.hidden_at IS NULL
                   AND er.event_id IS NULL
+                  AND (dr.expires_at IS NULL OR dr.expires_at > clock_timestamp())
                 ORDER BY e.canonical_cursor DESC
                 LIMIT $3
              ) latest
