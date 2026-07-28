@@ -9053,22 +9053,31 @@ impl NoiseClient {
         if group.owner_public_key == identity.public_key_base64() {
             bail!("the founder must delete the group instead of leaving it")
         }
+        // Leaving must never be held hostage by missing remote history or a
+        // stale MLS epoch. Build and publish the signed departure when this
+        // installation still has enough group state, but always erase the
+        // local membership below. Otherwise an obsolete group can become
+        // impossible to remove from the app.
         let event = create_group_event(
             &state,
             &identity,
             &group,
             GroupEventPayload::MemberLeft,
             sequence,
-        )?;
+        )
+        .ok();
         let removal_request = state
             .mls_control_logs
             .contains_key(&group.group_id)
             .then(|| MlsRemovalRequest::self_left(&identity, group.group_id.clone()))
-            .transpose()?;
-        save_state(path, &state)?;
-        self.publish_event(&relays, &event).await?;
+            .transpose()
+            .ok()
+            .flatten();
+        if let Some(event) = event {
+            let _ = self.publish_event(&relays, &event).await;
+        }
         if let Some(request) = removal_request {
-            self.publish_mls_removal_request(&relays, &request).await?;
+            let _ = self.publish_mls_removal_request(&relays, &request).await;
         }
         purge_group_cache(cache_path.as_ref(), &group.group_id)?;
         purge_profile_image_cache(cache_path.as_ref())?;
