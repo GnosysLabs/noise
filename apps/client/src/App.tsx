@@ -683,13 +683,6 @@ const mediaPreparationPromises = new Map<string, Promise<void>>();
 const decodedImageCache = new Set<string>();
 const MEDIA_DIMENSIONS_STORAGE_KEY = "noise.media-dimensions.v1";
 const mediaDimensionCache = loadStoredMediaDimensions();
-type StickerContentBounds = {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-};
-const stickerContentBoundsCache = new Map<string, StickerContentBounds>();
 const sentMediaPreviewCache = new Map<string, NonNullable<MessageSummary["local_attachment"]>>();
 const imagePosterCache = new Map<string, string>();
 const videoPosterCache = new Map<string, string>();
@@ -7734,83 +7727,6 @@ function mediaFrameStyle(
   };
 }
 
-function stickerFrameStyle(
-  dimensions: { width: number; height: number } | null,
-  bounds: StickerContentBounds | null,
-): CSSProperties {
-  const naturalWidth = dimensions?.width ?? 320;
-  const naturalHeight = dimensions?.height ?? 320;
-  const contentWidth = naturalWidth * (bounds?.width ?? 1);
-  const contentHeight = naturalHeight * (bounds?.height ?? 1);
-  const scale = Math.min(1, 320 / contentWidth, 360 / contentHeight);
-  const displayWidth = Math.max(1, Math.round(contentWidth * scale));
-  const displayHeight = Math.max(1, Math.round(contentHeight * scale));
-  return {
-    width: `${displayWidth}px`,
-    maxWidth: "100%",
-    aspectRatio: `${displayWidth} / ${displayHeight}`,
-  };
-}
-
-function stickerImageStyle(
-  bounds: StickerContentBounds | null,
-): CSSProperties | undefined {
-  if (!bounds) return undefined;
-  return {
-    inset: "auto",
-    left: `${(-bounds.x / bounds.width) * 100}%`,
-    top: `${(-bounds.y / bounds.height) * 100}%`,
-    width: `${100 / bounds.width}%`,
-    height: `${100 / bounds.height}%`,
-  };
-}
-
-function measureStickerContent(image: HTMLImageElement): StickerContentBounds | null {
-  try {
-    const maximumSampleEdge = 384;
-    const scale = Math.min(
-      1,
-      maximumSampleEdge / Math.max(image.naturalWidth, image.naturalHeight),
-    );
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
-    canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
-    const context = canvas.getContext("2d", { willReadFrequently: true });
-    if (!context) return null;
-    context.drawImage(image, 0, 0, canvas.width, canvas.height);
-    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
-    let left = canvas.width;
-    let top = canvas.height;
-    let right = -1;
-    let bottom = -1;
-    for (let y = 0; y < canvas.height; y += 1) {
-      for (let x = 0; x < canvas.width; x += 1) {
-        if (pixels[(y * canvas.width + x) * 4 + 3] < 12) continue;
-        left = Math.min(left, x);
-        top = Math.min(top, y);
-        right = Math.max(right, x);
-        bottom = Math.max(bottom, y);
-      }
-    }
-    if (right < left || bottom < top) return null;
-    const paddingX = Math.max(2, Math.round(canvas.width * 0.025));
-    const paddingY = Math.max(2, Math.round(canvas.height * 0.025));
-    left = Math.max(0, left - paddingX);
-    top = Math.max(0, top - paddingY);
-    right = Math.min(canvas.width - 1, right + paddingX);
-    bottom = Math.min(canvas.height - 1, bottom + paddingY);
-    const bounds = {
-      x: left / canvas.width,
-      y: top / canvas.height,
-      width: (right - left + 1) / canvas.width,
-      height: (bottom - top + 1) / canvas.height,
-    };
-    return bounds.width < 0.98 || bounds.height < 0.98 ? bounds : null;
-  } catch {
-    return null;
-  }
-}
-
 function rememberMediaDimensions(cacheKey: string, width: number, height: number) {
   if (
     !Number.isFinite(width)
@@ -7893,16 +7809,12 @@ function ChatImage({
       && (suppliedDimensions || mediaDimensionCache.has(cacheKey))
     ),
   );
-  const [stickerBounds, setStickerBounds] = useState<StickerContentBounds | null>(
-    () => sticker ? stickerContentBoundsCache.get(cacheKey) ?? null : null,
-  );
   const [expanded, setExpanded] = useState(false);
   useEffect(() => {
     const knownDimensions = suppliedDimensions ?? mediaDimensionCache.get(cacheKey) ?? null;
     setDimensions(knownDimensions);
     setReady(Boolean(source && decodedImageCache.has(cacheKey) && knownDimensions));
-    setStickerBounds(sticker ? stickerContentBoundsCache.get(cacheKey) ?? null : null);
-  }, [cacheKey, pixelHeight, pixelWidth, source, sticker]);
+  }, [cacheKey, pixelHeight, pixelWidth, source]);
   useEffect(() => {
     if (!expanded) return;
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -7911,9 +7823,7 @@ function ChatImage({
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [expanded]);
-  const style = sticker
-    ? stickerFrameStyle(dimensions, stickerBounds)
-    : mediaFrameStyle(dimensions?.width, dimensions?.height);
+  const style = mediaFrameStyle(dimensions?.width, dimensions?.height);
   const visibleSource = source ?? preview;
   const lightboxRoot = document.querySelector<HTMLElement>(".app-shell")
     ?? document.body;
@@ -7944,7 +7854,6 @@ function ChatImage({
         <img
           className={ready ? "ready" : ""}
           src={source}
-          style={sticker ? stickerImageStyle(stickerBounds) : undefined}
           alt="shared media"
           onLoad={(event) => {
             const image = event.currentTarget;
@@ -7954,11 +7863,6 @@ function ChatImage({
             };
             rememberMediaDimensions(cacheKey, measured.width, measured.height);
             setDimensions(measured);
-            if (sticker) {
-              const bounds = measureStickerContent(image);
-              if (bounds) stickerContentBoundsCache.set(cacheKey, bounds);
-              setStickerBounds(bounds);
-            }
             decodedImageCache.add(cacheKey);
             setReady(true);
           }}
