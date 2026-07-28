@@ -1670,6 +1670,13 @@ pub enum GroupEventPayload {
     DirectThreadDeleted {
         recipient_public_key: String,
     },
+    DirectThreadCleared {
+        recipient_public_key: String,
+    },
+    DirectMessageDeleted {
+        recipient_public_key: String,
+        message_id: String,
+    },
     DirectBlockChanged {
         recipient_public_key: String,
         sender_profile: Profile,
@@ -2085,6 +2092,40 @@ impl SignedEvent {
             mailbox,
             GroupEventPayload::DirectThreadDeleted {
                 recipient_public_key: recipient_public_key.into(),
+            },
+            author_sequence,
+        )
+    }
+
+    pub fn direct_thread_cleared(
+        identity: &Identity,
+        mailbox: &GroupMembership,
+        recipient_public_key: impl Into<String>,
+        author_sequence: u64,
+    ) -> Result<Self, NoiseError> {
+        Self::create_legacy(
+            identity,
+            mailbox,
+            GroupEventPayload::DirectThreadCleared {
+                recipient_public_key: recipient_public_key.into(),
+            },
+            author_sequence,
+        )
+    }
+
+    pub fn direct_message_deleted(
+        identity: &Identity,
+        mailbox: &GroupMembership,
+        recipient_public_key: impl Into<String>,
+        message_id: impl Into<String>,
+        author_sequence: u64,
+    ) -> Result<Self, NoiseError> {
+        Self::create_legacy(
+            identity,
+            mailbox,
+            GroupEventPayload::DirectMessageDeleted {
+                recipient_public_key: recipient_public_key.into(),
+                message_id: message_id.into(),
             },
             author_sequence,
         )
@@ -3045,6 +3086,8 @@ impl GroupState {
                 }
                 GroupEventPayload::DirectMessage { .. }
                 | GroupEventPayload::DirectThreadDeleted { .. }
+                | GroupEventPayload::DirectThreadCleared { .. }
+                | GroupEventPayload::DirectMessageDeleted { .. }
                 | GroupEventPayload::DirectBlockChanged { .. } => {
                     state.rejected_events += 1;
                 }
@@ -4087,6 +4130,34 @@ mod tests {
             GroupEventPayload::DirectThreadDeleted { recipient_public_key } if recipient_public_key == bob_public_key
         ));
 
+        let clear = SignedEvent::direct_thread_cleared(
+            &alice,
+            &alice_view_of_bob_mailbox,
+            &bob_public_key,
+            3,
+        )
+        .unwrap();
+        assert!(matches!(
+            clear.decrypt(&bob_view_of_bob_mailbox).unwrap(),
+            GroupEventPayload::DirectThreadCleared { recipient_public_key } if recipient_public_key == bob_public_key
+        ));
+
+        let message_deletion = SignedEvent::direct_message_deleted(
+            &alice,
+            &alice_view_of_bob_mailbox,
+            &bob_public_key,
+            "event-to-delete",
+            4,
+        )
+        .unwrap();
+        assert!(matches!(
+            message_deletion.decrypt(&bob_view_of_bob_mailbox).unwrap(),
+            GroupEventPayload::DirectMessageDeleted {
+                recipient_public_key,
+                message_id,
+            } if recipient_public_key == bob_public_key && message_id == "event-to-delete"
+        ));
+
         let block = SignedEvent::direct_block_changed(
             &alice,
             &alice_view_of_bob_mailbox,
@@ -4100,7 +4171,7 @@ mod tests {
                 direct_message_policy: DirectMessagePolicy::Everyone,
             },
             true,
-            3,
+            5,
         )
         .unwrap();
         assert!(matches!(

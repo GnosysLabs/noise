@@ -131,6 +131,7 @@ type Dialog =
   | { type: "leave_group"; group: GroupSummary }
   | { type: "delete_group"; group: GroupSummary }
   | { type: "delete_direct"; direct: DirectSummary }
+  | { type: "delete_direct_message"; message: MessageSummary; publicKey: string; scopeId: string }
   | { type: "delete_account" }
   | { type: "logout" }
   | { type: "search" }
@@ -4472,6 +4473,12 @@ export default function App() {
               onAlbum={(person) => setDialog({ type: "album", person, editable: false })}
               onBlock={(person) => setDialog({ type: "block_person", person })}
               onDelete={() => setDialog({ type: "delete_direct", direct: selectedDirectConversation.contact })}
+              onDeleteMessage={(item) => setDialog({
+                type: "delete_direct_message",
+                message: item,
+                publicKey: selectedDirectConversation.contact.public_key,
+                scopeId: selectedDirectConversation.media_scope_id,
+              })}
               onDownload={(item) => perform(async () => {
                 if (!item.attachment) throw new Error("this message has no media");
                 if (!await downloadAttachment(
@@ -5046,6 +5053,27 @@ export default function App() {
           direct={dialog.direct}
           busy={busy}
           onClose={() => setDialog(null)}
+          onClear={() => perform(async () => {
+            const publicKey = dialog.direct.public_key;
+            const local = await noise<LocalSummary>({
+              action: "clear_direct",
+              public_key: publicKey,
+              relays,
+            });
+            const clearMessages = (current: DirectConversation): DirectConversation => ({
+              ...current,
+              messages: [],
+            });
+            const cached = directConversationCache.current.get(publicKey);
+            if (cached) directConversationCache.current.set(publicKey, clearMessages(cached));
+            setDirectConversation((current) =>
+              current?.contact.public_key === publicKey ? clearMessages(current) : current
+            );
+            setSummary(local);
+            clearMediaMemoryCache();
+            setDialog(null);
+            void refresh().catch((cause) => setError(message(cause)));
+          })}
           onDelete={(forBoth) => perform(async () => {
             const local = await noise<LocalSummary>({ action: "delete_direct", public_key: dialog.direct.public_key, for_both: forBoth, relays });
             setSummary(local);
@@ -5055,6 +5083,51 @@ export default function App() {
             setDialog(null);
             void refresh().catch((cause) => setError(message(cause)));
           })}
+        />
+      )}
+      {dialog?.type === "delete_direct_message" && (
+        <DeleteDirectMessageDialog
+          message={dialog.message}
+          scopeId={dialog.scopeId}
+          busy={busy}
+          onClose={() => setDialog(null)}
+          onDelete={() => perform(async () => {
+            const publicKey = dialog.publicKey;
+            const messageId = dialog.message.message_id;
+            const previous = directConversationCache.current.get(publicKey)
+              ?? (directConversation?.contact.public_key === publicKey
+                ? directConversation
+                : null);
+            const withoutTarget = (current: DirectConversation): DirectConversation => ({
+              ...current,
+              messages: current.messages.filter((item) => item.message_id !== messageId),
+            });
+            if (previous) {
+              directConversationCache.current.set(publicKey, withoutTarget(previous));
+              setDirectConversation((current) =>
+                current?.contact.public_key === publicKey ? withoutTarget(current) : current
+              );
+            }
+            setDialog(null);
+            try {
+              await noise({
+                action: "delete_direct_message",
+                public_key: publicKey,
+                message_id: messageId,
+                relays,
+              });
+            } catch (cause) {
+              if (previous) {
+                directConversationCache.current.set(publicKey, previous);
+                setDirectConversation((current) =>
+                  current?.contact.public_key === publicKey ? previous : current
+                );
+              }
+              throw cause;
+            }
+            clearMediaMemoryCache();
+            void refresh().catch((cause) => setError(message(cause)));
+          }, false)}
         />
       )}
       {dialog?.type === "delete_account" && (
@@ -6339,7 +6412,7 @@ function ConversationPanel({
   );
 }
 
-function DirectConversationPanel({ conversation, contact, active, busy, self, selfPresence, contactPresence, messageJump, onPerson, onAlbum, onBlock, onDelete, onDownload, onForward, onSetDisappearing, onMessagesExpired, onSend }: { conversation: DirectConversation; contact: DirectSummary; active: boolean; busy: boolean; self: IdentitySummary; selfPresence: PresenceStatus; contactPresence: PresenceStatus; messageJump: { eventId: string; nonce: number } | null; onPerson: (person: PersonSummary) => void; onAlbum: (person: PersonSummary) => void; onBlock: (person: PersonSummary) => void; onDelete: () => void; onDownload: (message: MessageSummary) => Promise<boolean>; onForward: (message: MessageSummary) => void; onSetDisappearing: (seconds: number | null) => Promise<boolean>; onMessagesExpired: () => Promise<void>; onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null, signal: AbortSignal) => Promise<boolean> }) {
+function DirectConversationPanel({ conversation, contact, active, busy, self, selfPresence, contactPresence, messageJump, onPerson, onAlbum, onBlock, onDelete, onDeleteMessage, onDownload, onForward, onSetDisappearing, onMessagesExpired, onSend }: { conversation: DirectConversation; contact: DirectSummary; active: boolean; busy: boolean; self: IdentitySummary; selfPresence: PresenceStatus; contactPresence: PresenceStatus; messageJump: { eventId: string; nonce: number } | null; onPerson: (person: PersonSummary) => void; onAlbum: (person: PersonSummary) => void; onBlock: (person: PersonSummary) => void; onDelete: () => void; onDeleteMessage: (message: MessageSummary) => void; onDownload: (message: MessageSummary) => Promise<boolean>; onForward: (message: MessageSummary) => void; onSetDisappearing: (seconds: number | null) => Promise<boolean>; onMessagesExpired: () => Promise<void>; onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null, signal: AbortSignal) => Promise<boolean> }) {
   const [draft, setDraft] = useState("");
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const composerUploadKey = `direct:${contact.public_key}`;
@@ -6538,7 +6611,7 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
         <span className={`direct-profile-status ${contact.direct_message_policy !== "nobody" ? "open" : "closed"}`}><i />{contact.direct_message_policy === "everyone" ? "accepting DMs" : contact.direct_message_policy === "shared_groups" ? "shared groups only" : "DMs closed"}</span>
       </aside>
       <AppVersionFooter />
-      {messageMenu && <MessageContextMenu x={messageMenu.x} y={messageMenu.y} busy={busy} onClose={() => setMessageMenu(null)} onReply={() => { setReplyingTo(messageMenu.message); setMessageMenu(null); window.setTimeout(() => composerInput.current?.focus(), 0); }} onForward={() => { onForward(messageMenu.message); setMessageMenu(null); }} onDownload={messageMenu.message.attachment ? () => onDownload(messageMenu.message) : undefined} />}
+      {messageMenu && <MessageContextMenu x={messageMenu.x} y={messageMenu.y} busy={busy} onClose={() => setMessageMenu(null)} onReply={() => { setReplyingTo(messageMenu.message); setMessageMenu(null); window.setTimeout(() => composerInput.current?.focus(), 0); }} onForward={() => { onForward(messageMenu.message); setMessageMenu(null); }} onDownload={messageMenu.message.attachment ? () => onDownload(messageMenu.message) : undefined} onDelete={messageMenu.message.author_public_key === self.public_key ? () => { onDeleteMessage(messageMenu.message); setMessageMenu(null); } : undefined} />}
       {showDisappearingMessages && (
         <DisappearingMessagesDialog
           currentSeconds={conversation.disappearing_after_read_seconds ?? null}
@@ -10023,8 +10096,29 @@ function LeaveGroupDialog({ group, busy, onClose, onLeave }: { group: GroupSumma
   return <Modal onClose={onClose} compact><DialogHeading icon={<LogOut />} title="leave group?" detail={group.name} /><p className="deletion-warning">This removes the group, its decrypted media cache, and its local data from this device.</p><DialogButtons onClose={onClose}><button className="delete-confirm" disabled={busy} onClick={() => void onLeave()}>{busy && <LoaderCircle className="spinner" size={13} />} leave group</button></DialogButtons></Modal>;
 }
 
-function DeleteDirectDialog({ direct, busy, onClose, onDelete }: { direct: DirectSummary; busy: boolean; onClose: () => void; onDelete: (forBoth: boolean) => Promise<boolean> }) {
-  return <Modal onClose={onClose}><DialogHeading icon={<Trash2 />} title="delete conversation?" detail={direct.username} /><p className="deletion-warning">Choose whether noise should erase this thread only from this device or send a signed erasure to both users’ noise clients.</p><div className="direct-delete-options"><button disabled={busy} onClick={() => void onDelete(false)}><strong>just for me</strong><small>erase this device’s history and cached media</small></button><button className="danger" disabled={busy} onClick={() => void onDelete(true)}><strong>for both of us</strong><small>ask all synced noise clients to erase the thread</small></button></div><DialogButtons onClose={onClose} closeLabel="cancel">{busy && <LoaderCircle className="spinner" size={14} />}</DialogButtons></Modal>;
+function DeleteDirectDialog({ direct, busy, onClose, onClear, onDelete }: { direct: DirectSummary; busy: boolean; onClose: () => void; onClear: () => Promise<boolean>; onDelete: (forBoth: boolean) => Promise<boolean> }) {
+  return <Modal onClose={onClose}><DialogHeading icon={<Trash2 />} title="conversation options" detail={direct.username} /><p className="deletion-warning">Clearing keeps the conversation available. Deleting removes the conversation itself.</p><div className="direct-delete-options"><button className="danger" disabled={busy} onClick={() => void onClear()}><strong>clear for both of us</strong><small>erase every message while keeping the conversation open</small></button><button disabled={busy} onClick={() => void onDelete(false)}><strong>delete just for me</strong><small>erase this device’s conversation and cached media</small></button><button className="danger" disabled={busy} onClick={() => void onDelete(true)}><strong>delete for both of us</strong><small>ask all synced noise clients to erase the entire conversation</small></button></div><DialogButtons onClose={onClose} closeLabel="cancel">{busy && <LoaderCircle className="spinner" size={14} />}</DialogButtons></Modal>;
+}
+
+function DeleteDirectMessageDialog({ message, scopeId, busy, onClose, onDelete }: { message: MessageSummary; scopeId: string; busy: boolean; onClose: () => void; onDelete: () => Promise<boolean> }) {
+  return (
+    <Modal onClose={onClose} compact>
+      <DialogHeading icon={<Trash2 />} title="delete for both?" detail="this message will disappear from both sides" />
+      <div className="delete-message-preview">
+        {message.attachment && <ReplyMediaThumbnail message={message as MessageSummary & { attachment: MediaAttachment }} scopeId={scopeId} />}
+        <span>
+          <strong>{replyPreview(message)}</strong>
+          <small>{formatTime(message.created_at_millis)}</small>
+        </span>
+      </div>
+      <p className="deletion-warning">This removes the message and its cached media from both users’ official noise clients. It cannot recall screenshots or exports.</p>
+      <DialogButtons onClose={onClose}>
+        <button className="delete-confirm" disabled={busy} onClick={() => void onDelete()}>
+          {busy && <LoaderCircle className="spinner" size={13} />} delete for both
+        </button>
+      </DialogButtons>
+    </Modal>
+  );
 }
 
 function DeleteAccountDialog({ busy, ownedGroupCount, onClose, onDelete }: { busy: boolean; ownedGroupCount: number; onClose: () => void; onDelete: (deleteGroupMessages: boolean, deleteDirectThreads: boolean) => Promise<boolean> }) {

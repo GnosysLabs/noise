@@ -460,6 +460,19 @@ enum Request {
         for_both: bool,
         relays: Vec<String>,
     },
+    ClearDirect {
+        state_path: String,
+        cache_path: String,
+        public_key: String,
+        relays: Vec<String>,
+    },
+    DeleteDirectMessage {
+        state_path: String,
+        cache_path: String,
+        public_key: String,
+        message_id: String,
+        relays: Vec<String>,
+    },
     SetModerator {
         state_path: String,
         member_public_key: String,
@@ -1971,6 +1984,35 @@ fn invoke(request_json: &str) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
+        Request::ClearDirect {
+            state_path,
+            cache_path,
+            public_key,
+            relays,
+        } => serde_json::to_value(
+            runtime()?
+                .block_on(client.clear_direct(state_path, cache_path, &public_key, relays))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::DeleteDirectMessage {
+            state_path,
+            cache_path,
+            public_key,
+            message_id,
+            relays,
+        } => {
+            runtime()?
+                .block_on(client.delete_direct_message(
+                    state_path,
+                    cache_path,
+                    &public_key,
+                    &message_id,
+                    relays,
+                ))
+                .map_err(|error| error.to_string())?;
+            Ok(Value::Null)
+        }
         Request::SetModerator {
             state_path,
             member_public_key,

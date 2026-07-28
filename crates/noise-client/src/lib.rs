@@ -805,6 +805,15 @@ enum DecryptedDirectEvent {
         counterparty_public_key: String,
         deleted_at_millis: u64,
     },
+    ThreadCleared {
+        counterparty_public_key: String,
+        cleared_at_millis: u64,
+    },
+    MessageDeleted {
+        counterparty_public_key: String,
+        message_id: String,
+        deleting_author_public_key: String,
+    },
     BlockChanged {
         counterparty_public_key: String,
         contact: DirectContact,
@@ -889,6 +898,10 @@ struct ClientState {
     active_direct_public_key: Option<String>,
     #[serde(default)]
     direct_deleted_before: HashMap<String, u64>,
+    #[serde(default)]
+    direct_cleared_before: HashMap<String, u64>,
+    #[serde(default)]
+    direct_message_deletions: HashMap<String, HashSet<String>>,
     #[serde(default)]
     direct_policy_rejected_through: HashMap<String, DirectMessageMarker>,
     #[serde(default)]
@@ -1026,6 +1039,10 @@ struct AccountVaultContents {
     blocked_by_states: HashMap<String, BlockState>,
     active_direct_public_key: Option<String>,
     direct_deleted_before: HashMap<String, u64>,
+    #[serde(default)]
+    direct_cleared_before: HashMap<String, u64>,
+    #[serde(default)]
+    direct_message_deletions: HashMap<String, HashSet<String>>,
     #[serde(default)]
     direct_policy_rejected_through: HashMap<String, DirectMessageMarker>,
     #[serde(default)]
@@ -2119,6 +2136,8 @@ impl ClientState {
             blocked_by_states: self.blocked_by_states.clone(),
             active_direct_public_key: self.active_direct_public_key.clone(),
             direct_deleted_before: self.direct_deleted_before.clone(),
+            direct_cleared_before: self.direct_cleared_before.clone(),
+            direct_message_deletions: self.direct_message_deletions.clone(),
             direct_policy_rejected_through: self.direct_policy_rejected_through.clone(),
             direct_disappearing_after_read_seconds: self
                 .direct_disappearing_after_read_seconds
@@ -2182,6 +2201,8 @@ impl ClientState {
             blocked_by_states: contents.blocked_by_states,
             active_direct_public_key: contents.active_direct_public_key,
             direct_deleted_before: contents.direct_deleted_before,
+            direct_cleared_before: contents.direct_cleared_before,
+            direct_message_deletions: contents.direct_message_deletions,
             direct_policy_rejected_through: contents.direct_policy_rejected_through,
             direct_disappearing_after_read_seconds: contents.direct_disappearing_after_read_seconds,
             direct_closed_periods: contents.direct_closed_periods,
@@ -2260,6 +2281,25 @@ impl ClientState {
                     .reopened_at_millis
                     .is_none_or(|reopened| created_at_millis < reopened)
         })
+    }
+
+    fn direct_history_cutoff(&self, public_key: &str) -> u64 {
+        self.direct_deleted_before
+            .get(public_key)
+            .copied()
+            .unwrap_or_default()
+            .max(
+                self.direct_cleared_before
+                    .get(public_key)
+                    .copied()
+                    .unwrap_or_default(),
+            )
+    }
+
+    fn direct_message_was_deleted(&self, message: &DirectMessageSummary) -> bool {
+        self.direct_message_deletions
+            .get(&message.message_id)
+            .is_some_and(|authors| authors.contains(&message.author_public_key))
     }
 
     fn shares_active_group_with(&self, public_key: &str) -> bool {
@@ -3274,6 +3314,8 @@ impl NoiseClient {
             blocked_by_states: HashMap::new(),
             active_direct_public_key: None,
             direct_deleted_before: HashMap::new(),
+            direct_cleared_before: HashMap::new(),
+            direct_message_deletions: HashMap::new(),
             direct_policy_rejected_through: HashMap::new(),
             direct_disappearing_after_read_seconds: HashMap::new(),
             direct_closed_periods: Vec::new(),
@@ -7450,6 +7492,177 @@ impl NoiseClient {
         state.summary()
     }
 
+    pub async fn clear_direct(
+        &self,
+        path: impl AsRef<Path>,
+        cache_path: impl AsRef<Path>,
+        public_key: &str,
+        relays: Vec<String>,
+    ) -> anyhow::Result<LocalSummary> {
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        let contact = state
+            .direct_contacts
+            .iter()
+            .find(|contact| contact.public_key == public_key)
+            .cloned()
+            .context("direct conversation is missing")?;
+        let identity = state.identity()?;
+        let self_public_key = identity.public_key_base64();
+        let recipient_mailbox =
+            identity.direct_mailbox(&contact.public_key, &contact.public_key)?;
+        let sender_mailbox = identity.direct_mailbox(&contact.public_key, &self_public_key)?;
+        let sequence = state.take_sequence();
+        let recipient_event = SignedEvent::direct_thread_cleared(
+            &identity,
+            &recipient_mailbox,
+            &contact.public_key,
+            sequence,
+        )?;
+        let sender_event = SignedEvent::direct_thread_cleared(
+            &identity,
+            &sender_mailbox,
+            &contact.public_key,
+            sequence,
+        )?;
+        let relays = relay_list(relays)?;
+        let mut cleared_at_millis = recipient_event.created_at_millis;
+        if self.central.is_some() {
+            let complete = self
+                .fetch_central_direct_event_cache(&identity, state.direct_event_cache.clone(), true)
+                .await?;
+            let storage = complete
+                .events
+                .iter()
+                .filter_map(|event| decrypt_direct_event(&identity, &state, event))
+                .filter_map(|event| match event {
+                    DecryptedDirectEvent::Message(message)
+                        if message.counterparty_public_key == contact.public_key
+                            && message.message.author_public_key == self_public_key =>
+                    {
+                        message.message.attachment
+                    }
+                    _ => None,
+                })
+                .flat_map(|attachment| attachment_storage_references(&attachment))
+                .collect();
+            self.publish_direct_event(&relays, &contact.public_key, &recipient_event)
+                .await?;
+            let _ = self.erase_storage_references(storage, true).await;
+        } else {
+            self.publish_event(&relays, &recipient_event).await?;
+            self.publish_event(&relays, &sender_event).await?;
+            cleared_at_millis = cleared_at_millis.max(sender_event.created_at_millis);
+        }
+        purge_scope_cache(
+            cache_path.as_ref(),
+            &identity.direct_scope_id(&contact.public_key)?,
+        )?;
+        state
+            .direct_cleared_before
+            .entry(contact.public_key.clone())
+            .and_modify(|cutoff| *cutoff = (*cutoff).max(cleared_at_millis))
+            .or_insert(cleared_at_millis);
+        state.direct_latest_incoming.remove(&contact.public_key);
+        state.direct_latest_activity.remove(&contact.public_key);
+        state.direct_read_through.remove(&contact.public_key);
+        save_state(path, &state)?;
+        state.summary()
+    }
+
+    pub async fn delete_direct_message(
+        &self,
+        path: impl AsRef<Path>,
+        cache_path: impl AsRef<Path>,
+        public_key: &str,
+        message_id: &str,
+        relays: Vec<String>,
+    ) -> anyhow::Result<()> {
+        if message_id.len() != 64 || !message_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("message target is invalid")
+        }
+        let path = path.as_ref();
+        let mut state = load_state(path)?;
+        let contact = state
+            .direct_contacts
+            .iter()
+            .find(|contact| contact.public_key == public_key)
+            .cloned()
+            .context("direct conversation is missing")?;
+        let identity = state.identity()?;
+        let self_public_key = identity.public_key_base64();
+        let recipient_mailbox =
+            identity.direct_mailbox(&contact.public_key, &contact.public_key)?;
+        let sender_mailbox = identity.direct_mailbox(&contact.public_key, &self_public_key)?;
+        let relays = relay_list(relays)?;
+        let history = if self.central.is_some() {
+            self.fetch_central_direct_event_cache(&identity, state.direct_event_cache.clone(), true)
+                .await?
+                .events
+        } else {
+            let mut events = self.fetch_events(&sender_mailbox, relays.clone()).await?;
+            events.extend(
+                self.fetch_events(&recipient_mailbox, relays.clone())
+                    .await?,
+            );
+            events
+        };
+        let target = history
+            .iter()
+            .filter_map(|event| decrypt_direct_event(&identity, &state, event))
+            .find_map(|event| match event {
+                DecryptedDirectEvent::Message(message)
+                    if message.counterparty_public_key == contact.public_key
+                        && message.message.message_id == message_id =>
+                {
+                    Some(message.message)
+                }
+                _ => None,
+            })
+            .context("that direct message is no longer available")?;
+        if target.author_public_key != self_public_key {
+            bail!("you can only delete direct messages you sent")
+        }
+        let sequence = state.take_sequence();
+        let recipient_event = SignedEvent::direct_message_deleted(
+            &identity,
+            &recipient_mailbox,
+            &contact.public_key,
+            message_id,
+            sequence,
+        )?;
+        let sender_event = SignedEvent::direct_message_deleted(
+            &identity,
+            &sender_mailbox,
+            &contact.public_key,
+            message_id,
+            sequence,
+        )?;
+        self.publish_direct_event(&relays, &contact.public_key, &recipient_event)
+            .await?;
+        if self.central.is_none() {
+            self.publish_event(&relays, &sender_event).await?;
+        }
+        if let Some(attachment) = target.attachment.as_ref() {
+            purge_attachment_cache(
+                cache_path.as_ref(),
+                &identity.direct_scope_id(&contact.public_key)?,
+                attachment,
+            )?;
+            let storage = attachment_storage_references(attachment);
+            let _ = self.erase_storage_references(storage, true).await;
+        }
+        state
+            .direct_message_deletions
+            .entry(message_id.to_owned())
+            .or_default()
+            .insert(self_public_key);
+        state.direct_latest_incoming.remove(&contact.public_key);
+        state.direct_latest_activity.remove(&contact.public_key);
+        save_state(path, &state)?;
+        Ok(())
+    }
+
     pub async fn say(
         &self,
         path: impl AsRef<Path>,
@@ -10116,6 +10329,8 @@ impl NoiseClient {
         let contacts_before = state.direct_contacts.clone();
         let active_before = state.active_direct_public_key.clone();
         let deletions_before = state.direct_deleted_before.clone();
+        let clears_before = state.direct_cleared_before.clone();
+        let message_deletions_before = state.direct_message_deletions.clone();
         let blocked_by_before = state.blocked_by_states.clone();
         let policy_rejections_before = state.direct_policy_rejected_through.clone();
         let latest_incoming_before = state.direct_latest_incoming.clone();
@@ -10198,6 +10413,27 @@ impl NoiseClient {
                         .and_modify(|cutoff| *cutoff = (*cutoff).max(*deleted_at_millis))
                         .or_insert(*deleted_at_millis);
                 }
+                DecryptedDirectEvent::ThreadCleared {
+                    counterparty_public_key,
+                    cleared_at_millis,
+                } => {
+                    state
+                        .direct_cleared_before
+                        .entry(counterparty_public_key.clone())
+                        .and_modify(|cutoff| *cutoff = (*cutoff).max(*cleared_at_millis))
+                        .or_insert(*cleared_at_millis);
+                }
+                DecryptedDirectEvent::MessageDeleted {
+                    message_id,
+                    deleting_author_public_key,
+                    ..
+                } => {
+                    state
+                        .direct_message_deletions
+                        .entry(message_id.clone())
+                        .or_default()
+                        .insert(deleting_author_public_key.clone());
+                }
                 DecryptedDirectEvent::BlockChanged {
                     counterparty_public_key,
                     contact,
@@ -10246,11 +10482,55 @@ impl NoiseClient {
             })
             .map(|(public_key, _)| public_key.clone())
             .collect::<Vec<_>>();
-        for public_key in &newly_deleted {
+        let newly_cleared = state
+            .direct_cleared_before
+            .iter()
+            .filter(|(public_key, cutoff)| {
+                clears_before.get(*public_key).copied().unwrap_or_default() < **cutoff
+            })
+            .map(|(public_key, _)| public_key.clone())
+            .collect::<Vec<_>>();
+        let message_deletion_peers = decoded
+            .iter()
+            .filter_map(|event| {
+                let DecryptedDirectEvent::MessageDeleted {
+                    counterparty_public_key,
+                    message_id,
+                    deleting_author_public_key,
+                } = event
+                else {
+                    return None;
+                };
+                (!message_deletions_before
+                    .get(message_id)
+                    .is_some_and(|authors| authors.contains(deleting_author_public_key)))
+                .then(|| counterparty_public_key.clone())
+            })
+            .collect::<HashSet<_>>();
+        for public_key in newly_deleted.iter().chain(newly_cleared.iter()) {
             purge_scope_cache(cache_path, &identity.direct_scope_id(public_key)?)?;
             state.direct_latest_incoming.remove(public_key);
             state.direct_latest_activity.remove(public_key);
             state.direct_read_through.remove(public_key);
+        }
+        for public_key in &message_deletion_peers {
+            state.direct_latest_incoming.remove(public_key);
+            state.direct_latest_activity.remove(public_key);
+        }
+        for event in &decoded {
+            let DecryptedDirectEvent::Message(message) = event else {
+                continue;
+            };
+            if !state.direct_message_was_deleted(&message.message) {
+                continue;
+            }
+            if let Some(attachment) = message.message.attachment.as_ref() {
+                purge_attachment_cache(
+                    cache_path,
+                    &identity.direct_scope_id(&message.counterparty_public_key)?,
+                    attachment,
+                )?;
+            }
         }
         state
             .direct_contacts
@@ -10260,11 +10540,8 @@ impl NoiseClient {
             .filter_map(|event| match event {
                 DecryptedDirectEvent::Message(message)
                     if message.message.created_at_millis
-                        > state
-                            .direct_deleted_before
-                            .get(&message.counterparty_public_key)
-                            .copied()
-                            .unwrap_or_default()
+                        > state.direct_history_cutoff(&message.counterparty_public_key)
+                        && !state.direct_message_was_deleted(&message.message)
                         && !state.is_content_hidden(&message.counterparty_public_key)
                         && message
                             .message
@@ -10354,6 +10631,8 @@ impl NoiseClient {
             || state.direct_contacts != contacts_before
             || state.active_direct_public_key != active_before
             || state.direct_deleted_before != deletions_before
+            || state.direct_cleared_before != clears_before
+            || state.direct_message_deletions != message_deletions_before
             || state.direct_policy_rejected_through != policy_rejections_before
             || state.blocked_by_states != blocked_by_before
             || state.direct_latest_incoming != latest_incoming_before
@@ -12531,6 +12810,26 @@ fn decrypt_direct_event(
                         deleted_at_millis: event.created_at_millis,
                     });
                 }
+                Ok(GroupEventPayload::DirectThreadCleared {
+                    recipient_public_key,
+                }) if recipient_public_key == contact.public_key => {
+                    return Some(DecryptedDirectEvent::ThreadCleared {
+                        counterparty_public_key: contact.public_key.clone(),
+                        cleared_at_millis: event.created_at_millis,
+                    });
+                }
+                Ok(GroupEventPayload::DirectMessageDeleted {
+                    recipient_public_key,
+                    message_id,
+                }) if recipient_public_key == contact.public_key
+                    && validate_reply_reference(Some(&message_id)).is_ok() =>
+                {
+                    return Some(DecryptedDirectEvent::MessageDeleted {
+                        counterparty_public_key: contact.public_key.clone(),
+                        message_id,
+                        deleting_author_public_key: event.author_public_key.clone(),
+                    });
+                }
                 _ => continue,
             }
         }
@@ -12600,6 +12899,24 @@ fn decrypt_direct_event(
             counterparty_public_key: event.author_public_key.clone(),
             deleted_at_millis: event.created_at_millis,
         }),
+        GroupEventPayload::DirectThreadCleared {
+            recipient_public_key,
+        } if recipient_public_key == self_public_key => Some(DecryptedDirectEvent::ThreadCleared {
+            counterparty_public_key: event.author_public_key.clone(),
+            cleared_at_millis: event.created_at_millis,
+        }),
+        GroupEventPayload::DirectMessageDeleted {
+            recipient_public_key,
+            message_id,
+        } if recipient_public_key == self_public_key
+            && validate_reply_reference(Some(&message_id)).is_ok() =>
+        {
+            Some(DecryptedDirectEvent::MessageDeleted {
+                counterparty_public_key: event.author_public_key.clone(),
+                message_id,
+                deleting_author_public_key: event.author_public_key.clone(),
+            })
+        }
         GroupEventPayload::DirectBlockChanged {
             recipient_public_key,
             sender_profile,
@@ -13546,11 +13863,8 @@ fn cached_direct_messages(state: &ClientState) -> anyhow::Result<Vec<DecryptedDi
         .filter_map(|event| match event {
             DecryptedDirectEvent::Message(message)
                 if message.message.created_at_millis
-                    > state
-                        .direct_deleted_before
-                        .get(&message.counterparty_public_key)
-                        .copied()
-                        .unwrap_or_default()
+                    > state.direct_history_cutoff(&message.counterparty_public_key)
+                    && !state.direct_message_was_deleted(&message.message)
                     && !state.is_content_hidden(&message.counterparty_public_key)
                     && message
                         .message
@@ -15564,6 +15878,8 @@ mod tests {
             blocked_by_states: HashMap::new(),
             active_direct_public_key: None,
             direct_deleted_before: HashMap::new(),
+            direct_cleared_before: HashMap::new(),
+            direct_message_deletions: HashMap::new(),
             direct_policy_rejected_through: HashMap::new(),
             direct_disappearing_after_read_seconds: HashMap::new(),
             direct_closed_periods: Vec::new(),

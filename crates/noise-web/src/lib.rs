@@ -717,6 +717,30 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .await
                 .map_err(|error| error.to_string())?,
         ),
+        "clear_direct" => data(
+            client
+                .clear_direct(
+                    STATE_PATH,
+                    CACHE_PATH,
+                    &required::<String>(&request, "public_key")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        "delete_direct_message" => {
+            client
+                .delete_direct_message(
+                    STATE_PATH,
+                    CACHE_PATH,
+                    &required::<String>(&request, "public_key")?,
+                    &required::<String>(&request, "message_id")?,
+                    relays(&request)?,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(Value::Null)
+        }
         "set_moderator" => {
             client
                 .set_moderator(
