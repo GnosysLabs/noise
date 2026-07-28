@@ -691,6 +691,7 @@ let mediaCacheGeneration = 0;
 
 const INITIAL_MESSAGE_COUNT = 24;
 const MESSAGE_PAGE_SIZE = 40;
+const MESSAGE_HIGHLIGHT_DURATION_MS = 2400;
 // How close to the top of the list counts as "asking for older messages".
 const OLDER_MESSAGE_TRIGGER_DISTANCE = 320;
 // A relay page can be entirely made of messages the current topic filters out,
@@ -6042,7 +6043,10 @@ function useChunkedMessageList<T extends { event_id: string }>(
       row.classList.remove("search-highlight");
       void row.offsetWidth;
       row.classList.add("search-highlight");
-      window.setTimeout(() => row.classList.remove("search-highlight"), 1900);
+      window.setTimeout(
+        () => row.classList.remove("search-highlight"),
+        MESSAGE_HIGHLIGHT_DURATION_MS + 50,
+      );
     }, 0);
     return true;
   }, [revealMessage]);
@@ -6172,7 +6176,10 @@ function ConversationPanel({
       row.classList.remove("search-highlight");
       void row.offsetWidth;
       row.classList.add("search-highlight");
-      window.setTimeout(() => row.classList.remove("search-highlight"), 1900);
+      window.setTimeout(
+        () => row.classList.remove("search-highlight"),
+        MESSAGE_HIGHLIGHT_DURATION_MS + 50,
+      );
     }, 0);
     return () => window.clearTimeout(timer);
   }, [messageJump?.eventId, messageJump?.nonce]);
@@ -6523,7 +6530,10 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
       row.classList.remove("search-highlight");
       void row.offsetWidth;
       row.classList.add("search-highlight");
-      window.setTimeout(() => row.classList.remove("search-highlight"), 1900);
+      window.setTimeout(
+        () => row.classList.remove("search-highlight"),
+        MESSAGE_HIGHLIGHT_DURATION_MS + 50,
+      );
     }, 0);
     return () => window.clearTimeout(timer);
   }, [messageJump?.eventId, messageJump?.nonce]);
