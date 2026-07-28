@@ -687,7 +687,6 @@ const mediaDimensionCache = loadStoredMediaDimensions();
 const sentMediaPreviewCache = new Map<string, NonNullable<MessageSummary["local_attachment"]>>();
 const imagePosterCache = new Map<string, string>();
 const videoPosterCache = new Map<string, string>();
-const convertedMediaObjectUrls = new Set<string>();
 const renderedMessageCounts = new Map<string, number>();
 let mediaCacheGeneration = 0;
 
@@ -800,8 +799,6 @@ function clearMediaMemoryCache() {
   );
   for (const preview of previews) URL.revokeObjectURL(preview);
   sentMediaPreviewCache.clear();
-  for (const source of convertedMediaObjectUrls) URL.revokeObjectURL(source);
-  convertedMediaObjectUrls.clear();
   imagePosterCache.clear();
   videoPosterCache.clear();
   decodedImageCache.clear();
@@ -1231,13 +1228,6 @@ async function convertHeicFile(file: File) {
     type: "image/jpeg",
     lastModified: file.lastModified,
   });
-}
-
-async function renderableHeicSource(source: string) {
-  const response = await fetch(source);
-  if (!response.ok) throw new Error("the HEIC photo could not be read");
-  const converted = await convertHeicBlob(await response.blob());
-  return URL.createObjectURL(converted);
 }
 
 async function optimizeOutgoingVideo(file: File) {
@@ -7530,18 +7520,10 @@ function requestMediaSource(
           relays,
         });
         if (!data) throw new Error("media is not available yet");
-        const storedSource = isTauri
+        const next = isTauri
           ? (await import("@tauri-apps/api/core")).convertFileSrc(data.file_path)
           : data.file_path;
-        const next = isHeicMedia(attachment.mime_type, attachment.file_name)
-          ? await renderableHeicSource(storedSource)
-          : storedSource;
-        if (generation === mediaCacheGeneration) {
-          mediaCache.set(cacheKey, next);
-          if (next !== storedSource) convertedMediaObjectUrls.add(next);
-        } else if (next !== storedSource) {
-          URL.revokeObjectURL(next);
-        }
+        if (generation === mediaCacheGeneration) mediaCache.set(cacheKey, next);
         return next;
       } catch (cause) {
         if (
