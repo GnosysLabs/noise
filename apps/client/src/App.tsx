@@ -9619,8 +9619,8 @@ function GroupSettingsDialog({ group, explicitContentEnabled, bannedMembers, pre
                 <span>{group.frequency ?? "not stored on this device"}</span>
                 {group.frequency && <CopyButton value={group.frequency} label="copy frequency" iconOnly disabled={busy} />}
                 {group.remote_deletion_supported && <div className="group-frequency-inline-actions">
-                  {group.frequency && <button className={revokeArmed ? "confirm" : "danger"} disabled={busy} onClick={() => { if (revokeArmed) { setRevokeArmed(false); void onRotateFrequency(true); } else { setRevokeArmed(true); } }}><Trash2 size={13} /> {revokeArmed ? "confirm revoke" : "revoke"}</button>}
                   <button disabled={busy} onClick={() => { setRevokeArmed(false); void onRotateFrequency(false); }}><Radio size={13} /> {group.frequency ? "generate new" : "generate frequency"}</button>
+                  {group.frequency && <button className={revokeArmed ? "confirm" : "danger"} disabled={busy} onClick={() => { if (revokeArmed) { setRevokeArmed(false); void onRotateFrequency(true); } else { setRevokeArmed(true); } }}><Trash2 size={13} /> {revokeArmed ? "confirm revoke" : "revoke"}</button>}
                 </div>}
               </div>
               <p>{group.frequency ? "Anyone with this code can join the group." : "Generate one to revoke any older invitation and create a code this device can manage."}</p>
