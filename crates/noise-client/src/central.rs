@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
@@ -24,7 +25,15 @@ pub(crate) struct CentralTransport {
     /// Recording the path with the session lets every caller recover without
     /// carrying it through each publisher.
     session_state_path: Arc<RwLock<Option<PathBuf>>>,
+    /// Tokens the service has already refused. A stored session that looks
+    /// unexpired is otherwise indistinguishable from a live one, so without
+    /// this a client can keep picking the same dead token back up and retry
+    /// against it forever instead of asking for a new one.
+    rejected_tokens: Arc<RwLock<VecDeque<Arc<str>>>>,
 }
+
+/// Enough to cover the requests already in flight when a session dies.
+const REMEMBERED_REJECTED_TOKENS: usize = 8;
 
 pub(crate) struct CentralResponse {
     pub status: u16,
@@ -63,6 +72,7 @@ impl CentralTransport {
             http,
             access_token: Arc::new(RwLock::new(None)),
             session_state_path: Arc::new(RwLock::new(None)),
+            rejected_tokens: Arc::new(RwLock::new(VecDeque::new())),
         })
     }
 
@@ -78,6 +88,25 @@ impl CentralTransport {
 
     pub(crate) fn session_state_path(&self) -> Option<PathBuf> {
         self.session_state_path.read().ok()?.clone()
+    }
+
+    pub(crate) fn note_rejected_token(&self, token: &str) {
+        let Ok(mut rejected) = self.rejected_tokens.write() else {
+            return;
+        };
+        if rejected.iter().any(|current| current.as_ref() == token) {
+            return;
+        }
+        if rejected.len() == REMEMBERED_REJECTED_TOKENS {
+            rejected.pop_front();
+        }
+        rejected.push_back(Arc::from(token));
+    }
+
+    pub(crate) fn token_was_rejected(&self, token: &str) -> bool {
+        self.rejected_tokens
+            .read()
+            .is_ok_and(|rejected| rejected.iter().any(|current| current.as_ref() == token))
     }
 
     pub(crate) async fn set_access_token(&self, token: Option<String>) {

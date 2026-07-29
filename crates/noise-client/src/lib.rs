@@ -3264,8 +3264,13 @@ impl NoiseClient {
 
         // Another request may have renewed the installation while this watch
         // was receiving its 401. Adopt that token instead of opening another
-        // session. Otherwise invalidate the rejected token and renew once.
-        if current_is_fresh && current_token != failed_token {
+        // session — unless the service has already refused it, in which case
+        // it only looks live and adopting it would fail exactly the same way.
+        // Otherwise invalidate the rejected token and renew once.
+        if current_is_fresh
+            && current_token != failed_token
+            && !current_token.is_some_and(|token| central.token_was_rejected(token))
+        {
             central
                 .set_access_token(current_token.map(str::to_owned))
                 .await;
@@ -13414,11 +13419,13 @@ impl NoiseClient {
         if response.status != 401 {
             return Ok(response);
         }
-        let Some(state_path) = self
-            .central
-            .as_ref()
-            .and_then(central::CentralTransport::session_state_path)
-        else {
+        let Some(central) = self.central.as_ref() else {
+            return Ok(response);
+        };
+        if let Some(failed) = failed_token.as_deref() {
+            central.note_rejected_token(failed);
+        }
+        let Some(state_path) = central.session_state_path() else {
             return Ok(response);
         };
         self.recover_central_session(&state_path, failed_token.as_deref())
@@ -13444,6 +13451,9 @@ impl NoiseClient {
         let response = central.json(method.clone(), path, body, true).await?;
         if response.status != 401 {
             return central::CentralTransport::require_ok(response);
+        }
+        if let Some(failed) = failed_token.as_deref() {
+            central.note_rejected_token(failed);
         }
         let Some(state_path) = central.session_state_path() else {
             return central::CentralTransport::require_ok(response);
@@ -16531,6 +16541,34 @@ fn load_state(path: &Path) -> anyhow::Result<ClientState> {
     Ok(state)
 }
 
+/// Carry a newer central session across a write of older state.
+///
+/// The whole state is stored as one value, so a request that loaded it before
+/// the session was renewed rolls the token back when it saves. Every request
+/// after that authenticates with a token the service has already rejected, and
+/// since the rolled-back token still looks unexpired to this device, nothing
+/// asks for another one: watches fail in a retry loop and the app quietly stops
+/// receiving anything.
+fn preserve_newer_central_session(state: &mut ClientState, stored: &ClientState) {
+    let (Some(saving), Some(stored)) = (
+        state.central_installation.as_mut(),
+        stored.central_installation.as_ref(),
+    ) else {
+        return;
+    };
+    // Only ever within one installation. A different or absent one belongs to
+    // another identity, and resurrecting its session would be worse than
+    // losing this one.
+    if saving.installation_id_base64 != stored.installation_id_base64 {
+        return;
+    }
+    if stored.access_token_expires_at_millis > saving.access_token_expires_at_millis {
+        saving.access_token = stored.access_token.clone();
+        saving.access_token_expires_at_millis = stored.access_token_expires_at_millis;
+        saving.registered |= stored.registered;
+    }
+}
+
 #[cfg(all(not(target_arch = "wasm32"), not(test)))]
 fn save_state(path: &Path, state: &ClientState) -> anyhow::Result<()> {
     let cache = native_state_cache();
@@ -16544,10 +16582,14 @@ fn save_state(path: &Path, state: &ClientState) -> anyhow::Result<()> {
         .entries
         .get(path)
         .map_or(0, |entry| entry.persisted_generation);
+    let mut state = state.clone();
+    if let Some(entry) = guard.entries.get(path) {
+        preserve_newer_central_session(&mut state, &entry.state);
+    }
     guard.entries.insert(
         path.to_path_buf(),
         NativeStateEntry {
-            state: state.clone(),
+            state,
             generation,
             persisted_generation,
             write_after: Some(Instant::now() + STATE_WRITE_DEBOUNCE),
@@ -16561,6 +16603,7 @@ fn save_state(path: &Path, state: &ClientState) -> anyhow::Result<()> {
 fn save_state_immediately(path: &Path, state: &ClientState) -> anyhow::Result<()> {
     let cache = native_state_cache();
     let (lock, condition) = &**cache;
+    let mut state = state.clone();
     let generation = {
         let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.next_generation = guard.next_generation.saturating_add(1);
@@ -16569,6 +16612,9 @@ fn save_state_immediately(path: &Path, state: &ClientState) -> anyhow::Result<()
             .entries
             .get(path)
             .map_or(0, |entry| entry.persisted_generation);
+        if let Some(entry) = guard.entries.get(path) {
+            preserve_newer_central_session(&mut state, &entry.state);
+        }
         // `None` reserves this generation for the synchronous writer so the
         // debounce thread cannot race the same temporary file.
         guard.entries.insert(
@@ -16582,7 +16628,7 @@ fn save_state_immediately(path: &Path, state: &ClientState) -> anyhow::Result<()
         );
         generation
     };
-    let bytes = serde_json::to_vec(state)?;
+    let bytes = serde_json::to_vec(&state)?;
     if let Err(error) = persist_native_state_generation(cache, path, generation, &bytes) {
         let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(entry) = guard.entries.get_mut(path)
@@ -16633,7 +16679,14 @@ fn save_state_immediately(path: &Path, state: &ClientState) -> anyhow::Result<()
 #[cfg(target_arch = "wasm32")]
 fn save_state(path: &Path, state: &ClientState) -> anyhow::Result<()> {
     let key = path.to_string_lossy().into_owned();
-    let bytes = serde_json::to_vec(state)?;
+    let mut state = state.clone();
+    if let Some(stored) = WEB_STATE
+        .with(|states| states.borrow().get(&key).cloned())
+        .and_then(|bytes| serde_json::from_slice::<ClientState>(&bytes).ok())
+    {
+        preserve_newer_central_session(&mut state, &stored);
+    }
+    let bytes = serde_json::to_vec(&state)?;
     WEB_STATE.with(|states| states.borrow_mut().insert(key, bytes));
     Ok(())
 }
@@ -17951,6 +18004,59 @@ mod tests {
         assert_eq!(
             cache.get("a", 2).as_deref().map(Vec::as_slice),
             Some(&[2, 2][..])
+        );
+    }
+
+    fn installation(id: &str, token: &str, expires_at_millis: u64) -> CentralInstallationState {
+        CentralInstallationState {
+            installation_id_base64: id.to_owned(),
+            auth_secret_base64: "secret".to_owned(),
+            registration_version: 1,
+            registered: true,
+            access_token: Some(token.to_owned()),
+            access_token_expires_at_millis: expires_at_millis,
+        }
+    }
+
+    fn session_state(installation: CentralInstallationState) -> ClientState {
+        let identity = Identity::generate();
+        let credentials = AccountCredentials {
+            noise_id: "123456789012".to_owned(),
+            locator: "ab".repeat(32),
+            vault_key_base64: STANDARD_NO_PAD.encode([7_u8; 32]),
+        };
+        let mut state = account_state(&identity, &credentials, test_profile(None), 1, 1);
+        state.central_installation = Some(installation);
+        state
+    }
+
+    #[test]
+    fn saving_older_state_cannot_roll_the_central_session_back() {
+        // The request that renewed the session and the one that saves a moment
+        // later both hold their own copy of the whole state.
+        let mut saving = session_state(installation("device", "stale", 1_000));
+        let renewed = session_state(installation("device", "fresh", 2_000));
+
+        preserve_newer_central_session(&mut saving, &renewed);
+
+        let kept = saving.central_installation.unwrap();
+        assert_eq!(kept.access_token.as_deref(), Some("fresh"));
+        assert_eq!(kept.access_token_expires_at_millis, 2_000);
+    }
+
+    #[test]
+    fn another_identity_session_is_never_carried_over() {
+        let mut saving = session_state(installation("this-device", "own", 1_000));
+        let other = session_state(installation("other-device", "theirs", 9_000));
+
+        preserve_newer_central_session(&mut saving, &other);
+
+        assert_eq!(
+            saving
+                .central_installation
+                .and_then(|installation| installation.access_token)
+                .as_deref(),
+            Some("own")
         );
     }
 
