@@ -685,6 +685,14 @@ fn state_lock() -> &'static Mutex<()> {
     STATE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Read-state publication no longer holds the local write lock, so this keeps
+/// two publishes from racing for the same vault revision and burning their
+/// retry budget against each other. It blocks nothing else.
+fn read_state_publish_lock() -> &'static Mutex<()> {
+    static PUBLISH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    PUBLISH_LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn search_lock() -> &'static Mutex<()> {
     static SEARCH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     SEARCH_LOCK.get_or_init(|| Mutex::new(()))
@@ -916,6 +924,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             | Request::RefreshAccountState { .. }
             | Request::SyncGroupActivity { .. }
             | Request::SyncTopicActivity { .. }
+            | Request::PublishReadState { .. }
             | Request::GroupHasPendingAdmissions { .. }
             | Request::CachedConversation { .. }
             | Request::CachedDirectInbox { .. }
@@ -1164,12 +1173,34 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             .map_err(|error| error.to_string())?;
             serde_json::to_value(result).map_err(|error| error.to_string())
         }
-        Request::PublishReadState { state_path, relays } => serde_json::to_value(
-            runtime()?
-                .block_on(client.publish_read_state(state_path, relays))
+        Request::PublishReadState { state_path, relays } => {
+            // Sealing and verifying the read-state vault is several relay round
+            // trips. Holding the local write lock across them is what used to
+            // put the next click, send, or reaction behind a whole publish.
+            let _publish_guard = read_state_publish_lock()
+                .lock()
+                .map_err(|_| "read state publication is unavailable".to_owned())?;
+            let update = runtime()?
+                .block_on(client.prepare_read_state_publish(&state_path, relays))
+                .map_err(|error| error.to_string())?;
+            if session_ending().load(Ordering::Acquire) {
+                return Err("session ended".to_owned());
+            }
+            let _state_guard = state_lock()
+                .lock()
+                .map_err(|_| "local state lock is unavailable".to_owned())?;
+            if session_ending().load(Ordering::Acquire) {
+                return Err("session ended".to_owned());
+            }
+            serde_json::to_value(
+                match update {
+                    Some(update) => client.apply_read_state_publication(state_path, update),
+                    None => client.local_summary(state_path),
+                }
                 .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string()),
+            )
+            .map_err(|error| error.to_string())
+        }
         Request::RefreshAccountState {
             state_path,
             cache_path,

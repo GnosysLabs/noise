@@ -253,6 +253,9 @@ export type Conversation = {
 export type GroupActivityResult = {
   summary: LocalSummary;
   conversation: Conversation | null;
+  // Set when the sync only hydrated an empty cache, so the real group activity
+  // is one more round trip away. Absent on older cores.
+  follow_up_recommended?: boolean;
 };
 
 export type GroupEncryptionStatus = {

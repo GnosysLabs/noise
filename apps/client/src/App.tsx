@@ -764,6 +764,10 @@ const OLDER_MESSAGE_TRIGGER_DISTANCE = 320;
 // so walk back a few pages before giving the scroll gesture back to the user.
 const REMOTE_HISTORY_ATTEMPTS = 4;
 const GENERAL_TOPIC_LOADING_KEY = "__noise_general_topic__";
+// Publishing the encrypted read cursor is a multi-round-trip relay write that
+// holds the local state lock, so one publish per read gesture would put every
+// following click behind it. Bursts of navigation coalesce into one publish.
+const READ_STATE_PUBLISH_DELAY_MILLIS = 250;
 type MediaLoadPriority = "visible" | "nearby" | "background";
 const MEDIA_PRIORITY_RANK: Record<MediaLoadPriority, number> = {
   visible: 0,
@@ -1833,6 +1837,10 @@ export default function App() {
     timer: number | null;
   }>());
   const queueAdmissionPassRef = useRef<(groupId: string) => void>(() => undefined);
+  const publishReadStateRef = useRef<() => void>(() => undefined);
+  const readStatePublishTimer = useRef<number | null>(null);
+  const readStatePublishInFlight = useRef(false);
+  const readStatePublishQueued = useRef(false);
   const accountCacheSyncTimer = useRef<number | null>(null);
   const groupSelectionInFlight = useRef(false);
   const topicSelectionGeneration = useRef(0);
@@ -2282,6 +2290,43 @@ export default function App() {
     );
   }, []);
 
+  // Read cursors are durable locally the moment they are marked. Publishing
+  // them is a relay round trip that serializes against every local write, so it
+  // is debounced and never allowed to run twice at once: walking through five
+  // topics costs one publish instead of five queued behind each other.
+  const publishReadState = useCallback(() => {
+    if (readStatePublishInFlight.current) {
+      readStatePublishQueued.current = true;
+      return;
+    }
+    if (readStatePublishTimer.current !== null) {
+      window.clearTimeout(readStatePublishTimer.current);
+    }
+    readStatePublishTimer.current = window.setTimeout(() => {
+      readStatePublishTimer.current = null;
+      readStatePublishInFlight.current = true;
+      void noise({ action: "publish_read_state", relays })
+        .catch(() => {
+          // The local cursor is durable; the next read gesture retries publication.
+        })
+        .finally(() => {
+          readStatePublishInFlight.current = false;
+          if (readStatePublishQueued.current) {
+            readStatePublishQueued.current = false;
+            publishReadStateRef.current();
+          }
+        });
+    }, READ_STATE_PUBLISH_DELAY_MILLIS);
+  }, []);
+  publishReadStateRef.current = publishReadState;
+
+  useEffect(() => () => {
+    if (readStatePublishTimer.current !== null) {
+      window.clearTimeout(readStatePublishTimer.current);
+      readStatePublishTimer.current = null;
+    }
+  }, []);
+
   const markDirectRead = useCallback(async (publicKey: string) => {
     const marked = await noise<LocalSummary>({
       action: "mark_direct_read",
@@ -2289,10 +2334,8 @@ export default function App() {
       relays,
     });
     if (marked) setSummary(marked);
-    void noise({ action: "publish_read_state", relays }).catch(() => {
-      // The local read marker is immediate; cross-device sync retries normally.
-    });
-  }, []);
+    publishReadState();
+  }, [publishReadState]);
 
   const markActiveGroupRead = useCallback(async (groupId: string) => {
     if (groupReadInFlight.current.has(groupId)) return;
@@ -2331,13 +2374,11 @@ export default function App() {
       if (!marked) return;
       setSummary(marked);
       clearVisibleUnread();
-      void noise({ action: "publish_read_state", relays }).catch(() => {
-        // The local group read marker is immediate; cross-device sync retries normally.
-      });
+      publishReadState();
     } finally {
       groupReadInFlight.current.delete(groupId);
     }
-  }, []);
+  }, [publishReadState]);
 
   const markActiveTopicRead = useCallback(async (groupId: string, topicId: string) => {
     const readKey = `${groupId}:${topicId}`;
@@ -2383,13 +2424,11 @@ export default function App() {
       if (!marked) return;
       setSummary(marked);
       clearVisibleUnread();
-      void noise({ action: "publish_read_state", relays }).catch(() => {
-        // The local topic read marker is immediate; cross-device sync retries normally.
-      });
+      publishReadState();
     } finally {
       groupReadInFlight.current.delete(readKey);
     }
-  }, []);
+  }, [publishReadState]);
 
   const markEntireGroupRead = useCallback(async (groupId: string) => {
     const readKey = `all:${groupId}`;
@@ -3827,15 +3866,9 @@ export default function App() {
       if (cached) {
         desiredGroupIdRef.current = group.group_id;
         setConversation(cached);
-        // A cache with an applied watch revision is already live. Otherwise
-        // keep the brief catch-up indicator until the selected stream has
-        // reconciled rather than showing stale content as current.
-        if (
-          groupWatchRevisions.current.has(group.group_id)
-          && !dirtyGroupIds.current.has(group.group_id)
-        ) {
-          setLoadingTopicId(null);
-        }
+        // The cached conversation is a complete view of this device's history,
+        // so the group opens on it right away and reconciles in the background.
+        setLoadingTopicId(null);
         setSummary((current) => current ? {
           ...current,
           groups: current.groups.map((candidate) => ({
@@ -3886,22 +3919,25 @@ export default function App() {
     const topicId = topic?.topic_id ?? null;
     const loadingKey = topicId ?? GENERAL_TOPIC_LOADING_KEY;
     const generation = ++topicSelectionGeneration.current;
-    const groupIsCaughtUp = groupWatchRevisions.current.has(activeGroupId)
-      && !dirtyGroupIds.current.has(activeGroupId);
     const hasCachedMessages = conversation.messages.some(
       (item) => (item.topic_id ?? null) === topicId,
     );
     setActiveTopicId(topicId);
     setPendingTopicId(null);
     setError(null);
-    setLoadingTopicId(hasCachedMessages && groupIsCaughtUp ? null : loadingKey);
+    // Opening a topic is a local navigation. The cached stream is this device's
+    // own history, so it renders immediately and the relay catch-up lands
+    // underneath it. Only a stream with nothing cached at all waits for a page,
+    // because there is no complete view to show in the meantime.
+    setLoadingTopicId(hasCachedMessages ? null : loadingKey);
     try {
-      // Record the navigation locally before relay reconciliation. A slow or
-      // failed topic refresh must not keep an already-open topic unread.
+      // Record the navigation locally alongside relay reconciliation. Marking
+      // read takes the local write lock, so awaiting it here would put the
+      // refresh behind any publish or send already holding it.
       if (topicId) {
-        await markActiveTopicRead(activeGroupId, topicId);
+        void markActiveTopicRead(activeGroupId, topicId);
       } else {
-        await markActiveGroupRead(activeGroupId);
+        void markActiveGroupRead(activeGroupId);
       }
       const activity = topicId
         ? await syncTopicActivity(activeGroupId, topicId, true)
@@ -3921,15 +3957,15 @@ export default function App() {
       }
     } finally {
       if (generation === topicSelectionGeneration.current) {
+        setPendingTopicId(null);
+        setLoadingTopicId(null);
         // A failed refresh or an older in-flight snapshot must not be allowed
         // to restore the unread state after the user has opened this topic.
         if (topicId) {
-          await markActiveTopicRead(activeGroupId, topicId);
+          void markActiveTopicRead(activeGroupId, topicId);
         } else {
-          await markActiveGroupRead(activeGroupId);
+          void markActiveGroupRead(activeGroupId);
         }
-        setPendingTopicId(null);
-        setLoadingTopicId(null);
       }
     }
   }
@@ -3974,7 +4010,10 @@ export default function App() {
       } else if (!hasCachedConversation) {
         throw new Error("the selected group has no locally available conversation");
       }
-      if (activity) {
+      // A cache that had never been filled in answers the first sync from a
+      // hydration shortcut, so the real activity is one more round trip away.
+      // Every other open is already current and must not pay for a second pass.
+      if (activity?.follow_up_recommended) {
         const recovered = await syncGroupActivity(group.group_id, {
           topicId: activeTopicIdRef.current,
         });
@@ -4048,12 +4087,7 @@ export default function App() {
         setDirectConversation(fresh);
       }
       setSummary(reconciled);
-      void noise({
-        action: "publish_read_state",
-        relays,
-      }).catch(() => {
-        // The thread is already read locally; cross-device sync retries normally.
-      });
+      publishReadState();
     } catch (cause) {
       if (generation === refreshGeneration.current) setError(message(cause));
     }

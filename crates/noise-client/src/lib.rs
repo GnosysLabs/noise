@@ -172,6 +172,12 @@ struct TopicActivityUpdate {
 pub struct GroupActivityResult {
     pub summary: LocalSummary,
     pub conversation: Option<Conversation>,
+    /// True when this sync only hydrated a cache that had never been filled in
+    /// (a recovered device, or a group whose control state was still missing).
+    /// `fetch_group_activity` answers those from a shortcut branch, so the real
+    /// activity fetch is the caller's next round trip rather than this one.
+    #[serde(default)]
+    pub follow_up_recommended: bool,
 }
 
 impl Default for NoiseClient {
@@ -3892,13 +3898,46 @@ impl NoiseClient {
         relays: Vec<String>,
     ) -> anyhow::Result<LocalSummary> {
         let path = path.as_ref();
+        let Some(update) = self.prepare_read_state_publish(path, relays).await? else {
+            return load_state(path)?.summary();
+        };
+        self.apply_read_state_publication(path, update)
+    }
+
+    /// Publishing read cursors costs several relay round trips. Callers that
+    /// serialize local writes run this half without holding that lock and keep
+    /// only [`Self::apply_read_state_publication`] inside it.
+    pub async fn prepare_read_state_publish(
+        &self,
+        path: impl AsRef<Path>,
+        relays: Vec<String>,
+    ) -> anyhow::Result<Option<AccountStateUpdate>> {
+        let mut state = load_state(path.as_ref())?;
+        if state.account.is_none() {
+            return Ok(None);
+        }
+        let credentials = state.account_read_state_credentials()?;
+        let vault = self
+            .publish_read_state_for_state(&mut state, &relay_list(relays)?)
+            .await?;
+        Ok(Some(AccountStateUpdate { credentials, vault }))
+    }
+
+    pub fn apply_read_state_publication(
+        &self,
+        path: impl AsRef<Path>,
+        update: AccountStateUpdate,
+    ) -> anyhow::Result<LocalSummary> {
+        let path = path.as_ref();
         let mut state = load_state(path)?;
         if state.account.is_none() {
             return state.summary();
         }
-        self.publish_read_state_for_state(&mut state, &relay_list(relays)?)
-            .await?;
-        save_state(path, &state)?;
+        // Cursors merge monotonically, so read gestures made while the vault
+        // was in flight survive: they are simply carried by the next publish.
+        if Self::merge_remote_read_state(&mut state, &update.credentials, &update.vault)? {
+            save_state(path, &state)?;
+        }
         state.summary()
     }
 
@@ -10278,6 +10317,13 @@ impl NoiseClient {
         let existing_control_is_usable = existing_cache
             .as_ref()
             .is_some_and(|cache| group_cache_has_usable_control_state(&state, &group, cache));
+        // These are the two conditions `fetch_group_activity` answers from a
+        // shortcut branch. Applying this update clears them, so the caller
+        // learns here that one more pass reaches the real group activity.
+        let follow_up_recommended = existing_cache.as_ref().is_some_and(|cache| {
+            cache.needs_recent_hydration
+                || (cache.needs_control_hydration && !existing_control_is_usable)
+        });
         let full_snapshot = update.full_snapshot;
         let portable_group_state = existing_cache
             .as_ref()
@@ -10434,6 +10480,7 @@ impl NoiseClient {
         Ok(GroupActivityResult {
             summary: state.summary()?,
             conversation,
+            follow_up_recommended,
         })
     }
 
@@ -10445,12 +10492,13 @@ impl NoiseClient {
     ) -> anyhow::Result<GroupActivityResult> {
         let path = path.as_ref();
         let group_id = update.group_id.clone();
-        self.apply_group_activity(path, update)?;
+        let applied = self.apply_group_activity(path, update)?;
         let summary = self.mark_topic_read(path, &group_id, topic_id)?;
         let conversation = self.cached_conversation(path, &group_id)?;
         Ok(GroupActivityResult {
             summary,
             conversation,
+            follow_up_recommended: applied.follow_up_recommended,
         })
     }
 
@@ -11681,11 +11729,14 @@ impl NoiseClient {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("account sync did not complete")))
     }
 
+    /// Publishes this device's read cursors and returns the vault that the
+    /// relays accepted, so a caller holding no lock can merge the result into
+    /// a freshly loaded state instead of saving this snapshot over it.
     async fn publish_read_state_for_state(
         &self,
         state: &mut ClientState,
         relays: &[RelayDescriptor],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<AccountVault> {
         let credentials = state.account_read_state_credentials()?;
         let identity = state.identity()?;
         if let Ok(remote) = self.fetch_account_vault(relays, &credentials.locator).await {
@@ -11721,7 +11772,7 @@ impl NoiseClient {
                     .as_mut()
                     .context("this identity has no noise ID")?
                     .read_state_revision = revision;
-                return Ok(());
+                return Ok(vault);
             }
 
             Self::merge_remote_read_state(state, &credentials, &remote)?;
