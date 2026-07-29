@@ -1,4 +1,7 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, RwLock},
+};
 
 use anyhow::{Context, anyhow, bail};
 use reqwest::{
@@ -14,6 +17,13 @@ pub(crate) struct CentralTransport {
     base_url: Arc<str>,
     http: reqwest::Client,
     access_token: Arc<RwLock<Option<Arc<str>>>>,
+    /// The state file that stores the session behind `access_token`.
+    ///
+    /// A rejected token can only be renewed against the state that holds its
+    /// installation, and any request can be the one that meets the rejection.
+    /// Recording the path with the session lets every caller recover without
+    /// carrying it through each publisher.
+    session_state_path: Arc<RwLock<Option<PathBuf>>>,
 }
 
 pub(crate) struct CentralResponse {
@@ -52,11 +62,22 @@ impl CentralTransport {
             base_url: Arc::from(base_url),
             http,
             access_token: Arc::new(RwLock::new(None)),
+            session_state_path: Arc::new(RwLock::new(None)),
         })
     }
 
     pub(crate) fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    pub(crate) fn bind_session_state(&self, path: &Path) {
+        if let Ok(mut current) = self.session_state_path.write() {
+            *current = Some(path.to_path_buf());
+        }
+    }
+
+    pub(crate) fn session_state_path(&self) -> Option<PathBuf> {
+        self.session_state_path.read().ok()?.clone()
     }
 
     pub(crate) async fn set_access_token(&self, token: Option<String>) {
@@ -147,14 +168,11 @@ impl CentralTransport {
             .await
     }
 
-    pub(crate) async fn require_success(
-        &self,
-        method: Method,
-        path: &str,
-        body: &[u8],
-        authenticated: bool,
-    ) -> anyhow::Result<CentralResponse> {
-        let response = self.json(method, path, body, authenticated).await?;
+    /// Reject anything but a success status, naming the service's error code.
+    ///
+    /// Kept separate from `require_success` so a caller that renews a rejected
+    /// session can apply the same check after its retry.
+    pub(crate) fn require_ok(response: CentralResponse) -> anyhow::Result<CentralResponse> {
         let status =
             StatusCode::from_u16(response.status).context("central service returned bad status")?;
         if !status.is_success() {
@@ -165,5 +183,16 @@ impl CentralTransport {
             bail!("central service rejected the request ({code})")
         }
         Ok(response)
+    }
+
+    pub(crate) async fn require_success(
+        &self,
+        method: Method,
+        path: &str,
+        body: &[u8],
+        authenticated: bool,
+    ) -> anyhow::Result<CentralResponse> {
+        let response = self.json(method, path, body, authenticated).await?;
+        Self::require_ok(response)
     }
 }

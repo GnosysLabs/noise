@@ -3213,7 +3213,13 @@ impl NoiseClient {
 
     pub async fn bind_central_state(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         let path = path.as_ref();
-        if self.central.is_none() || !state_exists(path) {
+        let Some(central) = self.central.as_ref() else {
+            return Ok(());
+        };
+        // Record the path even when this identity has no state yet, so the
+        // first request after registration can still renew its own session.
+        central.bind_session_state(path);
+        if !state_exists(path) {
             return Ok(());
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -3415,6 +3421,9 @@ impl NoiseClient {
         if state_exists(path) {
             bail!("{} already exists", path.display());
         }
+        if let Some(central) = self.central.as_ref() {
+            central.bind_session_state(path);
+        }
         let username = username.into().trim().to_owned();
         validate_display_name(&username)?;
         let password = password.into();
@@ -3566,6 +3575,9 @@ impl NoiseClient {
         let password = password.into();
         if password.is_empty() || password.chars().count() > 256 {
             bail!("noise ID or password is incorrect")
+        }
+        if let Some(central) = self.central.as_ref() {
+            central.bind_session_state(path);
         }
         let credentials = derive_account_credentials(noise_id, &password)?;
         if state_exists(path) {
@@ -4198,7 +4210,7 @@ impl NoiseClient {
         since: Option<u64>,
         relays: Vec<RelayDescriptor>,
     ) -> anyhow::Result<GroupWatch> {
-        match self.watch_id(path, &group, since, relays).await {
+        match self.watch_id(&group, since, relays).await {
             Ok(change) => Ok(change),
             Err(error) if error.to_string() == "group has been deleted" => {
                 let mut state = load_state(path)?;
@@ -4340,7 +4352,7 @@ impl NoiseClient {
 
         for index in 0..relays.len() {
             let Ok(response) = self
-                .relay_request_with_session_retry(path, &relays, index, "GET", &endpoint, &[])
+                .relay_request(&relays, index, "GET", &endpoint, &[])
                 .await
             else {
                 continue;
@@ -4375,7 +4387,7 @@ impl NoiseClient {
 
         for index in 0..relays.len() {
             let Ok(response) = self
-                .relay_request_with_session_retry(path, &relays, index, "GET", &endpoint, &[])
+                .relay_request(&relays, index, "GET", &endpoint, &[])
                 .await
             else {
                 continue;
@@ -4394,7 +4406,6 @@ impl NoiseClient {
 
     async fn watch_id(
         &self,
-        path: &Path,
         group: &GroupMembership,
         since: Option<u64>,
         relays: Vec<RelayDescriptor>,
@@ -4407,7 +4418,7 @@ impl NoiseClient {
         let mut deleted_relays = 0usize;
         for index in 0..relays.len() {
             let Ok(response) = self
-                .relay_request_with_session_retry(path, &relays, index, "GET", &endpoint, &[])
+                .relay_request(&relays, index, "GET", &endpoint, &[])
                 .await
             else {
                 continue;
@@ -4496,7 +4507,6 @@ impl NoiseClient {
 
     async fn watch_direct_id(
         &self,
-        path: &Path,
         id: &str,
         direct_mailboxes: &[(String, GroupMembership)],
         since: Option<u64>,
@@ -4508,7 +4518,7 @@ impl NoiseClient {
         let endpoint = format!("/v1/groups/{id}/watch/{revision}");
         for index in 0..relays.len() {
             let Ok(response) = self
-                .relay_request_with_session_retry(path, &relays, index, "GET", &endpoint, &[])
+                .relay_request(&relays, index, "GET", &endpoint, &[])
                 .await
             else {
                 continue;
@@ -6952,15 +6962,13 @@ impl NoiseClient {
             state.profile_sequence
         };
         let event = SignedEvent::profile_updated(&identity, &membership, &state.profile, sequence)?;
-        if let Some(central) = self.central.as_ref() {
-            central
-                .require_success(
-                    reqwest::Method::POST,
-                    "/v1/contact-signals",
-                    &serde_json::to_vec(&event)?,
-                    true,
-                )
-                .await?;
+        if self.central.is_some() {
+            self.central_success(
+                reqwest::Method::POST,
+                "/v1/contact-signals",
+                &serde_json::to_vec(&event)?,
+            )
+            .await?;
         } else {
             self.publish_event(relays, &event).await?;
         }
@@ -7637,18 +7645,12 @@ impl NoiseClient {
             return Ok(false);
         }
 
-        if let Some(central) = self.central.as_ref() {
+        if self.central.is_some() {
             let body = serde_json::to_vec(&serde_json::json!({
                 "peer_public_key": public_key,
                 "through_event_id": latest.event_id,
             }))?;
-            central
-                .require_success(
-                    reqwest::Method::POST,
-                    "/v1/direct-receipts/read",
-                    &body,
-                    true,
-                )
+            self.central_success(reqwest::Method::POST, "/v1/direct-receipts/read", &body)
                 .await?;
             let now = current_millis();
             for event in state.direct_event_cache.events.iter().filter(|event| {
@@ -7704,14 +7706,8 @@ impl NoiseClient {
                     .map(|mailbox| (contact.public_key.clone(), mailbox))
             })
             .collect::<Vec<_>>();
-        self.watch_direct_id(
-            path,
-            &mailbox_id,
-            &direct_mailboxes,
-            since,
-            relay_list(relays)?,
-        )
-        .await
+        self.watch_direct_id(&mailbox_id, &direct_mailboxes, since, relay_list(relays)?)
+            .await
     }
 
     pub async fn say_direct(
@@ -7877,13 +7873,12 @@ impl NoiseClient {
             topic,
             current_millis(),
         )?;
-        if let Some(central) = self.central.as_ref() {
+        if self.central.is_some() {
             let body = serde_json::to_vec(&serde_json::json!({
                 "device_token": registration.device_token.clone(),
                 "environment": registration.environment.clone(),
             }))?;
-            central
-                .require_success(reqwest::Method::POST, "/v1/push/subscriptions", &body, true)
+            self.central_success(reqwest::Method::POST, "/v1/push/subscriptions", &body)
                 .await?;
             return Ok(registration);
         }
@@ -11403,9 +11398,9 @@ impl NoiseClient {
         }
         if accepted == 0 {
             match refusal {
-                Some(reason) => bail!(
-                    "no relay accepted this device's encrypted group join request ({reason})"
-                ),
+                Some(reason) => {
+                    bail!("no relay accepted this device's encrypted group join request ({reason})")
+                }
                 None => bail!("no relay accepted this device's encrypted group join request"),
             }
         }
@@ -12421,15 +12416,14 @@ impl NoiseClient {
         recipient_public_key: &str,
         event: &SignedEvent,
     ) -> anyhow::Result<()> {
-        let Some(central) = self.central.as_ref() else {
+        if self.central.is_none() {
             return self.publish_event(relays, event).await;
-        };
+        }
         let body = serde_json::to_vec(&serde_json::json!({
             "recipient_public_key": recipient_public_key,
             "event": event,
         }))?;
-        central
-            .require_success(reqwest::Method::POST, "/v1/direct-events", &body, true)
+        self.central_success(reqwest::Method::POST, "/v1/direct-events", &body)
             .await?;
         Ok(())
     }
@@ -12924,12 +12918,8 @@ impl NoiseClient {
         existing: DirectEventCache,
         complete: bool,
     ) -> anyhow::Result<DirectEventCache> {
-        let central = self
-            .central
-            .as_ref()
-            .context("central service transport is unavailable")?;
-        let peers_response = central
-            .require_success(reqwest::Method::GET, "/v1/direct-peers", &[], true)
+        let peers_response = self
+            .central_success(reqwest::Method::GET, "/v1/direct-peers", &[])
             .await?;
         let peers: Vec<String> = serde_json::from_slice(&peers_response.body)
             .context("central service returned invalid direct peers")?;
@@ -12950,7 +12940,7 @@ impl NoiseClient {
                 .flatten();
             let mut endpoint =
                 central_direct_history_endpoint(&peer, None, prior_cursor.as_deref());
-            let mut page = central_direct_history_page(central, &endpoint).await?;
+            let mut page = central_direct_history_page(self, &endpoint).await?;
             validate_central_direct_page(&self_public_key, &peer, &page.events)?;
             for receipt in &page.receipts {
                 receipts.insert(receipt.event_id.clone(), receipt.clone());
@@ -12969,7 +12959,7 @@ impl NoiseClient {
                         .map(|event| event.event_id.as_str())
                         .context("central direct history has no backward cursor")?;
                     endpoint = central_direct_history_endpoint(&peer, Some(cursor), None);
-                    let next = central_direct_history_page(central, &endpoint).await?;
+                    let next = central_direct_history_page(self, &endpoint).await?;
                     validate_central_direct_page(&self_public_key, &peer, &next.events)?;
                     for receipt in &next.receipts {
                         receipts.insert(receipt.event_id.clone(), receipt.clone());
@@ -12994,7 +12984,7 @@ impl NoiseClient {
                         .map(|event| event.event_id.as_str())
                         .context("central direct history has no forward cursor")?;
                     endpoint = central_direct_history_endpoint(&peer, None, Some(cursor));
-                    let next = central_direct_history_page(central, &endpoint).await?;
+                    let next = central_direct_history_page(self, &endpoint).await?;
                     validate_central_direct_page(&self_public_key, &peer, &next.events)?;
                     for receipt in &next.receipts {
                         receipts.insert(receipt.event_id.clone(), receipt.clone());
@@ -13341,7 +13331,9 @@ impl NoiseClient {
         body: &[u8],
     ) -> anyhow::Result<PlainResponse> {
         if self.central.is_some() {
-            return self.central_request(method, path, body).await;
+            return self
+                .central_request_renewing_session(method, path, body)
+                .await;
         }
         let storage = relays
             .get(storage_index)
@@ -13372,11 +13364,14 @@ impl NoiseClient {
         self.direct_request(storage, method, path, body).await
     }
 
-    async fn relay_request_with_session_retry(
+    /// Send a central request, renewing a rejected session once.
+    ///
+    /// Sessions expire on their own schedule, so any request can be the one
+    /// that meets the rejection. A 401 is answered before the request reaches
+    /// the group, membership, or media it names, so replaying it cannot repeat
+    /// a side effect.
+    async fn central_request_renewing_session(
         &self,
-        state_path: &Path,
-        relays: &[RelayDescriptor],
-        storage_index: usize,
         method: &str,
         path: &str,
         body: &[u8],
@@ -13387,16 +13382,47 @@ impl NoiseClient {
             .map(central::CentralTransport::access_token)
             .transpose()?
             .flatten();
-        let response = self
-            .relay_request(relays, storage_index, method, path, body)
-            .await?;
-        if response.status != 401 || self.central.is_none() {
+        let response = self.central_request(method, path, body).await?;
+        if response.status != 401 {
             return Ok(response);
         }
-        self.recover_central_session(state_path, failed_token.as_deref())
+        let Some(state_path) = self
+            .central
+            .as_ref()
+            .and_then(central::CentralTransport::session_state_path)
+        else {
+            return Ok(response);
+        };
+        self.recover_central_session(&state_path, failed_token.as_deref())
             .await?;
-        self.relay_request(relays, storage_index, method, path, body)
-            .await
+        self.central_request(method, path, body).await
+    }
+
+    /// Send a central request that must succeed, renewing a rejected session
+    /// once. The session-opening requests themselves must keep using
+    /// [`central::CentralTransport::require_success`]: a 401 there means the
+    /// credentials were refused, and renewing would only ask again.
+    async fn central_success(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &[u8],
+    ) -> anyhow::Result<central::CentralResponse> {
+        let central = self
+            .central
+            .as_ref()
+            .context("central service transport is unavailable")?;
+        let failed_token = central.access_token()?;
+        let response = central.json(method.clone(), path, body, true).await?;
+        if response.status != 401 {
+            return central::CentralTransport::require_ok(response);
+        }
+        let Some(state_path) = central.session_state_path() else {
+            return central::CentralTransport::require_ok(response);
+        };
+        self.recover_central_session(&state_path, failed_token.as_deref())
+            .await?;
+        central::CentralTransport::require_ok(central.json(method, path, body, true).await?)
     }
 
     async fn central_request(
@@ -14690,11 +14716,11 @@ fn central_direct_history_endpoint(
 }
 
 async fn central_direct_history_page(
-    central: &central::CentralTransport,
+    client: &NoiseClient,
     endpoint: &str,
 ) -> anyhow::Result<GroupEventPage> {
-    let response = central
-        .require_success(reqwest::Method::GET, endpoint, &[], true)
+    let response = client
+        .central_success(reqwest::Method::GET, endpoint, &[])
         .await?;
     serde_json::from_slice(&response.body)
         .context("central service returned invalid direct history")
@@ -17123,8 +17149,7 @@ mod tests {
         };
         let group = GroupMembership::create_owned("group", identity.public_key_base64());
         let group_id = group.group_id.clone();
-        let mut remote_state =
-            account_state(&identity, &credentials, test_profile(None), 1, 1);
+        let mut remote_state = account_state(&identity, &credentials, test_profile(None), 1, 1);
         remote_state.add_group(group.clone());
         remote_state
             .group_frequencies
@@ -17137,27 +17162,31 @@ mod tests {
         )
         .unwrap();
 
-        let mut stale_local =
-            account_state(&identity, &credentials, test_profile(None), 1, 1);
+        let mut stale_local = account_state(&identity, &credentials, test_profile(None), 1, 1);
         stale_local.add_group(group.clone());
         stale_local
             .group_frequencies
             .insert(group_id.clone(), "111111111111".to_owned());
         NoiseClient::merge_remote_account_state(&mut stale_local, &credentials, &remote).unwrap();
         assert_eq!(
-            stale_local.group_frequencies.get(&group_id).map(String::as_str),
+            stale_local
+                .group_frequencies
+                .get(&group_id)
+                .map(String::as_str),
             Some("222222222222")
         );
 
-        let mut newer_local =
-            account_state(&identity, &credentials, test_profile(None), 1, 3);
+        let mut newer_local = account_state(&identity, &credentials, test_profile(None), 1, 3);
         newer_local.add_group(group);
         newer_local
             .group_frequencies
             .insert(group_id.clone(), "333333333333".to_owned());
         NoiseClient::merge_remote_account_state(&mut newer_local, &credentials, &remote).unwrap();
         assert_eq!(
-            newer_local.group_frequencies.get(&group_id).map(String::as_str),
+            newer_local
+                .group_frequencies
+                .get(&group_id)
+                .map(String::as_str),
             Some("333333333333")
         );
     }
