@@ -1,9 +1,10 @@
 # noise central API
 
-Status: authentication, encrypted account-vault, canonical group/direct-event,
-and MLS control service implemented; not deployed
+Status: deployed to production on Cyphers VPS, including authentication,
+encrypted account-vaults, canonical group/direct events, MLS control, and
+encrypted APNs subscription delivery
 
-Updated: 2026-07-27
+Updated: 2026-07-28
 
 Implementation: `crates/noise-central`
 

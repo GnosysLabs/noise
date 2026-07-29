@@ -1,9 +1,9 @@
 # noise central service deployment
 
-Status: production foundation provisioned; authentication, encrypted-vault,
-canonical group-event, and MLS control service built but not deployed
+Status: deployed to production on Cyphers VPS with PostgreSQL, private R2
+media, realtime watch delivery, and encrypted APNs subscription delivery
 
-Updated: 2026-07-27
+Updated: 2026-07-28
 
 ## Initial providers
 
