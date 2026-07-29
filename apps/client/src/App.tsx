@@ -6228,6 +6228,8 @@ function useChunkedMessageList<T extends { event_id: string }>(
   const observedRows = useRef(new Set<Element>());
   const previousMessageCount = useRef(messages.length);
   const savedScroll = useRef<SavedMessageScroll>({ stuckAtBottom: true });
+  const userScrollPointerActive = useRef(false);
+  const userScrollIntentUntil = useRef(0);
   const olderSentinel = useRef<HTMLDivElement>(null);
   const loadingOlder = useRef(false);
   const pendingLocalPage = useRef(false);
@@ -6275,6 +6277,47 @@ function useChunkedMessageList<T extends { event_id: string }>(
       }
     }
   }, []);
+
+  // A scroll event is not proof that the reader scrolled. WebKit also emits
+  // scroll events while media metadata, posters, fonts, and the composer are
+  // changing the transcript's layout. On a slower machine that event can run
+  // before ResizeObserver and incorrectly revoke the initial bottom lock.
+  const markUserScrollIntent = useCallback(() => {
+    userScrollIntentUntil.current = performance.now() + 300;
+  }, []);
+
+  const beginUserScrollPointer = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    userScrollPointerActive.current = true;
+    markUserScrollIntent();
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // The pointer may belong to a native scrollbar, which is still covered
+      // by the short intent window above.
+    }
+  }, [markUserScrollIntent]);
+
+  const endUserScrollPointer = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    userScrollPointerActive.current = false;
+    markUserScrollIntent();
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  }, [markUserScrollIntent]);
+
+  const onScrollKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    if ([
+      "ArrowUp",
+      "ArrowDown",
+      "PageUp",
+      "PageDown",
+      "Home",
+      "End",
+      " ",
+    ].includes(event.key)) {
+      markUserScrollIntent();
+    }
+  }, [markUserScrollIntent]);
 
   // Media, link previews, and posters finish loading after their row is already
   // in the document, and none of that runs through React. A transcript parked
@@ -6381,6 +6424,8 @@ function useChunkedMessageList<T extends { event_id: string }>(
       element.scrollTop = element.scrollHeight;
       positionedConversation.current = conversationKey;
       savedScroll.current = { stuckAtBottom: true };
+      userScrollPointerActive.current = false;
+      userScrollIntentUntil.current = 0;
       exhaustedRemoteHistory.current = false;
       setRemoteHistoryExhausted(false);
       setAtBottom(true);
@@ -6469,9 +6514,18 @@ function useChunkedMessageList<T extends { event_id: string }>(
   const onScroll = useCallback(() => {
     const element = ref.current;
     if (!element) return;
-    saveScrollPosition();
-    if (element.scrollTop <= OLDER_MESSAGE_TRIGGER_DISTANCE) loadOlder();
-  }, [loadOlder, saveScrollPosition]);
+    const userInitiated = userScrollPointerActive.current
+      || performance.now() <= userScrollIntentUntil.current;
+    if (userInitiated) {
+      saveScrollPosition();
+      if (element.scrollTop <= OLDER_MESSAGE_TRIGGER_DISTANCE) loadOlder();
+    } else {
+      // Preserve the opening-at-bottom invariant through browser-generated
+      // scroll events. ResizeObserver normally performs this correction too,
+      // but this closes the ordering race between the two event sources.
+      pinToBottom();
+    }
+  }, [loadOlder, pinToBottom, saveScrollPosition]);
 
   const revealMessage = useCallback((messageId: string) => {
     const index = messages.findIndex((item) => item.event_id === messageId);
@@ -6508,6 +6562,11 @@ function useChunkedMessageList<T extends { event_id: string }>(
     ref,
     olderSentinel,
     onScroll,
+    onWheel: markUserScrollIntent,
+    onPointerDown: beginUserScrollPointer,
+    onPointerUp: endUserScrollPointer,
+    onPointerCancel: endUserScrollPointer,
+    onKeyDown: onScrollKeyDown,
     visibleMessages,
     renderedCount,
     atBottom,
@@ -6891,7 +6950,16 @@ function ConversationPanel({
           {busy && <LoaderCircle className="spinner" size={14} />}
         </div>
       </header>
-      <div className={`messages ${messageList.settling ? "settling" : ""}`} ref={messageList.ref} onScroll={messageList.onScroll}>
+      <div
+        className={`messages ${messageList.settling ? "settling" : ""}`}
+        ref={messageList.ref}
+        onScroll={messageList.onScroll}
+        onWheel={messageList.onWheel}
+        onPointerDown={messageList.onPointerDown}
+        onPointerUp={messageList.onPointerUp}
+        onPointerCancel={messageList.onPointerCancel}
+        onKeyDown={messageList.onKeyDown}
+      >
         {loadingTopic ? (
           <MediaLoadStatus prominent />
         ) : (
@@ -7202,7 +7270,16 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
         </div>
         <div className="chat-header-actions"><button className="icon-button media-button delete-direct-button" onClick={onDelete} aria-label="delete conversation" title="delete conversation"><Trash2 size={16} /></button>{busy && <LoaderCircle className="spinner" size={14} />}</div>
       </header>
-      <div className={`messages ${messageList.settling ? "settling" : ""}`} ref={messageList.ref} onScroll={messageList.onScroll}>
+      <div
+        className={`messages ${messageList.settling ? "settling" : ""}`}
+        ref={messageList.ref}
+        onScroll={messageList.onScroll}
+        onWheel={messageList.onWheel}
+        onPointerDown={messageList.onPointerDown}
+        onPointerUp={messageList.onPointerUp}
+        onPointerCancel={messageList.onPointerCancel}
+        onKeyDown={messageList.onKeyDown}
+      >
         {visibleMessages.length === 0 && <div className="quiet">start the conversation</div>}
         {messageList.canLoadOlder && (
           <OlderMessagesSentinel
