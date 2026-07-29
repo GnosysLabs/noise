@@ -760,6 +760,10 @@ const MESSAGE_PAGE_SIZE = 40;
 const MESSAGE_HIGHLIGHT_DURATION_MS = 2400;
 // How close to the top of the list counts as "asking for older messages".
 const OLDER_MESSAGE_TRIGGER_DISTANCE = 320;
+// How long a freshly opened transcript may stay hidden while its rows settle at
+// their final heights. Cached rows with known media dimensions settle within a
+// frame or two; the cap keeps slower media from holding the whole view back.
+const SETTLE_BUDGET_MS = 220;
 // A relay page can be entirely made of messages the current topic filters out,
 // so walk back a few pages before giving the scroll gesture back to the user.
 const REMOTE_HISTORY_ATTEMPTS = 4;
@@ -6208,6 +6212,10 @@ function useChunkedMessageList<T extends { event_id: string }>(
 ) {
   const ref = useRef<HTMLDivElement>(null);
   const positionedConversation = useRef<string | null>(null);
+  const settledConversation = useRef<string | null>(null);
+  const settleFrame = useRef(0);
+  const rowObserver = useRef<ResizeObserver | null>(null);
+  const observedRows = useRef(new Set<Element>());
   const previousMessageCount = useRef(messages.length);
   const savedScroll = useRef<SavedMessageScroll>({ stuckAtBottom: true });
   const olderSentinel = useRef<HTMLDivElement>(null);
@@ -6220,6 +6228,7 @@ function useChunkedMessageList<T extends { event_id: string }>(
   const [remoteHistoryExhausted, setRemoteHistoryExhausted] = useState(false);
   const [loadingOlderHistory, setLoadingOlderHistory] = useState(false);
   const [atBottom, setAtBottom] = useState(true);
+  const [settling, setSettling] = useState(false);
   const [visibleCount, setVisibleCount] = useState(() =>
     Math.min(
       messages.length,
@@ -6256,6 +6265,55 @@ function useChunkedMessageList<T extends { event_id: string }>(
       }
     }
   }, []);
+
+  // Media, link previews, and posters finish loading after their row is already
+  // in the document, and none of that runs through React. A transcript parked
+  // at the bottom has to follow that growth or it drifts off the last message.
+  const pinToBottom = useCallback(() => {
+    const element = ref.current;
+    if (!element || !savedScroll.current.stuckAtBottom) return;
+    if (element.scrollHeight - element.scrollTop - element.clientHeight > 0.5) {
+      element.scrollTop = element.scrollHeight;
+    }
+  }, []);
+
+  // Hold a newly opened transcript until its rows stop changing height, so the
+  // reader is never shown a layout that then settles under them. The budget
+  // caps the wait: media that keeps arriving is pinned by the observer above
+  // instead of holding the view back any longer.
+  const settleAtBottom = useCallback(() => {
+    window.cancelAnimationFrame(settleFrame.current);
+    setSettling(true);
+    const deadline = performance.now() + SETTLE_BUDGET_MS;
+    let previousHeight = -1;
+    const step = () => {
+      const element = ref.current;
+      if (!element || !savedScroll.current.stuckAtBottom) {
+        setSettling(false);
+        return;
+      }
+      pinToBottom();
+      const height = element.scrollHeight;
+      if (height === previousHeight || performance.now() >= deadline) {
+        setSettling(false);
+        return;
+      }
+      previousHeight = height;
+      settleFrame.current = window.requestAnimationFrame(step);
+    };
+    settleFrame.current = window.requestAnimationFrame(step);
+  }, [pinToBottom]);
+
+  useLayoutEffect(() => {
+    const observer = new ResizeObserver(() => pinToBottom());
+    rowObserver.current = observer;
+    return () => {
+      window.cancelAnimationFrame(settleFrame.current);
+      observer.disconnect();
+      observedRows.current.clear();
+      rowObserver.current = null;
+    };
+  }, [pinToBottom]);
 
   // The async history walk below outlives the render that started it, so read
   // paging inputs through a ref instead of a captured closure.
@@ -6331,6 +6389,32 @@ function useChunkedMessageList<T extends { event_id: string }>(
           element.scrollBy({ top: correction, behavior: "auto" });
         }
       }
+    }
+    // Watch the rows themselves: a scroll container's own box never changes
+    // when its content grows, so only the rows report a poster or preview that
+    // arrived after the transcript was positioned. The container is watched
+    // too, for the viewport the composer and the window resize.
+    const observer = rowObserver.current;
+    if (observer) {
+      const rows = new Set<Element>(element.children);
+      rows.add(element);
+      for (const row of observedRows.current) {
+        if (rows.has(row)) continue;
+        observer.unobserve(row);
+        observedRows.current.delete(row);
+      }
+      for (const row of rows) {
+        if (observedRows.current.has(row)) continue;
+        observer.observe(row);
+        observedRows.current.add(row);
+      }
+    }
+    // The first paint that carries messages is the one the reader actually
+    // sees; an empty conversation has nothing to settle under.
+    if (settledConversation.current !== conversationKey && messages.length > 0) {
+      settledConversation.current = conversationKey;
+      pinToBottom();
+      settleAtBottom();
     }
     if (visibleCount !== renderedCount) {
       setVisibleCount(renderedCount);
@@ -6417,6 +6501,7 @@ function useChunkedMessageList<T extends { event_id: string }>(
     visibleMessages,
     renderedCount,
     atBottom,
+    settling,
     canLoadOlder,
     loadingOlder: loadingOlderHistory,
     revealMessage,
@@ -6796,7 +6881,7 @@ function ConversationPanel({
           {busy && <LoaderCircle className="spinner" size={14} />}
         </div>
       </header>
-      <div className="messages" ref={messageList.ref} onScroll={messageList.onScroll}>
+      <div className={`messages ${messageList.settling ? "settling" : ""}`} ref={messageList.ref} onScroll={messageList.onScroll}>
         {loadingTopic ? (
           <MediaLoadStatus prominent />
         ) : (
@@ -7107,7 +7192,7 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
         </div>
         <div className="chat-header-actions"><button className="icon-button media-button delete-direct-button" onClick={onDelete} aria-label="delete conversation" title="delete conversation"><Trash2 size={16} /></button>{busy && <LoaderCircle className="spinner" size={14} />}</div>
       </header>
-      <div className="messages" ref={messageList.ref} onScroll={messageList.onScroll}>
+      <div className={`messages ${messageList.settling ? "settling" : ""}`} ref={messageList.ref} onScroll={messageList.onScroll}>
         {visibleMessages.length === 0 && <div className="quiet">start the conversation</div>}
         {messageList.canLoadOlder && (
           <OlderMessagesSentinel
@@ -8406,7 +8491,10 @@ function ChatImage({
               height: image.naturalHeight,
             };
             rememberMediaDimensions(cacheKey, measured.width, measured.height);
-            setDimensions(measured);
+            // Resizing a frame that already reserved its space would move every
+            // row under it, and `source` is sometimes the preview rather than
+            // the full image. Adopt the measurement only when nothing is known.
+            setDimensions((current) => current ?? measured);
             decodedImageCache.add(cacheKey);
             setReady(true);
           }}
