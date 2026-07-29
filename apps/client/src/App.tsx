@@ -3917,19 +3917,15 @@ export default function App() {
   async function selectTopic(topic: TopicSummary | null) {
     if (!activeGroupId || !conversation || conversation.group.group_id !== activeGroupId) return;
     const topicId = topic?.topic_id ?? null;
-    const loadingKey = topicId ?? GENERAL_TOPIC_LOADING_KEY;
     const generation = ++topicSelectionGeneration.current;
-    const hasCachedMessages = conversation.messages.some(
-      (item) => (item.topic_id ?? null) === topicId,
-    );
     setActiveTopicId(topicId);
     setPendingTopicId(null);
     setError(null);
     // Opening a topic is a local navigation. The cached stream is this device's
     // own history, so it renders immediately and the relay catch-up lands
-    // underneath it. Only a stream with nothing cached at all waits for a page,
-    // because there is no complete view to show in the meantime.
-    setLoadingTopicId(hasCachedMessages ? null : loadingKey);
+    // underneath it. An uncached stream renders its quiet state immediately
+    // instead of replacing the conversation with a blocking throbber.
+    setLoadingTopicId(null);
     try {
       // Record the navigation locally alongside relay reconciliation. Marking
       // read takes the local write lock, so awaiting it here would put the
