@@ -6636,7 +6636,44 @@ impl NoiseClient {
         }
         let frequency = generate_frequency();
         let invitation = InviteRecord::create(&identity, &frequency, group.clone())?;
+        // The signed genesis is what registers this group and its founder, so
+        // it has to reach the service before anything that refers to the group.
+        // An invitation published first is refused: the group does not exist
+        // yet, and nothing else creates it.
+        let mut candidate = state.ensure_mls_group_state(&group.group_id)?.clone();
+        let genesis = candidate
+            .create_group_genesis(&identity, &group)
+            .context("could not create the group MLS genesis")?;
+        state.set_mls_group_state(&group.group_id, candidate);
+        // Nothing here is persisted until the whole creation succeeds. A group
+        // abandoned midway keeps its identifier forever, so a half-written
+        // local record could never be resumed and would only be dead weight.
+        self.publish_mls_genesis(&relays, &genesis).await?;
+        let control_log = MlsControlLog {
+            genesis,
+            epochs: Vec::new(),
+        };
         self.publish_invite(&relays, &invitation).await?;
+        // A frequency is usually shared the moment it is created, and joining
+        // the founding epoch needs this group's continuity package. Publish it
+        // here rather than leaving the first joiner to wait for this device's
+        // next encryption pass, which republishes the package on its own if
+        // this attempt does not land.
+        if let Some(mls) = state.mls_group_state(&group.group_id) {
+            let (_, head_record_id) = control_log.head();
+            let package = mls
+                .external_join_package(&identity, &group, head_record_id)
+                .context("could not prepare immediate encrypted group joining")?;
+            let _ = self
+                .publish_mls_external_join_package(&relays, &package)
+                .await;
+        }
+        state
+            .mls_local_geneses
+            .insert(group.group_id.clone(), control_log.genesis.clone());
+        state
+            .mls_control_logs
+            .insert(group.group_id.clone(), control_log);
         state
             .group_frequencies
             .insert(group.group_id.clone(), frequency.clone());
@@ -6646,7 +6683,24 @@ impl NoiseClient {
         state.add_group(group);
         let sequence = state.take_sequence();
         let group = state.active_group()?.clone();
-        let joined = SignedEvent::member_joined(&identity, &group, &state.profile, sequence)?;
+        // The group is encrypted from its first epoch, so this membership
+        // record has to carry that epoch. A legacy event would be refused now
+        // that the group has a genesis.
+        let joined = create_group_event(
+            &state,
+            &identity,
+            &group,
+            GroupEventPayload::MemberJoined {
+                username: state.profile.username.clone(),
+                bio: state.profile.bio.clone(),
+                avatar: state.profile.avatar.clone(),
+                album: state.profile.album.clone(),
+                accepts_direct_messages: state.profile.effective_direct_message_policy()
+                    != DirectMessagePolicy::Nobody,
+                direct_message_policy: state.profile.effective_direct_message_policy(),
+            },
+            sequence,
+        )?;
         self.publish_event(&relays, &joined).await?;
         save_state(path, &state)?;
         Ok(MakeResult {
@@ -11305,17 +11359,24 @@ impl NoiseClient {
     ) -> anyhow::Result<()> {
         let body = serde_json::to_vec(invitation)?;
         let mut accepted = 0usize;
+        let mut refusal = None;
         for index in 0..relays.len() {
             if let Ok(response) = self
                 .relay_request(relays, index, "POST", "/v1/invites", &body)
                 .await
-                && (200..300).contains(&response.status)
             {
-                accepted += 1;
+                if (200..300).contains(&response.status) {
+                    accepted += 1;
+                } else {
+                    refusal = Some(describe_refusal(&response));
+                }
             }
         }
         if accepted == 0 {
-            bail!("no relay accepted the invitation")
+            match refusal {
+                Some(reason) => bail!("no relay accepted the invitation ({reason})"),
+                None => bail!("no relay accepted the invitation"),
+            }
         }
         Ok(())
     }
@@ -11327,17 +11388,26 @@ impl NoiseClient {
     ) -> anyhow::Result<()> {
         let body = serde_json::to_vec(request)?;
         let mut accepted = 0usize;
+        let mut refusal = None;
         for index in 0..relays.len() {
             if let Ok(response) = self
                 .relay_request(relays, index, "POST", "/v2/mls/join-requests", &body)
                 .await
-                && (200..300).contains(&response.status)
             {
-                accepted += 1;
+                if (200..300).contains(&response.status) {
+                    accepted += 1;
+                } else {
+                    refusal = Some(describe_refusal(&response));
+                }
             }
         }
         if accepted == 0 {
-            bail!("no relay accepted this device's encrypted group join request")
+            match refusal {
+                Some(reason) => bail!(
+                    "no relay accepted this device's encrypted group join request ({reason})"
+                ),
+                None => bail!("no relay accepted this device's encrypted group join request"),
+            }
         }
         Ok(())
     }
@@ -14838,6 +14908,18 @@ fn compact_group_event_cache(
         topic_streams,
         portable_conversation: None,
     })
+}
+
+/// Describe why a relay refused a write.
+///
+/// The service answers with a machine-readable `error` code, and carrying it
+/// into the message is the difference between a deterministic refusal and what
+/// otherwise reads like every relay being unreachable.
+fn describe_refusal(response: &PlainResponse) -> String {
+    serde_json::from_slice::<serde_json::Value>(&response.body)
+        .ok()
+        .and_then(|value| value.get("error")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| response.status.to_string())
 }
 
 fn active_group_epoch(
