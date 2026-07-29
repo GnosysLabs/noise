@@ -6,14 +6,14 @@
     <meta name="theme-color" content="#09080c" />
     <meta
       name="description"
-      content="noise Terms of Service for the desktop apps, web app, marketing site, and Gnosys Labs-operated relays."
+      content="noise Terms of Service for the desktop, web, and mobile apps, marketing site, and Gnosys Labs central service."
     />
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="noise" />
     <meta property="og:title" content="Terms of Service | noise" />
     <meta
       property="og:description"
-      content="The rules for using noise and the limits of an open, independently operated relay network."
+      content="The rules for using noise and the limits of its centrally operated early-alpha service."
     />
     <meta property="og:url" content="https://makenoise.chat/terms/" />
     <meta property="og:image" content="https://makenoise.chat/og.png?v=wordmark-20260724" />
@@ -45,13 +45,13 @@
         <p class="section-kicker">Legal / Terms</p>
         <h1>The rules of<br />the room.</h1>
         <p class="legal-intro">
-          These Terms govern the noise services operated by Gnosys Labs. noise is an open,
-          early-alpha network: we can set the rules for our software and infrastructure, but
-          we cannot promise control over every independent relay or every copy of content.
+          These Terms govern the noise apps, websites, and central service operated by Gnosys
+          Labs. noise is early-alpha software: we operate the official service, but we cannot
+          promise uninterrupted access or control every copy a recipient makes.
         </p>
         <div class="legal-meta">
-          <span>Effective July 23, 2026</span>
-          <span>Last updated July 23, 2026</span>
+          <span>Effective July 29, 2026</span>
+          <span>Last updated July 29, 2026</span>
         </div>
       </header>
 
@@ -62,7 +62,7 @@
           <a href="#account">02 / Your account</a>
           <a href="#content">03 / Your content</a>
           <a href="#conduct">04 / Conduct</a>
-          <a href="#relays">05 / Relays</a>
+          <a href="#service">05 / Service</a>
           <a href="#disclaimers">06 / Disclaimers</a>
           <a href="#contact">07 / Contact</a>
         </aside>
@@ -74,8 +74,8 @@
             <p>
               These Terms of Service (“Terms”) are an agreement between you and Gnosys Labs
               (“noise,” “we,” “us,” or “our”) covering the noise desktop applications, web
-              application, marketing website, and relays operated by Gnosys Labs (together,
-              the “Gnosys Labs Services”).
+              and mobile applications, marketing website, and central service operated by
+              Gnosys Labs (together, the “Gnosys Labs Services”).
             </p>
             <p>
               By accessing or using a Gnosys Labs Service, you agree to these Terms and the
@@ -117,7 +117,7 @@
             <p>
               Your display name, avatar, and bio are not unique identifiers. A noise signature
               helps distinguish cryptographic identities. Do not impersonate another person or
-              misrepresent who controls an identity, group, or relay.
+              misrepresent who controls an identity or group.
             </p>
             <p>
               You are responsible for activity performed with your credentials. Tell us
@@ -138,7 +138,9 @@
             <p>
               Gnosys Labs does not endorse user-created groups and is not a party to agreements
               between group members. We may restrict access to infrastructure we operate when
-              necessary to protect users, comply with law, or enforce these Terms.
+              necessary to protect users, comply with law, or enforce these Terms. This can
+              include hiding an event, pausing or blocking a group, restricting an identity,
+              removing encrypted media, or suspending an account in official noise apps.
             </p>
           </section>
 
@@ -178,7 +180,8 @@
               <li>infringe intellectual-property or other legal rights;</li>
               <li>
                 attack, probe, overload, scrape, reverse engineer for abuse, or interfere with
-                the service, its users, relays, update system, or security controls;
+                the service, its users, central infrastructure, update system, or security
+                controls;
               </li>
               <li>
                 evade suspensions, bans, rate limits, storage limits, moderation actions, or
@@ -193,39 +196,38 @@
             </p>
           </section>
 
-          <section id="relays">
+          <section id="service">
             <p class="legal-number">07</p>
-            <h2>Independent relays and third-party services</h2>
+            <h2>Central service and third-party services</h2>
             <p>
-              noise clients may communicate with relays run by independent people or
-              organizations. Those relays are not Gnosys Labs Services, employees, agents, or
-              representatives unless we expressly identify them as operated by Gnosys Labs.
-              Their availability, capacity, update status, security, logging, retention,
-              content policies, and legal obligations may differ.
+              Official noise clients communicate with a central service operated by Gnosys
+              Labs. We may set technical limits, maintain protocol and account state, process
+              encrypted events and media, apply safety restrictions, and change the service
+              architecture as needed to operate noise.
             </p>
             <p>
-              noise may also depend on operating-system services, browsers, GitHub, hosting
-              providers, content-delivery networks, and S3-compatible storage. Their separate
-              terms and policies apply to their services. We are not responsible for
-              third-party services we do not control.
+              noise also depends on operating-system services, browsers, Apple notification
+              services, GitHub, KLIPY, hosting providers, content-delivery networks, databases,
+              linked webpages, and Cloudflare R2 object storage. Their separate terms and
+              policies apply to their services. We are not responsible for third-party
+              services we do not control.
             </p>
           </section>
 
           <section id="deletion">
             <p class="legal-number">08</p>
-            <h2>Deletion is best effort across the network</h2>
+            <h2>Deletion and its limits</h2>
             <p>
               noise includes controls to delete messages, groups, direct-message threads,
-              accounts, and encrypted media references. Clients can publish signed deletion
-              events and reveal deletion capabilities for media shards. We will honor valid
-              deletion requests on systems we control, subject to availability, legal duties,
-              abuse prevention, and technical limits.
+              accounts, and encrypted media. The central service processes valid deletion
+              requests on systems we control, subject to availability, legal duties, abuse
+              prevention, and technical limits.
             </p>
             <p>
               We cannot guarantee deletion from screenshots, exports, backups, modified
-              clients, offline devices, recipients’ devices, or independently operated relays
-              that do not receive or honor a request. Account deletion does not revoke rights
-              other users already have in their own lawful contributions.
+              clients, offline devices, or recipients’ devices that have not received a
+              deletion instruction. Account deletion does not revoke rights other users
+              already have in their own lawful contributions.
             </p>
           </section>
 
@@ -276,10 +278,10 @@
             </p>
             <p>
               We do not warrant that the service will be uninterrupted, that encryption or
-              relays will prevent every disclosure, that content will remain available, that
-              deletion will reach every copy, or that independent relays and users will behave
-              as expected. Some jurisdictions do not allow certain warranty exclusions, so
-              some of these exclusions may not apply to you.
+              security controls will prevent every disclosure, that content will remain
+              available, that deletion will reach every copy, or that users and third-party
+              services will behave as expected. Some jurisdictions do not allow certain
+              warranty exclusions, so some of these exclusions may not apply to you.
             </p>
           </section>
 
