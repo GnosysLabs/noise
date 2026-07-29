@@ -511,6 +511,13 @@ async fn publish_epoch_inner(
     }
     let member_account_ids =
         resolve_member_accounts(&transaction, &record.member_accounts, &parent_member_ids).await?;
+    let next_members = member_account_ids.iter().copied().collect::<HashSet<_>>();
+    let removed_member_ids = parent_member_ids
+        .iter()
+        .filter(|account_id| !next_members.contains(account_id))
+        .copied()
+        .collect::<Vec<_>>();
+    require_current_removal_requests(&transaction, group_pk, &removed_member_ids).await?;
     transaction
         .execute(
             "INSERT INTO noise.mls_epochs (
@@ -866,9 +873,14 @@ pub async fn removal_requests(
     let rows = client
         .query(
             "SELECT signed_wire_record
-             FROM noise.mls_removal_requests
-             WHERE group_pk = $1
-             ORDER BY created_at_millis ASC, request_id ASC",
+             FROM noise.mls_removal_requests request
+             JOIN noise.group_memberships membership
+               ON membership.group_pk = request.group_pk
+              AND membership.account_id = request.target_account_id
+              AND membership.active_until_cursor IS NULL
+             WHERE request.group_pk = $1
+               AND request.accepted_at > membership.created_at
+             ORDER BY request.created_at_millis ASC, request.request_id ASC",
             &[&group_pk],
         )
         .await
@@ -1260,6 +1272,51 @@ async fn materialize_current_memberships(
             )
             .await
             .map_err(ApiError::database)?;
+    }
+    Ok(())
+}
+
+/// Every removal must have been requested after the target's current
+/// membership began.
+///
+/// Removal records are durable so a founder that was offline can process them
+/// later. Without this ordering check, a leave or ban that already removed an
+/// account can be replayed after that account legitimately rejoins, silently
+/// deleting the newer membership. Server acceptance time and membership
+/// creation time share the same database clock, so this remains correct even
+/// when client clocks disagree.
+async fn require_current_removal_requests(
+    transaction: &Transaction<'_>,
+    group_pk: i64,
+    removed_member_ids: &[i64],
+) -> Result<(), ApiError> {
+    if removed_member_ids.is_empty() {
+        return Ok(());
+    }
+    let rows = transaction
+        .query(
+            "SELECT DISTINCT request.target_account_id
+             FROM noise.mls_removal_requests request
+             JOIN noise.group_memberships membership
+               ON membership.group_pk = request.group_pk
+              AND membership.account_id = request.target_account_id
+              AND membership.active_until_cursor IS NULL
+             WHERE request.group_pk = $1
+               AND request.target_account_id = ANY($2::bigint[])
+               AND request.accepted_at > membership.created_at",
+            &[&group_pk, &removed_member_ids],
+        )
+        .await
+        .map_err(ApiError::database)?;
+    let requested = rows
+        .into_iter()
+        .map(|row| row.get::<_, i64>(0))
+        .collect::<HashSet<_>>();
+    if removed_member_ids
+        .iter()
+        .any(|account_id| !requested.contains(account_id))
+    {
+        return Err(ApiError::conflict("mls_removal_request_stale"));
     }
     Ok(())
 }

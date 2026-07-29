@@ -9803,7 +9803,7 @@ impl NoiseClient {
         let mut page = self
             .fetch_group_event_page(group_id, Some(&topic.stream_locator), request, &relays)
             .await?
-            .context("the configured relays do not support topic streams")?;
+            .context("topic history is unavailable")?;
         let is_latest = matches!(request, GroupEventPageRequest::Latest);
         // Relays cap a page by byte length, so a topic carrying media can answer
         // with only a handful of events. Walk back until the opening window is
@@ -9932,7 +9932,7 @@ impl NoiseClient {
                     &relays,
                 )
                 .await?
-                .context("the configured relays do not support topic streams")?;
+                .context("topic history is unavailable")?;
             events.extend(page.events);
             has_older_messages = page.has_more;
             let Some(next_cursor) = page.continuation_cursor else {
@@ -13123,13 +13123,16 @@ impl NoiseClient {
             let response = central
                 .json(reqwest::Method::GET, &endpoint, &[], true)
                 .await?;
-            if response.status == 404 {
-                return Ok(None);
+            if !(200..300).contains(&response.status) {
+                let code = serde_json::from_slice::<serde_json::Value>(&response.body)
+                    .ok()
+                    .and_then(|value| value.get("error")?.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| response.status.to_string());
+                if code == "group_unavailable" {
+                    bail!("you are no longer a member of this group")
+                }
+                bail!("central service rejected group history ({code})")
             }
-            anyhow::ensure!(
-                (200..300).contains(&response.status),
-                "central service rejected group history"
-            );
             let mut page: GroupEventPage = serde_json::from_slice(&response.body)
                 .context("central service returned invalid group history")?;
             anyhow::ensure!(
