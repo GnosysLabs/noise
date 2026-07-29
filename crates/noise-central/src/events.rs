@@ -21,6 +21,12 @@ use super::{
 const DEFAULT_PAGE_SIZE: u16 = 100;
 const MAX_PAGE_SIZE: u16 = 128;
 const MAX_EVENT_CIPHERTEXT_BYTES: usize = 2_000_016;
+// A page is capped by event count, but one event can carry a 2 MB attachment,
+// so 128 of them is far past the 3 MB ceiling every client enforces on a
+// response. Pages are trimmed to this budget and the caller pages for the rest.
+const MAX_PAGE_BYTES: usize = 2_000_000;
+// Identifiers, keys, and the signature that travel with every event body.
+const EVENT_ENVELOPE_BYTES: usize = 512;
 const MIN_DISAPPEARING_SECONDS: u32 = 60;
 const MAX_DISAPPEARING_SECONDS: u32 = 28 * 24 * 60 * 60;
 
@@ -428,6 +434,48 @@ enum ClientPagePosition {
     After(String),
 }
 
+fn event_wire_bytes(event: &CanonicalEvent) -> usize {
+    event
+        .event
+        .ciphertext_base64
+        .len()
+        .saturating_add(EVENT_ENVELOPE_BYTES)
+}
+
+/// Drops events until the page fits the byte ceiling clients enforce, and
+/// reports whether anything was dropped so the caller can set `has_more`.
+///
+/// `latest` and `before` are read backwards into history, so the oldest events
+/// in the page are the ones to give up; `after` walks forward, so the newest
+/// are. One event is always kept, otherwise a stream holding a single
+/// oversized message could never be paged past.
+fn trim_page_to_byte_budget(events: &mut Vec<CanonicalEvent>, reads_forward: bool) -> bool {
+    let mut total = 0usize;
+    let mut kept = 0usize;
+    let ordered: Box<dyn Iterator<Item = &CanonicalEvent>> = if reads_forward {
+        Box::new(events.iter())
+    } else {
+        Box::new(events.iter().rev())
+    };
+    for event in ordered {
+        let next = total.saturating_add(event_wire_bytes(event));
+        if kept > 0 && next > MAX_PAGE_BYTES {
+            break;
+        }
+        total = next;
+        kept += 1;
+    }
+    if kept >= events.len() {
+        return false;
+    }
+    if reads_forward {
+        events.truncate(kept);
+    } else {
+        events.drain(..events.len() - kept);
+    }
+    true
+}
+
 async fn client_group_events(
     State(state): State<Arc<AppState>>,
     Path(group_id): Path<String>,
@@ -505,7 +553,7 @@ async fn client_group_events(
             .await?
         }
     };
-    let has_more = events.len() > MAX_PAGE_SIZE as usize;
+    let mut has_more = events.len() > MAX_PAGE_SIZE as usize;
     if has_more {
         match &position {
             ClientPagePosition::After(_) => {
@@ -516,6 +564,8 @@ async fn client_group_events(
             }
         }
     }
+    let reads_forward = matches!(&position, ClientPagePosition::After(_));
+    has_more |= trim_page_to_byte_budget(&mut events, reads_forward);
     Ok(Json(ClientEventPage {
         events: events.into_iter().map(|event| event.event).collect(),
         has_more,
@@ -1010,7 +1060,7 @@ pub async fn client_direct_history(
         )
         .await?
     };
-    let has_more = events.len() > MAX_PAGE_SIZE as usize;
+    let mut has_more = events.len() > MAX_PAGE_SIZE as usize;
     if has_more {
         if query.after_event_id.is_some() {
             events.pop();
@@ -1018,6 +1068,9 @@ pub async fn client_direct_history(
             events.remove(0);
         }
     }
+    // Trim before delivery is recorded, so a receipt is never written for an
+    // event this response does not carry.
+    has_more |= trim_page_to_byte_budget(&mut events, query.after_event_id.is_some());
     let watch_scopes = direct_watch_scopes(&session, &query.peer_public_key)?;
     let transaction = client.transaction().await.map_err(ApiError::database)?;
     let delivery_recorded = record_direct_delivery(&transaction, &session, &events).await?;
@@ -1628,5 +1681,70 @@ fn event_conflict(error: tokio_postgres::Error) -> ApiError {
         ApiError::conflict("event_sequence_conflict")
     } else {
         ApiError::database(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(ciphertext_bytes: usize, cursor: i64) -> CanonicalEvent {
+        CanonicalEvent {
+            canonical_cursor: cursor,
+            event: SignedEvent {
+                event_id: format!("{cursor:064x}"),
+                group_id: String::new(),
+                author_public_key: String::new(),
+                author_sequence: 0,
+                created_at_millis: 0,
+                expires_after_read_seconds: None,
+                encryption_version: 2,
+                epoch: None,
+                stream_locator: None,
+                nonce_base64: String::new(),
+                ciphertext_base64: "a".repeat(ciphertext_bytes),
+                signature_base64: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn a_page_of_media_events_is_trimmed_to_the_client_response_ceiling() {
+        // Four 800 KB events are a legal page by count and 3.2 MB on the wire,
+        // which every client refuses.
+        let mut events = (0..4)
+            .map(|index| event(800_000, index))
+            .collect::<Vec<_>>();
+        assert!(trim_page_to_byte_budget(&mut events, false));
+        assert_eq!(events.len(), 2);
+        // Reading backwards keeps the newest and pages for the older ones.
+        assert_eq!(events.first().unwrap().canonical_cursor, 2);
+        assert_eq!(events.last().unwrap().canonical_cursor, 3);
+    }
+
+    #[test]
+    fn reading_forward_keeps_the_oldest_events_in_the_page() {
+        let mut events = (0..4)
+            .map(|index| event(800_000, index))
+            .collect::<Vec<_>>();
+        assert!(trim_page_to_byte_budget(&mut events, true));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events.first().unwrap().canonical_cursor, 0);
+        assert_eq!(events.last().unwrap().canonical_cursor, 1);
+    }
+
+    #[test]
+    fn a_single_oversized_event_is_still_delivered() {
+        // Otherwise a stream holding one giant message could never be paged.
+        let mut events = vec![event(MAX_EVENT_CIPHERTEXT_BYTES, 7)];
+        assert!(!trim_page_to_byte_budget(&mut events, false));
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn a_page_within_the_budget_is_left_alone() {
+        let mut events = (0..8).map(|index| event(1_000, index)).collect::<Vec<_>>();
+        assert!(!trim_page_to_byte_budget(&mut events, false));
+        assert_eq!(events.len(), 8);
     }
 }
