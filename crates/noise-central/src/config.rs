@@ -1,4 +1,7 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
+};
 
 use anyhow::{Context, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
@@ -52,6 +55,18 @@ pub struct CentralConfig {
 
     #[arg(long, env = "NOISE_KLIPY_API_KEY", hide_env_values = true)]
     pub(crate) klipy_api_key: Option<String>,
+
+    #[arg(long, env = "NOISE_APNS_KEY_FILE")]
+    pub(crate) apns_key_file: Option<PathBuf>,
+
+    #[arg(long, env = "NOISE_APNS_KEY_ID")]
+    pub(crate) apns_key_id: Option<String>,
+
+    #[arg(long, env = "NOISE_APNS_TEAM_ID")]
+    pub(crate) apns_team_id: Option<String>,
+
+    #[arg(long, env = "NOISE_APNS_TOPIC")]
+    pub(crate) apns_topic: Option<String>,
 }
 
 impl CentralConfig {
@@ -90,6 +105,7 @@ impl CentralConfig {
         }
         self.token_hash_key()?;
         self.media_config()?;
+        self.push_config()?;
         if self
             .klipy_api_key
             .as_deref()
@@ -185,6 +201,55 @@ impl CentralConfig {
                 .to_owned(),
         }))
     }
+
+    pub(crate) fn push_config(&self) -> anyhow::Result<Option<PushConfig>> {
+        let configured = [
+            self.apns_key_file.is_some(),
+            self.apns_key_id.is_some(),
+            self.apns_team_id.is_some(),
+            self.apns_topic.is_some(),
+        ];
+        if configured.iter().all(|configured| !configured) {
+            return Ok(None);
+        }
+        if configured.iter().any(|configured| !configured) {
+            bail!("central APNs requires the key file, key ID, team ID, and application topic");
+        }
+        let key_file = self.apns_key_file.clone().expect("checked above");
+        if !key_file.is_absolute() {
+            bail!("NOISE_APNS_KEY_FILE must be an absolute path");
+        }
+        let key_id = self.apns_key_id.as_deref().expect("checked above").trim();
+        let team_id = self.apns_team_id.as_deref().expect("checked above").trim();
+        if !valid_apple_identifier(key_id) {
+            bail!("NOISE_APNS_KEY_ID is invalid");
+        }
+        if !valid_apple_identifier(team_id) {
+            bail!("NOISE_APNS_TEAM_ID is invalid");
+        }
+        let topic = self.apns_topic.as_deref().expect("checked above").trim();
+        if topic.len() > 255
+            || !topic.contains('.')
+            || !topic
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+        {
+            bail!("NOISE_APNS_TOPIC is invalid");
+        }
+        Ok(Some(PushConfig {
+            key_file,
+            key_id: key_id.to_owned(),
+            team_id: team_id.to_owned(),
+            topic: topic.to_owned(),
+        }))
+    }
+}
+
+fn valid_apple_identifier(value: &str) -> bool {
+    value.len() == 10
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
 }
 
 pub(crate) struct MediaConfig {
@@ -192,4 +257,11 @@ pub(crate) struct MediaConfig {
     pub bucket: String,
     pub access_key_id: String,
     pub secret_access_key: String,
+}
+
+pub(crate) struct PushConfig {
+    pub key_file: PathBuf,
+    pub key_id: String,
+    pub team_id: String,
+    pub topic: String,
 }

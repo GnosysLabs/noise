@@ -7,6 +7,7 @@ mod klipy;
 mod link_preview;
 mod media;
 mod mls;
+mod push;
 mod realtime;
 mod social;
 mod vaults;
@@ -52,12 +53,14 @@ struct AppState {
     token_hash_key: [u8; 32],
     klipy: Option<klipy::KlipyProxy>,
     media: Option<media::MediaStore>,
+    push: Option<push::PushService>,
     presences: Arc<RwLock<HashMap<String, HashMap<String, GroupPresence>>>>,
     watch: Arc<watch::WatchNotifier>,
 }
 
 struct AuthenticatedSession {
     account_id: i64,
+    device_pk: i64,
     identity_public_key: [u8; 32],
 }
 
@@ -101,11 +104,14 @@ pub async fn build_app(config: &CentralConfig) -> anyhow::Result<Router> {
     config.validate()?;
     let klipy = klipy::KlipyProxy::open(config)?;
     let media = media::MediaStore::open(config)?;
+    let token_hash_key = config.token_hash_key()?;
+    let push = push::PushService::open(config, &token_hash_key)?;
     let state = Arc::new(AppState {
         database: Database::connect(config).await?,
-        token_hash_key: config.token_hash_key()?,
+        token_hash_key,
         klipy,
         media,
+        push,
         presences: Arc::new(RwLock::new(HashMap::new())),
         watch: Arc::new(watch::WatchNotifier::default()),
     });
@@ -120,6 +126,7 @@ pub async fn build_app(config: &CentralConfig) -> anyhow::Result<Router> {
         .route("/v1/devices/register", post(register_installation))
         .route("/v1/auth/sessions", post(open_session))
         .route("/v1/auth/sessions/current", delete(close_current_session))
+        .route("/v1/push/subscriptions", post(push::register_subscription))
         .route(
             "/v1/account-vaults/{locator}",
             get(vaults::get_account_vault).put(vaults::put_account_vault),
@@ -996,7 +1003,7 @@ async fn authenticate_session(
         .map_err(ApiError::database)?;
     let row = client
         .query_opt(
-            "SELECT s.account_id, a.identity_public_key
+            "SELECT s.account_id, s.device_pk, a.identity_public_key
              FROM noise.sessions s
              JOIN noise.accounts a ON a.account_id = s.account_id
              JOIN noise.devices d
@@ -1015,12 +1022,13 @@ async fn authenticate_session(
         .await
         .map_err(ApiError::database)?
         .ok_or_else(ApiError::unauthorized)?;
-    let identity: Vec<u8> = row.get(1);
+    let identity: Vec<u8> = row.get(2);
     let identity_public_key: [u8; 32] = identity
         .try_into()
         .map_err(|_| ApiError::database("stored identity key has an invalid length"))?;
     Ok(AuthenticatedSession {
         account_id: row.get(0),
+        device_pk: row.get(1),
         identity_public_key,
     })
 }

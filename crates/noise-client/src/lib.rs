@@ -7784,6 +7784,16 @@ impl NoiseClient {
             topic,
             current_millis(),
         )?;
+        if let Some(central) = self.central.as_ref() {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "device_token": registration.device_token.clone(),
+                "environment": registration.environment.clone(),
+            }))?;
+            central
+                .require_success(reqwest::Method::POST, "/v1/push/subscriptions", &body, true)
+                .await?;
+            return Ok(registration);
+        }
         let relays = relay_list(relays)?;
         let relays = relays.as_slice();
         let body = serde_json::to_vec(&registration)?;

@@ -800,6 +800,24 @@ pub async fn publish_direct_event(
     transaction.commit().await.map_err(ApiError::database)?;
     state.watch.wake(&recipient_mailbox).await;
     state.watch.wake(&author_mailbox).await;
+    if let Some(push) = state.push.clone() {
+        let database = state.database.clone();
+        let sender_public_key = request.event.author_public_key.clone();
+        let event_id = request.event.event_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = push
+                .deliver_direct(
+                    &database,
+                    recipient_account_id,
+                    &sender_public_key,
+                    &event_id,
+                )
+                .await
+            {
+                eprintln!("noise-central direct APNs delivery failed: {error:#}");
+            }
+        });
+    }
 
     Ok((
         StatusCode::CREATED,

@@ -20,6 +20,7 @@ The first runnable central-service layer implements:
 | `POST /v1/auth/sessions` | Verify the same installation's proof and return a one-hour opaque bearer token |
 | `DELETE /v1/auth/sessions/current` | Revoke the current bearer token |
 | `POST /v1/devices/{installation_id}/revoke` | Verify an account-signed revocation and invalidate every installation token |
+| `POST /v1/push/subscriptions` | Register or refresh the authenticated installation's encrypted APNs routing token |
 | `GET /v1/account-vaults/{locator}` | Bootstrap-fetch the current signed encrypted vault and revision ETag by its opaque locator |
 | `PUT /v1/account-vaults/{locator}` | Compare-and-swap the authenticated account's next signed encrypted vault revision |
 | `POST /v1/events` | Verify and canonically order a signed encrypted group or topic event |
@@ -173,6 +174,13 @@ plaintext, group name, or profile plaintext.
 Request bodies, passwords, vault keys, identity secrets, installation private
 keys, raw challenge nonces, and raw bearer tokens are not logged.
 
+APNs device tokens are normalized and keyed-hashed for lookup, then encrypted
+with a purpose-derived XChaCha20-Poly1305 key before storage. The encryption is
+bound to the authenticated central device and APNs environment. Direct-message
+push payloads contain only generic alert text, the sender public key, and the
+encrypted event identifier used for client routing; message text and media are
+never sent to Apple.
+
 ## Runtime configuration
 
 | Environment variable | Required | Initial value or rule |
@@ -187,12 +195,16 @@ keys, raw challenge nonces, and raw bearer tokens are not logged.
 | `NOISE_TOKEN_HASH_KEY` | yes | Independent 32-byte random secret |
 | `NOISE_ALLOWED_ORIGIN` | no | Exact HTTPS origin, initially `https://app.makenoise.chat` when web traffic begins |
 | `NOISE_KLIPY_API_KEY` | no | Protected server-side key enabling authenticated GIF, sticker, and clip search |
+| `NOISE_APNS_KEY_FILE` | no | Absolute path to the Apple `.p8` key; requires every other APNs setting |
+| `NOISE_APNS_KEY_ID` | no | Ten-character Apple key identifier |
+| `NOISE_APNS_TEAM_ID` | no | Ten-character Apple developer team identifier |
+| `NOISE_APNS_TOPIC` | no | Fixed iOS application bundle identifier used as the APNs topic |
 
 The production PostgreSQL role has a 20-connection limit. The service's
 maximum accepted pool size leaves connections available for migrations,
 maintenance, and recovery.
 
-At startup the service requires canonical schema migration version 2. It does
+At startup the service requires canonical schema migration version 8. It does
 not apply migrations automatically.
 
 ## HTTP boundary
