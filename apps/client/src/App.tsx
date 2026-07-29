@@ -5436,6 +5436,14 @@ export default function App() {
       {dialog?.type === "delete_direct" && (
         <DeleteDirectDialog
           direct={dialog.direct}
+          // A thread this device has never opened has no cached transcript, so
+          // an unknown history keeps the two-sided choice rather than quietly
+          // narrowing it to a local delete.
+          neverUsed={(
+            directConversation?.contact.public_key === dialog.direct.public_key
+              ? directConversation
+              : directConversationCache.current.get(dialog.direct.public_key)
+          )?.messages.length === 0}
           busy={busy}
           onClose={() => setDialog(null)}
           onDelete={(forBoth) => perform(async () => {
@@ -9768,12 +9776,16 @@ function useProfileImageSource(
 
 function Avatar({ name, image, size, square = false }: { name: string; image: ProfileImage | null; size: number; square?: boolean }) {
   const source = useProfileImageSource(image, true);
-  const fallback = square ? null : generateUserAvatarSource(image?.blob_id ?? name);
+  // The generated mark is the face of someone who never set a picture. A
+  // profile that has one shows its own tinted circle until the bytes decode —
+  // switching accounts empties the cache, and standing the mark in there put a
+  // stranger's face on people who were already recognisable.
+  const fallback = square || image ? null : generateUserAvatarSource(name);
   return (
     <span className={`avatar ${square ? "square" : ""}`} style={{ width: size, height: size }}>
       {source || fallback
         ? <img src={source ?? fallback ?? undefined} alt="" />
-        : <b>{name.slice(0, 1).toUpperCase()}</b>}
+        : image ? null : <b>{name.slice(0, 1).toUpperCase()}</b>}
     </span>
   );
 }
@@ -10965,7 +10977,11 @@ function ClearDirectDialog({ direct, busy, onClose, onClear }: { direct: DirectS
   return <Modal onClose={onClose} compact><DialogHeading icon={<Eraser />} title="clear messages for both?" detail={direct.username} /><p className="deletion-warning">This erases every message for both users while keeping the conversation available.</p><DialogButtons onClose={onClose}><button className="delete-confirm" disabled={busy} onClick={() => void onClear()}>{busy && <LoaderCircle className="spinner" size={13} />} clear messages</button></DialogButtons></Modal>;
 }
 
-function DeleteDirectDialog({ direct, busy, onClose, onDelete }: { direct: DirectSummary; busy: boolean; onClose: () => void; onDelete: (forBoth: boolean) => Promise<boolean> }) {
+function DeleteDirectDialog({ direct, neverUsed, busy, onClose, onDelete }: { direct: DirectSummary; neverUsed: boolean; busy: boolean; onClose: () => void; onDelete: (forBoth: boolean) => Promise<boolean> }) {
+  // Nothing was ever sent, so there is nothing on the other side to ask about.
+  if (neverUsed) {
+    return <Modal onClose={onClose} compact><DialogHeading icon={<Trash2 />} title="delete conversation?" detail={direct.username} /><p className="deletion-warning">Nothing was ever sent here, so there is nothing on {direct.username}’s side to remove.</p><DialogButtons onClose={onClose} closeLabel="cancel"><button className="delete-confirm" disabled={busy} onClick={() => void onDelete(false)}>{busy && <LoaderCircle className="spinner" size={13} />} delete conversation</button></DialogButtons></Modal>;
+  }
   return <Modal onClose={onClose}><DialogHeading icon={<Trash2 />} title="delete conversation?" detail={direct.username} /><p className="deletion-warning">Choose whether to remove the conversation only from this device or from both users’ official noise clients.</p><div className="direct-delete-options"><button disabled={busy} onClick={() => void onDelete(false)}><strong>delete just for me</strong><small>erase this device’s conversation and cached media</small></button><button className="danger" disabled={busy} onClick={() => void onDelete(true)}><strong>delete for both of us</strong><small>ask all synced noise clients to erase the entire conversation</small></button></div><DialogButtons onClose={onClose} closeLabel="cancel">{busy && <LoaderCircle className="spinner" size={14} />}</DialogButtons></Modal>;
 }
 
