@@ -928,6 +928,7 @@ type PendingMedia = {
   file: Promise<File>;
   previewUrl: string;
   mediaPreview: Promise<MediaPreview | null> | null;
+  mediaDimensions: Promise<MediaDimensions | null> | null;
 };
 
 type ComposerUploadState = {
@@ -1125,6 +1126,11 @@ type MediaPreview = {
   pixelHeight: number;
 };
 
+type MediaDimensions = {
+  pixelWidth: number;
+  pixelHeight: number;
+};
+
 function preparePendingMedia(file: File): PendingMedia {
   const sticker = isKlipyStickerFileName(file.name);
   const previewUrl = URL.createObjectURL(file);
@@ -1132,20 +1138,29 @@ function preparePendingMedia(file: File): PendingMedia {
   const immediatePreview = file.type.startsWith("video/")
     ? prepareVideoPreviewSource(previewUrl)
     : null;
+  const mediaKind = file.type.startsWith("video/")
+    ? "video"
+    : (file.type.startsWith("image/") || isHeicMedia(file.type, file.name))
+      ? "image"
+      : null;
+  const mediaPreview = file.type.startsWith("video/")
+    ? firstMediaPreview(
+        immediatePreview,
+        prepareMediaPreviewFromFile(preparedFile, "video"),
+      )
+    : (file.type.startsWith("image/") || isHeicMedia(file.type, file.name)) && !sticker
+      ? prepareMediaPreviewFromFile(preparedFile, "image")
+      : null;
   return {
     name: file.name,
     mimeType: file.type,
     byteLength: file.size,
     file: preparedFile,
     previewUrl,
-    mediaPreview: file.type.startsWith("video/")
-      ? firstMediaPreview(
-          immediatePreview,
-          prepareMediaPreviewFromFile(preparedFile, "video"),
-        )
-      : (file.type.startsWith("image/") || isHeicMedia(file.type, file.name)) && !sticker
-        ? prepareMediaPreviewFromFile(preparedFile, "image")
-        : null,
+    mediaPreview,
+    mediaDimensions: mediaKind
+      ? prepareMediaDimensions(preparedFile, mediaKind)
+      : null,
   };
 }
 
@@ -1200,6 +1215,77 @@ async function prepareMediaPreviewFromFile(
   } finally {
     URL.revokeObjectURL(source);
   }
+}
+
+/// Resolves geometry from the final prepared upload independently of thumbnail
+/// generation. Preview encoding may fail or time out without taking dimensions
+/// down with it, and video optimization cannot leave dimensions describing the
+/// original file rather than the bytes that are actually sent.
+async function prepareMediaDimensions(
+  file: Promise<File>,
+  kind: "video" | "image",
+): Promise<MediaDimensions | null> {
+  const prepared = await file;
+  const source = URL.createObjectURL(prepared);
+  try {
+    return kind === "video"
+      ? await prepareVideoDimensionsSource(source)
+      : await prepareImageDimensionsSource(source);
+  } finally {
+    URL.revokeObjectURL(source);
+  }
+}
+
+function prepareImageDimensionsSource(
+  source: string,
+): Promise<MediaDimensions | null> {
+  const image = new Image();
+  return new Promise((resolve) => {
+    image.onload = () => {
+      const pixelWidth = image.naturalWidth;
+      const pixelHeight = image.naturalHeight;
+      resolve(
+        pixelWidth > 0 && pixelHeight > 0
+          ? { pixelWidth, pixelHeight }
+          : null,
+      );
+    };
+    image.onerror = () => resolve(null);
+    image.src = source;
+  });
+}
+
+function prepareVideoDimensionsSource(
+  source: string,
+): Promise<MediaDimensions | null> {
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = "metadata";
+  return new Promise((resolve) => {
+    let settled = false;
+    const timeout = window.setTimeout(() => finish(null), 15_000);
+    const finish = (value: MediaDimensions | null) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      video.removeAttribute("src");
+      video.load();
+      resolve(value);
+    };
+    video.addEventListener("loadedmetadata", () => {
+      const pixelWidth = video.videoWidth;
+      const pixelHeight = video.videoHeight;
+      finish(
+        pixelWidth > 0 && pixelHeight > 0
+          ? { pixelWidth, pixelHeight }
+          : null,
+      );
+    }, { once: true });
+    video.addEventListener("error", () => finish(null), { once: true });
+    video.src = source;
+    video.load();
+  });
 }
 
 async function optimizeOutgoingMedia(file: File) {
@@ -1434,22 +1520,31 @@ async function pendingMediaFromNativePath(sourcePath: string) {
     ? preparedFile.then(convertHeicFile)
     : preparedFile;
   if (heic) previewUrl = URL.createObjectURL(await file);
+  const mediaKind = inspected.mime_type.startsWith("video/")
+    ? "video"
+    : inspected.mime_type.startsWith("image/")
+      ? "image"
+      : null;
+  const mediaPreview = inspected.mime_type.startsWith("video/")
+    ? firstMediaPreview(
+        prepareVideoPreviewSource(previewUrl),
+        prepareMediaPreviewFromFile(file, "video"),
+      )
+    : inspected.mime_type.startsWith("image/")
+      ? (heic
+          ? prepareMediaPreviewFromFile(file, "image")
+          : prepareImagePreviewSource(previewUrl))
+      : null;
   return {
     name: inspected.file_name,
     mimeType: inspected.mime_type,
     byteLength: inspected.byte_length,
     file,
     previewUrl,
-    mediaPreview: inspected.mime_type.startsWith("video/")
-      ? firstMediaPreview(
-          prepareVideoPreviewSource(previewUrl),
-          prepareMediaPreviewFromFile(file, "video"),
-        )
-      : inspected.mime_type.startsWith("image/")
-        ? (heic
-            ? prepareMediaPreviewFromFile(file, "image")
-            : prepareImagePreviewSource(previewUrl))
-        : null,
+    mediaPreview,
+    mediaDimensions: mediaKind
+      ? prepareMediaDimensions(file, mediaKind)
+      : null,
   } satisfies PendingMedia;
 }
 
@@ -4705,19 +4800,36 @@ export default function App() {
                   upload_progress: pending ? 0 : undefined,
                 };
                 addOptimisticGroupMessage(groupId, optimistic);
-                if (pending?.mediaPreview && optimistic.local_attachment) {
+                if (
+                  pending
+                  && (pending.mediaPreview || pending.mediaDimensions)
+                  && optimistic.local_attachment
+                ) {
                   const optimisticId = optimistic.event_id;
                   const localAttachment = optimistic.local_attachment;
-                  void pending.mediaPreview.then((preview) => {
-                    if (!preview) return;
-                    updateOptimisticGroupMessage(groupId, optimisticId, {
-                      local_attachment: {
-                        ...localAttachment,
-                        poster_url: `data:${preview.mimeType};base64,${preview.dataBase64}`,
-                        pixel_width: preview.pixelWidth,
-                        pixel_height: preview.pixelHeight,
+                  void Promise.all([
+                    pending.mediaPreview ?? Promise.resolve(null),
+                    pending.mediaDimensions ?? Promise.resolve(null),
+                  ]).then(([preview, dimensions]) => {
+                    if (!preview && !dimensions) return;
+                    const geometry = dimensions ?? preview;
+                    updateOptimisticGroupMessage(
+                      groupId,
+                      optimisticId,
+                      {
+                        local_attachment: {
+                          ...localAttachment,
+                          poster_url: preview
+                            ? `data:${preview.mimeType};base64,${preview.dataBase64}`
+                            : localAttachment.poster_url,
+                          pixel_width: geometry?.pixelWidth,
+                          pixel_height: geometry?.pixelHeight,
+                        },
                       },
-                    });
+                    );
+                  }).catch(() => {
+                    // The upload reports preparation failures through its
+                    // normal error state; optimistic geometry is best effort.
                   });
                 }
                 let attachment: MediaAttachment | null = null;
@@ -8138,14 +8250,33 @@ async function pendingMediaFromAttachment(
         pixelHeight: attachment.pixel_height,
       })
     : null;
+  const mediaKind = file.type.startsWith("video/")
+    ? "video"
+    : file.type.startsWith("image/")
+      ? "image"
+      : null;
+  const mediaPreview = embeddedPreview
+    ?? (file.type.startsWith("image/")
+      ? prepareMediaPreviewFromFile(Promise.resolve(file), "image")
+      : null);
+  const embeddedDimensions = attachment.pixel_width
+    && attachment.pixel_height
+    ? Promise.resolve({
+        pixelWidth: attachment.pixel_width,
+        pixelHeight: attachment.pixel_height,
+      })
+    : null;
   return {
     name: file.name,
     mimeType: file.type,
     byteLength: file.size,
     file: Promise.resolve(file),
     previewUrl: URL.createObjectURL(file),
-    mediaPreview: embeddedPreview
-      ?? (file.type.startsWith("image/") ? prepareMediaPreviewFromFile(Promise.resolve(file), "image") : null),
+    mediaPreview,
+    mediaDimensions: embeddedDimensions
+      ?? (mediaKind
+        ? prepareMediaDimensions(Promise.resolve(file), mediaKind)
+        : null),
   };
 }
 
@@ -9527,15 +9658,23 @@ function ProfileAlbumDialog({
         let attachment = queued.attachment;
         if (!attachment) {
           const preparedFile = optimizeOutgoingMedia(queued.file);
+          const mediaKind = queued.file.type.startsWith("video/")
+            ? "video"
+            : "image";
+          const mediaPreview = queued.file.type.startsWith("video/")
+            ? prepareVideoPreviewSource(queued.previewUrl)
+            : prepareMediaPreviewFromFile(preparedFile, "image");
           const pending: PendingMedia = {
             name: queued.file.name,
             mimeType: queued.file.type,
             byteLength: queued.file.size,
             file: preparedFile,
             previewUrl: queued.previewUrl,
-            mediaPreview: queued.file.type.startsWith("video/")
-              ? prepareVideoPreviewSource(queued.previewUrl)
-              : prepareMediaPreviewFromFile(preparedFile, "image"),
+            mediaPreview,
+            mediaDimensions: prepareMediaDimensions(
+              preparedFile,
+              mediaKind,
+            ),
           };
           attachment = await uploadPendingMedia(
             pending,
@@ -11722,6 +11861,7 @@ async function uploadPendingMedia(
   if (!pending) return null;
   const file = await pending.file;
   const mediaPreview = pending.mediaPreview;
+  const mediaDimensions = pending.mediaDimensions;
   const chunks: MediaChunk[] = [];
   const mimeType = file.type || pending.mimeType;
   const streaming = mimeType.startsWith("video/") || mimeType.startsWith("audio/");
@@ -11745,7 +11885,10 @@ async function uploadPendingMedia(
     offset += chunk.byte_length;
   }
   if (signal.aborted) throw new Error("media upload cancelled");
-  const preview = mediaPreview ? await mediaPreview : null;
+  const [preview, dimensions] = await Promise.all([
+    mediaPreview ?? Promise.resolve(null),
+    mediaDimensions ?? Promise.resolve(null),
+  ]);
   if (signal.aborted) throw new Error("media upload cancelled");
   return {
     file_name: file.name || pending.name,
@@ -11754,8 +11897,8 @@ async function uploadPendingMedia(
     chunks,
     preview_data_base64: preview?.dataBase64 ?? null,
     preview_mime_type: preview?.mimeType ?? null,
-    pixel_width: preview?.pixelWidth ?? null,
-    pixel_height: preview?.pixelHeight ?? null,
+    pixel_width: dimensions?.pixelWidth ?? preview?.pixelWidth ?? null,
+    pixel_height: dimensions?.pixelHeight ?? preview?.pixelHeight ?? null,
   };
 }
 
