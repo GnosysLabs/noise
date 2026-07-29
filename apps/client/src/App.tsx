@@ -1545,10 +1545,15 @@ function prepareVideoPreviewSource(source: string): Promise<MediaPreview | null>
       if (capturing || settled || !video.videoWidth || !video.videoHeight) return;
       capturing = true;
       try {
-        if (videoFrameIsNearBlack(video) && previewIndex < previewTimes.length - 1) {
+        // Seeking costs a decode from the nearest keyframe, which is most of
+        // the wait on a long or large video. The frame already decoded is
+        // almost always the thumbnail, so only a black opening frame is worth
+        // paying for a seek to look past.
+        if (videoFrameIsNearBlack(video) && previewIndex < previewTimes.length) {
+          const nextTime = previewTimes[previewIndex];
           previewIndex += 1;
           capturing = false;
-          video.currentTime = previewTimes[previewIndex];
+          video.currentTime = nextTime;
           return;
         }
         const profiles = [
@@ -1591,11 +1596,8 @@ function prepareVideoPreviewSource(source: string): Promise<MediaPreview | null>
     };
     video.addEventListener("loadedmetadata", () => {
       previewTimes = videoPreviewTimes(video.duration);
-      if (previewTimes.length) video.currentTime = previewTimes[0];
     }, { once: true });
-    video.addEventListener("loadeddata", () => {
-      if (!previewTimes.length) void capture();
-    }, { once: true });
+    video.addEventListener("loadeddata", () => void capture(), { once: true });
     video.addEventListener("seeked", () => void capture());
     video.addEventListener("error", () => finish(null), { once: true });
     video.src = source;
@@ -8639,20 +8641,11 @@ function ChatVideo({
   }, [pixelHeight, pixelWidth, posterCacheKey]);
   useEffect(() => {
     const cached = posterCacheKey ? videoPosterCache.get(posterCacheKey) : undefined;
-    if (!poster) {
-      setDecodedPoster(cached);
-      return;
-    }
-    let active = true;
-    void imageIsNearBlack(poster).then((nearBlack) => {
-      if (!active) return;
-      if (nearBlack) {
-        setDecodedPoster(cached);
-        return;
-      }
-      setDecodedPoster(cached ?? poster);
-    });
-    return () => { active = false; };
+    // Show the frame the message carries at once. Deciding whether it is a
+    // black opening frame means decoding it first, and waiting on that left
+    // every video blank for as long as the decode queue took. A better frame
+    // captured from playback replaces it when one arrives.
+    setDecodedPoster(cached ?? poster);
   }, [poster, posterCacheKey]);
   const capturePoster = (element: HTMLVideoElement) => {
     if (!posterCacheKey || !element.videoWidth || !element.videoHeight) return;
@@ -11635,35 +11628,6 @@ function videoFrameIsNearBlack(video: HTMLVideoElement) {
   } catch {
     return false;
   }
-}
-
-function imageIsNearBlack(source: string) {
-  return new Promise<boolean>((resolve) => {
-    const image = new Image();
-    image.onload = () => {
-      try {
-        const canvas = document.createElement("canvas");
-        canvas.width = 24;
-        canvas.height = 24;
-        const context = canvas.getContext("2d", { willReadFrequently: true });
-        if (!context) return resolve(false);
-        context.drawImage(image, 0, 0, canvas.width, canvas.height);
-        const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
-        let luminance = 0;
-        let brightest = 0;
-        for (let index = 0; index < pixels.length; index += 4) {
-          const value = pixels[index] * 0.2126 + pixels[index + 1] * 0.7152 + pixels[index + 2] * 0.0722;
-          luminance += value;
-          brightest = Math.max(brightest, value);
-        }
-        resolve(luminance / (pixels.length / 4) < 18 && brightest < 48);
-      } catch {
-        resolve(false);
-      }
-    };
-    image.onerror = () => resolve(false);
-    image.src = source;
-  });
 }
 
 async function uploadPendingMedia(
