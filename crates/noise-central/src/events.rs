@@ -74,6 +74,17 @@ pub struct DirectClientHistoryQuery {
 pub struct DirectEventPublication {
     recipient_public_key: String,
     event: SignedEvent,
+    /// Whether this record is worth waking the recipient's device for.
+    ///
+    /// Deletions, clears, and blocks travel exactly like messages and are just
+    /// as encrypted, so only the sender can say which is which. Absent means a
+    /// message: that is all any client sent before the flag existed.
+    #[serde(default = "notifies_by_default")]
+    notifies: bool,
+}
+
+fn notifies_by_default() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -850,7 +861,9 @@ pub async fn publish_direct_event(
     transaction.commit().await.map_err(ApiError::database)?;
     state.watch.wake(&recipient_mailbox).await;
     state.watch.wake(&author_mailbox).await;
-    if let Some(push) = state.push.clone() {
+    if request.notifies
+        && let Some(push) = state.push.clone()
+    {
         let database = state.database.clone();
         let sender_public_key = request.event.author_public_key.clone();
         let event_id = request.event.event_id.clone();

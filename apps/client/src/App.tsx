@@ -9777,7 +9777,7 @@ function useProfileImageSource(
 function Avatar({ name, image, size, square = false }: { name: string; image: ProfileImage | null; size: number; square?: boolean }) {
   const source = useProfileImageSource(image, true);
   // The generated mark is the face of someone who never set a picture. A
-  // profile that has one shows its own tinted circle until the bytes decode —
+  // profile that has one holds its own initial until the bytes decode —
   // switching accounts empties the cache, and standing the mark in there put a
   // stranger's face on people who were already recognisable.
   const fallback = square || image ? null : generateUserAvatarSource(name);
@@ -9785,7 +9785,7 @@ function Avatar({ name, image, size, square = false }: { name: string; image: Pr
     <span className={`avatar ${square ? "square" : ""}`} style={{ width: size, height: size }}>
       {source || fallback
         ? <img src={source ?? fallback ?? undefined} alt="" />
-        : image ? null : <b>{name.slice(0, 1).toUpperCase()}</b>}
+        : <b>{name.slice(0, 1).toUpperCase()}</b>}
     </span>
   );
 }

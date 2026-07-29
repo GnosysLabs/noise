@@ -7103,7 +7103,7 @@ impl NoiseClient {
             blocked,
             sequence,
         )?;
-        self.publish_direct_event(&relay_list(relays)?, public_key, &notice)
+        self.publish_direct_control_event(&relay_list(relays)?, public_key, &notice)
             .await?;
         let changed_at_millis = notice.created_at_millis;
         state.block_states.insert(
@@ -8012,7 +8012,7 @@ impl NoiseClient {
                     })
                     .flat_map(|attachment| attachment_storage_references(&attachment))
                     .collect();
-                self.publish_direct_event(&relays, &contact.public_key, &recipient_event)
+                self.publish_direct_control_event(&relays, &contact.public_key, &recipient_event)
                     .await?;
                 self.erase_storage_references(storage, true).await?;
                 deleted_at_millis = deleted_at_millis.max(recipient_event.created_at_millis);
@@ -8123,7 +8123,7 @@ impl NoiseClient {
                 })
                 .flat_map(|attachment| attachment_storage_references(&attachment))
                 .collect();
-            self.publish_direct_event(&relays, &contact.public_key, &recipient_event)
+            self.publish_direct_control_event(&relays, &contact.public_key, &recipient_event)
                 .await?;
             let _ = self.erase_storage_references(storage, true).await;
         } else {
@@ -8215,7 +8215,7 @@ impl NoiseClient {
             message_id,
             sequence,
         )?;
-        self.publish_direct_event(&relays, &contact.public_key, &recipient_event)
+        self.publish_direct_control_event(&relays, &contact.public_key, &recipient_event)
             .await?;
         if self.central.is_none() {
             self.publish_event(&relays, &sender_event).await?;
@@ -9663,7 +9663,7 @@ impl NoiseClient {
                     ));
                     storage
                 };
-                self.publish_direct_event(&relays, &contact.public_key, &recipient_event)
+                self.publish_direct_control_event(&relays, &contact.public_key, &recipient_event)
                     .await?;
                 if self.central.is_none() {
                     self.publish_event(&relays, &sender_event).await?;
@@ -12416,12 +12416,40 @@ impl NoiseClient {
         recipient_public_key: &str,
         event: &SignedEvent,
     ) -> anyhow::Result<()> {
+        self.publish_direct_event_notifying(relays, recipient_public_key, event, true)
+            .await
+    }
+
+    /// Deliver a record the peer's client acts on rather than reads.
+    ///
+    /// A deletion, a clear, or a block reaches the peer exactly like a message
+    /// and is just as encrypted, so the service cannot tell them apart. Saying
+    /// so here is what stops an erased conversation from ringing their phone
+    /// with "sent you a DM".
+    async fn publish_direct_control_event(
+        &self,
+        relays: &[RelayDescriptor],
+        recipient_public_key: &str,
+        event: &SignedEvent,
+    ) -> anyhow::Result<()> {
+        self.publish_direct_event_notifying(relays, recipient_public_key, event, false)
+            .await
+    }
+
+    async fn publish_direct_event_notifying(
+        &self,
+        relays: &[RelayDescriptor],
+        recipient_public_key: &str,
+        event: &SignedEvent,
+        notifies: bool,
+    ) -> anyhow::Result<()> {
         if self.central.is_none() {
             return self.publish_event(relays, event).await;
         }
         let body = serde_json::to_vec(&serde_json::json!({
             "recipient_public_key": recipient_public_key,
             "event": event,
+            "notifies": notifies,
         }))?;
         self.central_success(reqwest::Method::POST, "/v1/direct-events", &body)
             .await?;
