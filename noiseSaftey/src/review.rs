@@ -229,7 +229,7 @@ pub(crate) async fn serve(
     let review_url = if state.tailscale_logins.is_empty() {
         format!("http://{bind}{}/{}", state.base_path, state.token)
     } else {
-        format!("https://{}{}/", state.expected_host, state.base_path)
+        format!("https://{}{}", state.expected_host, state.base_path)
     };
     println!("noise safety reviewer listening on its private transport");
     println!("open this private URL: {review_url}");
@@ -1029,7 +1029,7 @@ details.technical{border:1px solid #ffffff0c;border-radius:10px;background:#1514
 .report-foot{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 20px;border-top:1px solid #ffffff0d;background:#17161980}
 .report-foot>span{color:#958c98;font-size:10px}.actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:7px}.actions button{padding:9px 11px;border:1px solid #ffffff14;border-radius:9px;background:#302d33;color:#eee7f0;font-size:10px;font-weight:850;cursor:pointer}.actions .hide{background:#b8ff38;color:#192000}.actions .pause{border-color:#ff9a5b55;background:#ff9a5b18;color:#ffc49f}.actions .block{border-color:#ff718566;background:#ff71851a;color:#ff9aaa}
 @media(max-width:680px){.topbar{align-items:flex-start;flex-wrap:wrap;padding:14px 12px}.brand{margin-right:0}.topbar nav{order:3;width:100%;overflow:auto}.private-pill{margin-left:auto}main{width:min(100% - 20px,980px);padding-top:30px}header{align-items:flex-start;flex-direction:column}.queue-bar{align-items:flex-start;flex-direction:column}.facts,.people{grid-template-columns:1fr}.report-head{flex-direction:column}.report-foot{align-items:flex-start;flex-direction:column}.actions{justify-content:flex-start}}
-</style></head><body><div class="topbar"><a class="brand" href="/"><span class="mark">n</span><span>noise control</span></a><nav aria-label="admin sections"><a href="/">overview</a><a href="/usage">usage</a><a href="/infrastructure">infrastructure</a><a href="/audit">audit log</a><a class="active" href="/safety/">safety</a></nav><span class="private-pill">tailnet only</span></div><main><header><div>"#,
+</style></head><body><div class="topbar"><a class="brand" href="/"><span class="mark">n</span><span>noise control</span></a><nav aria-label="admin sections"><a href="/">overview</a><a href="/usage">usage</a><a href="/infrastructure">infrastructure</a><a href="/audit">audit log</a><a class="active" href="/safety">safety</a></nav><span class="private-pill">tailnet only</span></div><main><header><div>"#,
     );
     if state.tailscale_logins.is_empty() {
         html.push_str(

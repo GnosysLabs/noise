@@ -44,11 +44,11 @@ password and no public fallback URL.
 The same tailnet URL also hosts **noise control**, a read-only operational
 dashboard with Overview, Usage, Infrastructure, Safety, and Audit Log
 navigation. The stable root is served by a separate `noise-admin` process with
-an independently provisioned PostgreSQL role. `/safety/` is routed to this
+an independently provisioned PostgreSQL role. `/safety` is routed to this
 reviewer process; report decryption keys and directive signing keys never enter
 the dashboard process.
 
-After Tailscale authentication, the `/safety/` URL redirects to a random
+After Tailscale authentication, the `/safety` URL redirects to a random
 single-process capability path. The reviewer records the authenticated
 Tailscale login with each immutable decision. It decrypts and
 cryptographically verifies reports only inside the isolated reviewer service.

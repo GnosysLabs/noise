@@ -356,7 +356,9 @@ fn render_navigation(html: &mut String, page: AdminPage) {
             candidate.title(),
         );
     }
-    html.push_str(r#"<a href="/safety/">safety</a></nav><span class="private-pill">tailnet only</span></div>"#);
+    html.push_str(
+        r#"<a href="/safety">safety</a></nav><span class="private-pill">tailnet only</span></div>"#,
+    );
 }
 
 fn render_overview(html: &mut String, snapshot: &AdminSnapshot) {
@@ -422,7 +424,7 @@ fn render_overview(html: &mut String, snapshot: &AdminSnapshot) {
         &format_number(snapshot.active_restrictions),
         "content-free safety enforcement state",
     );
-    html.push_str(r#"</div></article><article class="panel safety-panel"><div><p class="kicker">isolated authority</p><h2>noise safety</h2><p>Open and resolve severe reports in the separate key-holding reviewer. Report plaintext and signing keys never enter this dashboard process.</p></div><a class="primary" href="/safety/">open safety queue</a></article></section>"#);
+    html.push_str(r#"</div></article><article class="panel safety-panel"><div><p class="kicker">isolated authority</p><h2>noise safety</h2><p>Open and resolve severe reports in the separate key-holding reviewer. Report plaintext and signing keys never enter this dashboard process.</p></div><a class="primary" href="/safety">open safety queue</a></article></section>"#);
 }
 
 fn render_usage(html: &mut String, snapshot: &AdminSnapshot) {
