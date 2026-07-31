@@ -149,6 +149,13 @@ internet listener.
 The private case store must not create media previews, accept manual uploads,
 place reports in email, or copy report contents into general application logs.
 
+The tailnet-only operational dashboard may share the reviewer's external host
+and navigation, but it runs as a separate Unix user, process, database role,
+and Unix socket. Tailscale Serve mounts the dashboard at `/` and the reviewer
+at `/safety`. The dashboard receives only aggregate central-service metadata;
+it cannot read the report inbox, recipient secret, reviewer decisions, or
+directive signing key.
+
 Opening a report verifies cryptographic facts, not the legal character of
 unknown media. Temporary suppression and quarantine decisions must be recorded
 as precautionary actions unless evidence has been verified through an approved

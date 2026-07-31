@@ -2,4 +2,4 @@
 
 set reviewer_url "https://cyphers-vps.yakalo-lizard.ts.net:8443/"
 exec open $reviewer_url
-puts "Opened the private noise safety reviewer through Tailscale."
+puts "Opened private noise control through Tailscale."

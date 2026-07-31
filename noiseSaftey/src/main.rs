@@ -29,10 +29,12 @@ use tokio::{
 };
 use tower_http::cors::CorsLayer;
 
+mod admin;
 mod review;
 
 const DEFAULT_BIND: &str = "127.0.0.1:4310";
 const DEFAULT_REVIEW_BIND: &str = "127.0.0.1:4311";
+const DEFAULT_ADMIN_BIND: &str = "127.0.0.1:4312";
 const MAX_REPORT_BODY_BYTES: usize = 384 * 1024;
 const MAX_CIPHERTEXT_BYTES: usize = 256 * 1024;
 const MAX_DIRECTIVE_BYTES: usize = 64 * 1024;
@@ -85,7 +87,34 @@ enum Command {
         /// Private Unix socket used by Tailscale Serve instead of a TCP listener.
         #[arg(long)]
         unix_socket: Option<PathBuf>,
+        /// URL prefix used when the reviewer is mounted beneath the admin dashboard.
+        #[arg(long, default_value = "")]
+        base_path: String,
         #[arg(long, default_value = DEFAULT_REVIEW_BIND)]
+        bind: SocketAddr,
+    },
+    /// Run the private, read-only operational dashboard.
+    Admin {
+        #[arg(long, env = "NOISE_ADMIN_DATABASE_HOST", default_value = "127.0.0.1")]
+        database_host: String,
+        #[arg(long, env = "NOISE_ADMIN_DATABASE_PORT", default_value_t = 5432)]
+        database_port: u16,
+        #[arg(long, env = "NOISE_ADMIN_DATABASE_NAME", default_value = "noise")]
+        database_name: String,
+        #[arg(long, env = "NOISE_ADMIN_DATABASE_USER", default_value = "noise_admin")]
+        database_user: String,
+        #[arg(long, env = "NOISE_ADMIN_DATABASE_PASSWORD", hide_env_values = true)]
+        database_password: String,
+        /// Permit this exact Tailscale login through the private dashboard proxy.
+        #[arg(long)]
+        tailscale_login: Vec<String>,
+        /// Host and optional port presented by Tailscale Serve, without a scheme or path.
+        #[arg(long)]
+        external_host: Option<String>,
+        /// Private Unix socket used by Tailscale Serve instead of a TCP listener.
+        #[arg(long)]
+        unix_socket: Option<PathBuf>,
+        #[arg(long, default_value = DEFAULT_ADMIN_BIND)]
         bind: SocketAddr,
     },
     /// List verified encrypted-report receipt identifiers for restricted sync.
@@ -188,12 +217,38 @@ async fn main() -> anyhow::Result<()> {
             tailscale_login,
             external_host,
             unix_socket,
+            base_path,
             bind,
         } => {
             review::serve(
                 &secret_key_file,
                 &spool_dir,
                 state_dir.as_deref(),
+                &tailscale_login,
+                external_host.as_deref(),
+                unix_socket.as_deref(),
+                &base_path,
+                bind,
+            )
+            .await
+        }
+        Command::Admin {
+            database_host,
+            database_port,
+            database_name,
+            database_user,
+            database_password,
+            tailscale_login,
+            external_host,
+            unix_socket,
+            bind,
+        } => {
+            admin::serve(
+                &database_host,
+                database_port,
+                &database_name,
+                &database_user,
+                &database_password,
                 &tailscale_login,
                 external_host.as_deref(),
                 unix_socket.as_deref(),

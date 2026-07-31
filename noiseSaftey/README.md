@@ -34,14 +34,21 @@ cargo run -p noise-safety-intake -- review \
   --spool-dir noiseSaftey/dev-data/inbox
 ```
 
-The generated **noise safety reviewer** launcher runs
+The generated **noise control** launcher runs
 `noiseSaftey/open-reviewer.exp` and opens the production tailnet URL. The
 browser must be on the noise Tailscale network. Tailscale supplies the
 authenticated login, and the reviewer accepts only the exact accounts listed
 by repeated `--tailscale-login` arguments. There is no separate reviewer
 password and no public fallback URL.
 
-After Tailscale authentication, the stable root URL redirects to a random
+The same tailnet URL also hosts **noise control**, a read-only operational
+dashboard with Overview, Usage, Infrastructure, Safety, and Audit Log
+navigation. The stable root is served by a separate `noise-admin` process with
+an independently provisioned PostgreSQL role. `/safety/` is routed to this
+reviewer process; report decryption keys and directive signing keys never enter
+the dashboard process.
+
+After Tailscale authentication, the `/safety/` URL redirects to a random
 single-process capability path. The reviewer records the authenticated
 Tailscale login with each immutable decision. It decrypts and
 cryptographically verifies reports only inside the isolated reviewer service.
@@ -141,7 +148,25 @@ The online reviewer deployment uses:
 - `noiseSaftey/deploy/noise-safety-reviewer.service` — isolated reviewer;
 - `noiseSaftey/deploy/noise-safety-reviewer-sync.timer` — ten-second bridge;
 - `https://cyphers-vps.yakalo-lizard.ts.net:8443/` — tailnet-only reviewer
-  URL. Port 8443 avoids the VPS's public nginx listener on 443.
+  and admin URL. Port 8443 avoids the VPS's public nginx listener on 443.
+
+The private admin deployment additionally uses:
+
+- `/etc/noise-admin/environment` — mode-`0640` credentials for the restricted
+  `noise_admin` PostgreSQL role;
+- `/run/noise-admin/dashboard.sock` — private dashboard Unix socket;
+- `noiseSaftey/deploy/bootstrap-noise-admin.sh` — idempotent service-user and
+  read-only database-role provisioning;
+- `noiseSaftey/deploy/noise-admin-dashboard.service` — sandboxed dashboard;
+- `noiseSaftey/deploy/configure-noise-control-serve.sh` — Tailscale Serve path
+  routing for `/` and `/safety`.
+
+The dashboard reads aggregate operational metadata only. It never receives
+message text, media plaintext, passwords, private identity keys, stable IP
+histories, report plaintext, or report decryption keys. Its database role has
+`SELECT` access only to three aggregate views—not the underlying production
+tables—defaults to read-only transactions, and has a five-second statement
+timeout.
 
 The restricted Mac sync remains available for emergency encrypted export; it
 does not participate in normal online reviewing and does not use the Mac's
