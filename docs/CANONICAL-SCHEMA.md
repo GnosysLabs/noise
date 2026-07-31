@@ -99,13 +99,15 @@ transport order, not permission to decrypt or display an invalid event.
 
 ## Account vaults
 
-Every verified encrypted account-vault revision is retained in
-`account_vault_versions`. `account_vault_heads` selects the highest accepted
-revision for a locator. Updating the head uses compare-and-swap in one
-transaction.
+The current verified encrypted account-vault revision is retained in
+`account_vault_versions`. `account_vault_heads` selects that accepted revision
+for a locator. Updating the head uses compare-and-swap in one transaction, and
+the database removes the superseded full-vault snapshot after the head moves.
+This keeps vault storage proportional to active recovery locators instead of
+the number of account mutations.
 
 An account may own multiple identity-signed recovery locators. Each locator
-retains its own revision chain and head; all of those locator aliases resolve
+retains its own current revision and head; all of those locator aliases resolve
 to the same canonical account.
 
 Deleted vaults retain their signed tombstone and contain no nonce or
