@@ -46,7 +46,9 @@ dashboard with Overview, Usage, Infrastructure, Safety, and Audit Log
 navigation. The stable root is served by a separate `noise-admin` process with
 an independently provisioned PostgreSQL role. `/safety` is routed to this
 reviewer process; report decryption keys and directive signing keys never enter
-the dashboard process.
+the dashboard process. Tailscale Serve strips the `/safety` mount prefix before
+forwarding requests, while the reviewer adds that prefix back to generated
+browser links and redirects.
 
 After Tailscale authentication, the `/safety` URL redirects to a random
 single-process capability path. The reviewer records the authenticated

@@ -25,6 +25,9 @@ wait_for_socket() {
 wait_for_socket /run/noise-admin/dashboard.sock
 wait_for_socket /run/noise-safety-reviewer/reviewer.sock
 
+probe_headers="$(mktemp /tmp/noise-safety-reviewer-probe.XXXXXXXX)"
+trap 'rm -f -- "${probe_headers}"' EXIT
+
 backup="/var/lib/noise-admin/tailscale-serve-before-noise-control.json"
 if [[ ! -e "${backup}" ]]; then
     tailscale serve status --json >"${backup}"
@@ -41,7 +44,9 @@ curl --fail --silent --show-error \
     --unix-socket /run/noise-safety-reviewer/reviewer.sock \
     --header 'X-Forwarded-Host: cyphers-vps.yakalo-lizard.ts.net:8443' \
     --header 'Tailscale-User-Login: cmcelvogue91@gmail.com' \
-    http://localhost/safety >/dev/null
+    --dump-header "${probe_headers}" \
+    http://localhost/ >/dev/null
+grep -Fqi 'location: /safety/' "${probe_headers}"
 
 tailscale serve --bg --https=8443 \
     unix:/run/noise-admin/dashboard.sock

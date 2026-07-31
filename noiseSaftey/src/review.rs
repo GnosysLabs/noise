@@ -192,7 +192,7 @@ pub(crate) async fn serve(
         expected_host,
         tailscale_logins: Arc::new(tailscale_logins),
     };
-    let reviewer_routes = Router::new()
+    let router = Router::new()
         .route("/", get(review_entry))
         .route("/{token}", get(review_index))
         .route(
@@ -219,13 +219,8 @@ pub(crate) async fn serve(
             "/{token}/reports/{receipt_id}/download",
             get(download_report),
         )
-        .layer(DefaultBodyLimit::max(1_024));
-    let router = if state.base_path.is_empty() {
-        reviewer_routes
-    } else {
-        Router::new().nest(&state.base_path, reviewer_routes)
-    }
-    .with_state(state.clone());
+        .layer(DefaultBodyLimit::max(1_024))
+        .with_state(state.clone());
     let review_url = if state.tailscale_logins.is_empty() {
         format!("http://{bind}{}/{}", state.base_path, state.token)
     } else {
