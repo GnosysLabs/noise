@@ -303,20 +303,6 @@ pub async fn publish_group_deletion(
         )
         .await
         .map_err(ApiError::database)?;
-    let outbox_payload = serde_json::to_vec(&serde_json::json!({
-        "group_id": deletion.group_id,
-        "deleted_at_millis": deletion.deleted_at_millis,
-    }))
-    .map_err(ApiError::database)?;
-    transaction
-        .execute(
-            "INSERT INTO noise.outbox_events (
-                topic, aggregate_kind, aggregate_id, payload
-             ) VALUES ('group.deleted', 'group', $1, $2)",
-            &[&group_id.as_slice(), &outbox_payload],
-        )
-        .await
-        .map_err(ApiError::database)?;
     let watch_scope = encode_hex(&group_id);
     record_watch_change(
         &transaction,

@@ -84,7 +84,8 @@ CREATE SCHEMA IF NOT EXISTS noise_admin AUTHORIZATION postgres;
 REVOKE ALL ON SCHEMA noise_admin FROM PUBLIC;
 REVOKE CREATE ON SCHEMA noise_admin FROM noise_admin;
 
-CREATE OR REPLACE VIEW noise_admin.operational_totals
+DROP VIEW IF EXISTS noise_admin.operational_totals;
+CREATE VIEW noise_admin.operational_totals
 WITH (security_barrier = true) AS
 SELECT
     (SELECT version FROM noise.schema_migrations ORDER BY version DESC LIMIT 1) AS schema_version,
@@ -111,11 +112,6 @@ SELECT
     (SELECT COUNT(*) FROM noise.media_objects WHERE created_at >= now() - interval '7 days')::bigint AS media_7d,
     (SELECT COUNT(*) FROM noise.sessions WHERE revoked_at IS NULL AND expires_at > now())::bigint AS active_sessions,
     (SELECT COUNT(*) FROM noise.push_subscriptions WHERE revoked_at IS NULL)::bigint AS active_push_subscriptions,
-    (SELECT COUNT(*) FROM noise.durable_jobs WHERE state = 'ready')::bigint AS ready_jobs,
-    (SELECT COUNT(*) FROM noise.durable_jobs WHERE state = 'running')::bigint AS running_jobs,
-    (SELECT COUNT(*) FROM noise.durable_jobs WHERE state = 'failed')::bigint AS failed_jobs,
-    (SELECT COUNT(*) FROM noise.outbox_events WHERE published_at IS NULL)::bigint AS pending_outbox,
-    (SELECT COALESCE(EXTRACT(EPOCH FROM (now() - MIN(created_at)))::bigint, 0) FROM noise.outbox_events WHERE published_at IS NULL) AS oldest_outbox_seconds,
     (
         (SELECT COUNT(*) FROM noise.event_restrictions WHERE expires_at IS NULL OR expires_at > now()) +
         (SELECT COUNT(*) FROM noise.group_restrictions WHERE expires_at IS NULL OR expires_at > now()) +

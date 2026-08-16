@@ -171,17 +171,6 @@ pub async fn publish_genesis(
             .await
             .map_err(ApiError::database)?;
     }
-    insert_outbox(
-        &transaction,
-        "mls.genesis.accepted",
-        "mls_genesis",
-        &decoded.record_id,
-        serde_json::json!({
-            "group_id": genesis.group_id,
-            "record_id": genesis.record_id,
-        }),
-    )
-    .await?;
     let watch_scope = record_group_control_change(&transaction, &decoded.group_id).await?;
     transaction.commit().await.map_err(ApiError::database)?;
     state.watch.wake(&watch_scope).await;
@@ -241,17 +230,6 @@ pub async fn publish_join_request(
         )
         .await
         .map_err(mls_conflict)?;
-    insert_outbox(
-        &transaction,
-        "mls.join_request.accepted",
-        "mls_join_request",
-        &decoded.request_id,
-        serde_json::json!({
-            "group_id": request.group_id,
-            "request_id": request.request_id,
-        }),
-    )
-    .await?;
     let watch_scope = record_group_control_change(&transaction, &decoded.group_id).await?;
     transaction.commit().await.map_err(ApiError::database)?;
     state.watch.wake(&watch_scope).await;
@@ -338,17 +316,6 @@ pub async fn publish_removal_request(
         )
         .await
         .map_err(mls_conflict)?;
-    insert_outbox(
-        &transaction,
-        "mls.removal_request.accepted",
-        "mls_removal_request",
-        &decoded.request_id,
-        serde_json::json!({
-            "group_id": request.group_id,
-            "request_id": request.request_id,
-        }),
-    )
-    .await?;
     let watch_scope = record_group_control_change(&transaction, &decoded.group_id).await?;
     transaction.commit().await.map_err(ApiError::database)?;
     state.watch.wake(&watch_scope).await;
@@ -590,18 +557,6 @@ async fn publish_epoch_inner(
             .await
             .map_err(mls_conflict)?;
     }
-    insert_outbox(
-        &transaction,
-        "mls.epoch.accepted",
-        "mls_epoch",
-        &decoded.record_id,
-        serde_json::json!({
-            "epoch": record.bundle.epoch,
-            "group_id": record.bundle.group_id,
-            "record_id": record.record_id,
-        }),
-    )
-    .await?;
     let watch_scope = record_group_control_change(&transaction, &decoded.group_id).await?;
     transaction.commit().await.map_err(ApiError::database)?;
     state.watch.wake(&watch_scope).await;
@@ -1318,26 +1273,6 @@ async fn require_current_removal_requests(
     {
         return Err(ApiError::conflict("mls_removal_request_stale"));
     }
-    Ok(())
-}
-
-async fn insert_outbox(
-    transaction: &Transaction<'_>,
-    topic: &'static str,
-    aggregate_kind: &'static str,
-    aggregate_id: &[u8; 32],
-    payload: serde_json::Value,
-) -> Result<(), ApiError> {
-    let payload = serde_json::to_vec(&payload).map_err(ApiError::database)?;
-    transaction
-        .execute(
-            "INSERT INTO noise.outbox_events (
-                topic, aggregate_kind, aggregate_id, payload
-             ) VALUES ($1, $2, $3, $4)",
-            &[&topic, &aggregate_kind, &aggregate_id.as_slice(), &payload],
-        )
-        .await
-        .map_err(ApiError::database)?;
     Ok(())
 }
 

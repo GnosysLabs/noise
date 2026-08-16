@@ -258,20 +258,6 @@ pub async fn publish_group_event(
         )
         .await
         .map_err(ApiError::database)?;
-    let outbox_payload = serde_json::to_vec(&serde_json::json!({
-        "canonical_cursor": canonical_cursor,
-        "event_id": event.event_id,
-    }))
-    .map_err(ApiError::database)?;
-    transaction
-        .execute(
-            "INSERT INTO noise.outbox_events (
-                topic, aggregate_kind, aggregate_id, payload
-             ) VALUES ('event.accepted', 'event', $1, $2)",
-            &[&decoded.event_id.as_slice(), &outbox_payload],
-        )
-        .await
-        .map_err(ApiError::database)?;
     let watch_scope = encode_hex(&decoded.group_id);
     let stream_locator_hex = decoded
         .stream_locator
@@ -818,21 +804,6 @@ pub async fn publish_direct_event(
         )
         .await
         .map_err(ApiError::database)?;
-    let outbox_payload = serde_json::to_vec(&serde_json::json!({
-        "canonical_cursor": canonical_cursor,
-        "event_id": request.event.event_id,
-        "direct_scope_id": scope_id,
-    }))
-    .map_err(ApiError::database)?;
-    transaction
-        .execute(
-            "INSERT INTO noise.outbox_events (
-                topic, aggregate_kind, aggregate_id, payload
-             ) VALUES ('event.accepted', 'event', $1, $2)",
-            &[&decoded.event_id.as_slice(), &outbox_payload],
-        )
-        .await
-        .map_err(ApiError::database)?;
     // The recipient watches their own mailbox (the event's group id); the
     // author's other devices watch the author's mailbox. Record both so a sent
     // message reaches every device without a server-wide wakeup.
@@ -1151,8 +1122,8 @@ pub async fn mark_direct_read(
         .map_err(ApiError::database)?
         .map(|row| row.get::<_, i64>(0))
         .ok_or_else(|| ApiError::bad_request("invalid_read_boundary"))?;
-    let rows = transaction
-        .query(
+    let updated = transaction
+        .execute(
             "UPDATE noise.direct_event_receipts receipt
              SET delivered_at = COALESCE(receipt.delivered_at, clock_timestamp()),
                  read_at = COALESCE(receipt.read_at, clock_timestamp()),
@@ -1169,29 +1140,12 @@ pub async fn mark_direct_read(
                AND event.stream_pk = $2
                AND event.author_account_id <> $1
                AND event.canonical_cursor <= $3
-               AND receipt.read_at IS NULL
-             RETURNING event.event_id",
+               AND receipt.read_at IS NULL",
             &[&session.account_id, &stream.stream_pk, &boundary],
         )
         .await
         .map_err(ApiError::database)?;
-    let receipts_recorded = !rows.is_empty();
-    for row in rows {
-        let event_id: Vec<u8> = row.get(0);
-        let payload = serde_json::to_vec(&serde_json::json!({
-            "through_event_id": request.through_event_id,
-        }))
-        .map_err(ApiError::database)?;
-        transaction
-            .execute(
-                "INSERT INTO noise.outbox_events (
-                    topic, aggregate_kind, aggregate_id, payload
-                 ) VALUES ('direct.read', 'event', $1, $2)",
-                &[&event_id, &payload],
-            )
-            .await
-            .map_err(ApiError::database)?;
-    }
+    let receipts_recorded = updated > 0;
     if receipts_recorded {
         for mailbox in &watch_scopes {
             record_watch_change(
@@ -1553,19 +1507,6 @@ async fn record_direct_delivery<C: GenericClient + Sync>(
             continue;
         }
         recorded = true;
-        let payload = serde_json::to_vec(&serde_json::json!({
-            "event_id": event.event.event_id,
-        }))
-        .map_err(ApiError::database)?;
-        client
-            .execute(
-                "INSERT INTO noise.outbox_events (
-                    topic, aggregate_kind, aggregate_id, payload
-                 ) VALUES ('direct.delivered', 'event', $1, $2)",
-                &[&event_id.as_slice(), &payload],
-            )
-            .await
-            .map_err(ApiError::database)?;
     }
     Ok(recorded)
 }

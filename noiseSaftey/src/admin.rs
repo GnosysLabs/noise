@@ -79,11 +79,6 @@ struct AdminSnapshot {
     media_7d: i64,
     active_sessions: i64,
     active_push_subscriptions: i64,
-    ready_jobs: i64,
-    running_jobs: i64,
-    failed_jobs: i64,
-    pending_outbox: i64,
-    oldest_outbox_seconds: i64,
     active_restrictions: i64,
     daily: Vec<DailyUsage>,
     audit: Vec<AuditEvent>,
@@ -304,11 +299,6 @@ LIMIT 50
         media_7d: totals.get("media_7d"),
         active_sessions: totals.get("active_sessions"),
         active_push_subscriptions: totals.get("active_push_subscriptions"),
-        ready_jobs: totals.get("ready_jobs"),
-        running_jobs: totals.get("running_jobs"),
-        failed_jobs: totals.get("failed_jobs"),
-        pending_outbox: totals.get("pending_outbox"),
-        oldest_outbox_seconds: totals.get("oldest_outbox_seconds"),
         active_restrictions: totals.get("active_restrictions"),
         daily,
         audit,
@@ -373,35 +363,12 @@ struct ServiceStatus {
     tone: &'static str,
 }
 
-fn service_status(snapshot: &AdminSnapshot) -> ServiceStatus {
-    if snapshot.failed_jobs > 0 {
-        ServiceStatus {
-            title: "Needs a look",
-            detail: "A background task failed. People can still chat, but something did not finish.",
-            badge: "needs a look",
-            tone: "attention",
-        }
-    } else if snapshot.pending_outbox > 0 && snapshot.oldest_outbox_seconds >= 3_600 {
-        ServiceStatus {
-            title: "A little backed up",
-            detail: "Some messages have been waiting more than an hour to go out.",
-            badge: "backed up",
-            tone: "attention",
-        }
-    } else if snapshot.pending_outbox > 0 {
-        ServiceStatus {
-            title: "All good",
-            detail: "A few messages are still going out. That is normal.",
-            badge: "all good",
-            tone: "good",
-        }
-    } else {
-        ServiceStatus {
-            title: "All good",
-            detail: "Nothing is stuck. Messages and notifications are keeping up.",
-            badge: "all good",
-            tone: "good",
-        }
+fn service_status() -> ServiceStatus {
+    ServiceStatus {
+        title: "All good",
+        detail: "These numbers just loaded from the live database. People can send and receive.",
+        badge: "all good",
+        tone: "good",
     }
 }
 
@@ -444,7 +411,7 @@ fn render_overview(html: &mut String, snapshot: &AdminSnapshot) {
     );
     html.push_str("</section>");
     render_activity_chart(html, snapshot);
-    let health = service_status(snapshot);
+    let health = service_status();
     html.push_str(r#"<section class="split"><article class="panel"><div class="panel-head"><div><p class="kicker">quick check</p><h2>"#);
     html.push_str(escape_html(health.title).as_str());
     html.push_str(r#"</h2></div><span class="status "#);
@@ -454,29 +421,15 @@ fn render_overview(html: &mut String, snapshot: &AdminSnapshot) {
     html.push_str(r#"</span></div><div class="rows">"#);
     status_row(
         html,
-        "Messages waiting to send",
-        &format_number(snapshot.pending_outbox),
-        if snapshot.pending_outbox == 0 {
-            "nothing is backed up"
-        } else {
-            "still going out"
-        },
+        "Signed in right now",
+        &format_number(snapshot.active_sessions),
+        "phones and computers with an open session",
     );
     status_row(
         html,
         "Safety holds",
         &format_number(snapshot.active_restrictions),
         "hidden messages, paused groups, or blocked people",
-    );
-    status_row(
-        html,
-        "Broken background tasks",
-        &format_number(snapshot.failed_jobs),
-        if snapshot.failed_jobs == 0 {
-            "none"
-        } else {
-            "something failed and needs a look"
-        },
     );
     html.push_str(r#"</div></article><article class="panel safety-panel"><div><p class="kicker">reports</p><h2>safety</h2><p>Open the report queue when someone flags a serious problem. That page is separate so report details stay off this dashboard.</p></div><a class="primary" href="/safety">open reports</a></article></section>"#);
 }
@@ -571,7 +524,7 @@ fn render_usage(html: &mut String, snapshot: &AdminSnapshot) {
 }
 
 fn render_infrastructure(html: &mut String, snapshot: &AdminSnapshot) {
-    let health = service_status(snapshot);
+    let health = service_status();
     html.push_str(r#"<section class="health-banner "#);
     html.push_str(health.tone);
     html.push_str(r#""><strong>"#);
@@ -608,48 +561,12 @@ fn render_infrastructure(html: &mut String, snapshot: &AdminSnapshot) {
         "blue",
     );
     html.push_str("</section>");
-    html.push_str(r#"<section class="panel"><div class="panel-head"><div><p class="kicker">behind the scenes</p><h2>is anything stuck?</h2></div></div><div class="rows">"#);
-    status_row_with_state(
-        html,
-        "Messages waiting to send",
-        &format_number(snapshot.pending_outbox),
-        if snapshot.pending_outbox == 0 {
-            "all caught up".to_owned()
-        } else {
-            format!(
-                "oldest has been waiting {}",
-                format_duration(snapshot.oldest_outbox_seconds)
-            )
-        }
-        .as_str(),
-        if snapshot.pending_outbox == 0 {
-            "clear"
-        } else if snapshot.oldest_outbox_seconds >= 3_600 {
-            "attention"
-        } else {
-            "clear"
-        },
-    );
-    status_row_with_state(
-        html,
-        "Broken background tasks",
-        &format_number(snapshot.failed_jobs),
-        if snapshot.failed_jobs == 0 {
-            "none"
-        } else {
-            "needs a look"
-        },
-        if snapshot.failed_jobs == 0 {
-            "clear"
-        } else {
-            "attention"
-        },
-    );
+    html.push_str(r#"<section class="panel"><div class="panel-head"><div><p class="kicker">safety</p><h2>holds in effect</h2></div></div><div class="rows">"#);
     status_row(
         html,
-        "Work in progress",
-        &format_number(snapshot.ready_jobs + snapshot.running_jobs),
-        "normal background sending and cleanup",
+        "Safety holds",
+        &format_number(snapshot.active_restrictions),
+        "hidden messages, paused groups, or blocked people",
     );
     html.push_str("</div></section>");
 }
@@ -767,16 +684,6 @@ fn format_bytes(value: i64) -> String {
         format!("{} {}", scaled as i64, UNITS[unit])
     } else {
         format!("{scaled:.1} {}", UNITS[unit])
-    }
-}
-
-fn format_duration(seconds: i64) -> String {
-    match seconds.max(0) {
-        0 => "now".to_owned(),
-        value if value < 60 => format!("{value}s"),
-        value if value < 3_600 => format!("{}m", value / 60),
-        value if value < 86_400 => format!("{}h", value / 3_600),
-        value => format!("{}d", value / 86_400),
     }
 }
 
@@ -1031,7 +938,6 @@ mod tests {
     fn admin_formats_aggregate_values() {
         assert_eq!(format_number(1_234_567), "1,234,567");
         assert_eq!(format_bytes(1_572_864), "1.5 MB");
-        assert_eq!(format_duration(7_200), "2h");
     }
 
     fn sample_snapshot() -> AdminSnapshot {
@@ -1061,11 +967,6 @@ mod tests {
             media_7d: 1,
             active_sessions: 3,
             active_push_subscriptions: 3,
-            ready_jobs: 0,
-            running_jobs: 0,
-            failed_jobs: 0,
-            pending_outbox: 0,
-            oldest_outbox_seconds: 0,
             active_restrictions: 0,
             daily: Vec::new(),
             audit: Vec::new(),
@@ -1074,18 +975,9 @@ mod tests {
 
     #[test]
     fn service_status_stays_plain_when_healthy() {
-        let healthy = service_status(&sample_snapshot());
+        let healthy = service_status();
         assert_eq!(healthy.title, "All good");
         assert_eq!(healthy.tone, "good");
-    }
-
-    #[test]
-    fn service_status_flags_failed_work() {
-        let mut snapshot = sample_snapshot();
-        snapshot.failed_jobs = 2;
-        let status = service_status(&snapshot);
-        assert_eq!(status.title, "Needs a look");
-        assert_eq!(status.tone, "attention");
     }
 
     #[test]
@@ -1097,8 +989,21 @@ mod tests {
         assert!(html.contains("messages each day"));
         assert!(!html.contains("encrypted events"));
         assert!(!html.contains("ciphertext"));
+        assert!(!html.contains("waiting to send"));
+        assert!(!html.contains("backed up"));
         assert!(!html.contains(r#"class="mark">n"#));
         assert!(html.contains("noise-logo-wave"));
         assert!(html.contains(">today</a>"));
+    }
+
+    #[test]
+    fn service_page_does_not_treat_outbox_as_a_backlog() {
+        let html =
+            render_dashboard(&sample_snapshot(), AdminPage::Infrastructure, "chris@example.com");
+        assert!(html.contains("signed in right now"));
+        assert!(!html.contains("waiting to send"));
+        assert!(!html.contains("backed up"));
+        assert!(!html.contains("outbox"));
+        assert!(!html.contains("durable job"));
     }
 }

@@ -4,12 +4,20 @@ Status: initial schema contract consumed by the authentication,
 encrypted-account-vault, canonical group/direct-event, and MLS control service
 layers
 
-Updated: 2026-07-27
+Updated: 2026-08-16
 
 Migrations:
 
 - `deploy/central/migrations/0001_canonical_schema.sql`
 - `deploy/central/migrations/0002_recovery_aliases.sql`
+- `deploy/central/migrations/0003_live_social_operations.sql`
+- `deploy/central/migrations/0004_canonical_media_storage_keys.sql`
+- `deploy/central/migrations/0005_direct_receipts_and_expiry.sql`
+- `deploy/central/migrations/0006_external_mls_join.sql`
+- `deploy/central/migrations/0007_scoped_watch_changes.sql`
+- `deploy/central/migrations/0008_central_push_notifications.sql`
+- `deploy/central/migrations/0009_current_account_vault_only.sql`
+- `deploy/central/migrations/0010_retire_unused_outbox.sql`
 
 ## Purpose
 
@@ -51,7 +59,8 @@ RETURNING last_cursor;
 The row lock remains held until commit. A competing event transaction waits,
 so a higher cursor cannot commit before an uncommitted lower cursor. A rolled
 back transaction does not leave a permanent gap. WebSocket notifications are
-published from the transactional outbox only after the event commit.
+published from `watch_changes` after the event commit. The original
+`outbox_events` table is leftover schema; nothing publishes those rows.
 
 ## Minimum server-visible membership
 
@@ -140,9 +149,10 @@ identifier needed to enforce it.
 
 ## Durable jobs and idempotency
 
-State changes and their `outbox_events`/`durable_jobs` rows commit together.
-Workers claim jobs with `FOR UPDATE SKIP LOCKED`, bounded batches, leases, and
-unique deduplication keys.
+State changes and their `watch_changes` rows commit together. Clients poll
+`/v1/groups/{scope}/watch/{since}` and wake on the scoped revision. The
+`outbox_events` and `durable_jobs` tables remain from the original contract
+but have no workers.
 
 Mutation retries use `idempotency_keys`. The database stores a request
 fingerprint and bounded replay result, not a plaintext request body.
@@ -161,8 +171,7 @@ the relays until:
 
 The service now consumes the account, device, session, account-vault, group,
 direct-thread, membership, MLS control, stream, event, restriction, cursor, and
-outbox portions of this contract in isolated validation. Media, push,
-safety-directive ingestion, and workers remain to be implemented.
+watch-change portions of this contract.
 
 The empty production `noise` database is intentionally left unchanged by these
 design and service-validation steps.

@@ -500,15 +500,15 @@ async fn verify_group_event_flow(
     assert_eq!(latest.next_cursor, 2);
     assert!(latest.has_more);
 
-    let outbox = database
+    let watches = database
         .query_one(
-            "SELECT count(*) FROM noise.outbox_events
-             WHERE topic = 'event.accepted'",
-            &[],
+            "SELECT count(*) FROM noise.watch_changes
+             WHERE scope_id = $1 AND control = false",
+            &[&group.group_id],
         )
         .await
         .unwrap();
-    assert_eq!(outbox.get::<_, i64>(0), 2);
+    assert_eq!(watches.get::<_, i64>(0), 2);
 }
 
 async fn verify_mls_control_flow(
@@ -796,16 +796,16 @@ async fn verify_mls_control_flow(
     assert_eq!(epoch_members[1].get::<_, &str>(0), "2");
     assert_eq!(epoch_members[1].get::<_, i64>(1), 1);
 
-    let mls_outbox = database
+    let mls_watches = database
         .query_one(
             "SELECT count(*)
-             FROM noise.outbox_events
-             WHERE topic LIKE 'mls.%'",
-            &[],
+             FROM noise.watch_changes
+             WHERE scope_id = $1 AND control = true",
+            &[&group.group_id],
         )
         .await
         .unwrap();
-    assert_eq!(mls_outbox.get::<_, i64>(0), 5);
+    assert_eq!(mls_watches.get::<_, i64>(0), 5);
 }
 
 async fn verify_direct_event_flow(
