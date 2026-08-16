@@ -468,6 +468,8 @@ async fn serve(
         .allow_origin([
             HeaderValue::from_static("http://127.0.0.1:1420"),
             HeaderValue::from_static("http://localhost:1420"),
+            HeaderValue::from_static("http://127.0.0.1:1421"),
+            HeaderValue::from_static("http://localhost:1421"),
             HeaderValue::from_static("https://app.makenoise.chat"),
         ])
         .allow_methods([Method::GET, Method::POST])

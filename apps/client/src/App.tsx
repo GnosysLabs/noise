@@ -75,6 +75,7 @@ import { firstLink, linkify, openExternalLink } from "./linkify";
 import { ReactionPicker } from "./ReactionPicker";
 import { KlipyPicker } from "./KlipyPicker";
 import { useLinkPreview } from "./useLinkPreview";
+import { useContextMenuTarget, useDismissibleOverlay } from "./useDismissibleOverlay";
 import {
   MAX_COMPOSER_MEDIA_ITEMS,
   composerMediaError,
@@ -82,6 +83,12 @@ import {
   restoreComposerAfterSend,
   selectComposerMedia,
 } from "./composerMedia";
+import {
+  groupMediaMessages,
+  isCollageMediaMime,
+  mediaAlbumIdForPending,
+  withMediaAlbumId,
+} from "./mediaAlbum";
 import type {
   AdultAccessSummary,
   AttachmentData,
@@ -1570,9 +1577,10 @@ async function pendingMediaFromNativePath(sourcePath: string): Promise<PendingMe
         prepareMediaPreviewFromFile(file, "video"),
       )
     : inspected.mime_type.startsWith("image/")
-      ? (heic
-          ? prepareMediaPreviewFromFile(file, "image")
-          : prepareImagePreviewSource(previewUrl))
+      ? firstMediaPreview(
+          heic ? null : prepareImagePreviewSource(previewUrl),
+          prepareMediaPreviewFromFile(file, "image"),
+        )
       : null;
   return {
     id: crypto.randomUUID(),
@@ -1746,6 +1754,7 @@ async function optimisticMessage(
   attachment: PendingMedia | null,
   replyToMessageId: string | null,
   reuseAttachmentPreview = false,
+  mediaAlbumId: string | null = null,
 ): Promise<MessageSummary> {
   const localId = `local:${crypto.randomUUID()}`;
   const localFile = attachment && !reuseAttachmentPreview ? await attachment.file : null;
@@ -1770,6 +1779,9 @@ async function optimisticMessage(
         ? attachment.previewUrl
         : URL.createObjectURL(localFile as File),
       mime_type: attachment.mimeType,
+      media_album_id: attachment && mediaAlbumId && isCollageMediaMime(attachment.mimeType, attachment.name)
+        ? mediaAlbumId
+        : undefined,
     } : undefined,
   };
 }
@@ -2122,7 +2134,10 @@ export default function App() {
   useEffect(() => {
     const suppressNativeContextMenu = (event: MouseEvent) => {
       const target = event.target;
-      if (target instanceof Element && target.closest(".composer textarea, .composer input:not([type='file'])")) {
+      if (
+        target instanceof Element
+        && target.closest(".composer textarea, .composer input:not([type='file']), .message-row, .media-album-tile, .group-row")
+      ) {
         return;
       }
       event.preventDefault();
@@ -4872,6 +4887,7 @@ export default function App() {
               onSend={async (text, pending, replyToMessageId, signal, onProgress) => {
                 const groupId = selectedConversation.group.group_id;
                 const batch = pending.length ? pending : [null];
+                const mediaAlbumId = mediaAlbumIdForPending(batch);
                 const optimisticItems = await Promise.all(batch.map(async (attachment, index) => ({
                   ...await optimisticMessage(
                     summary.identity,
@@ -4879,6 +4895,7 @@ export default function App() {
                     attachment,
                     index === 0 ? replyToMessageId : null,
                     Boolean(attachment),
+                    mediaAlbumId,
                   ),
                   topic_id: effectiveTopicId,
                   upload_progress: attachment ? 0 : undefined,
@@ -4920,16 +4937,19 @@ export default function App() {
                 let confirmedCount = 0;
                 await performConcurrent(async () => {
                   for (let index = 0; index < batch.length; index += 1) {
-                    uploaded[index] = await uploadPendingMedia(
-                      batch[index],
-                      "upload_media_chunk",
-                      (progress) => {
-                        updateOptimisticGroupMessage(groupId, optimisticItems[index].event_id, {
-                          upload_progress: progress,
-                        });
-                        onProgress?.(index, progress);
-                      },
-                      signal,
+                    uploaded[index] = withMediaAlbumId(
+                      await uploadPendingMedia(
+                        batch[index],
+                        "upload_media_chunk",
+                        (progress) => {
+                          updateOptimisticGroupMessage(groupId, optimisticItems[index].event_id, {
+                            upload_progress: progress,
+                          });
+                          onProgress?.(index, progress);
+                        },
+                        signal,
+                      ),
+                      mediaAlbumId,
                     );
                   }
                   for (let index = 0; index < batch.length; index += 1) {
@@ -5086,6 +5106,7 @@ export default function App() {
               onSend={async (text, pending, replyToMessageId, signal, onProgress) => {
                 const publicKey = selectedDirectConversation.contact.public_key;
                 const batch = pending.length ? pending : [null];
+                const mediaAlbumId = mediaAlbumIdForPending(batch);
                 const optimisticItems = await Promise.all(batch.map(async (attachment, index) => ({
                   ...await optimisticMessage(
                     summary.identity,
@@ -5093,6 +5114,7 @@ export default function App() {
                     attachment,
                     index === 0 ? replyToMessageId : null,
                     Boolean(attachment),
+                    mediaAlbumId,
                   ),
                   upload_progress: attachment ? 0 : undefined,
                 })));
@@ -5132,16 +5154,19 @@ export default function App() {
                 let confirmedCount = 0;
                 await perform(async () => {
                   for (let index = 0; index < batch.length; index += 1) {
-                    uploaded[index] = await uploadPendingMedia(
-                      batch[index],
-                      "upload_direct_media_chunk",
-                      (progress) => {
-                        updateOptimisticDirectMessage(publicKey, optimisticItems[index].event_id, {
-                          upload_progress: progress,
-                        });
-                        onProgress?.(index, progress);
-                      },
-                      signal,
+                    uploaded[index] = withMediaAlbumId(
+                      await uploadPendingMedia(
+                        batch[index],
+                        "upload_direct_media_chunk",
+                        (progress) => {
+                          updateOptimisticDirectMessage(publicKey, optimisticItems[index].event_id, {
+                            upload_progress: progress,
+                          });
+                          onProgress?.(index, progress);
+                        },
+                        signal,
+                      ),
+                      mediaAlbumId,
                     );
                   }
                   for (let index = 0; index < batch.length; index += 1) {
@@ -6383,20 +6408,7 @@ function GroupContextMenu({
   onDelete: () => void;
   onLeave: () => void;
 }) {
-  useEffect(() => {
-    const close = () => onClose();
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("mousedown", close);
-    window.addEventListener("blur", close);
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.removeEventListener("mousedown", close);
-      window.removeEventListener("blur", close);
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [onClose]);
+  useDismissibleOverlay(onClose);
   return (
     <div
       className="group-context-menu"
@@ -6412,18 +6424,7 @@ function GroupContextMenu({
 }
 
 function DirectContextMenu({ x, y, onClose, onBlock, onClear, onDelete }: { x: number; y: number; onClose: () => void; onBlock: () => void; onClear: () => void; onDelete: () => void }) {
-  useEffect(() => {
-    const close = () => onClose();
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
-    window.addEventListener("mousedown", close);
-    window.addEventListener("blur", close);
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.removeEventListener("mousedown", close);
-      window.removeEventListener("blur", close);
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [onClose]);
+  useDismissibleOverlay(onClose);
   return (
     <div className="group-context-menu" style={{ left: Math.min(x, window.innerWidth - 190), top: Math.min(y, window.innerHeight - 135) }} onMouseDown={(event) => event.stopPropagation()}>
       <button className="clear-action" onClick={onClear}><Eraser size={14} /> clear for both</button>
@@ -6436,35 +6437,13 @@ function DirectContextMenu({ x, y, onClose, onBlock, onClear, onDelete }: { x: n
 function MessageContextMenu({ x, y, busy, onClose, onReact, onReply, onForward, onDownload, onReport, onBlock, onDelete, onBan }: { x: number; y: number; busy: boolean; onClose: () => void; onReact?: () => void; onReply: () => void; onForward: () => void; onDownload?: () => Promise<boolean>; onReport?: () => void; onBlock?: () => void; onDelete?: () => void; onBan?: () => void }) {
   const [downloading, setDownloading] = useState(false);
   const [downloaded, setDownloaded] = useState(false);
-  useEffect(() => {
-    const close = () => onClose();
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
-    window.addEventListener("mousedown", close);
-    window.addEventListener("blur", close);
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.removeEventListener("mousedown", close);
-      window.removeEventListener("blur", close);
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [onClose]);
+  useDismissibleOverlay(onClose);
   const menuHeight = 92 + (onReact ? 42 : 0) + (onDownload ? 42 : 0) + (onReport ? 42 : 0) + (onBlock ? 42 : 0) + (onDelete ? 42 : 0) + (onBan ? 42 : 0);
   return <div className="member-context-menu" style={{ left: Math.min(x, window.innerWidth - 200), top: Math.min(y, window.innerHeight - menuHeight) }} onMouseDown={(event) => event.stopPropagation()}>{onReact && <button disabled={busy || downloading} onClick={onReact}><SmilePlus size={14} /> react</button>}<button disabled={busy || downloading} onClick={onReply}><Reply size={14} /> reply</button><button disabled={busy || downloading} onClick={onForward}><Forward size={14} /> forward</button>{onDownload && <button disabled={busy || downloading || downloaded} onClick={() => { setDownloading(true); void onDownload().then((success) => { setDownloading(false); if (success) { setDownloaded(true); window.setTimeout(onClose, 650); } else { onClose(); } }); }}>{downloaded ? <Check size={14} /> : downloading ? <LoaderCircle className="spinner" size={14} /> : <Download size={14} />}{downloaded ? "downloaded" : downloading ? "downloading" : "download media"}</button>}{onReport && <button className="report-action" disabled={busy || downloading} onClick={onReport}><TriangleAlert size={14} /> report message</button>}{onBlock && <button className="danger" disabled={busy || downloading} onClick={onBlock}><ShieldOff size={14} /> block user</button>}{onDelete && <button className="danger" disabled={busy || downloading} onClick={onDelete}><Trash2 size={14} /> delete message</button>}{onBan && <button className="danger" disabled={busy || downloading} onClick={onBan}><UserRoundX size={14} /> ban member</button>}</div>;
 }
 
 function MemberContextMenu({ member, x, y, canDesignate, canBan, onClose, onMessage, onBlock, onSetModerator, onBan }: { member: MemberSummary; x: number; y: number; canDesignate: boolean; canBan: boolean; onClose: () => void; onMessage: () => void; onBlock: () => void; onSetModerator: (enabled: boolean) => void; onBan: () => void }) {
-  useEffect(() => {
-    const close = () => onClose();
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
-    window.addEventListener("mousedown", close);
-    window.addEventListener("blur", close);
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.removeEventListener("mousedown", close);
-      window.removeEventListener("blur", close);
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [onClose]);
+  useDismissibleOverlay(onClose);
   return (
     <div className="member-context-menu" style={{ left: Math.min(x - 188, window.innerWidth - 196), top: Math.min(y, window.innerHeight - (90 + (canDesignate ? 42 : 0) + (canBan ? 42 : 0))) }} onMouseDown={(event) => event.stopPropagation()}>
       {member.accepts_direct_messages
@@ -6553,24 +6532,30 @@ function useChunkedMessageList<T extends { event_id: string }>(
     userScrollIntentUntil.current = performance.now() + 300;
   }, []);
 
-  const beginUserScrollPointer = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+  // Do not setPointerCapture here. In WKWebView that retargets click to the
+  // scroller, so images, videos, and album tiles never receive the tap.
+  const beginUserScrollPointer = useCallback(() => {
     userScrollPointerActive.current = true;
     markUserScrollIntent();
-    try {
-      event.currentTarget.setPointerCapture(event.pointerId);
-    } catch {
-      // The pointer may belong to a native scrollbar, which is still covered
-      // by the short intent window above.
-    }
   }, [markUserScrollIntent]);
 
-  const endUserScrollPointer = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+  const endUserScrollPointer = useCallback(() => {
     userScrollPointerActive.current = false;
     markUserScrollIntent();
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
   }, [markUserScrollIntent]);
+
+  useEffect(() => {
+    const end = () => {
+      if (!userScrollPointerActive.current) return;
+      userScrollPointerActive.current = false;
+    };
+    window.addEventListener("pointerup", end);
+    window.addEventListener("pointercancel", end);
+    return () => {
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+    };
+  }, []);
 
   const onScrollKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
     if ([
@@ -7359,14 +7344,12 @@ function ConversationPanel({
                     presence={presenceStatuses.get(item.author_public_key) ?? "offline"}
                     replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)}
                     onNavigateToMessage={messageList.navigateToMessage}
-                    onContextMenu={item.optimistic ? undefined : (event) => {
-                      event.preventDefault();
-                      setMessageMenu({ message: item, x: event.clientX, y: event.clientY });
+                    onContextMenu={item.optimistic ? undefined : (position) => {
+                      setMessageMenu({ message: item, x: position.x, y: position.y });
                     }}
-                    onAlbumContextMenu={(target, event) => {
+                    onAlbumContextMenu={(target, position) => {
                       if (target.optimistic) return;
-                      event.preventDefault();
-                      setMessageMenu({ message: target, x: event.clientX, y: event.clientY });
+                      setMessageMenu({ message: target, x: position.x, y: position.y });
                     }}
                     onToggleReaction={(emoji) => void onReaction(item, emoji)}
                     onToggleAlbumReaction={(target, emoji) => void onReaction(target, emoji)}
@@ -7746,14 +7729,12 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
                 presence={item.author_public_key === self.public_key ? selfPresence : contactPresence}
                 replyTo={replyTo}
                 onNavigateToMessage={messageList.navigateToMessage}
-                onContextMenu={item.optimistic ? undefined : (event) => {
-                  event.preventDefault();
-                  setMessageMenu({ message: item, x: event.clientX, y: event.clientY });
+                onContextMenu={item.optimistic ? undefined : (position) => {
+                  setMessageMenu({ message: item, x: position.x, y: position.y });
                 }}
-                onAlbumContextMenu={(target, event) => {
+                onAlbumContextMenu={(target, position) => {
                   if (target.optimistic) return;
-                  event.preventDefault();
-                  setMessageMenu({ message: target, x: event.clientX, y: event.clientY });
+                  setMessageMenu({ message: target, x: position.x, y: position.y });
                 }}
                 onPerson={onPerson}
                 mediaScopeId={conversation.media_scope_id}
@@ -7982,8 +7963,8 @@ function MessageRow({
   presence?: PresenceStatus;
   replyTo?: MessageSummary;
   onNavigateToMessage: (eventId: string) => void;
-  onContextMenu?: (event: React.MouseEvent<HTMLElement>) => void;
-  onAlbumContextMenu?: (message: MessageSummary, event: React.MouseEvent<HTMLElement>) => void;
+  onContextMenu?: (position: { x: number; y: number }) => void;
+  onAlbumContextMenu?: (message: MessageSummary, position: { x: number; y: number }) => void;
   onToggleReaction?: (emoji: string) => void;
   onToggleAlbumReaction?: (message: MessageSummary, emoji: string) => void;
   reactionPeople?: Map<string, PersonSummary>;
@@ -8009,16 +7990,12 @@ function MessageRow({
   const previewUrl = firstLink(message.text);
   const footerMessage = album?.at(-1) ?? message;
   const showReceipt = own && directReceiptMessageId === footerMessage.event_id;
+  const menuRef = useContextMenuTarget<HTMLElement>(onContextMenu, ".media-album-tile");
   return (
     <article
+      ref={menuRef}
       className={`message-row ${own ? "own" : ""} ${message.optimistic ? "optimistic" : ""} ${album ? "media-album-row" : ""}`}
       data-message-id={message.event_id}
-      onMouseDown={onContextMenu ? (event) => { if (event.button === 2) event.preventDefault(); } : undefined}
-      onContextMenu={onContextMenu ? (event) => {
-        event.preventDefault();
-        window.getSelection()?.removeAllRanges();
-        onContextMenu(event);
-      } : undefined}
     >
       <button onClick={() => onPerson(person)}><PresenceAvatar name={message.username} image={message.avatar} size={34} status={presence ?? "offline"} /></button>
       <div className="message-body">
@@ -8075,47 +8052,204 @@ function MessageMediaAlbum({
 }: {
   messages: MessageSummary[];
   scopeId?: string;
-  onContextMenu?: (message: MessageSummary, event: React.MouseEvent<HTMLElement>) => void;
+  onContextMenu?: (message: MessageSummary, position: { x: number; y: number }) => void;
   onToggleReaction?: (message: MessageSummary, emoji: string) => void;
   reactionPeople?: Map<string, PersonSummary>;
   onPerson: (person: PersonSummary) => void;
 }) {
+  const [openIndex, setOpenIndex] = useState<number | null>(null);
   return (
-    <div className={`media-album media-album-${messages.length}`}>
-      {messages.map((message, index) => {
-        const localAttachment = message.local_attachment ?? sentMediaPreviewCache.get(message.event_id);
-        return (
-          <div
-            className={`media-album-tile media-album-tile-${index + 1} ${message.optimistic ? "optimistic" : ""}`}
+    <>
+      <div className={`media-album media-album-${messages.length}`}>
+        {messages.map((message, index) => (
+          <MessageAlbumTile
             key={message.event_id}
-            data-message-id={message.event_id}
-            onMouseDown={onContextMenu ? (event) => {
-              if (event.button === 2) event.preventDefault();
-            } : undefined}
-            onContextMenu={onContextMenu ? (event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              window.getSelection()?.removeAllRanges();
-              onContextMenu(message, event);
-            } : undefined}
-          >
-            {localAttachment ? (
-              <LocalMessageMedia attachment={localAttachment} manifest={message.attachment} scopeId={scopeId} uploadProgress={message.upload_progress} uploadError={message.upload_error} />
-            ) : message.attachment ? (
-              <MessageMedia attachment={message.attachment} scopeId={scopeId} />
-            ) : null}
-            {message.reactions && message.reactions.length > 0 && (
-              <MessageReactions
-                reactions={message.reactions}
-                people={reactionPeople}
-                onToggle={onToggleReaction ? (emoji) => onToggleReaction(message, emoji) : undefined}
-                onPerson={onPerson}
-              />
-            )}
-          </div>
-        );
-      })}
+            message={message}
+            index={index}
+            scopeId={scopeId}
+            onOpen={() => setOpenIndex(index)}
+            onContextMenu={onContextMenu}
+            onToggleReaction={onToggleReaction}
+            reactionPeople={reactionPeople}
+            onPerson={onPerson}
+          />
+        ))}
+      </div>
+      {openIndex !== null && (
+        <AlbumMediaLightbox
+          messages={messages}
+          index={openIndex}
+          scopeId={scopeId}
+          onClose={() => setOpenIndex(null)}
+          onIndex={setOpenIndex}
+        />
+      )}
+    </>
+  );
+}
+
+function MessageAlbumTile({
+  message,
+  index,
+  scopeId,
+  onOpen,
+  onContextMenu,
+  onToggleReaction,
+  reactionPeople,
+  onPerson,
+}: {
+  message: MessageSummary;
+  index: number;
+  scopeId?: string;
+  onOpen: () => void;
+  onContextMenu?: (message: MessageSummary, position: { x: number; y: number }) => void;
+  onToggleReaction?: (message: MessageSummary, emoji: string) => void;
+  reactionPeople?: Map<string, PersonSummary>;
+  onPerson: (person: PersonSummary) => void;
+}) {
+  const localAttachment = message.local_attachment ?? sentMediaPreviewCache.get(message.event_id);
+  const menuRef = useContextMenuTarget<HTMLDivElement>(
+    onContextMenu && !message.optimistic
+      ? (position) => onContextMenu(message, position)
+      : undefined,
+  );
+  return (
+    <div
+      ref={menuRef}
+      className={`media-album-tile media-album-tile-${index + 1} ${message.optimistic ? "optimistic" : ""}`}
+      data-message-id={message.event_id}
+      role="button"
+      tabIndex={0}
+      aria-label="view media full size"
+      onClickCapture={(event) => {
+        if ((event.target as Element).closest(".message-reactions, .noise-video-controls, audio")) {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        onOpen();
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onOpen();
+        }
+      }}
+    >
+      {localAttachment ? (
+        <LocalMessageMedia
+          attachment={localAttachment}
+          manifest={message.attachment}
+          scopeId={scopeId}
+          uploadProgress={message.upload_progress}
+          uploadError={message.upload_error}
+          expandable={false}
+        />
+      ) : message.attachment ? (
+        <MessageMedia attachment={message.attachment} scopeId={scopeId} expandable={false} />
+      ) : null}
+      {message.reactions && message.reactions.length > 0 && (
+        <MessageReactions
+          reactions={message.reactions}
+          people={reactionPeople}
+          onToggle={onToggleReaction ? (emoji) => onToggleReaction(message, emoji) : undefined}
+          onPerson={onPerson}
+        />
+      )}
     </div>
+  );
+}
+
+function AlbumMediaLightbox({
+  messages,
+  index,
+  scopeId,
+  onClose,
+  onIndex,
+}: {
+  messages: MessageSummary[];
+  index: number;
+  scopeId?: string;
+  onClose: () => void;
+  onIndex: (index: number) => void;
+}) {
+  const message = messages[index];
+  const localAttachment = message?.local_attachment ?? (message ? sentMediaPreviewCache.get(message.event_id) : undefined);
+  const lightboxRoot = document.querySelector<HTMLElement>(".app-shell") ?? document.body;
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+      if (event.key === "ArrowLeft" && index > 0) onIndex(index - 1);
+      if (event.key === "ArrowRight" && index < messages.length - 1) onIndex(index + 1);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [index, messages.length, onClose, onIndex]);
+  if (!message) return null;
+  return createPortal(
+    <div
+      className="image-lightbox album-lightbox"
+      role="dialog"
+      aria-modal="true"
+      aria-label="expanded album media"
+      onClick={onClose}
+    >
+      <button
+        type="button"
+        className="image-lightbox-close"
+        onClick={onClose}
+        aria-label="close expanded media"
+        autoFocus
+      >
+        <X size={18} />
+      </button>
+      {index > 0 && (
+        <button
+          type="button"
+          className="gallery-nav previous"
+          aria-label="previous media"
+          onClick={(event) => {
+            event.stopPropagation();
+            onIndex(index - 1);
+          }}
+        >
+          <ChevronLeft size={20} />
+        </button>
+      )}
+      {index < messages.length - 1 && (
+        <button
+          type="button"
+          className="gallery-nav next"
+          aria-label="next media"
+          onClick={(event) => {
+            event.stopPropagation();
+            onIndex(index + 1);
+          }}
+        >
+          <ChevronRight size={20} />
+        </button>
+      )}
+      <div className="album-lightbox-stage" onClick={(event) => event.stopPropagation()}>
+        {localAttachment ? (
+          <LocalMessageMedia
+            attachment={localAttachment}
+            manifest={message.attachment}
+            scopeId={scopeId}
+            expandable={false}
+          />
+        ) : message.attachment ? (
+          <MessageMedia
+            attachment={message.attachment}
+            scopeId={scopeId}
+            autoplayVideo
+            expandable={false}
+            priority="visible"
+          />
+        ) : null}
+        <small>{index + 1} / {messages.length}</small>
+      </div>
+    </div>,
+    lightboxRoot,
   );
 }
 
@@ -8343,8 +8477,21 @@ function ReplyMediaThumbnail({ message, scopeId }: { message: MessageSummary & {
   return <span className="reply-media-thumbnail audio"><AudioWaveform size={18} /></span>;
 }
 
-function MessageMedia({ attachment, scopeId, autoplayVideo = false }: { attachment: MediaAttachment; scopeId?: string; autoplayVideo?: boolean }) {
+function MessageMedia({
+  attachment,
+  scopeId,
+  autoplayVideo = false,
+  expandable = true,
+  priority: priorityOverride,
+}: {
+  attachment: MediaAttachment;
+  scopeId?: string;
+  autoplayVideo?: boolean;
+  expandable?: boolean;
+  priority?: MediaLoadPriority;
+}) {
   const visibility = useMediaPriority<HTMLDivElement>();
+  const priority = priorityOverride ?? visibility.priority;
   const image = attachment.mime_type.startsWith("image/");
   const video = attachment.mime_type.startsWith("video/");
   const sticker = image && isKlipyStickerFileName(attachment.file_name);
@@ -8356,21 +8503,21 @@ function MessageMedia({ attachment, scopeId, autoplayVideo = false }: { attachme
     if (
       !video
       || videoRequested
-      || !visibility.priority
-      || visibility.priority === "background"
+      || !priority
+      || priority === "background"
     ) return;
-    void prewarmMediaBootstrap(attachment, scopeId, visibility.priority);
-  }, [attachment, scopeId, video, videoRequested, visibility.priority]);
+    void prewarmMediaBootstrap(attachment, scopeId, priority);
+  }, [attachment, scopeId, video, videoRequested, priority]);
   const { source, failed, retry: retrySource, resumeGeneration } = useMediaSource(
     attachment,
     scopeId,
     video
       ? videoRequested
         ? "visible"
-        : isTauri && visibility.priority === "visible"
+        : isTauri && priority === "visible"
           ? "visible"
           : null
-      : visibility.priority,
+      : priority,
   );
   const poster = mediaPoster(attachment);
   const posterCacheKey = mediaCacheKey(attachment);
@@ -8386,6 +8533,7 @@ function MessageMedia({ attachment, scopeId, autoplayVideo = false }: { attachme
           pixelHeight={attachment.pixel_height}
           failed={failed}
           sticker={sticker}
+          expandable={expandable}
         />
       ) : video ? (
         <ChatVideo
@@ -8451,12 +8599,14 @@ function LocalMessageMedia({
   scopeId,
   uploadProgress,
   uploadError,
+  expandable = true,
 }: {
   attachment: NonNullable<MessageSummary["local_attachment"]>;
   manifest: MediaAttachment | null;
   scopeId?: string;
   uploadProgress?: number;
   uploadError?: string;
+  expandable?: boolean;
 }) {
   const poster = attachment.poster_url ?? (manifest ? mediaPoster(manifest) : undefined);
   const posterCacheKey = manifest ? mediaCacheKey(manifest) : undefined;
@@ -8470,7 +8620,7 @@ function LocalMessageMedia({
     <div className="message-media local-message-media">
       <div className="local-message-media-frame">
         {attachment.mime_type.startsWith("image/") ? (
-          <ChatImage source={attachment.preview_url} preview={sticker ? undefined : poster ?? attachment.preview_url} cacheKey={posterCacheKey ?? attachment.preview_url} pixelWidth={pixelWidth} pixelHeight={pixelHeight} sticker={sticker} />
+          <ChatImage source={attachment.preview_url} preview={sticker ? undefined : poster ?? attachment.preview_url} cacheKey={posterCacheKey ?? attachment.preview_url} pixelWidth={pixelWidth} pixelHeight={pixelHeight} sticker={sticker} expandable={expandable} />
         ) : pendingVideo ? (
           <div className="chat-video media-pending" style={mediaFrameStyle(pixelWidth, pixelHeight, 288, 176)}>
             {poster ? (
@@ -9057,6 +9207,7 @@ function ChatImage({
   pixelHeight,
   failed = false,
   sticker = false,
+  expandable = true,
 }: {
   source?: string;
   preview?: string;
@@ -9065,6 +9216,7 @@ function ChatImage({
   pixelHeight?: number | null;
   failed?: boolean;
   sticker?: boolean;
+  expandable?: boolean;
 }) {
   const suppliedDimensions = pixelWidth && pixelHeight
     ? { width: pixelWidth, height: pixelHeight }
@@ -9095,6 +9247,7 @@ function ChatImage({
   }, [expanded]);
   const style = mediaFrameStyle(dimensions?.width, dimensions?.height);
   const visibleSource = source ?? preview;
+  const canExpand = expandable && Boolean(visibleSource);
   const lightboxRoot = document.querySelector<HTMLElement>(".app-shell")
     ?? document.body;
   const expandedImageStyle: CSSProperties | undefined =
@@ -9108,11 +9261,11 @@ function ChatImage({
     <span
       className={`chat-image ${sticker ? "sticker" : ""}`}
       style={style}
-      role={visibleSource ? "button" : undefined}
-      tabIndex={visibleSource ? 0 : undefined}
-      aria-label={visibleSource ? "view image full size" : undefined}
-      onClick={visibleSource ? () => setExpanded(true) : undefined}
-      onKeyDown={visibleSource ? (event) => {
+      role={canExpand ? "button" : undefined}
+      tabIndex={canExpand ? 0 : undefined}
+      aria-label={canExpand ? "view image full size" : undefined}
+      onClick={canExpand ? () => setExpanded(true) : undefined}
+      onKeyDown={canExpand ? (event) => {
         if (event.target !== event.currentTarget) return;
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
@@ -12196,60 +12349,6 @@ function sameLocalDay(leftMillis: number, rightMillis: number) {
     && left.getDate() === right.getDate();
 }
 
-const MEDIA_ALBUM_WINDOW_MILLIS = 5 * 60_000;
-
-type MediaMessageGroup<T extends MessageSummary> = {
-  messages: T[];
-};
-
-function messageMediaMime(message: MessageSummary) {
-  return message.local_attachment?.mime_type ?? message.attachment?.mime_type ?? "";
-}
-
-function messageMediaFileName(message: MessageSummary) {
-  return message.local_attachment?.file_name ?? message.attachment?.file_name ?? "";
-}
-
-function isCollageMediaMessage(message: MessageSummary) {
-  const mimeType = messageMediaMime(message);
-  return (mimeType.startsWith("image/") || mimeType.startsWith("video/"))
-    && !isKlipyStickerFileName(messageMediaFileName(message));
-}
-
-function canAppendToMediaAlbum(
-  album: MessageSummary[],
-  candidate: MessageSummary,
-) {
-  const previous = album.at(-1);
-  if (!previous || album.length >= MAX_COMPOSER_MEDIA_ITEMS) return false;
-  const elapsed = candidate.created_at_millis - previous.created_at_millis;
-  return isCollageMediaMessage(candidate)
-    && candidate.author_public_key === previous.author_public_key
-    && sameLocalDay(previous.created_at_millis, candidate.created_at_millis)
-    && elapsed >= 0
-    && elapsed <= MEDIA_ALBUM_WINDOW_MILLIS
-    && !candidate.text.trim()
-    && !candidate.reply_to_message_id
-    && !candidate.forwarded_from;
-}
-
-function groupMediaMessages<T extends MessageSummary>(messages: T[]) {
-  const groups: MediaMessageGroup<T>[] = [];
-  for (const message of messages) {
-    const previousGroup = groups.at(-1);
-    if (
-      previousGroup
-      && isCollageMediaMessage(previousGroup.messages[0])
-      && canAppendToMediaAlbum(previousGroup.messages, message)
-    ) {
-      previousGroup.messages.push(message);
-    } else {
-      groups.push({ messages: [message] });
-    }
-  }
-  return groups;
-}
-
 function formatMessageDate(millis: number) {
   const date = new Date(millis);
   const today = new Date();
@@ -12373,10 +12472,36 @@ async function uploadPendingMedia(
     mime_type: mimeType,
     byte_length: file.size,
     chunks,
-    preview_data_base64: preview?.dataBase64 ?? null,
-    preview_mime_type: preview?.mimeType ?? null,
-    pixel_width: dimensions?.pixelWidth ?? preview?.pixelWidth ?? null,
-    pixel_height: dimensions?.pixelHeight ?? preview?.pixelHeight ?? null,
+    ...completeMediaPreview(preview, dimensions),
+  };
+}
+
+function completeMediaPreview(
+  preview: MediaPreview | null,
+  dimensions: MediaDimensions | null,
+) {
+  const width = dimensions?.pixelWidth ?? preview?.pixelWidth ?? null;
+  const height = dimensions?.pixelHeight ?? preview?.pixelHeight ?? null;
+  const hasDimensions = Boolean(
+    width
+    && height
+    && width > 0
+    && width <= 16_384
+    && height > 0
+    && height <= 16_384,
+  );
+  const hasPreview = Boolean(
+    preview
+    && preview.mimeType === "image/jpeg"
+    && preview.dataBase64
+    && preview.dataBase64.length <= 80_000
+    && hasDimensions,
+  );
+  return {
+    preview_data_base64: hasPreview ? preview?.dataBase64 ?? null : null,
+    preview_mime_type: hasPreview ? preview?.mimeType ?? null : null,
+    pixel_width: hasPreview ? width : null,
+    pixel_height: hasPreview ? height : null,
   };
 }
 

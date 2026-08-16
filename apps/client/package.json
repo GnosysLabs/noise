@@ -1,11 +1,11 @@
 {
   "name": "@noise/client",
   "private": true,
-  "version": "0.3.7",
+  "version": "0.3.8",
   "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
-    "dev": "vite --host 127.0.0.1 --port 1420",
+    "dev": "vite --host 127.0.0.1 --port 1421",
     "dev:desktop": "tauri dev --release",
     "build": "tsc && vite build",
     "test": "node --experimental-strip-types --test tests/*.test.ts",

@@ -699,6 +699,8 @@ pub struct MediaAttachment {
     pub pixel_width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pixel_height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_album_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3391,6 +3393,15 @@ fn valid_media(media: &MediaAttachment) -> bool {
             .sum::<u64>()
             == media.byte_length
         && media_preview_is_valid(media)
+        && media_album_id_is_valid(media.media_album_id.as_deref())
+}
+
+#[must_use]
+pub fn media_album_id_is_valid(id: Option<&str>) -> bool {
+    match id {
+        None => true,
+        Some(id) => id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+    }
 }
 
 #[must_use]
@@ -3402,17 +3413,19 @@ pub fn media_preview_is_valid(media: &MediaAttachment) -> bool {
         media.pixel_height,
     ) {
         (None, None, None, None) => true,
+        (None, None, Some(width), Some(height)) => valid_media_dimensions(width, height),
         (Some(data), Some("image/jpeg"), Some(width), Some(height)) => {
             (media.mime_type.starts_with("image/") || media.mime_type.starts_with("video/"))
                 && !data.is_empty()
                 && data.len() <= 80_000
-                && width > 0
-                && width <= 16_384
-                && height > 0
-                && height <= 16_384
+                && valid_media_dimensions(width, height)
         }
         _ => false,
     }
+}
+
+fn valid_media_dimensions(width: u32, height: u32) -> bool {
+    width > 0 && width <= 16_384 && height > 0 && height <= 16_384
 }
 
 fn valid_message_id(message_id: &str) -> bool {
@@ -3617,12 +3630,41 @@ mod tests {
                 preview_mime_type: Some("image/jpeg".into()),
                 pixel_width: Some(1920),
                 pixel_height: Some(1080),
+                media_album_id: None,
             };
             assert!(
                 media_preview_is_valid(&media),
                 "{mime_type} should accept a generated JPEG preview"
             );
         }
+    }
+
+    #[test]
+    fn media_dimensions_are_valid_without_a_preview() {
+        let media = MediaAttachment {
+            file_name: "media".into(),
+            mime_type: "image/jpeg".into(),
+            byte_length: 1,
+            chunks: Vec::new(),
+            preview_data_base64: None,
+            preview_mime_type: None,
+            pixel_width: Some(1920),
+            pixel_height: Some(1080),
+            media_album_id: None,
+        };
+        assert!(media_preview_is_valid(&media));
+    }
+
+    #[test]
+    fn media_album_ids_are_optional_32_hex_characters() {
+        assert!(media_album_id_is_valid(None));
+        assert!(media_album_id_is_valid(Some(
+            "0123456789abcdef0123456789abcdef"
+        )));
+        assert!(!media_album_id_is_valid(Some("short")));
+        assert!(!media_album_id_is_valid(Some(
+            "0123456789abcdef0123456789abcdeg"
+        )));
     }
 
     #[test]

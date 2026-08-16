@@ -62,7 +62,8 @@ use noise_core::{
     SafetyReporterContextV1, ShardPlacement, SignedEvent, StorageManifest,
     derive_account_credentials, direct_mailbox_id, direct_message_id, display_frequency,
     display_noise_id, encode_blob_for_storage, frequency_locator, generate_frequency,
-    generate_noise_id, media_preview_is_valid, normalize_frequency, profile_media_scope_id,
+    generate_noise_id, media_album_id_is_valid, media_preview_is_valid, normalize_frequency,
+    profile_media_scope_id,
     reconstruct_blob_from_storage_payloads, valid_reaction_emoji,
 };
 pub use noise_core::{
@@ -16009,6 +16010,9 @@ fn validate_media_reference(media: &MediaAttachment) -> anyhow::Result<()> {
     if !media_preview_is_valid(media) {
         bail!("media has an invalid preview")
     }
+    if !media_album_id_is_valid(media.media_album_id.as_deref()) {
+        bail!("media has an invalid album id")
+    }
     Ok(())
 }
 
@@ -17615,6 +17619,7 @@ mod tests {
             preview_mime_type: None,
             pixel_width: None,
             pixel_height: None,
+            media_album_id: None,
         }
     }
 

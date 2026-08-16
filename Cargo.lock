@@ -4332,7 +4332,7 @@ dependencies = [
 
 [[package]]
 name = "noise-central"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "a2",
  "anyhow",
@@ -4360,7 +4360,7 @@ dependencies = [
 
 [[package]]
 name = "noise-cli"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "clap",
@@ -4370,7 +4370,7 @@ dependencies = [
 
 [[package]]
 name = "noise-client"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4393,7 +4393,7 @@ dependencies = [
 
 [[package]]
 name = "noise-core"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -4419,7 +4419,7 @@ dependencies = [
 
 [[package]]
 name = "noise-desktop"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -4441,7 +4441,7 @@ dependencies = [
 
 [[package]]
 name = "noise-ffi"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -4453,7 +4453,7 @@ dependencies = [
 
 [[package]]
 name = "noise-migration-importer"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4473,7 +4473,7 @@ dependencies = [
 
 [[package]]
 name = "noise-migration-verifier"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4518,7 +4518,7 @@ dependencies = [
 
 [[package]]
 name = "noise-safety-intake"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "axum",
@@ -4539,7 +4539,7 @@ dependencies = [
 
 [[package]]
 name = "noise-sim"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "clap",
@@ -4549,7 +4549,7 @@ dependencies = [
 
 [[package]]
 name = "noise-transport"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4562,7 +4562,7 @@ dependencies = [
 
 [[package]]
 name = "noise-web"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "getrandom 0.4.3",
  "noise-client",

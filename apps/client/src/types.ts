@@ -170,6 +170,7 @@ export type MediaAttachment = {
   preview_mime_type?: string | null;
   pixel_width?: number | null;
   pixel_height?: number | null;
+  media_album_id?: string | null;
 };
 
 export type LinkPreview = {
@@ -214,6 +215,7 @@ export type MessageSummary = {
     poster_url?: string;
     pixel_width?: number;
     pixel_height?: number;
+    media_album_id?: string | null;
   };
 };
 
@@ -317,6 +319,7 @@ export type DirectMessageSummary = {
     poster_url?: string;
     pixel_width?: number;
     pixel_height?: number;
+    media_album_id?: string | null;
   };
 };
 

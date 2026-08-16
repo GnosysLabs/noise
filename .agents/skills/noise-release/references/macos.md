@@ -22,7 +22,7 @@ pnpm --dir apps/client install --frozen-lockfile
 pnpm --dir apps/client dev:desktop
 ```
 
-Vite listens on `127.0.0.1:1420`; frontend hot reload remains active while
+Vite listens on `127.0.0.1:1421`; frontend hot reload remains active while
 the Rust backend runs from `target/release/noise-desktop`. Keep the native
 backend optimized: encrypted group rebuilding is fast in web's release WASM
 but can take seconds in an unoptimized Rust binary. If hot reload appears
