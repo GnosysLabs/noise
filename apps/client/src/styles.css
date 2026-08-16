@@ -45,9 +45,28 @@ button:disabled { cursor: default; opacity: 0.48; }
 .sidebar { position: relative; display: flex; flex-direction: column; width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; padding-top: 56px; background: linear-gradient(150deg, #242129 0%, #1d1c20 70%); border-right: 1px solid rgba(255,255,255,.035); }
 .group-background-active .sidebar { background: rgba(21,19,24,.5); border-right-color: rgba(255,255,255,.15); box-shadow: 1px 0 rgba(0,0,0,.28); -webkit-backdrop-filter: none; backdrop-filter: none; }
 .group-background-active .self-account { background: rgba(30,28,33,.52); border-top-color: rgba(255,255,255,.15); box-shadow: 0 -1px rgba(0,0,0,.28); -webkit-backdrop-filter: blur(20px); backdrop-filter: blur(20px); }
-.sidebar-drag { position: absolute; inset: 0 0 auto; display: flex; height: 56px; align-items: center; justify-content: center; background: rgba(35,33,39,.84); border-bottom: 1px solid rgba(255,255,255,.055); -webkit-backdrop-filter: blur(24px); backdrop-filter: blur(24px); }
+.sidebar-drag { position: absolute; z-index: 4; inset: 0 0 auto; display: grid; height: 56px; grid-template-columns: 36px minmax(0, 1fr) 36px; align-items: center; padding: 0 10px; background: rgba(35,33,39,.84); border-bottom: 1px solid rgba(255,255,255,.055); -webkit-backdrop-filter: blur(24px); backdrop-filter: blur(24px); }
 .group-background-active .sidebar-drag { background: rgba(30,28,33,.52); border-bottom-color: rgba(255,255,255,.15); box-shadow: 0 1px rgba(0,0,0,.28); -webkit-backdrop-filter: blur(20px); backdrop-filter: blur(20px); }
-.brand { display: flex; align-items: center; gap: 8px; padding: 0; pointer-events: none; font-size: 18px; letter-spacing: -.4px; }
+.brand { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 0; pointer-events: none; font-size: 18px; letter-spacing: -.4px; }
+.activity-inbox { position: relative; justify-self: end; -webkit-app-region: no-drag; app-region: no-drag; }
+.activity-bell { position: relative; display: grid; width: 32px; height: 32px; place-items: center; border-radius: 9px; background: transparent; color: var(--muted); }
+.activity-bell:hover, .activity-bell.open { background: rgba(255,255,255,.08); color: #f2eff5; }
+.activity-bell > i { position: absolute; top: 3px; right: 2px; min-width: 14px; height: 14px; padding: 0 4px; border-radius: 7px; background: var(--accent); color: var(--accent-contrast); font-size: 8px; font-style: normal; font-weight: 750; line-height: 14px; }
+.activity-panel { position: absolute; z-index: 80; top: calc(100% + 8px); right: 0; width: min(248px, calc(100vw - 24px)); overflow: hidden; border: 1px solid rgba(255,255,255,.11); border-radius: 14px; background: rgba(30,28,33,.97); box-shadow: 0 20px 55px rgba(0,0,0,.52); -webkit-backdrop-filter: blur(24px); backdrop-filter: blur(24px); }
+.activity-panel > header { display: grid; gap: 2px; padding: 12px 13px 10px; border-bottom: 1px solid rgba(255,255,255,.07); }
+.activity-panel > header strong { font-size: 12px; }
+.activity-panel > header small { color: var(--faint); font-size: 10px; }
+.activity-empty { padding: 22px 16px 24px; color: var(--faint); text-align: center; font-size: 11px; line-height: 1.45; }
+.activity-list { display: grid; max-height: min(360px, 52vh); overflow: auto; padding: 6px; }
+.activity-row { display: grid; width: 100%; grid-template-columns: 34px minmax(0, 1fr); gap: 9px; padding: 8px; border-radius: 10px; background: transparent; text-align: left; }
+.activity-row:hover { background: rgba(255,255,255,.065); }
+.activity-avatar { position: relative; width: 34px; height: 34px; }
+.activity-avatar > .avatar { width: 34px; height: 34px; }
+.activity-avatar > b { position: absolute; right: -3px; bottom: -2px; display: grid; width: 16px; height: 16px; place-items: center; border: 1px solid rgba(20,18,22,.9); border-radius: 50%; background: var(--accent); color: var(--accent-contrast); }
+.activity-copy { min-width: 0; display: grid; gap: 2px; }
+.activity-copy strong { overflow: hidden; font-size: 11.5px; text-overflow: ellipsis; white-space: nowrap; }
+.activity-copy > span { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.activity-copy small { color: var(--faint); font-size: 10px; }
 .brand svg { color: var(--accent); }
 .sidebar-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin: 12px 11px; padding: 3px; border-radius: 10px; background: rgba(0,0,0,.16); }
 .sidebar-tabs button { display: flex; align-items: center; justify-content: center; gap: 6px; height: 29px; border-radius: 7px; background: transparent; color: var(--muted); font-size: 11px; font-weight: 600; }
@@ -262,6 +281,9 @@ button:disabled { cursor: default; opacity: 0.48; }
 .message-row.own .message-reply-reference { margin-left: auto; background: color-mix(in srgb, var(--accent) 18%, rgba(28,26,31,.92)); }
 .message-row.own .message-reply-reference.navigable:hover { background: color-mix(in srgb, var(--accent) 26%, rgba(38,35,42,.94)); }
 .composer { position: relative; z-index: 10; grid-column: 1; grid-row: 3; display: grid; min-height: var(--conversation-footer-height); grid-template-columns: auto minmax(0, 1fr) 38px; align-items: end; gap: 10px; padding: 14px 16px 16px; border-top: 1px solid rgba(255,255,255,.055); }
+.new-messages-pill { position: absolute; z-index: 12; left: 50%; bottom: calc(100% + 12px); display: inline-flex; align-items: center; gap: 6px; padding: 8px 12px 8px 14px; transform: translateX(-50%); border: 1px solid rgba(255,255,255,.14); border-radius: 999px; background: rgba(28, 26, 32, .92); color: #f4f1f7; box-shadow: 0 10px 28px rgba(0,0,0,.42); font-size: 12px; font-weight: 650; letter-spacing: -.01em; -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px); }
+.new-messages-pill:hover, .new-messages-pill:focus-visible { background: var(--accent); color: var(--accent-contrast); outline: none; }
+.new-messages-pill > svg { flex: none; }
 .composer textarea { grid-column: 2; width: 100%; max-height: 168px; min-height: 42px; overflow-y: hidden; resize: none; padding: 10px 14px; border: 0; outline: none; border-radius: 11px; background: var(--soft); font-size: 14px; line-height: 21px; }
 .composer textarea::placeholder { color: var(--faint); }
 .composer > button { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 50%; background: var(--accent); }

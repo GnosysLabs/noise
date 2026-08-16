@@ -546,6 +546,9 @@ enum Request {
         state_path: String,
         group_id: String,
     },
+    CachedConversations {
+        state_path: String,
+    },
     WatchGroup {
         state_path: String,
         since: Option<u64>,
@@ -927,6 +930,7 @@ fn invoke(request_json: &str) -> Result<Value, String> {
             | Request::PublishReadState { .. }
             | Request::GroupHasPendingAdmissions { .. }
             | Request::CachedConversation { .. }
+            | Request::CachedConversations { .. }
             | Request::CachedDirectInbox { .. }
             | Request::HeartbeatPresence { .. }
             | Request::ReplyNotificationSnapshot { .. }
@@ -2210,6 +2214,12 @@ fn invoke(request_json: &str) -> Result<Value, String> {
         } => serde_json::to_value(
             client
                 .cached_conversation(state_path, &group_id)
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        Request::CachedConversations { state_path } => serde_json::to_value(
+            client
+                .cached_conversations(state_path)
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),

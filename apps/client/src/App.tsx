@@ -89,6 +89,23 @@ import {
   mediaAlbumIdForPending,
   withMediaAlbumId,
 } from "./mediaAlbum";
+import {
+  conversationScrollStorageKey,
+  countMessagesAfter,
+  readConversationScrollAnchor,
+  resolveConversationRestore,
+  visibleCountForRestore,
+  writeConversationScrollAnchor,
+  type ConversationScrollAnchor,
+} from "./conversationScroll";
+import { NewMessagesPill } from "./NewMessagesPill";
+import { ActivityInbox } from "./ActivityInbox";
+import { useActivityInbox } from "./useActivityInbox";
+import { loadLocalActivityConversations } from "./activityInboxSync";
+import {
+  notificationsFromGroupConversation,
+  type ActivityNotification,
+} from "./activityNotifications";
 import type {
   AdultAccessSummary,
   AttachmentData,
@@ -2031,6 +2048,51 @@ export default function App() {
   } | null>(null);
   const [directMenu, setDirectMenu] = useState<{ direct: DirectSummary; x: number; y: number } | null>(null);
   const identityPublicKey = summary?.identity.public_key ?? null;
+  const activityInbox = useActivityInbox(identityPublicKey);
+  const [activityHarvestTick, setActivityHarvestTick] = useState(0);
+  const activityGroupIdsKey = (summary?.groups ?? [])
+    .filter((group) => !group.safety_restriction)
+    .map((group) => group.group_id)
+    .sort()
+    .join("|");
+  useEffect(() => {
+    if (!identityPublicKey) return;
+    let cancelled = false;
+    void (async () => {
+      const groups = await loadLocalActivityConversations(
+        activityGroupIdsKey.split("|").filter(Boolean),
+      );
+      if (cancelled) return;
+      for (const item of groups) {
+        groupConversationCache.current.set(item.group.group_id, item);
+      }
+      setActivityHarvestTick((n) => n + 1);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activityGroupIdsKey, identityPublicKey]);
+  useEffect(() => {
+    if (!summary) return;
+    const harvestGroup = (item: Conversation) => {
+      activityInbox.harvest(
+        `group:${item.group.group_id}`,
+        notificationsFromGroupConversation(item, summary.identity, summary.hidden_public_keys),
+      );
+    };
+    if (conversation) harvestGroup(conversation);
+    for (const cached of groupConversationCache.current.values()) {
+      if (cached.group.group_id !== conversation?.group.group_id) harvestGroup(cached);
+    }
+  }, [activityHarvestTick, activityInbox.harvest, conversation, summary]);
+  const harvestGroupConversationRef = useRef<(item: Conversation) => void>(() => {});
+  harvestGroupConversationRef.current = (item) => {
+    if (!summary) return;
+    activityInbox.harvest(
+      `group:${item.group.group_id}`,
+      notificationsFromGroupConversation(item, summary.identity, summary.hidden_public_keys),
+    );
+  };
   const blockedPublicKeyKey = summary?.hidden_public_keys.join("|") ?? "";
   const activeSafetyRestrictionKey = safetyRestrictionKey(summary);
   const previousBlockedPublicKeyKey = useRef("");
@@ -3269,6 +3331,7 @@ export default function App() {
       if (activity.conversation) {
         topicSource = activity.conversation;
         groupConversationCache.current.set(groupId, activity.conversation);
+        harvestGroupConversationRef.current(activity.conversation);
         if (desiredGroupIdRef.current === groupId) {
           setConversation(activity.conversation);
         }
@@ -3319,6 +3382,7 @@ export default function App() {
         if (topicActivity.conversation) {
           topicSource = topicActivity.conversation;
           groupConversationCache.current.set(groupId, topicActivity.conversation);
+          harvestGroupConversationRef.current(topicActivity.conversation);
           if (desiredGroupIdRef.current === groupId) {
             setConversation(topicActivity.conversation);
           }
@@ -4696,6 +4760,22 @@ export default function App() {
       nonce: Date.now(),
     });
   };
+  const openActivityNotification = async (item: ActivityNotification) => {
+    await openSearchMessage({
+      event_id: item.eventId,
+      author_public_key: item.actor.public_key,
+      username: item.actor.username,
+      avatar: item.actor.avatar,
+      text: item.preview,
+      attachment: null,
+      created_at_millis: item.createdAtMillis,
+      group_id: item.groupId ?? null,
+      group_name: item.groupName ?? null,
+      topic_id: item.topicId ?? null,
+      topic_name: item.topicName ?? null,
+      direct_public_key: item.directPublicKey ?? null,
+    });
+  };
   const openSearchPerson = (result: SearchPersonResult) => {
     const person: PersonSummary = {
       public_key: result.public_key,
@@ -4764,6 +4844,10 @@ export default function App() {
         onReorderGroups={reorderGroups}
         onReorderTopics={(group, topicIds) => reorderTopics(group.group_id, topicIds)}
         onSelectDirect={(direct) => void selectDirect(direct)}
+        activityItems={activityInbox.items}
+        activityUnreadCount={activityInbox.unreadCount}
+        onOpenActivity={openActivityNotification}
+        onActivityOpened={activityInbox.markAllRead}
       />
 
       <main className="conversation-pane">
@@ -5955,6 +6039,10 @@ function Sidebar({
   onReorderGroups,
   onReorderTopics,
   onSelectDirect,
+  activityItems,
+  activityUnreadCount,
+  onOpenActivity,
+  onActivityOpened,
 }: {
   summary: LocalSummary;
   conversation: Conversation | null;
@@ -5986,6 +6074,10 @@ function Sidebar({
   onReorderGroups: (groupIds: string[]) => Promise<void>;
   onReorderTopics: (group: GroupSummary, topicIds: string[]) => Promise<void>;
   onSelectDirect: (direct: DirectSummary) => void;
+  activityItems: ActivityNotification[];
+  activityUnreadCount: number;
+  onOpenActivity: (item: ActivityNotification) => void;
+  onActivityOpened: () => void;
 }) {
   const hasUnreadDirects = summary.directs.some((direct) => direct.has_unread);
   const isGroupFounder =
@@ -6041,7 +6133,15 @@ function Sidebar({
   return (
     <aside className="sidebar">
       <div className="sidebar-drag" data-tauri-drag-region>
+        <span />
         <div className="brand" data-tauri-drag-region><NoiseMark size={22} /><strong>noise</strong></div>
+        <ActivityInbox
+          items={activityItems}
+          unreadCount={activityUnreadCount}
+          onOpen={(item) => void onOpenActivity(item)}
+          onOpened={onActivityOpened}
+          renderActor={(actor) => <Avatar name={actor.username} image={actor.avatar} size={34} />}
+        />
       </div>
       <div className="sidebar-tabs">
         <button className={mode === "groups" ? "active" : ""} onClick={() => onMode("groups")}><UsersRound size={14} /> groups</button>
@@ -6465,6 +6565,9 @@ function useChunkedMessageList<T extends { event_id: string }>(
   messages: T[],
   hasRemoteHistory = false,
   onLoadRemoteHistory?: () => Promise<void>,
+  storageKey?: string,
+  preferredMessageId?: string | null,
+  unreadHint = 0,
 ) {
   const ref = useRef<HTMLDivElement>(null);
   const positionedConversation = useRef<string | null>(null);
@@ -6474,6 +6577,10 @@ function useChunkedMessageList<T extends { event_id: string }>(
   const observedRows = useRef(new Set<Element>());
   const previousMessageCount = useRef(messages.length);
   const savedScroll = useRef<SavedMessageScroll>({ stuckAtBottom: true });
+  const lastSeenNewestId = useRef<string | null>(null);
+  const persistKeyRef = useRef(storageKey);
+  const messagesRef = useRef(messages);
+  const persistTimer = useRef(0);
   const userScrollPointerActive = useRef(false);
   const userScrollIntentUntil = useRef(0);
   const olderSentinel = useRef<HTMLDivElement>(null);
@@ -6487,6 +6594,7 @@ function useChunkedMessageList<T extends { event_id: string }>(
   const [loadingOlderHistory, setLoadingOlderHistory] = useState(false);
   const [atBottom, setAtBottom] = useState(true);
   const [settling, setSettling] = useState(false);
+  const [newMessageCount, setNewMessageCount] = useState(0);
   const [visibleCount, setVisibleCount] = useState(() =>
     Math.min(
       messages.length,
@@ -6499,13 +6607,52 @@ function useChunkedMessageList<T extends { event_id: string }>(
   const hasOlder = renderedCount < messages.length;
   const canLoadOlder = hasOlder || (hasRemoteHistory && !remoteHistoryExhausted);
 
+  const syncNewMessageCount = useCallback((eventIds: string[]) => {
+    const lastSeen = lastSeenNewestId.current;
+    const next = lastSeen ? countMessagesAfter(eventIds, lastSeen) : 0;
+    setNewMessageCount(next);
+  }, []);
+
+  const persistScrollAnchor = useCallback((immediate = false) => {
+    const key = persistKeyRef.current;
+    if (!key) return;
+    const list = messagesRef.current;
+    const newestId = list[list.length - 1]?.event_id ?? "";
+    const lastSeen = lastSeenNewestId.current ?? newestId;
+    const saved = savedScroll.current;
+    const anchor: ConversationScrollAnchor = saved.stuckAtBottom
+      ? {
+        stuckAtBottom: true,
+        trackedMessageId: lastSeen,
+        pixelOffset: 0,
+        lastSeenNewestId: lastSeen,
+      }
+      : {
+        stuckAtBottom: false,
+        trackedMessageId: saved.trackedMessageId,
+        pixelOffset: saved.pixelOffset,
+        lastSeenNewestId: lastSeen,
+      };
+    const write = () => writeConversationScrollAnchor(key, anchor);
+    window.clearTimeout(persistTimer.current);
+    if (immediate) {
+      write();
+      return;
+    }
+    persistTimer.current = window.setTimeout(write, 280);
+  }, []);
+
   const saveScrollPosition = useCallback(() => {
     const element = ref.current;
     if (!element) return;
     const bottomDistance = element.scrollHeight - element.scrollTop - element.clientHeight;
     if (bottomDistance < 96) {
       savedScroll.current = { stuckAtBottom: true };
+      const newestId = messages[messages.length - 1]?.event_id ?? null;
+      if (newestId) lastSeenNewestId.current = newestId;
       setAtBottom(true);
+      syncNewMessageCount(messages.map((item) => item.event_id));
+      persistScrollAnchor();
       return;
     }
     setAtBottom(false);
@@ -6519,10 +6666,12 @@ function useChunkedMessageList<T extends { event_id: string }>(
           trackedMessageId: row.dataset.messageId ?? "",
           pixelOffset: bounds.top - containerTop,
         };
+        syncNewMessageCount(messages.map((item) => item.event_id));
+        persistScrollAnchor();
         return;
       }
     }
-  }, []);
+  }, [messages, persistScrollAnchor, syncNewMessageCount]);
 
   // A scroll event is not proof that the reader scrolled. WebKit also emits
   // scroll events while media metadata, posters, fonts, and the composer are
@@ -6582,22 +6731,41 @@ function useChunkedMessageList<T extends { event_id: string }>(
     }
   }, []);
 
+  const applySavedScroll = useCallback(() => {
+    const element = ref.current;
+    if (!element) return;
+    if (savedScroll.current.stuckAtBottom) {
+      pinToBottom();
+      return;
+    }
+    const tracked = element.querySelector<HTMLElement>(
+      `[data-message-id="${CSS.escape(savedScroll.current.trackedMessageId)}"]`,
+    );
+    if (!tracked) return;
+    const containerTop = element.getBoundingClientRect().top;
+    const currentOffset = tracked.getBoundingClientRect().top - containerTop;
+    const correction = currentOffset - savedScroll.current.pixelOffset;
+    if (Math.abs(correction) > 0.5) {
+      element.scrollBy({ top: correction, behavior: "auto" });
+    }
+  }, [pinToBottom]);
+
   // Hold a newly opened transcript until its rows stop changing height, so the
   // reader is never shown a layout that then settles under them. The budget
   // caps the wait: media that keeps arriving is pinned by the observer above
   // instead of holding the view back any longer.
-  const settleAtBottom = useCallback(() => {
+  const settleTranscript = useCallback(() => {
     window.cancelAnimationFrame(settleFrame.current);
     setSettling(true);
     const deadline = performance.now() + SETTLE_BUDGET_MS;
     let previousHeight = -1;
     const step = () => {
       const element = ref.current;
-      if (!element || !savedScroll.current.stuckAtBottom) {
+      if (!element) {
         setSettling(false);
         return;
       }
-      pinToBottom();
+      applySavedScroll();
       const height = element.scrollHeight;
       if (height === previousHeight || performance.now() >= deadline) {
         setSettling(false);
@@ -6607,10 +6775,21 @@ function useChunkedMessageList<T extends { event_id: string }>(
       settleFrame.current = window.requestAnimationFrame(step);
     };
     settleFrame.current = window.requestAnimationFrame(step);
-  }, [pinToBottom]);
+  }, [applySavedScroll]);
+
+  const scrollToNewest = useCallback(() => {
+    const newestId = messages[messages.length - 1]?.event_id ?? null;
+    savedScroll.current = { stuckAtBottom: true };
+    if (newestId) lastSeenNewestId.current = newestId;
+    setAtBottom(true);
+    setNewMessageCount(0);
+    persistScrollAnchor(true);
+    pinToBottom();
+    settleTranscript();
+  }, [messages, persistScrollAnchor, pinToBottom, settleTranscript]);
 
   useLayoutEffect(() => {
-    const observer = new ResizeObserver(() => pinToBottom());
+    const observer = new ResizeObserver(() => applySavedScroll());
     rowObserver.current = observer;
     return () => {
       window.cancelAnimationFrame(settleFrame.current);
@@ -6618,7 +6797,7 @@ function useChunkedMessageList<T extends { event_id: string }>(
       observedRows.current.clear();
       rowObserver.current = null;
     };
-  }, [pinToBottom]);
+  }, [applySavedScroll]);
 
   // The async history walk below outlives the render that started it, so read
   // paging inputs through a ref instead of a captured closure.
@@ -6672,29 +6851,65 @@ function useChunkedMessageList<T extends { event_id: string }>(
   useLayoutEffect(() => {
     const element = ref.current;
     if (!element) return;
+    let conversationJustOpened = false;
     if (positionedConversation.current !== conversationKey) {
-      element.scrollTop = element.scrollHeight;
+      conversationJustOpened = true;
+      if (positionedConversation.current) persistScrollAnchor(true);
+      persistKeyRef.current = storageKey;
+      messagesRef.current = messages;
       positionedConversation.current = conversationKey;
-      savedScroll.current = { stuckAtBottom: true };
+      previousMessageCount.current = messages.length;
       userScrollPointerActive.current = false;
       userScrollIntentUntil.current = 0;
       exhaustedRemoteHistory.current = false;
       setRemoteHistoryExhausted(false);
-      setAtBottom(true);
-    } else if (savedScroll.current.stuckAtBottom) {
-      const bottomDistance = element.scrollHeight - element.scrollTop - element.clientHeight;
-      if (bottomDistance > 0) element.scrollBy({ top: bottomDistance, behavior: "auto" });
-    } else {
-      const tracked = element.querySelector<HTMLElement>(
-        `[data-message-id="${CSS.escape(savedScroll.current.trackedMessageId)}"]`,
+      const eventIds = messages.map((item) => item.event_id);
+      const restore = resolveConversationRestore(
+        eventIds,
+        storageKey ? readConversationScrollAnchor(storageKey) : null,
+        preferredMessageId,
+        unreadHint,
       );
-      if (tracked) {
-        const containerTop = element.getBoundingClientRect().top;
-        const currentOffset = tracked.getBoundingClientRect().top - containerTop;
-        const correction = currentOffset - savedScroll.current.pixelOffset;
-        if (Math.abs(correction) > 0.5) {
-          element.scrollBy({ top: correction, behavior: "auto" });
-        }
+      if (restore.mode === "anchor") {
+        const restoreIndex = eventIds.lastIndexOf(restore.trackedMessageId);
+        const needed = visibleCountForRestore(
+          messages.length,
+          restoreIndex,
+          INITIAL_MESSAGE_COUNT,
+        );
+        renderedMessageCounts.set(conversationKey, needed);
+        setVisibleCount(needed);
+        lastSeenNewestId.current = restore.lastSeenNewestId;
+        savedScroll.current = {
+          stuckAtBottom: false,
+          trackedMessageId: restore.trackedMessageId,
+          pixelOffset: restore.pinLastSeenToBottom
+            ? Math.max(8, element.clientHeight - 88)
+            : restore.pixelOffset,
+        };
+        setAtBottom(false);
+        syncNewMessageCount(eventIds);
+      } else {
+        const newestId = eventIds[eventIds.length - 1] ?? null;
+        lastSeenNewestId.current = newestId;
+        savedScroll.current = { stuckAtBottom: true };
+        setAtBottom(true);
+        setNewMessageCount(0);
+        setVisibleCount(Math.min(
+          messages.length,
+          Math.max(INITIAL_MESSAGE_COUNT, renderedMessageCounts.get(conversationKey) ?? 0),
+        ));
+        element.scrollTop = element.scrollHeight;
+      }
+    } else {
+      messagesRef.current = messages;
+      applySavedScroll();
+      if (savedScroll.current.stuckAtBottom) {
+        const newestId = messages[messages.length - 1]?.event_id ?? null;
+        if (newestId) lastSeenNewestId.current = newestId;
+        if (newMessageCount !== 0) setNewMessageCount(0);
+      } else {
+        syncNewMessageCount(messages.map((item) => item.event_id));
       }
     }
     // Watch the rows themselves: a scroll container's own box never changes
@@ -6720,13 +6935,15 @@ function useChunkedMessageList<T extends { event_id: string }>(
     // sees; an empty conversation has nothing to settle under.
     if (settledConversation.current !== conversationKey && messages.length > 0) {
       settledConversation.current = conversationKey;
-      pinToBottom();
-      settleAtBottom();
+      applySavedScroll();
+      settleTranscript();
     }
-    if (visibleCount !== renderedCount) {
+    if (!conversationJustOpened && visibleCount !== renderedCount) {
       setVisibleCount(renderedCount);
     }
-    renderedMessageCounts.set(conversationKey, renderedCount);
+    if (!conversationJustOpened) {
+      renderedMessageCounts.set(conversationKey, renderedCount);
+    }
     if (previousMessageCount.current !== messages.length) {
       // History moved, so the relays are worth asking again.
       exhaustedRemoteHistory.current = false;
@@ -6775,9 +6992,9 @@ function useChunkedMessageList<T extends { event_id: string }>(
       // Preserve the opening-at-bottom invariant through browser-generated
       // scroll events. ResizeObserver normally performs this correction too,
       // but this closes the ordering race between the two event sources.
-      pinToBottom();
+      applySavedScroll();
     }
-  }, [loadOlder, pinToBottom, saveScrollPosition]);
+  }, [applySavedScroll, loadOlder, saveScrollPosition]);
 
   const revealMessage = useCallback((messageId: string) => {
     const index = messages.findIndex((item) => item.event_id === messageId);
@@ -6810,6 +7027,21 @@ function useChunkedMessageList<T extends { event_id: string }>(
     return true;
   }, [revealMessage]);
 
+  useEffect(() => {
+    const persist = () => persistScrollAnchor(true);
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") persist();
+    };
+    window.addEventListener("pagehide", persist);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      persist();
+      window.clearTimeout(persistTimer.current);
+      window.removeEventListener("pagehide", persist);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [persistScrollAnchor]);
+
   return {
     ref,
     olderSentinel,
@@ -6823,10 +7055,12 @@ function useChunkedMessageList<T extends { event_id: string }>(
     renderedCount,
     atBottom,
     settling,
+    newMessageCount,
     canLoadOlder,
     loadingOlder: loadingOlderHistory,
     revealMessage,
     navigateToMessage,
+    scrollToNewest,
   };
 }
 
@@ -7062,11 +7296,15 @@ function ConversationPanel({
   const sendController = useRef<AbortController | null>(null);
   useEffect(() => () => sendController.current?.abort(), []);
   useAutosizeComposer(composerInput, draft);
+  const conversationKey = `${conversation.group.group_id}:${topic?.topic_id ?? "general"}`;
   const messageList = useChunkedMessageList(
-    `${conversation.group.group_id}:${topic?.topic_id ?? "general"}`,
+    conversationKey,
     conversation.messages,
     conversation.has_older_messages,
     onLoadOlder,
+    conversationScrollStorageKey(self.public_key, conversationKey),
+    messageJump?.eventId,
+    unreadCount,
   );
   useEffect(() => {
     if (!messageJump || !messageList.revealMessage(messageJump.eventId)) return;
@@ -7237,6 +7475,7 @@ function ConversationPanel({
     setDraft("");
     setReplyingTo(null);
     setSending(true);
+    messageList.scrollToNewest();
     let confirmedCount = 0;
     try {
       const result = await onSend(
@@ -7267,6 +7506,7 @@ function ConversationPanel({
     const controller = new AbortController();
     sendController.current = controller;
     setSending(true);
+    messageList.scrollToNewest();
     try {
       const sent = await onSend(
         "",
@@ -7364,6 +7604,12 @@ function ConversationPanel({
         )}
       </div>
       {selfMember && (canSendMessages || canSendMedia) ? <div className="composer">
+        <NewMessagesPill
+          count={messageList.atBottom
+            ? 0
+            : (messageList.newMessageCount > 0 ? messageList.newMessageCount : unreadCount)}
+          onClick={messageList.scrollToNewest}
+        />
         {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.group.group_id} onClose={() => setReplyingTo(null)} />}
         <ComposerMediaDrafts attachments={attachments} onRemove={removeAttachment} />
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
@@ -7523,6 +7769,10 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
   const messageList = useChunkedMessageList(
     contact.public_key,
     visibleMessages,
+    false,
+    undefined,
+    conversationScrollStorageKey(self.public_key, `direct:${contact.public_key}`),
+    messageJump?.eventId,
   );
   useEffect(() => {
     const nextExpiry = conversation.messages.reduce<number | null>((next, message) => {
@@ -7627,6 +7877,7 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
     setDraft("");
     setReplyingTo(null);
     setSending(true);
+    messageList.scrollToNewest();
     let confirmedCount = 0;
     try {
       const result = await onSend(
@@ -7660,6 +7911,7 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
     const controller = new AbortController();
     sendController.current = controller;
     setSending(true);
+    messageList.scrollToNewest();
     try {
       const sent = await onSend(
         "",
@@ -7744,6 +7996,10 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
         })}
       </div>
       {contact.accepts_direct_messages ? <div className="composer direct-composer">
+        <NewMessagesPill
+          count={messageList.atBottom ? 0 : messageList.newMessageCount}
+          onClick={messageList.scrollToNewest}
+        />
         {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.media_scope_id} onClose={() => setReplyingTo(null)} />}
         <ComposerMediaDrafts attachments={attachments} onRemove={removeAttachment} />
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}

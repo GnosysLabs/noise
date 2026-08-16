@@ -871,6 +871,11 @@ async fn dispatch(request: Value) -> Result<Value, String> {
                 .cached_conversation(STATE_PATH, &required::<String>(&request, "group_id")?)
                 .map_err(|error| error.to_string())?,
         ),
+        "cached_conversations" => data(
+            client
+                .cached_conversations(STATE_PATH)
+                .map_err(|error| error.to_string())?,
+        ),
         "load_older_group_history" => data(
             client
                 .load_older_group_history(

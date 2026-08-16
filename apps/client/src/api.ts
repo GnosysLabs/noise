@@ -49,6 +49,8 @@ let localAccountTransitioning = false;
 const browserConcurrentActions = new Set([
   "discover_relay_masks",
   "cached_conversation",
+  "cached_conversations",
+  "cached_direct_inbox",
   "fetch_avatar",
   "fetch_attachment",
   "fetch_attachment_range",

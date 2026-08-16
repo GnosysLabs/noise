@@ -4149,6 +4149,24 @@ impl NoiseClient {
         cached_conversation_from_state(&state, group_id)
     }
 
+    pub fn cached_conversations(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> anyhow::Result<Vec<Conversation>> {
+        let state = load_state(path.as_ref())?;
+        let mut conversations = Vec::new();
+        for group in &state.groups {
+            if state.active_group_safety_restriction(&group.group_id).is_some() {
+                continue;
+            }
+            if let Ok(Some(conversation)) = cached_conversation_from_state(&state, &group.group_id)
+            {
+                conversations.push(conversation);
+            }
+        }
+        Ok(conversations)
+    }
+
     #[must_use]
     pub fn has_local_state(&self, path: impl AsRef<Path>) -> bool {
         state_exists(path.as_ref())
