@@ -1003,7 +1003,7 @@ fn render_index(
 :root{color-scheme:dark;font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#171619;color:#f4f0f5}
 *{box-sizing:border-box}body{margin:0;background:#171619}
 .topbar{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:24px;min-height:68px;padding:0 max(24px,calc((100vw - 1180px)/2));border-bottom:1px solid #ffffff10;background:#171619e8;backdrop-filter:blur(18px)}
-.brand{display:flex;align-items:center;gap:10px;margin-right:auto;color:#f8f4f9;text-decoration:none;font-size:13px;font-weight:850}.mark{display:grid;place-items:center;width:27px;height:27px;border-radius:8px;background:#b8ff38;color:#172000;font-size:18px;font-weight:950}.topbar nav{display:flex;align-items:center;gap:3px}.topbar nav a{padding:8px 10px;border-radius:8px;color:#978f9b;text-decoration:none;font-size:11px;font-weight:800}.topbar nav a:hover,.topbar nav a.active{background:#ffffff0b;color:#f3edf5}.topbar nav a.active{color:#c8ff6b}.private-pill{padding:6px 8px;border:1px solid #b8ff3825;border-radius:999px;color:#b8ff38;font-size:9px;font-weight:850;letter-spacing:.09em;text-transform:uppercase}
+.topbar nav{display:flex;align-items:center;gap:3px}.topbar nav a{padding:8px 10px;border-radius:8px;color:#978f9b;text-decoration:none;font-size:11px;font-weight:800}.topbar nav a:hover,.topbar nav a.active{background:#ffffff0b;color:#f3edf5}.topbar nav a.active{color:#c8ff6b}.private-pill{padding:6px 8px;border:1px solid #b8ff3825;border-radius:999px;color:#b8ff38;font-size:9px;font-weight:850;letter-spacing:.09em;text-transform:uppercase}
 main{width:min(980px,calc(100% - 32px));margin:0 auto;padding:52px 0 80px}
 header{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:28px}
 .eyebrow{margin:0 0 7px;color:#b8ff38;font-size:11px;font-weight:800;letter-spacing:.16em}
@@ -1024,7 +1024,12 @@ details.technical{border:1px solid #ffffff0c;border-radius:10px;background:#1514
 .report-foot{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 20px;border-top:1px solid #ffffff0d;background:#17161980}
 .report-foot>span{color:#958c98;font-size:10px}.actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:7px}.actions button{padding:9px 11px;border:1px solid #ffffff14;border-radius:9px;background:#302d33;color:#eee7f0;font-size:10px;font-weight:850;cursor:pointer}.actions .hide{background:#b8ff38;color:#192000}.actions .pause{border-color:#ff9a5b55;background:#ff9a5b18;color:#ffc49f}.actions .block{border-color:#ff718566;background:#ff71851a;color:#ff9aaa}
 @media(max-width:680px){.topbar{align-items:flex-start;flex-wrap:wrap;padding:14px 12px}.brand{margin-right:0}.topbar nav{order:3;width:100%;overflow:auto}.private-pill{margin-left:auto}main{width:min(100% - 20px,980px);padding-top:30px}header{align-items:flex-start;flex-direction:column}.queue-bar{align-items:flex-start;flex-direction:column}.facts,.people{grid-template-columns:1fr}.report-head{flex-direction:column}.report-foot{align-items:flex-start;flex-direction:column}.actions{justify-content:flex-start}}
-</style></head><body><div class="topbar"><a class="brand" href="/"><span class="mark">n</span><span>noise control</span></a><nav aria-label="admin sections"><a href="/">overview</a><a href="/usage">usage</a><a href="/infrastructure">infrastructure</a><a href="/audit">audit log</a><a class="active" href="/safety">safety</a></nav><span class="private-pill">tailnet only</span></div><main><header><div>"#,
+"#);
+    html.push_str(crate::brand::BRAND_CSS);
+    html.push_str(r#"</style></head><body><div class="topbar">"#);
+    html.push_str(crate::brand::BRAND_MARKUP);
+    html.push_str(
+        r#"<nav aria-label="admin sections"><a href="/">today</a><a href="/usage">people</a><a href="/infrastructure">service</a><a href="/audit">audit log</a><a class="active" href="/safety">safety</a></nav><span class="private-pill">tailnet only</span></div><main><header><div>"#,
     );
     if state.tailscale_logins.is_empty() {
         html.push_str(

@@ -30,6 +30,7 @@ use tokio::{
 use tower_http::cors::CorsLayer;
 
 mod admin;
+mod brand;
 mod review;
 
 const DEFAULT_BIND: &str = "127.0.0.1:4310";

@@ -35,9 +35,9 @@ enum AdminPage {
 impl AdminPage {
     fn title(self) -> &'static str {
         match self {
-            Self::Overview => "overview",
-            Self::Usage => "usage",
-            Self::Infrastructure => "infrastructure",
+            Self::Overview => "today",
+            Self::Usage => "people",
+            Self::Infrastructure => "service",
             Self::Audit => "audit log",
         }
     }
@@ -54,6 +54,7 @@ impl AdminPage {
 
 struct AdminSnapshot {
     captured_at: String,
+    #[allow(dead_code)]
     schema_version: i32,
     database_bytes: i64,
     total_accounts: i64,
@@ -317,10 +318,12 @@ LIMIT 50
 fn render_dashboard(snapshot: &AdminSnapshot, page: AdminPage, identity: &str) -> String {
     let mut html = String::with_capacity(24_000);
     html.push_str(DOCUMENT_START);
+    html.push_str(crate::brand::BRAND_CSS);
+    html.push_str(DOCUMENT_STYLE_END);
     render_navigation(&mut html, page);
     let _ = write!(
         html,
-        r#"<main><header class="page-head"><div><p class="eyebrow">PRIVATE / LIVE / TAILNET</p><h1>{}</h1><p class="lede">{}</p></div><a class="refresh" href="{}">refresh snapshot</a></header>"#,
+        r#"<main><header class="page-head"><div><p class="eyebrow">private · live</p><h1>{}</h1><p class="lede">{}</p></div><a class="refresh" href="{}">refresh</a></header>"#,
         page.title(),
         page_description(page),
         page.path(),
@@ -333,7 +336,7 @@ fn render_dashboard(snapshot: &AdminSnapshot, page: AdminPage, identity: &str) -
     }
     let _ = write!(
         html,
-        r#"<footer><span>signed in as {}</span><span>snapshot {}</span><span>aggregate metadata only</span></footer></main></body></html>"#,
+        r#"<footer><span>signed in as {}</span><span>updated {}</span></footer></main></body></html>"#,
         escape_html(identity),
         escape_html(&snapshot.captured_at),
     );
@@ -341,7 +344,9 @@ fn render_dashboard(snapshot: &AdminSnapshot, page: AdminPage, identity: &str) -
 }
 
 fn render_navigation(html: &mut String, page: AdminPage) {
-    html.push_str(r#"<div class="topbar"><a class="brand" href="/"><span class="mark">n</span><span>noise control</span></a><nav aria-label="admin sections">"#);
+    html.push_str(r#"<div class="topbar">"#);
+    html.push_str(crate::brand::BRAND_MARKUP);
+    html.push_str(r#"<nav aria-label="admin sections">"#);
     for candidate in [
         AdminPage::Overview,
         AdminPage::Usage,
@@ -361,260 +366,292 @@ fn render_navigation(html: &mut String, page: AdminPage) {
     );
 }
 
+struct ServiceStatus {
+    title: &'static str,
+    detail: &'static str,
+    badge: &'static str,
+    tone: &'static str,
+}
+
+fn service_status(snapshot: &AdminSnapshot) -> ServiceStatus {
+    if snapshot.failed_jobs > 0 {
+        ServiceStatus {
+            title: "Needs a look",
+            detail: "A background task failed. People can still chat, but something did not finish.",
+            badge: "needs a look",
+            tone: "attention",
+        }
+    } else if snapshot.pending_outbox > 0 && snapshot.oldest_outbox_seconds >= 3_600 {
+        ServiceStatus {
+            title: "A little backed up",
+            detail: "Some messages have been waiting more than an hour to go out.",
+            badge: "backed up",
+            tone: "attention",
+        }
+    } else if snapshot.pending_outbox > 0 {
+        ServiceStatus {
+            title: "All good",
+            detail: "A few messages are still going out. That is normal.",
+            badge: "all good",
+            tone: "good",
+        }
+    } else {
+        ServiceStatus {
+            title: "All good",
+            detail: "Nothing is stuck. Messages and notifications are keeping up.",
+            badge: "all good",
+            tone: "good",
+        }
+    }
+}
+
 fn render_overview(html: &mut String, snapshot: &AdminSnapshot) {
     html.push_str(r#"<section class="metric-grid">"#);
     metric_card(
         html,
-        "active accounts",
+        "people using it today",
         snapshot.active_accounts_24h,
         &format!(
-            "{} authors sent events today",
+            "{} people sent a message",
             format_number(snapshot.authors_24h)
         ),
         "lime",
     );
     metric_card(
         html,
-        "events today",
+        "messages today",
         snapshot.events_24h,
-        "encrypted group and direct events",
+        &format!(
+            "{} in groups · {} in DMs",
+            format_number(snapshot.group_events_24h),
+            format_number(snapshot.direct_events_24h)
+        ),
         "violet",
     );
     metric_card(
         html,
-        "active groups",
+        "groups",
         snapshot.active_groups,
-        &format!(
-            "{} created this week",
-            format_number(snapshot.new_groups_7d)
-        ),
+        &format!("{} new this week", format_number(snapshot.new_groups_7d)),
         "orange",
     );
     metric_card(
         html,
-        "media stored",
+        "photos & videos",
         snapshot.available_media,
-        &format!("{} encrypted", format_bytes(snapshot.media_bytes)),
+        &format!("{} stored", format_bytes(snapshot.media_bytes)),
         "blue",
     );
     html.push_str("</section>");
     render_activity_chart(html, snapshot);
-    html.push_str(r#"<section class="split"><article class="panel"><div class="panel-head"><div><p class="kicker">service pulse</p><h2>central data plane</h2></div><span class="status good">operational</span></div><div class="rows">"#);
+    let health = service_status(snapshot);
+    html.push_str(r#"<section class="split"><article class="panel"><div class="panel-head"><div><p class="kicker">quick check</p><h2>"#);
+    html.push_str(escape_html(health.title).as_str());
+    html.push_str(r#"</h2></div><span class="status "#);
+    html.push_str(health.tone);
+    html.push_str(r#"">"#);
+    html.push_str(escape_html(health.badge).as_str());
+    html.push_str(r#"</span></div><div class="rows">"#);
     status_row(
         html,
-        "PostgreSQL schema",
-        &format!("v{}", snapshot.schema_version),
-        "current snapshot query succeeded",
-    );
-    status_row(
-        html,
-        "Delivery outbox",
+        "Messages waiting to send",
         &format_number(snapshot.pending_outbox),
-        "items waiting to publish",
+        if snapshot.pending_outbox == 0 {
+            "nothing is backed up"
+        } else {
+            "still going out"
+        },
     );
     status_row(
         html,
-        "Durable jobs",
-        &format_number(snapshot.ready_jobs + snapshot.running_jobs),
-        "ready or currently running",
-    );
-    status_row(
-        html,
-        "Active restrictions",
+        "Safety holds",
         &format_number(snapshot.active_restrictions),
-        "content-free safety enforcement state",
+        "hidden messages, paused groups, or blocked people",
     );
-    html.push_str(r#"</div></article><article class="panel safety-panel"><div><p class="kicker">isolated authority</p><h2>noise safety</h2><p>Open and resolve severe reports in the separate key-holding reviewer. Report plaintext and signing keys never enter this dashboard process.</p></div><a class="primary" href="/safety">open safety queue</a></article></section>"#);
+    status_row(
+        html,
+        "Broken background tasks",
+        &format_number(snapshot.failed_jobs),
+        if snapshot.failed_jobs == 0 {
+            "none"
+        } else {
+            "something failed and needs a look"
+        },
+    );
+    html.push_str(r#"</div></article><article class="panel safety-panel"><div><p class="kicker">reports</p><h2>safety</h2><p>Open the report queue when someone flags a serious problem. That page is separate so report details stay off this dashboard.</p></div><a class="primary" href="/safety">open reports</a></article></section>"#);
 }
 
 fn render_usage(html: &mut String, snapshot: &AdminSnapshot) {
     html.push_str(r#"<section class="metric-grid compact">"#);
     metric_card(
         html,
-        "24h active",
-        snapshot.active_accounts_24h,
-        "accounts with an active device",
+        "signed up",
+        snapshot.total_accounts,
+        &format!(
+            "{} still active · {} new today",
+            format_number(snapshot.active_accounts),
+            format_number(snapshot.new_accounts_24h)
+        ),
         "lime",
-    );
-    metric_card(
-        html,
-        "7d active",
-        snapshot.active_accounts_7d,
-        "weekly active accounts",
-        "violet",
-    );
-    metric_card(
-        html,
-        "30d active",
-        snapshot.active_accounts_30d,
-        "monthly active accounts",
-        "blue",
     );
     metric_card(
         html,
         "new this week",
         snapshot.new_accounts_7d,
-        &format!(
-            "{} in the last 24h",
-            format_number(snapshot.new_accounts_24h)
-        ),
+        "people who created an account",
         "orange",
+    );
+    metric_card(
+        html,
+        "used it this week",
+        snapshot.active_accounts_7d,
+        "opened noise on a phone or computer",
+        "violet",
+    );
+    metric_card(
+        html,
+        "used it this month",
+        snapshot.active_accounts_30d,
+        "opened noise in the last 30 days",
+        "blue",
     );
     html.push_str("</section>");
     render_activity_chart(html, snapshot);
-    html.push_str(r#"<section class="split"><article class="panel"><div class="panel-head"><div><p class="kicker">community</p><h2>groups and membership</h2></div></div><div class="rows">"#);
+    html.push_str(r#"<section class="split"><article class="panel"><div class="panel-head"><div><p class="kicker">groups</p><h2>rooms people made</h2></div></div><div class="rows">"#);
     status_row(
         html,
-        "Active groups",
+        "Groups",
         &format_number(snapshot.active_groups),
         "not deleted",
     );
     status_row(
         html,
-        "Active memberships",
+        "People in groups",
         &format_number(snapshot.memberships),
-        "current group relationships",
+        "seats across every group",
     );
     status_row(
         html,
-        "New groups",
+        "New groups this week",
         &format_number(snapshot.new_groups_7d),
-        "last 7 days",
+        "created in the last 7 days",
     );
     status_row(
         html,
-        "Active devices",
+        "Phones & computers",
         &format_number(snapshot.active_devices),
-        "registered and not revoked",
+        "signed-in devices that still work",
     );
-    html.push_str(r#"</div></article><article class="panel"><div class="panel-head"><div><p class="kicker">encrypted activity</p><h2>events and media</h2></div></div><div class="rows">"#);
+    html.push_str(r#"</div></article><article class="panel"><div class="panel-head"><div><p class="kicker">activity</p><h2>what they sent</h2></div></div><div class="rows">"#);
     status_row(
         html,
-        "All events",
-        &format_number(snapshot.total_events),
-        "ciphertext records accepted",
-    );
-    status_row(
-        html,
-        "Group events today",
+        "Group messages today",
         &format_number(snapshot.group_events_24h),
-        "last 24 hours",
+        "in rooms",
     );
     status_row(
         html,
-        "Direct events today",
+        "DMs today",
         &format_number(snapshot.direct_events_24h),
-        "last 24 hours",
+        "private chats",
     );
     status_row(
         html,
-        "Media this week",
+        "Photos & videos this week",
         &format_number(snapshot.media_7d),
-        "encrypted uploads created",
+        "uploads in the last 7 days",
+    );
+    status_row(
+        html,
+        "Messages all time",
+        &format_number(snapshot.total_events),
+        "everything noise has accepted",
     );
     html.push_str("</div></article></section>");
-    html.push_str(r#"<div class="privacy-note"><strong>Privacy boundary</strong><span>These are aggregate counts from operational metadata. The dashboard does not receive message text, media plaintext, passwords, private keys, stable IP histories, or browsable relationship graphs.</span></div>"#);
 }
 
 fn render_infrastructure(html: &mut String, snapshot: &AdminSnapshot) {
-    let outbox_status = if snapshot.pending_outbox == 0 {
-        "clear"
-    } else {
-        "attention"
-    };
-    let jobs_status = if snapshot.failed_jobs == 0 {
-        "clear"
-    } else {
-        "attention"
-    };
-    html.push_str(r#"<section class="metric-grid compact">"#);
-    text_metric_card(
-        html,
-        "database",
-        &format_bytes(snapshot.database_bytes),
-        "PostgreSQL logical database size",
-        "blue",
-    );
+    let health = service_status(snapshot);
+    html.push_str(r#"<section class="health-banner "#);
+    html.push_str(health.tone);
+    html.push_str(r#""><strong>"#);
+    html.push_str(escape_html(health.title).as_str());
+    html.push_str(r#"</strong><span>"#);
+    html.push_str(escape_html(health.detail).as_str());
+    html.push_str(r#"</span></section><section class="metric-grid compact">"#);
     metric_card(
         html,
-        "active sessions",
+        "signed in right now",
         snapshot.active_sessions,
-        "unexpired and not revoked",
+        "phones and computers with an open session",
         "lime",
     );
     metric_card(
         html,
-        "push routes",
+        "can get notifications",
         snapshot.active_push_subscriptions,
-        "active device subscriptions",
+        "devices noise can ping",
         "violet",
     );
-    metric_card(
+    text_metric_card(
         html,
-        "stored media",
-        snapshot.available_media,
-        &format!("{} ciphertext", format_bytes(snapshot.media_bytes)),
+        "photo & video storage",
+        &format_bytes(snapshot.media_bytes),
+        &format!("{} files", format_number(snapshot.available_media)),
         "orange",
     );
+    text_metric_card(
+        html,
+        "database size",
+        &format_bytes(snapshot.database_bytes),
+        "how much the main database takes",
+        "blue",
+    );
     html.push_str("</section>");
-    html.push_str(r#"<section class="split"><article class="panel"><div class="panel-head"><div><p class="kicker">delivery</p><h2>queues</h2></div></div><div class="rows">"#);
+    html.push_str(r#"<section class="panel"><div class="panel-head"><div><p class="kicker">behind the scenes</p><h2>is anything stuck?</h2></div></div><div class="rows">"#);
     status_row_with_state(
         html,
-        "Outbox waiting",
+        "Messages waiting to send",
         &format_number(snapshot.pending_outbox),
-        &format!(
-            "oldest item {}",
-            format_duration(snapshot.oldest_outbox_seconds)
-        ),
-        outbox_status,
+        if snapshot.pending_outbox == 0 {
+            "all caught up".to_owned()
+        } else {
+            format!(
+                "oldest has been waiting {}",
+                format_duration(snapshot.oldest_outbox_seconds)
+            )
+        }
+        .as_str(),
+        if snapshot.pending_outbox == 0 {
+            "clear"
+        } else if snapshot.oldest_outbox_seconds >= 3_600 {
+            "attention"
+        } else {
+            "clear"
+        },
     );
     status_row_with_state(
         html,
-        "Jobs ready",
-        &format_number(snapshot.ready_jobs),
-        "waiting for a worker",
-        "clear",
-    );
-    status_row_with_state(
-        html,
-        "Jobs running",
-        &format_number(snapshot.running_jobs),
-        "currently leased",
-        "clear",
-    );
-    status_row_with_state(
-        html,
-        "Jobs failed",
+        "Broken background tasks",
         &format_number(snapshot.failed_jobs),
-        "terminal failures retained",
-        jobs_status,
-    );
-    html.push_str(r#"</div></article><article class="panel"><div class="panel-head"><div><p class="kicker">capacity</p><h2>current footprint</h2></div></div><div class="rows">"#);
-    status_row(
-        html,
-        "Accounts",
-        &format_number(snapshot.total_accounts),
-        &format!("{} active", format_number(snapshot.active_accounts)),
-    );
-    status_row(
-        html,
-        "Events",
-        &format_number(snapshot.total_events),
-        &format!("{} accepted this week", format_number(snapshot.events_7d)),
+        if snapshot.failed_jobs == 0 {
+            "none"
+        } else {
+            "needs a look"
+        },
+        if snapshot.failed_jobs == 0 {
+            "clear"
+        } else {
+            "attention"
+        },
     );
     status_row(
         html,
-        "Media bytes",
-        &format_bytes(snapshot.media_bytes),
-        "encrypted payload size declared by available objects",
+        "Work in progress",
+        &format_number(snapshot.ready_jobs + snapshot.running_jobs),
+        "normal background sending and cleanup",
     );
-    status_row(
-        html,
-        "Schema",
-        &format!("migration {}", snapshot.schema_version),
-        "canonical central schema",
-    );
-    html.push_str("</div></article></section>");
+    html.push_str("</div></section>");
 }
 
 fn render_audit(html: &mut String, snapshot: &AdminSnapshot) {
@@ -646,14 +683,14 @@ fn render_activity_chart(html: &mut String, snapshot: &AdminSnapshot) {
         .max()
         .unwrap_or(0)
         .max(1);
-    html.push_str(r#"<section class="panel chart-panel"><div class="panel-head"><div><p class="kicker">14 day pulse</p><h2>encrypted events</h2><p class="panel-copy">Daily accepted ciphertext records; unique authors appear on hover labels.</p></div><div class="chart-total"><strong>"#);
+    html.push_str(r#"<section class="panel chart-panel"><div class="panel-head"><div><p class="kicker">last two weeks</p><h2>messages each day</h2><p class="panel-copy">How many messages people sent. Hover a bar to see how many people were talking.</p></div><div class="chart-total"><strong>"#);
     html.push_str(&format_number(snapshot.events_7d));
-    html.push_str(r#"</strong><span>last 7 days</span></div></div><div class="chart" role="img" aria-label="Encrypted events accepted during the last fourteen days">"#);
+    html.push_str(r#"</strong><span>this week</span></div></div><div class="chart" role="img" aria-label="Messages sent during the last fourteen days">"#);
     for point in &snapshot.daily {
         let percent = ((point.events * 100) / max_events).max(if point.events > 0 { 4 } else { 1 });
         let _ = write!(
             html,
-            r#"<div class="bar-column" title="{} events · {} authors"><div class="bar-wrap"><div class="bar" style="height:{}%"></div></div><span>{}</span><small>{}</small></div>"#,
+            r#"<div class="bar-column" title="{} messages from {} people"><div class="bar-wrap"><div class="bar" style="height:{}%"></div></div><span>{}</span><small>{}</small></div>"#,
             format_number(point.events),
             format_number(point.authors),
             percent,
@@ -696,18 +733,12 @@ fn status_row_with_state(html: &mut String, label: &str, value: &str, detail: &s
 
 fn page_description(page: AdminPage) -> &'static str {
     match page {
-        AdminPage::Overview => {
-            "A private operating picture of Noise without exposing conversation content."
-        }
-        AdminPage::Usage => {
-            "Aggregate adoption and activity across accounts, groups, encrypted events, and media."
-        }
+        AdminPage::Overview => "How noise is doing right now. No message text, just counts.",
+        AdminPage::Usage => "Who signed up, who came back, and what they sent.",
         AdminPage::Infrastructure => {
-            "Database capacity, delivery queues, durable jobs, sessions, and storage."
+            "Whether the service is keeping up, and how much space it uses."
         }
-        AdminPage::Audit => {
-            "A deliberately content-free record of enforcement accepted by Noise Central."
-        }
+        AdminPage::Audit => "Safety actions that were taken, without names or message text.",
     }
 }
 
@@ -958,17 +989,19 @@ const DOCUMENT_START: &str = r#"<!doctype html><html lang="en"><head><meta chars
 :root{color-scheme:dark;font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#111013;color:#f6f1f7}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 12% -10%,#b8ff3810,transparent 28%),radial-gradient(circle at 84% 4%,#8d6bff12,transparent 24%),#111013;min-height:100vh}
 a{color:inherit}.topbar{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:24px;min-height:68px;padding:0 max(24px,calc((100vw - 1180px)/2));border-bottom:1px solid #ffffff10;background:#111013e8;backdrop-filter:blur(18px)}
-.brand{display:flex;align-items:center;gap:10px;margin-right:auto;color:#f8f4f9;text-decoration:none;font-size:13px;font-weight:850;letter-spacing:-.01em}.mark{display:grid;place-items:center;width:27px;height:27px;border-radius:8px;background:#b8ff38;color:#172000;font-size:18px;font-weight:950}
 .topbar nav{display:flex;align-items:center;gap:3px}.topbar nav a{padding:8px 10px;border-radius:8px;color:#978f9b;text-decoration:none;font-size:11px;font-weight:800}.topbar nav a:hover,.topbar nav a.active{background:#ffffff0b;color:#f3edf5}.topbar nav a:last-child{color:#c8ff6b}.private-pill{padding:6px 8px;border:1px solid #b8ff3825;border-radius:999px;color:#b8ff38;font-size:9px;font-weight:850;letter-spacing:.09em;text-transform:uppercase}
 main{width:min(1180px,calc(100% - 36px));margin:0 auto;padding:48px 0 72px}.page-head{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:26px}.eyebrow,.kicker{margin:0 0 8px;color:#b8ff38;font-size:10px;font-weight:850;letter-spacing:.15em;text-transform:uppercase}h1{margin:0;font-size:clamp(38px,5vw,64px);line-height:.95;letter-spacing:-.055em}h2{margin:0;font-size:19px;letter-spacing:-.025em}.lede{max-width:700px;margin:13px 0 0;color:#aaa1ae;font-size:14px;line-height:1.55}.refresh,.primary{flex:none;padding:10px 13px;border:1px solid #ffffff18;border-radius:9px;background:#ffffff08;color:#e8e1ea;text-decoration:none;font-size:11px;font-weight:800}.primary{border-color:#b8ff3840;background:#b8ff38;color:#1a210d}
 .metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}.metric{position:relative;overflow:hidden;min-height:150px;padding:18px;border:1px solid #ffffff10;border-radius:16px;background:#1a181ccc}.metric:before{content:"";position:absolute;inset:0 0 auto;height:2px;background:var(--accent)}.metric.lime{--accent:#b8ff38}.metric.violet{--accent:#9c7cff}.metric.orange{--accent:#ff9a5b}.metric.blue{--accent:#59b7ff}.metric span{display:block;color:#8f8793;font-size:10px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.metric strong{display:block;margin:24px 0 8px;font-size:34px;letter-spacing:-.05em}.metric small{color:#9f97a3;font-size:11px;line-height:1.45}
-.panel{padding:20px;border:1px solid #ffffff10;border-radius:16px;background:#19171bcc;box-shadow:0 18px 65px #0002}.panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:18px}.panel-copy{max-width:620px;margin:7px 0 0;color:#908793;font-size:11px;line-height:1.5}.status{padding:6px 8px;border-radius:999px;background:#ffffff0a;color:#a9a1ad;font-size:9px;font-weight:850;letter-spacing:.08em;text-transform:uppercase}.status.good{background:#b8ff3816;color:#c8ff6b}.split{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}.safety-panel{display:flex;align-items:center;justify-content:space-between;gap:24px;background:linear-gradient(135deg,#1c2018,#19171b 58%)}.safety-panel p{max-width:520px;margin:9px 0 0;color:#9d95a1;font-size:12px;line-height:1.55}
+.health-banner{display:flex;flex-direction:column;gap:6px;margin-bottom:14px;padding:18px 20px;border:1px solid #ffffff10;border-radius:16px;background:#19171bcc}.health-banner.good{border-color:#b8ff3828;background:#b8ff380c}.health-banner.attention{border-color:#ff9a5b40;background:#ff9a5b10}.health-banner strong{font-size:22px;letter-spacing:-.03em}.health-banner span{color:#9f97a3;font-size:13px;line-height:1.5}
+.panel{padding:20px;border:1px solid #ffffff10;border-radius:16px;background:#19171bcc;box-shadow:0 18px 65px #0002}.panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:18px}.panel-copy{max-width:620px;margin:7px 0 0;color:#908793;font-size:11px;line-height:1.5}.status{padding:6px 8px;border-radius:999px;background:#ffffff0a;color:#a9a1ad;font-size:9px;font-weight:850;letter-spacing:.08em;text-transform:uppercase}.status.good{background:#b8ff3816;color:#c8ff6b}.status.attention{background:#ff9a5b20;color:#ffb07e}.split{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}.safety-panel{display:flex;align-items:center;justify-content:space-between;gap:24px;background:linear-gradient(135deg,#1c2018,#19171b 58%)}.safety-panel p{max-width:520px;margin:9px 0 0;color:#9d95a1;font-size:12px;line-height:1.55}
 .rows{display:grid}.data-row{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:13px 0;border-top:1px solid #ffffff0b}.data-row:first-child{border-top:0}.data-row strong{display:block;font-size:12px}.data-row span{display:block;margin-top:4px;color:#817984;font-size:10px}.data-row b{font-size:14px}.data-row b.clear{color:#c8ff6b}.data-row b.attention{color:#ffb07e}
 .chart-panel{margin-bottom:14px}.chart-total{text-align:right}.chart-total strong{display:block;font-size:21px}.chart-total span{color:#8e8691;font-size:9px;text-transform:uppercase}.chart{display:grid;grid-template-columns:repeat(14,minmax(24px,1fr));align-items:end;gap:8px;height:220px;padding-top:10px}.bar-column{display:grid;grid-template-rows:1fr auto auto;gap:6px;height:100%;min-width:0;text-align:center}.bar-wrap{display:flex;align-items:flex-end;justify-content:center;height:100%;border-bottom:1px solid #ffffff10}.bar{width:min(24px,70%);min-height:2px;border-radius:6px 6px 2px 2px;background:linear-gradient(180deg,#c8ff6b,#7cae20);box-shadow:0 0 22px #b8ff3815}.bar-column span{color:#8f8793;font-size:8px;white-space:nowrap}.bar-column small{color:#c3bbc6;font-size:9px}
 .privacy-note{display:flex;align-items:flex-start;gap:14px;margin-top:14px;padding:16px;border:1px solid #59b7ff25;border-radius:12px;background:#59b7ff08}.privacy-note strong{flex:none;color:#87cbff;font-size:11px}.privacy-note span{color:#99909c;font-size:11px;line-height:1.5}.audit-table{display:grid}.audit-row{display:grid;grid-template-columns:1.1fr .8fr 1.2fr 1fr;gap:14px;padding:12px 0;border-top:1px solid #ffffff0b;color:#a69eaa;font-size:11px}.audit-row strong{color:#eee8ef}.audit-row time{color:#88808b}.audit-head{color:#716a74;font-size:9px;font-weight:850;letter-spacing:.1em;text-transform:uppercase}.empty{padding:45px;border:1px dashed #ffffff18;border-radius:12px;color:#918894;text-align:center;font-size:12px}footer{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px;color:#6f6872;font-size:9px;text-transform:uppercase}footer span+span:before{content:"·";margin-right:8px}
 @media(max-width:900px){.topbar{align-items:flex-start;flex-wrap:wrap;padding:14px 18px}.brand{margin-right:0}.topbar nav{order:3;width:100%;overflow:auto}.private-pill{margin-left:auto}.metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.split{grid-template-columns:1fr}.chart{gap:4px}.bar-column span{font-size:7px}}
 @media(max-width:580px){main{width:min(100% - 20px,1180px);padding-top:32px}.page-head{align-items:flex-start;flex-direction:column}.metric-grid{grid-template-columns:1fr 1fr;gap:8px}.metric{min-height:130px;padding:14px}.metric strong{margin-top:19px;font-size:27px}.chart{grid-template-columns:repeat(14,18px);overflow-x:auto;justify-content:start}.safety-panel{align-items:flex-start;flex-direction:column}.audit-row{grid-template-columns:1fr 1fr}.audit-head{display:none}.privacy-note{flex-direction:column}}
-</style></head><body>"#;
+"#;
+
+const DOCUMENT_STYLE_END: &str = "</style></head><body>";
 
 #[cfg(test)]
 mod tests {
@@ -999,5 +1032,73 @@ mod tests {
         assert_eq!(format_number(1_234_567), "1,234,567");
         assert_eq!(format_bytes(1_572_864), "1.5 MB");
         assert_eq!(format_duration(7_200), "2h");
+    }
+
+    fn sample_snapshot() -> AdminSnapshot {
+        AdminSnapshot {
+            captured_at: "now".to_owned(),
+            schema_version: 9,
+            database_bytes: 1_000,
+            total_accounts: 10,
+            active_accounts: 8,
+            new_accounts_24h: 1,
+            new_accounts_7d: 2,
+            active_accounts_24h: 3,
+            active_accounts_7d: 5,
+            active_accounts_30d: 7,
+            active_devices: 4,
+            active_groups: 2,
+            new_groups_7d: 1,
+            memberships: 6,
+            total_events: 20,
+            events_24h: 4,
+            events_7d: 12,
+            group_events_24h: 3,
+            direct_events_24h: 1,
+            authors_24h: 2,
+            available_media: 5,
+            media_bytes: 2_000,
+            media_7d: 1,
+            active_sessions: 3,
+            active_push_subscriptions: 3,
+            ready_jobs: 0,
+            running_jobs: 0,
+            failed_jobs: 0,
+            pending_outbox: 0,
+            oldest_outbox_seconds: 0,
+            active_restrictions: 0,
+            daily: Vec::new(),
+            audit: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn service_status_stays_plain_when_healthy() {
+        let healthy = service_status(&sample_snapshot());
+        assert_eq!(healthy.title, "All good");
+        assert_eq!(healthy.tone, "good");
+    }
+
+    #[test]
+    fn service_status_flags_failed_work() {
+        let mut snapshot = sample_snapshot();
+        snapshot.failed_jobs = 2;
+        let status = service_status(&snapshot);
+        assert_eq!(status.title, "Needs a look");
+        assert_eq!(status.tone, "attention");
+    }
+
+    #[test]
+    fn overview_uses_everyday_words_and_the_noise_logo() {
+        let html = render_dashboard(&sample_snapshot(), AdminPage::Overview, "chris@example.com");
+        assert!(html.contains("people using it today"));
+        assert!(html.contains("messages today"));
+        assert!(html.contains("photos &amp; videos"));
+        assert!(html.contains("messages each day"));
+        assert!(!html.contains("encrypted events"));
+        assert!(!html.contains("ciphertext"));
+        assert!(!html.contains(r#"class="mark">n"#));
+        assert!(html.contains("noise-logo-wave"));
+        assert!(html.contains(">today</a>"));
     }
 }
