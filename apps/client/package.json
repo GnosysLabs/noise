@@ -8,6 +8,7 @@
     "dev": "vite --host 127.0.0.1 --port 1420",
     "dev:desktop": "tauri dev --release",
     "build": "tsc && vite build",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
     "build:web": "../../scripts/build-web-client.sh",
     "tauri": "tauri"
   },

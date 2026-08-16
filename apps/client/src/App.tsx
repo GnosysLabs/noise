@@ -75,6 +75,13 @@ import { firstLink, linkify, openExternalLink } from "./linkify";
 import { ReactionPicker } from "./ReactionPicker";
 import { KlipyPicker } from "./KlipyPicker";
 import { useLinkPreview } from "./useLinkPreview";
+import {
+  MAX_COMPOSER_MEDIA_ITEMS,
+  composerMediaError,
+  composerMediaSelectionError,
+  restoreComposerAfterSend,
+  selectComposerMedia,
+} from "./composerMedia";
 import type {
   AdultAccessSummary,
   AttachmentData,
@@ -922,6 +929,7 @@ function loadProfileImageSource(image: ProfileImage) {
 }
 
 type PendingMedia = {
+  id: string;
   name: string;
   mimeType: string;
   byteLength: number;
@@ -931,17 +939,15 @@ type PendingMedia = {
   mediaDimensions: Promise<MediaDimensions | null> | null;
 };
 
-type ComposerUploadState = {
-  attachment: PendingMedia | null;
-  progress: number | null;
-  controller: AbortController | null;
+type ComposerSendResult = {
+  confirmedCount: number;
 };
 
-const emptyComposerUpload: ComposerUploadState = {
-  attachment: null,
-  progress: null,
-  controller: null,
+type ComposerUploadState = {
+  attachments: PendingMedia[];
 };
+
+const emptyComposerUpload: ComposerUploadState = { attachments: [] };
 const composerUploads = new Map<string, ComposerUploadState>();
 const composerUploadListeners = new Map<string, Set<() => void>>();
 
@@ -953,13 +959,9 @@ function updateComposerUpload(
   key: string,
   update: (current: ComposerUploadState) => ComposerUploadState,
 ) {
-  const current = composerUpload(key);
-  const next = update(current);
-  if (!next.attachment && next.progress === null && !next.controller) {
-    composerUploads.delete(key);
-  } else {
-    composerUploads.set(key, next);
-  }
+  const next = update(composerUpload(key));
+  if (!next.attachments.length) composerUploads.delete(key);
+  else composerUploads.set(key, next);
   for (const listener of composerUploadListeners.get(key) ?? []) listener();
 }
 
@@ -975,59 +977,61 @@ function useComposerUpload(key: string) {
   }, [key]);
   const getSnapshot = useCallback(() => composerUpload(key), [key]);
   const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
-  const setAttachment = useCallback((attachment: PendingMedia | null) => {
+  const addAttachments = useCallback((attachments: PendingMedia[]) => {
+    let accepted = 0;
     updateComposerUpload(key, (current) => {
-      if (current.attachment && current.attachment !== attachment) {
-        URL.revokeObjectURL(current.attachment.previewUrl);
-      }
-      return { ...current, attachment };
+      const available = Math.max(0, MAX_COMPOSER_MEDIA_ITEMS - current.attachments.length);
+      const additions = attachments.slice(0, available);
+      accepted = additions.length;
+      return { attachments: [...current.attachments, ...additions] };
+    });
+    for (const attachment of attachments.slice(accepted)) {
+      URL.revokeObjectURL(attachment.previewUrl);
+    }
+    return accepted;
+  }, [key]);
+  const removeAttachment = useCallback((id: string) => {
+    updateComposerUpload(key, (current) => {
+      const removed = current.attachments.find((attachment) => attachment.id === id);
+      if (removed) URL.revokeObjectURL(removed.previewUrl);
+      return {
+        attachments: current.attachments.filter((attachment) => attachment.id !== id),
+      };
     });
   }, [key]);
-  const setProgress = useCallback((progress: number | null) => {
-    updateComposerUpload(key, (current) => ({ ...current, progress }));
-  }, [key]);
-  const setController = useCallback((controller: AbortController | null) => {
-    updateComposerUpload(key, (current) => ({ ...current, controller }));
-  }, [key]);
-  const takeAttachment = useCallback(() => {
-    let attachment: PendingMedia | null = null;
+  const takeAttachments = useCallback(() => {
+    let attachments: PendingMedia[] = [];
     updateComposerUpload(key, (current) => {
-      attachment = current.attachment;
-      return { ...current, attachment: null, progress: null, controller: null };
+      attachments = current.attachments;
+      return emptyComposerUpload;
     });
-    return attachment;
+    return attachments;
   }, [key]);
-  return { ...state, setAttachment, setProgress, setController, takeAttachment };
+  return { ...state, addAttachments, removeAttachment, takeAttachments };
 }
 
 function hasTransferredFiles(transfer: DataTransfer) {
   return Array.from(transfer.types).includes("Files");
 }
 
-function firstTransferredFile(files: FileList | null | undefined) {
-  const all = Array.from(files ?? []);
-  return all.find((file) => /^(image|video|audio)\//.test(file.type))
-    ?? all[0]
-    ?? null;
+function transferredFiles(files: FileList | null | undefined) {
+  return Array.from(files ?? []);
 }
 
-function firstClipboardFile(clipboard: DataTransfer | null) {
-  const listed = firstTransferredFile(clipboard?.files);
-  if (listed) return listed;
-  const itemFiles = Array.from(clipboard?.items ?? [])
+function clipboardFiles(clipboard: DataTransfer | null) {
+  const listed = transferredFiles(clipboard?.files);
+  if (listed.length) return listed;
+  return Array.from(clipboard?.items ?? [])
     .filter((item) => item.kind === "file")
     .map((item) => item.getAsFile())
     .filter((file): file is File => Boolean(file));
-  return itemFiles.find((file) => /^(image|video|audio)\//.test(file.type))
-    ?? itemFiles[0]
-    ?? null;
 }
 
 function useComposerMediaIntake(
   active: boolean,
   canAccept: boolean,
-  onMedia: (file: File) => void,
-  onNativeMedia: (path: string) => void,
+  onMedia: (files: File[]) => void,
+  onNativeMedia: (paths: string[]) => void,
 ) {
   const [dragging, setDragging] = useState(false);
   const onMediaRef = useRef(onMedia);
@@ -1066,14 +1070,14 @@ function useComposerMediaIntake(
       event.preventDefault();
       resetDrag();
       if (!canAccept) return;
-      const file = firstTransferredFile(event.dataTransfer.files);
-      if (file) onMediaRef.current(file);
+      const files = transferredFiles(event.dataTransfer.files);
+      if (files.length) onMediaRef.current(files);
     };
     const onPaste = (event: ClipboardEvent) => {
-      const file = firstClipboardFile(event.clipboardData);
-      if (!file) return;
+      const files = clipboardFiles(event.clipboardData);
+      if (!files.length) return;
       event.preventDefault();
-      if (canAccept) onMediaRef.current(file);
+      if (canAccept) onMediaRef.current(files);
     };
     window.addEventListener("dragenter", onDragEnter);
     window.addEventListener("dragover", onDragOver);
@@ -1095,8 +1099,7 @@ function useComposerMediaIntake(
           }
           resetDrag();
           if (!canAccept) return;
-          const path = event.payload.paths[0];
-          if (path) onNativeMediaRef.current(path);
+          if (event.payload.paths.length) onNativeMediaRef.current(event.payload.paths);
         }))
         .then((unlisten) => {
           unlistenNativeDrop = unlisten;
@@ -1131,6 +1134,35 @@ type MediaDimensions = {
   pixelHeight: number;
 };
 
+function prepareComposerMediaFiles(files: File[], available: number) {
+  const selection = selectComposerMedia(
+    files,
+    available,
+    (file) => ({ mimeType: file.type, byteLength: file.size }),
+  );
+  return {
+    attachments: selection.accepted.map((file) => preparePendingMedia(file)),
+    error: composerMediaSelectionError(selection),
+  };
+}
+
+function prepareComposerPendingMedia(attachments: Array<PendingMedia | null>, available: number) {
+  const selection = selectComposerMedia(
+    attachments,
+    available,
+    (attachment) => attachment
+      ? { mimeType: attachment.mimeType, byteLength: attachment.byteLength }
+      : null,
+  );
+  for (const attachment of selection.rejected) {
+    if (attachment) URL.revokeObjectURL(attachment.previewUrl);
+  }
+  return {
+    attachments: selection.accepted.filter((attachment): attachment is PendingMedia => Boolean(attachment)),
+    error: composerMediaSelectionError(selection),
+  };
+}
+
 function preparePendingMedia(file: File): PendingMedia {
   const sticker = isKlipyStickerFileName(file.name);
   const previewUrl = URL.createObjectURL(file);
@@ -1152,6 +1184,7 @@ function preparePendingMedia(file: File): PendingMedia {
       ? prepareMediaPreviewFromFile(preparedFile, "image")
       : null;
   return {
+    id: crypto.randomUUID(),
     name: file.name,
     mimeType: file.type,
     byteLength: file.size,
@@ -1465,11 +1498,11 @@ async function optimizeOutgoingVideo(file: File) {
   }
 }
 
-async function chooseNativePendingMedia() {
-  if (!isTauri) return null;
+async function chooseNativePendingMedia(limit = MAX_COMPOSER_MEDIA_ITEMS) {
+  if (!isTauri) return { attachments: [], omittedCount: 0 };
   const { open } = await import("@tauri-apps/plugin-dialog");
   const selected = await open({
-    multiple: false,
+    multiple: limit > 1,
     directory: false,
     filters: [{
       name: "media",
@@ -1480,11 +1513,17 @@ async function chooseNativePendingMedia() {
       ],
     }],
   });
-  if (!selected) return null;
-  return pendingMediaFromNativePath(selected);
+  if (!selected) return { attachments: [], omittedCount: 0 };
+  const selectedPaths = typeof selected === "string" ? [selected] : selected;
+  const paths = selectedPaths.slice(0, limit);
+  const pending = await Promise.all(paths.map((path) => pendingMediaFromNativePath(path)));
+  return {
+    attachments: pending.filter((item): item is PendingMedia => item !== null),
+    omittedCount: Math.max(0, selectedPaths.length - paths.length),
+  };
 }
 
-async function pendingMediaFromNativePath(sourcePath: string) {
+async function pendingMediaFromNativePath(sourcePath: string): Promise<PendingMedia | null> {
   if (!isTauri) return null;
   const { convertFileSrc, invoke } = await import("@tauri-apps/api/core");
   const inspected = await invoke<{
@@ -1536,6 +1575,7 @@ async function pendingMediaFromNativePath(sourcePath: string) {
           : prepareImagePreviewSource(previewUrl))
       : null;
   return {
+    id: crypto.randomUUID(),
     name: inspected.file_name,
     mimeType: inspected.mime_type,
     byteLength: inspected.byte_length,
@@ -2270,6 +2310,64 @@ export default function App() {
     });
   }
 
+  function removeOptimisticGroupMessages(
+    groupId: string,
+    eventIds: string[],
+    releasePreview = true,
+  ) {
+    const ids = new Set(eventIds);
+    setOptimisticGroupMessages((current) => {
+      const pending = current.get(groupId);
+      if (!pending?.some((item) => ids.has(item.event_id))) return current;
+      const remaining = pending.filter((item) => {
+        if (!ids.has(item.event_id)) return true;
+        if (releasePreview) releaseOptimisticPreview(item);
+        return false;
+      });
+      const next = new Map(current);
+      if (remaining.length) next.set(groupId, remaining);
+      else next.delete(groupId);
+      return next;
+    });
+  }
+
+  function removeOptimisticDirectMessages(
+    publicKey: string,
+    eventIds: string[],
+    releasePreview = true,
+  ) {
+    const ids = new Set(eventIds);
+    setOptimisticDirectMessages((current) => {
+      const pending = current.get(publicKey);
+      if (!pending?.some((item) => ids.has(item.event_id))) return current;
+      const remaining = pending.filter((item) => {
+        if (!ids.has(item.event_id)) return true;
+        if (releasePreview) releaseOptimisticPreview(item);
+        return false;
+      });
+      const next = new Map(current);
+      if (remaining.length) next.set(publicKey, remaining);
+      else next.delete(publicKey);
+      return next;
+    });
+  }
+
+  function updateOptimisticDirectMessage(
+    publicKey: string,
+    eventId: string,
+    update: Partial<MessageSummary>,
+  ) {
+    setOptimisticDirectMessages((current) => {
+      const pending = current.get(publicKey);
+      if (!pending?.some((item) => item.event_id === eventId)) return current;
+      const next = new Map(current);
+      next.set(publicKey, pending.map((item) =>
+        item.event_id === eventId ? { ...item, ...update } : item
+      ));
+      return next;
+    });
+  }
+
   function confirmOptimisticGroupMessage(
     groupId: string,
     localId: string,
@@ -2309,21 +2407,9 @@ export default function App() {
         message_id: sent.message_id,
         created_at_millis: sent.created_at_millis,
         attachment,
+        upload_progress: undefined,
+        upload_error: undefined,
       } : item));
-      return next;
-    });
-  }
-
-  function removeOptimisticDirectMessage(publicKey: string, eventId: string) {
-    setOptimisticDirectMessages((current) => {
-      const pending = current.get(publicKey);
-      if (!pending) return current;
-      const removed = pending.find((item) => item.event_id === eventId);
-      const remaining = pending.filter((item) => item.event_id !== eventId);
-      if (removed) releaseOptimisticPreview(removed);
-      const next = new Map(current);
-      if (remaining.length) next.set(publicKey, remaining);
-      else next.delete(publicKey);
       return next;
     });
   }
@@ -4783,120 +4869,130 @@ export default function App() {
                     )
                   : loadOlderGroupHistory(selectedConversation.group.group_id)
               }
-              onSend={async (text, pending, replyToMessageId) => {
+              onSend={async (text, pending, replyToMessageId, signal, onProgress) => {
                 const groupId = selectedConversation.group.group_id;
-                const controller = new AbortController();
-                const signal = controller.signal;
-                let optimistic = await optimisticMessage(
-                  summary.identity,
-                  text,
-                  pending,
-                  replyToMessageId,
-                  Boolean(pending),
-                );
-                optimistic = {
-                  ...optimistic,
+                const batch = pending.length ? pending : [null];
+                const optimisticItems = await Promise.all(batch.map(async (attachment, index) => ({
+                  ...await optimisticMessage(
+                    summary.identity,
+                    index === 0 ? text : "",
+                    attachment,
+                    index === 0 ? replyToMessageId : null,
+                    Boolean(attachment),
+                  ),
                   topic_id: effectiveTopicId,
-                  upload_progress: pending ? 0 : undefined,
-                };
-                addOptimisticGroupMessage(groupId, optimistic);
-                if (
-                  pending
-                  && (pending.mediaPreview || pending.mediaDimensions)
-                  && optimistic.local_attachment
-                ) {
-                  const optimisticId = optimistic.event_id;
+                  upload_progress: attachment ? 0 : undefined,
+                })));
+                for (const optimistic of optimisticItems) {
+                  addOptimisticGroupMessage(groupId, optimistic);
+                }
+                batch.forEach((attachment, index) => {
+                  const optimistic = optimisticItems[index];
+                  if (
+                    !attachment
+                    || (!attachment.mediaPreview && !attachment.mediaDimensions)
+                    || !optimistic.local_attachment
+                  ) return;
                   const localAttachment = optimistic.local_attachment;
                   void Promise.all([
-                    pending.mediaPreview ?? Promise.resolve(null),
-                    pending.mediaDimensions ?? Promise.resolve(null),
+                    attachment.mediaPreview ?? Promise.resolve(null),
+                    attachment.mediaDimensions ?? Promise.resolve(null),
                   ]).then(([preview, dimensions]) => {
                     if (!preview && !dimensions) return;
                     const geometry = dimensions ?? preview;
-                    updateOptimisticGroupMessage(
-                      groupId,
-                      optimisticId,
-                      {
-                        local_attachment: {
-                          ...localAttachment,
-                          poster_url: preview
-                            ? `data:${preview.mimeType};base64,${preview.dataBase64}`
-                            : localAttachment.poster_url,
-                          pixel_width: geometry?.pixelWidth,
-                          pixel_height: geometry?.pixelHeight,
-                        },
+                    updateOptimisticGroupMessage(groupId, optimistic.event_id, {
+                      local_attachment: {
+                        ...localAttachment,
+                        poster_url: preview
+                          ? `data:${preview.mimeType};base64,${preview.dataBase64}`
+                          : localAttachment.poster_url,
+                        pixel_width: geometry?.pixelWidth,
+                        pixel_height: geometry?.pixelHeight,
                       },
-                    );
+                    });
                   }).catch(() => {
                     // The upload reports preparation failures through its
                     // normal error state; optimistic geometry is best effort.
                   });
-                }
-                let attachment: MediaAttachment | null = null;
-                let result: SentMessageResult | null = null;
-                const sent = await performConcurrent(async () => {
-                  attachment = await uploadPendingMedia(
-                    pending,
-                    "upload_media_chunk",
-                    (progress) => updateOptimisticGroupMessage(
+                });
+
+                const uploaded: Array<MediaAttachment | null> = [];
+                let confirmedCount = 0;
+                await performConcurrent(async () => {
+                  for (let index = 0; index < batch.length; index += 1) {
+                    uploaded[index] = await uploadPendingMedia(
+                      batch[index],
+                      "upload_media_chunk",
+                      (progress) => {
+                        updateOptimisticGroupMessage(groupId, optimisticItems[index].event_id, {
+                          upload_progress: progress,
+                        });
+                        onProgress?.(index, progress);
+                      },
+                      signal,
+                    );
+                  }
+                  for (let index = 0; index < batch.length; index += 1) {
+                    if (signal.aborted) throw new Error("media upload cancelled");
+                    const result = await noise<SentMessageResult>({
+                      action: "say",
+                      text: index === 0 ? text : "",
+                      attachment: uploaded[index],
+                      reply_to_message_id: index === 0 ? replyToMessageId : null,
+                      topic_id: effectiveTopicId,
+                      relays,
+                    });
+                    if (!result) throw new Error("the relay did not confirm the message");
+                    const optimistic = optimisticItems[index];
+                    const attachment = uploaded[index];
+                    if (attachment && optimistic.local_attachment) {
+                      mediaCache.set(mediaCacheKey(attachment), optimistic.local_attachment.preview_url);
+                      sentMediaPreviewCache.set(result.event_id, optimistic.local_attachment);
+                    }
+                    confirmOptimisticGroupMessage(
                       groupId,
                       optimistic.event_id,
-                      { upload_progress: progress },
-                    ),
-                    signal,
-                  );
-                  if (signal.aborted) throw new Error("media upload cancelled");
-                  result = await noise<SentMessageResult>({
-                    action: "say",
-                    text,
-                    attachment,
-                    reply_to_message_id: replyToMessageId,
-                    topic_id: effectiveTopicId,
-                    relays,
-                  });
-                  if (!result) throw new Error("the relay did not confirm the message");
+                      result,
+                      attachment,
+                    );
+                    confirmedCount += 1;
+                  }
                 });
-                if (!sent || !result) {
-                  updateOptimisticGroupMessage(groupId, optimistic.event_id, {
-                    upload_progress: undefined,
-                    upload_error: pending ? "upload failed" : "could not send",
-                  });
-                  return false;
+                if (confirmedCount < optimisticItems.length) {
+                  removeOptimisticGroupMessages(
+                    groupId,
+                    optimisticItems.slice(confirmedCount).map((item) => item.event_id),
+                    false,
+                  );
                 }
-                const confirmed = result as SentMessageResult;
-                const confirmedAttachment = attachment as MediaAttachment | null;
-                if (confirmedAttachment && optimistic.local_attachment) {
-                  mediaCache.set(mediaCacheKey(confirmedAttachment), optimistic.local_attachment.preview_url);
-                  sentMediaPreviewCache.set(confirmed.event_id, optimistic.local_attachment);
-                }
-                confirmOptimisticGroupMessage(groupId, optimistic.event_id, confirmed, confirmedAttachment);
-                // The send already applied the message to the local cache; a
-                // single targeted activity sync reconciles unread counts and
-                // interleaved messages without the full refresh pipeline.
-                void syncGroupActivity(groupId, {
-                  topicId: desiredGroupIdRef.current === groupId
-                    ? activeTopicIdRef.current
-                    : null,
-                })
-                  .then((activity) => {
-                    if (!activity) return;
-                    setSummary(activity.summary);
-                    if (activity.conversation) {
-                      groupConversationCache.current.set(groupId, activity.conversation);
-                      if (desiredGroupIdRef.current === groupId) {
-                        setConversation(activity.conversation);
-                      }
-                    }
+                if (confirmedCount > 0) {
+                  // The sends already updated the local cache. Reconcile the
+                  // whole batch once so interleaved messages keep their order.
+                  void syncGroupActivity(groupId, {
+                    topicId: desiredGroupIdRef.current === groupId
+                      ? activeTopicIdRef.current
+                      : null,
                   })
-                  .catch(() => {
-                    // The group watch redelivers anything this pass missed.
-                  });
-                void noise({
-                  action: "sync_account",
-                  relays,
-                  interruptible: true,
-                }).catch(() => undefined);
-                return true;
+                    .then((activity) => {
+                      if (!activity) return;
+                      setSummary(activity.summary);
+                      if (activity.conversation) {
+                        groupConversationCache.current.set(groupId, activity.conversation);
+                        if (desiredGroupIdRef.current === groupId) {
+                          setConversation(activity.conversation);
+                        }
+                      }
+                    })
+                    .catch(() => {
+                      // The group watch redelivers anything this pass missed.
+                    });
+                  void noise({
+                    action: "sync_account",
+                    relays,
+                    interruptible: true,
+                  }).catch(() => undefined);
+                }
+                return { confirmedCount };
               }}
             />
           ) : activeGroupId && groupEncryption?.group_id === activeGroupId
@@ -4987,49 +5083,108 @@ export default function App() {
                   // timestamp. The normal sync loop retries local cache purging.
                 }
               }}
-              onSend={async (text, pending, onProgress, replyToMessageId, signal) => {
+              onSend={async (text, pending, replyToMessageId, signal, onProgress) => {
                 const publicKey = selectedDirectConversation.contact.public_key;
-                let optimistic = pending
-                  ? null
-                  : await optimisticMessage(summary.identity, text, null, replyToMessageId);
-                if (optimistic) addOptimisticDirectMessage(publicKey, optimistic);
-                let attachment: MediaAttachment | null = null;
-                let result: SentMessageResult | null = null;
-                const sent = await perform(async () => {
-                  attachment = await uploadPendingMedia(pending, "upload_direct_media_chunk", onProgress, signal);
-                  if (signal.aborted) throw new Error("media upload cancelled");
-                  result = await noise<SentMessageResult>({
-                    action: "say_direct",
-                    text,
+                const batch = pending.length ? pending : [null];
+                const optimisticItems = await Promise.all(batch.map(async (attachment, index) => ({
+                  ...await optimisticMessage(
+                    summary.identity,
+                    index === 0 ? text : "",
                     attachment,
-                    reply_to_message_id: replyToMessageId,
-                    relays,
-                  });
-                  if (!result) throw new Error("the relay did not confirm the message");
-                }, false);
-                if (!sent || !result) {
-                  if (optimistic) removeOptimisticDirectMessage(publicKey, optimistic.event_id);
-                  return false;
-                }
-                const confirmed = result as SentMessageResult;
-                const confirmedAttachment = attachment as MediaAttachment | null;
-                if (pending) {
-                  optimistic = await optimisticMessage(summary.identity, text, pending, replyToMessageId);
+                    index === 0 ? replyToMessageId : null,
+                    Boolean(attachment),
+                  ),
+                  upload_progress: attachment ? 0 : undefined,
+                })));
+                for (const optimistic of optimisticItems) {
                   addOptimisticDirectMessage(publicKey, optimistic);
                 }
-                if (!optimistic) return false;
-                if (confirmedAttachment && optimistic.local_attachment) {
-                  mediaCache.set(mediaCacheKey(confirmedAttachment), optimistic.local_attachment.preview_url);
-                  sentMediaPreviewCache.set(confirmed.event_id, optimistic.local_attachment);
+                batch.forEach((attachment, index) => {
+                  const optimistic = optimisticItems[index];
+                  if (
+                    !attachment
+                    || (!attachment.mediaPreview && !attachment.mediaDimensions)
+                    || !optimistic.local_attachment
+                  ) return;
+                  const localAttachment = optimistic.local_attachment;
+                  void Promise.all([
+                    attachment.mediaPreview ?? Promise.resolve(null),
+                    attachment.mediaDimensions ?? Promise.resolve(null),
+                  ]).then(([preview, dimensions]) => {
+                    if (!preview && !dimensions) return;
+                    const geometry = dimensions ?? preview;
+                    updateOptimisticDirectMessage(publicKey, optimistic.event_id, {
+                      local_attachment: {
+                        ...localAttachment,
+                        poster_url: preview
+                          ? `data:${preview.mimeType};base64,${preview.dataBase64}`
+                          : localAttachment.poster_url,
+                        pixel_width: geometry?.pixelWidth,
+                        pixel_height: geometry?.pixelHeight,
+                      },
+                    });
+                  }).catch(() => {
+                    // Optimistic geometry is best effort.
+                  });
+                });
+
+                const uploaded: Array<MediaAttachment | null> = [];
+                let confirmedCount = 0;
+                await perform(async () => {
+                  for (let index = 0; index < batch.length; index += 1) {
+                    uploaded[index] = await uploadPendingMedia(
+                      batch[index],
+                      "upload_direct_media_chunk",
+                      (progress) => {
+                        updateOptimisticDirectMessage(publicKey, optimisticItems[index].event_id, {
+                          upload_progress: progress,
+                        });
+                        onProgress?.(index, progress);
+                      },
+                      signal,
+                    );
+                  }
+                  for (let index = 0; index < batch.length; index += 1) {
+                    if (signal.aborted) throw new Error("media upload cancelled");
+                    const result = await noise<SentMessageResult>({
+                      action: "say_direct",
+                      text: index === 0 ? text : "",
+                      attachment: uploaded[index],
+                      reply_to_message_id: index === 0 ? replyToMessageId : null,
+                      relays,
+                    });
+                    if (!result) throw new Error("the relay did not confirm the message");
+                    const optimistic = optimisticItems[index];
+                    const attachment = uploaded[index];
+                    if (attachment && optimistic.local_attachment) {
+                      mediaCache.set(mediaCacheKey(attachment), optimistic.local_attachment.preview_url);
+                      sentMediaPreviewCache.set(result.event_id, optimistic.local_attachment);
+                    }
+                    confirmOptimisticDirectMessage(
+                      publicKey,
+                      optimistic.event_id,
+                      result,
+                      attachment,
+                    );
+                    confirmedCount += 1;
+                  }
+                }, false);
+                if (confirmedCount < optimisticItems.length) {
+                  removeOptimisticDirectMessages(
+                    publicKey,
+                    optimisticItems.slice(confirmedCount).map((item) => item.event_id),
+                    false,
+                  );
                 }
-                confirmOptimisticDirectMessage(publicKey, optimistic.event_id, confirmed, confirmedAttachment);
-                void refresh().catch((cause) => setError(message(cause)));
-                void noise({
-                  action: "sync_account",
-                  relays,
-                  interruptible: true,
-                }).catch(() => undefined);
-                return true;
+                if (confirmedCount > 0) {
+                  void refresh().catch((cause) => setError(message(cause)));
+                  void noise({
+                    action: "sync_account",
+                    relays,
+                    interruptible: true,
+                  }).catch(() => undefined);
+                }
+                return { confirmedCount };
               }}
             />
           ) : activeDirectPublicKey ? <Loading /> : <EmptyDirects />}
@@ -6788,6 +6943,53 @@ function ComposerAttachmentPicker({
   );
 }
 
+function ComposerMediaDrafts({
+  attachments,
+  onRemove,
+}: {
+  attachments: PendingMedia[];
+  onRemove: (id: string) => void;
+}) {
+  if (!attachments.length) return null;
+  return (
+    <div
+      className="attachment-drafts"
+      style={{ gridTemplateColumns: `repeat(${Math.min(5, attachments.length)}, minmax(54px, 88px))` }}
+      aria-label={`${attachments.length} of ${MAX_COMPOSER_MEDIA_ITEMS} media items attached`}
+    >
+      {attachments.map((attachment) => (
+        <div
+          className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}
+          key={attachment.id}
+          title={attachment.name}
+        >
+          {attachment.mimeType.startsWith("image/") ? (
+            <img src={attachment.previewUrl} alt="" />
+          ) : attachment.mimeType.startsWith("video/") ? (
+            <video
+              src={attachment.previewUrl}
+              muted
+              playsInline
+              preload="metadata"
+              onLoadedMetadata={(event) => primeVideoFrame(event.currentTarget)}
+            />
+          ) : (
+            <div className="audio-thumbnail"><AudioWaveform size={25} /></div>
+          )}
+          <button
+            type="button"
+            onClick={() => onRemove(attachment.id)}
+            aria-label={`remove ${attachment.name}`}
+          >
+            <X size={13} />
+          </button>
+        </div>
+      ))}
+      <span className="attachment-draft-count">{attachments.length}/{MAX_COMPOSER_MEDIA_ITEMS}</span>
+    </div>
+  );
+}
+
 function ConversationPanel({
   conversation,
   topic,
@@ -6849,18 +7051,22 @@ function ConversationPanel({
   onLoadOlder: () => Promise<void>;
   onSend: (
     text: string,
-    attachment: PendingMedia | null,
+    attachments: PendingMedia[],
     replyToMessageId: string | null,
-  ) => Promise<boolean>;
+    signal: AbortSignal,
+    onProgress?: (index: number, progress: number) => void,
+  ) => Promise<ComposerSendResult>;
 }) {
   const selfPublicKey = self.public_key;
   const [draft, setDraft] = useState("");
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
   const composerUploadKey = `group:${conversation.group.group_id}:${topic?.topic_id ?? "general"}`;
   const {
-    attachment,
-    setAttachment,
-    takeAttachment,
+    attachments,
+    addAttachments,
+    removeAttachment,
+    takeAttachments,
   } = useComposerUpload(composerUploadKey);
   const [memberMenu, setMemberMenu] = useState<{ member: MemberSummary; x: number; y: number } | null>(null);
   const [messageMenu, setMessageMenu] = useState<{ message: MessageSummary; x: number; y: number } | null>(null);
@@ -6868,6 +7074,8 @@ function ConversationPanel({
   const [replyingTo, setReplyingTo] = useState<MessageSummary | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
+  const sendController = useRef<AbortController | null>(null);
+  useEffect(() => () => sendController.current?.abort(), []);
   useAutosizeComposer(composerInput, draft);
   const messageList = useChunkedMessageList(
     `${conversation.group.group_id}:${topic?.topic_id ?? "general"}`,
@@ -6974,29 +7182,36 @@ function ConversationPanel({
       {member.public_key !== selfPublicKey && <button className="member-actions" aria-label={`actions for ${member.username}`} onClick={(event) => { const rect = event.currentTarget.getBoundingClientRect(); setMemberMenu({ member, x: rect.right, y: rect.bottom + 4 }); }}><MoreHorizontal size={15} /></button>}
     </div>
   );
-  const chooseMedia = useCallback((file?: File) => {
-    if (!file) return;
-    setAttachmentError(null);
-    if (!/^(image|video|audio)\//.test(file.type)) {
-      setAttachmentError("choose an image, video, or audio file");
-      return;
-    }
-    if (!file.size || file.size > 500 * 1024 * 1024) {
-      setAttachmentError("media can be up to 500 MB");
-      return;
-    }
-    setAttachment(preparePendingMedia(file));
+  const chooseMedia = useCallback((files: File[]) => {
+    if (!files.length) return;
+    const selection = prepareComposerMediaFiles(
+      files,
+      MAX_COMPOSER_MEDIA_ITEMS - attachments.length,
+    );
+    const accepted = addAttachments(selection.attachments);
+    setAttachmentError(composerMediaError(
+      selection.error,
+      accepted < selection.attachments.length,
+    ));
     if (fileInput.current) fileInput.current.value = "";
-  }, [setAttachment]);
+  }, [addAttachments, attachments.length]);
   const mediaDragging = useComposerMediaIntake(
     active,
-    canSendMedia && !busy,
+    canSendMedia && !busy && !sending && attachments.length < MAX_COMPOSER_MEDIA_ITEMS,
     chooseMedia,
-    (path) => {
+    (paths) => {
       setAttachmentError(null);
-      void pendingMediaFromNativePath(path)
+      const available = MAX_COMPOSER_MEDIA_ITEMS - attachments.length;
+      void Promise.all(
+        paths.slice(0, MAX_COMPOSER_MEDIA_ITEMS * 2).map((path) => pendingMediaFromNativePath(path)),
+      )
         .then((pending) => {
-          if (pending) setAttachment(pending);
+          const selection = prepareComposerPendingMedia(pending, available);
+          const accepted = addAttachments(selection.attachments);
+          setAttachmentError(composerMediaError(
+            selection.error,
+            paths.length > available || accepted < selection.attachments.length,
+          ));
         })
         .catch((cause) => setAttachmentError(message(cause)));
     },
@@ -7008,43 +7223,87 @@ function ConversationPanel({
     }
     setAttachmentError(null);
     try {
-      const pending = await chooseNativePendingMedia();
-      if (pending) setAttachment(pending);
+      const available = MAX_COMPOSER_MEDIA_ITEMS - attachments.length;
+      const nativeSelection = await chooseNativePendingMedia(available);
+      const selection = prepareComposerPendingMedia(nativeSelection.attachments, available);
+      const accepted = addAttachments(selection.attachments);
+      setAttachmentError(composerMediaError(
+        selection.error,
+        nativeSelection.omittedCount > 0 || accepted < selection.attachments.length,
+      ));
     } catch (cause) {
       setAttachmentError(message(cause));
     }
   }
+  function cancelSend() {
+    sendController.current?.abort();
+  }
   async function submit() {
     const text = draft.trim();
-    if ((!text && !attachment)
+    if ((!text && !attachments.length)
       || busy
+      || sending
       || (text && !canSendMessages)
-      || (attachment && !canSendMedia)) return;
+      || (attachments.length > 0 && !canSendMedia)) return;
     const submittedReply = replyingTo;
-    const pendingAttachment = attachment ? takeAttachment() : null;
+    const pendingAttachments = takeAttachments();
+    const controller = new AbortController();
+    sendController.current = controller;
     setDraft("");
     setReplyingTo(null);
-    void onSend(text, pendingAttachment, submittedReply?.message_id ?? null);
+    setSending(true);
+    let confirmedCount = 0;
+    try {
+      const result = await onSend(
+        text,
+        pendingAttachments,
+        submittedReply?.message_id ?? null,
+        controller.signal,
+      );
+      confirmedCount = result.confirmedCount;
+    } finally {
+      if (sendController.current === controller) sendController.current = null;
+      setSending(false);
+    }
+    const restore = restoreComposerAfterSend({
+      confirmedCount,
+      attachments: pendingAttachments,
+    });
+    if (restore.remainingAttachments.length) addAttachments(restore.remainingAttachments);
+    if (restore.restoreDraft) {
+      setDraft((current) => current || text);
+      setReplyingTo((current) => current ?? submittedReply);
+    }
   }
-  async function sendKlipy(file: File) {
-    if (busy || !canSendMedia) return false;
+  async function sendKlipy(file: File, onProgress: (progress: number) => void) {
+    if (busy || sending || !canSendMedia) return false;
     setAttachmentError(null);
     const submittedReply = replyingTo;
-    const sent = await onSend(
-      "",
-      preparePendingMedia(file),
-      submittedReply?.message_id ?? null,
-    );
-    if (sent) {
-      setReplyingTo((current) =>
-        current?.message_id === submittedReply?.message_id ? null : current
+    const controller = new AbortController();
+    sendController.current = controller;
+    setSending(true);
+    try {
+      const sent = await onSend(
+        "",
+        [preparePendingMedia(file)],
+        submittedReply?.message_id ?? null,
+        controller.signal,
+        (_index, progress) => onProgress(progress),
       );
+      if (sent.confirmedCount > 0) {
+        setReplyingTo((current) =>
+          current?.message_id === submittedReply?.message_id ? null : current
+        );
+      }
+      return sent.confirmedCount > 0;
+    } finally {
+      if (sendController.current === controller) sendController.current = null;
+      setSending(false);
     }
-    return sent;
   }
   return (
     <div className={`conversation group-conversation ${hasBackground ? "has-background" : ""}`}>
-      {mediaDragging && <div className="media-drop-overlay" aria-hidden="true"><Images size={34} /><strong>drop media to attach</strong><span>images, video, or audio</span></div>}
+      {mediaDragging && <div className="media-drop-overlay" aria-hidden="true"><Images size={34} /><strong>drop media to attach</strong><span>up to {MAX_COMPOSER_MEDIA_ITEMS} images, videos, or audio files</span></div>}
       <header className="chat-header" data-tauri-drag-region>
         <div className="group-identity static" data-tauri-drag-region>
           <Avatar name={conversation.group.name} image={conversation.group.avatar} size={36} square />
@@ -7085,35 +7344,61 @@ function ConversationPanel({
                 sentinel={messageList.olderSentinel}
               />
             )}
-            {messageList.visibleMessages.map((item, index) => (
-              <Fragment key={item.event_id}>
-                {(index === 0 || !sameLocalDay(
-                  messageList.visibleMessages[index - 1].created_at_millis,
-                  item.created_at_millis,
-                )) && <MessageDateSeparator millis={item.created_at_millis} />}
-                <MessageRow message={item} own={item.author_public_key === selfPublicKey} presence={presenceStatuses.get(item.author_public_key) ?? "offline"} replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)} onNavigateToMessage={messageList.navigateToMessage} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onToggleReaction={(emoji) => void onReaction(item, emoji)} reactionPeople={reactionPeople} onPerson={onPerson} mediaScopeId={conversation.group.group_id} />
-              </Fragment>
-            ))}
+            {groupMediaMessages(messageList.visibleMessages).map((mediaGroup, index, groups) => {
+              const item = mediaGroup.messages[0];
+              return (
+                <Fragment key={item.event_id}>
+                  {(index === 0 || !sameLocalDay(
+                    groups[index - 1].messages[0].created_at_millis,
+                    item.created_at_millis,
+                  )) && <MessageDateSeparator millis={item.created_at_millis} />}
+                  <MessageRow
+                    message={item}
+                    album={mediaGroup.messages.length > 1 ? mediaGroup.messages : undefined}
+                    own={item.author_public_key === selfPublicKey}
+                    presence={presenceStatuses.get(item.author_public_key) ?? "offline"}
+                    replyTo={conversation.messages.find((candidate) => candidate.message_id === item.reply_to_message_id)}
+                    onNavigateToMessage={messageList.navigateToMessage}
+                    onContextMenu={item.optimistic ? undefined : (event) => {
+                      event.preventDefault();
+                      setMessageMenu({ message: item, x: event.clientX, y: event.clientY });
+                    }}
+                    onAlbumContextMenu={(target, event) => {
+                      if (target.optimistic) return;
+                      event.preventDefault();
+                      setMessageMenu({ message: target, x: event.clientX, y: event.clientY });
+                    }}
+                    onToggleReaction={(emoji) => void onReaction(item, emoji)}
+                    onToggleAlbumReaction={(target, emoji) => void onReaction(target, emoji)}
+                    reactionPeople={reactionPeople}
+                    onPerson={onPerson}
+                    mediaScopeId={conversation.group.group_id}
+                  />
+                </Fragment>
+              );
+            })}
           </>
         )}
       </div>
       {selfMember && (canSendMessages || canSendMedia) ? <div className="composer">
         {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.group.group_id} onClose={() => setReplyingTo(null)} />}
-        {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => { const video = event.currentTarget; if (Number.isFinite(video.duration) && video.duration > 0) video.currentTime = Math.min(0.25, video.duration / 2); }} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}<button onClick={() => setAttachment(null)} aria-label="remove attachment"><X size={14} /></button></div>}
+        <ComposerMediaDrafts attachments={attachments} onRemove={removeAttachment} />
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
         <div className="composer-media-actions">
           <ComposerAttachmentPicker
-            disabled={busy || !canSendMedia}
+            disabled={busy || sending || !canSendMedia || attachments.length >= MAX_COMPOSER_MEDIA_ITEMS}
             self={self}
             onFiles={chooseMediaFromDevice}
             onAttachment={(pending) => {
               setAttachmentError(null);
-              setAttachment(pending);
+              if (!addAttachments([pending])) {
+                setAttachmentError(`you can attach up to ${MAX_COMPOSER_MEDIA_ITEMS} media items`);
+              }
             }}
           />
-          <KlipyPicker disabled={busy || !canSendMedia} onPick={sendKlipy} />
+          <KlipyPicker disabled={busy || sending || !canSendMedia} onPick={sendKlipy} />
         </div>
-        <input ref={fileInput} hidden type="file" accept="image/*,video/*,audio/*" onChange={(event) => void chooseMedia(event.target.files?.[0])} />
+        <input ref={fileInput} hidden multiple type="file" accept="image/*,video/*,audio/*" onChange={(event) => chooseMedia(Array.from(event.target.files ?? []))} />
         <textarea
           ref={composerInput}
           rows={1}
@@ -7128,7 +7413,11 @@ function ConversationPanel({
             }
           }}
         />
-        <button className="send-button" disabled={(!draft.trim() && !attachment) || busy || (!!draft.trim() && !canSendMessages) || (!!attachment && !canSendMedia)} onClick={() => void submit()}><ArrowUp size={17} /></button>
+        {sending ? (
+          <button type="button" className="send-button" onClick={cancelSend} aria-label="cancel media upload" title="cancel media upload"><X size={17} /></button>
+        ) : (
+          <button className="send-button" disabled={(!draft.trim() && !attachments.length) || busy || (!!draft.trim() && !canSendMessages) || (attachments.length > 0 && !canSendMedia)} onClick={() => void submit()}><ArrowUp size={17} /></button>
+        )}
       </div> : selfMember ? <div className="membership-revoked"><ShieldOff size={16} /> {topic?.locked ? "this topic is locked" : "only moderators can post right now"}</div> : <div className="membership-revoked"><UserRoundX size={16} /> you no longer have access to this group</div>}
       <aside className="member-sidebar">
         <div className="member-sidebar-list">
@@ -7215,17 +7504,16 @@ function ConversationPanel({
   );
 }
 
-function DirectConversationPanel({ conversation, contact, active, busy, self, selfPresence, contactPresence, messageJump, onPerson, onAlbum, onBlock, onDelete, onDeleteMessage, onDownload, onForward, onSetDisappearing, onMessagesExpired, onSend }: { conversation: DirectConversation; contact: DirectSummary; active: boolean; busy: boolean; self: IdentitySummary; selfPresence: PresenceStatus; contactPresence: PresenceStatus; messageJump: { eventId: string; nonce: number } | null; onPerson: (person: PersonSummary) => void; onAlbum: (person: PersonSummary) => void; onBlock: (person: PersonSummary) => void; onDelete: () => void; onDeleteMessage: (message: MessageSummary) => void; onDownload: (message: MessageSummary) => Promise<boolean>; onForward: (message: MessageSummary) => void; onSetDisappearing: (seconds: number | null) => Promise<boolean>; onMessagesExpired: () => Promise<void>; onSend: (text: string, attachment: PendingMedia | null, onProgress: (progress: number) => void, replyToMessageId: string | null, signal: AbortSignal) => Promise<boolean> }) {
+function DirectConversationPanel({ conversation, contact, active, busy, self, selfPresence, contactPresence, messageJump, onPerson, onAlbum, onBlock, onDelete, onDeleteMessage, onDownload, onForward, onSetDisappearing, onMessagesExpired, onSend }: { conversation: DirectConversation; contact: DirectSummary; active: boolean; busy: boolean; self: IdentitySummary; selfPresence: PresenceStatus; contactPresence: PresenceStatus; messageJump: { eventId: string; nonce: number } | null; onPerson: (person: PersonSummary) => void; onAlbum: (person: PersonSummary) => void; onBlock: (person: PersonSummary) => void; onDelete: () => void; onDeleteMessage: (message: MessageSummary) => void; onDownload: (message: MessageSummary) => Promise<boolean>; onForward: (message: MessageSummary) => void; onSetDisappearing: (seconds: number | null) => Promise<boolean>; onMessagesExpired: () => Promise<void>; onSend: (text: string, attachments: PendingMedia[], replyToMessageId: string | null, signal: AbortSignal, onProgress?: (index: number, progress: number) => void) => Promise<ComposerSendResult> }) {
   const [draft, setDraft] = useState("");
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
   const composerUploadKey = `direct:${contact.public_key}`;
   const {
-    attachment,
-    progress: uploadProgress,
-    controller: uploadController,
-    setAttachment,
-    setProgress: setUploadProgress,
-    setController: setUploadController,
+    attachments,
+    addAttachments,
+    removeAttachment,
+    takeAttachments,
   } = useComposerUpload(composerUploadKey);
   const [messageMenu, setMessageMenu] = useState<{ message: MessageSummary; x: number; y: number } | null>(null);
   const [replyingTo, setReplyingTo] = useState<MessageSummary | null>(null);
@@ -7234,6 +7522,8 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
   const [expiryClock, setExpiryClock] = useState(() => Date.now());
   const fileInput = useRef<HTMLInputElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
+  const sendController = useRef<AbortController | null>(null);
+  useEffect(() => () => sendController.current?.abort(), []);
   const onMessagesExpiredRef = useRef(onMessagesExpired);
   useEffect(() => {
     onMessagesExpiredRef.current = onMessagesExpired;
@@ -7285,29 +7575,39 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
     }, 0);
     return () => window.clearTimeout(timer);
   }, [messageJump?.eventId, messageJump?.nonce]);
-  const chooseMedia = useCallback((file?: File) => {
-    if (!file) return;
-    setAttachmentError(null);
-    if (!/^(image|video|audio)\//.test(file.type)) {
-      setAttachmentError("choose an image, video, or audio file");
-      return;
-    }
-    if (!file.size || file.size > 500 * 1024 * 1024) {
-      setAttachmentError("media can be up to 500 MB");
-      return;
-    }
-    setAttachment(preparePendingMedia(file));
+  const chooseMedia = useCallback((files: File[]) => {
+    if (!files.length) return;
+    const selection = prepareComposerMediaFiles(
+      files,
+      MAX_COMPOSER_MEDIA_ITEMS - attachments.length,
+    );
+    const accepted = addAttachments(selection.attachments);
+    setAttachmentError(composerMediaError(
+      selection.error,
+      accepted < selection.attachments.length,
+    ));
     if (fileInput.current) fileInput.current.value = "";
-  }, [setAttachment]);
+  }, [addAttachments, attachments.length]);
   const mediaDragging = useComposerMediaIntake(
     active,
-    contact.accepts_direct_messages && !busy && uploadProgress === null,
+    contact.accepts_direct_messages
+      && !busy
+      && !sending
+      && attachments.length < MAX_COMPOSER_MEDIA_ITEMS,
     chooseMedia,
-    (path) => {
+    (paths) => {
       setAttachmentError(null);
-      void pendingMediaFromNativePath(path)
+      const available = MAX_COMPOSER_MEDIA_ITEMS - attachments.length;
+      void Promise.all(
+        paths.slice(0, MAX_COMPOSER_MEDIA_ITEMS * 2).map((path) => pendingMediaFromNativePath(path)),
+      )
         .then((pending) => {
-          if (pending) setAttachment(pending);
+          const selection = prepareComposerPendingMedia(pending, available);
+          const accepted = addAttachments(selection.attachments);
+          setAttachmentError(composerMediaError(
+            selection.error,
+            paths.length > available || accepted < selection.attachments.length,
+          ));
         })
         .catch((cause) => setAttachmentError(message(cause)));
     },
@@ -7319,33 +7619,51 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
     }
     setAttachmentError(null);
     try {
-      const pending = await chooseNativePendingMedia();
-      if (pending) setAttachment(pending);
+      const available = MAX_COMPOSER_MEDIA_ITEMS - attachments.length;
+      const nativeSelection = await chooseNativePendingMedia(available);
+      const selection = prepareComposerPendingMedia(nativeSelection.attachments, available);
+      const accepted = addAttachments(selection.attachments);
+      setAttachmentError(composerMediaError(
+        selection.error,
+        nativeSelection.omittedCount > 0 || accepted < selection.attachments.length,
+      ));
     } catch (cause) {
       setAttachmentError(message(cause));
     }
   }
+  function cancelSend() {
+    sendController.current?.abort();
+  }
   async function submit() {
     const text = draft.trim();
-    if ((!text && !attachment) || busy) return;
-    const submittedDraft = draft;
+    if ((!text && !attachments.length) || busy || sending) return;
     const submittedReply = replyingTo;
-    const pendingAttachment = attachment;
+    const pendingAttachments = takeAttachments();
+    const controller = new AbortController();
+    sendController.current = controller;
     setDraft("");
     setReplyingTo(null);
-    if (pendingAttachment) setUploadProgress(0);
-    const controller = new AbortController();
-    setUploadController(controller);
-    const sent = await onSend(text, pendingAttachment, setUploadProgress, submittedReply?.message_id ?? null, controller.signal);
-    const ownsUploadState = composerUpload(composerUploadKey).controller === controller;
-    if (ownsUploadState) {
-      setUploadController(null);
-      setUploadProgress(null);
+    setSending(true);
+    let confirmedCount = 0;
+    try {
+      const result = await onSend(
+        text,
+        pendingAttachments,
+        submittedReply?.message_id ?? null,
+        controller.signal,
+      );
+      confirmedCount = result.confirmedCount;
+    } finally {
+      if (sendController.current === controller) sendController.current = null;
+      setSending(false);
     }
-    if (sent && ownsUploadState) {
-      setAttachment(null);
-    } else if (!sent && ownsUploadState) {
-      setDraft((current) => current || submittedDraft);
+    const restore = restoreComposerAfterSend({
+      confirmedCount,
+      attachments: pendingAttachments,
+    });
+    if (restore.remainingAttachments.length) addAttachments(restore.remainingAttachments);
+    if (restore.restoreDraft) {
+      setDraft((current) => current || text);
       setReplyingTo((current) => current ?? submittedReply);
     }
   }
@@ -7353,28 +7671,35 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
     file: File,
     onProgress: (progress: number) => void,
   ) {
-    if (busy || uploadProgress !== null) return false;
+    if (busy || sending) return false;
     setAttachmentError(null);
     const submittedReply = replyingTo;
     const controller = new AbortController();
-    const sent = await onSend(
-      "",
-      preparePendingMedia(file),
-      onProgress,
-      submittedReply?.message_id ?? null,
-      controller.signal,
-    );
-    if (sent) {
-      setReplyingTo((current) =>
-        current?.message_id === submittedReply?.message_id ? null : current
+    sendController.current = controller;
+    setSending(true);
+    try {
+      const sent = await onSend(
+        "",
+        [preparePendingMedia(file)],
+        submittedReply?.message_id ?? null,
+        controller.signal,
+        (_index, progress) => onProgress(progress),
       );
+      if (sent.confirmedCount > 0) {
+        setReplyingTo((current) =>
+          current?.message_id === submittedReply?.message_id ? null : current
+        );
+      }
+      return sent.confirmedCount > 0;
+    } finally {
+      if (sendController.current === controller) sendController.current = null;
+      setSending(false);
     }
-    return sent;
   }
   const person = { public_key: contact.public_key, username: contact.username, bio: contact.bio, avatar: contact.avatar, album: contact.album, accepts_direct_messages: contact.accepts_direct_messages, direct_message_policy: contact.direct_message_policy, presence_status: contactPresence };
   return (
     <div className="conversation direct-conversation">
-      {mediaDragging && <div className="media-drop-overlay" aria-hidden="true"><Images size={34} /><strong>drop media to attach</strong><span>images, video, or audio</span></div>}
+      {mediaDragging && <div className="media-drop-overlay" aria-hidden="true"><Images size={34} /><strong>drop media to attach</strong><span>up to {MAX_COMPOSER_MEDIA_ITEMS} images, videos, or audio files</span></div>}
       <header className="chat-header" data-tauri-drag-region>
         <div className="group-identity static" data-tauri-drag-region>
           <PresenceAvatar name={contact.username} image={contact.avatar} size={36} status={contactPresence} />
@@ -7399,46 +7724,68 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
             sentinel={messageList.olderSentinel}
           />
         )}
-        {messageList.visibleMessages.map((rawItem, index) => {
-          const item = withCurrentDirectProfile(rawItem, self, contact);
-          const startsDay = index === 0 || !sameLocalDay(
-            messageList.visibleMessages[index - 1].created_at_millis,
-            rawItem.created_at_millis,
-          );
+        {groupMediaMessages(
+          messageList.visibleMessages.map((item) => withCurrentDirectProfile(item, self, contact)),
+        ).map((mediaGroup, index, groups) => {
+          const item = mediaGroup.messages[0];
           const rawReply = visibleMessages.find(
             (candidate) => candidate.message_id === item.reply_to_message_id,
           );
           const replyTo = rawReply ? withCurrentDirectProfile(rawReply, self, contact) : undefined;
           return (
             <Fragment key={item.event_id}>
-              {startsDay && <MessageDateSeparator millis={item.created_at_millis} />}
-              <MessageRow message={item} own={item.author_public_key === self.public_key} showDirectReceipt={item.event_id === latestOwnMessageEventId} presence={item.author_public_key === self.public_key ? selfPresence : contactPresence} replyTo={replyTo} onNavigateToMessage={messageList.navigateToMessage} onContextMenu={item.optimistic ? undefined : (event) => { event.preventDefault(); setMessageMenu({ message: item, x: event.clientX, y: event.clientY }); }} onPerson={onPerson} mediaScopeId={conversation.media_scope_id} />
+              {(index === 0 || !sameLocalDay(
+                groups[index - 1].messages[0].created_at_millis,
+                item.created_at_millis,
+              )) && <MessageDateSeparator millis={item.created_at_millis} />}
+              <MessageRow
+                message={item}
+                album={mediaGroup.messages.length > 1 ? mediaGroup.messages : undefined}
+                own={item.author_public_key === self.public_key}
+                directReceiptMessageId={latestOwnMessageEventId ?? undefined}
+                presence={item.author_public_key === self.public_key ? selfPresence : contactPresence}
+                replyTo={replyTo}
+                onNavigateToMessage={messageList.navigateToMessage}
+                onContextMenu={item.optimistic ? undefined : (event) => {
+                  event.preventDefault();
+                  setMessageMenu({ message: item, x: event.clientX, y: event.clientY });
+                }}
+                onAlbumContextMenu={(target, event) => {
+                  if (target.optimistic) return;
+                  event.preventDefault();
+                  setMessageMenu({ message: target, x: event.clientX, y: event.clientY });
+                }}
+                onPerson={onPerson}
+                mediaScopeId={conversation.media_scope_id}
+              />
             </Fragment>
           );
         })}
       </div>
       {contact.accepts_direct_messages ? <div className="composer direct-composer">
         {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.media_scope_id} onClose={() => setReplyingTo(null)} />}
-        {attachment && <div className={`attachment-draft ${attachment.mimeType.startsWith("audio/") ? "audio" : ""}`}>{attachment.mimeType.startsWith("image/") ? <img src={attachment.previewUrl} alt="" /> : attachment.mimeType.startsWith("video/") ? <video src={attachment.previewUrl} muted playsInline preload="metadata" onLoadedMetadata={(event) => primeVideoFrame(event.currentTarget)} /> : <div className="audio-thumbnail"><AudioWaveform size={30} /></div>}{uploadProgress !== null && <div className="attachment-progress"><i style={{ width: `${uploadProgress}%` }} /><span>{uploadProgress === 0 && attachment.mimeType.startsWith("video/") ? "preparing video" : `${uploadProgress}%`}</span></div>}<button onClick={() => { uploadController?.abort(); setUploadController(null); setAttachment(null); setUploadProgress(null); }} aria-label={uploadProgress !== null ? "cancel upload" : "remove attachment"}><X size={14} /></button></div>}
+        <ComposerMediaDrafts attachments={attachments} onRemove={removeAttachment} />
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
         <div className="composer-media-actions">
           <ComposerAttachmentPicker
-            disabled={busy || uploadProgress !== null}
+            disabled={busy || sending || attachments.length >= MAX_COMPOSER_MEDIA_ITEMS}
             self={self}
             onFiles={chooseMediaFromDevice}
             onAttachment={(pending) => {
               setAttachmentError(null);
-              setAttachment(pending);
+              if (!addAttachments([pending])) {
+                setAttachmentError(`you can attach up to ${MAX_COMPOSER_MEDIA_ITEMS} media items`);
+              }
             }}
           />
-          <KlipyPicker disabled={busy || uploadProgress !== null} onPick={sendKlipy} />
+          <KlipyPicker disabled={busy || sending} onPick={sendKlipy} />
         </div>
-        <input ref={fileInput} hidden type="file" accept="image/*,video/*,audio/*" onChange={(event) => void chooseMedia(event.target.files?.[0])} />
+        <input ref={fileInput} hidden multiple type="file" accept="image/*,video/*,audio/*" onChange={(event) => chooseMedia(Array.from(event.target.files ?? []))} />
         <div className="direct-composer-input">
-          <textarea ref={composerInput} rows={1} value={draft} placeholder={`message ${contact.username}`} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); } }} />
+          <textarea ref={composerInput} rows={1} value={draft} disabled={sending} placeholder={`message ${contact.username}`} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); } }} />
           <button
             className={`timer-button ${conversation.disappearing_after_read_seconds ? "active" : ""}`}
-            disabled={busy}
+            disabled={busy || sending}
             onClick={() => setShowDisappearingMessages(true)}
             aria-label="disappearing messages"
             title={conversation.disappearing_after_read_seconds
@@ -7448,7 +7795,11 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
             <TimerReset size={17} />
           </button>
         </div>
-        <button className="send-button" disabled={(!draft.trim() && !attachment) || busy} onClick={() => void submit()}><ArrowUp size={17} /></button>
+        {sending ? (
+          <button type="button" className="send-button" onClick={cancelSend} aria-label="cancel media upload" title="cancel media upload"><X size={17} /></button>
+        ) : (
+          <button className="send-button" disabled={(!draft.trim() && !attachments.length) || busy} onClick={() => void submit()}><ArrowUp size={17} /></button>
+        )}
       </div> : <div className="membership-revoked"><MessageCircle size={16} /> {contact.username} isn’t accepting DMs</div>}
       <aside className="member-sidebar direct-profile-sidebar">
         <button className="direct-profile-identity" onClick={() => onPerson(person)}>
@@ -7610,25 +7961,31 @@ function AboutNoiseDialog({ onClose }: { onClose: () => void }) {
 
 function MessageRow({
   message,
+  album,
   own,
-  showDirectReceipt = false,
+  directReceiptMessageId,
   presence,
   replyTo,
   onNavigateToMessage,
   onContextMenu,
+  onAlbumContextMenu,
   onToggleReaction,
+  onToggleAlbumReaction,
   reactionPeople,
   onPerson,
   mediaScopeId,
 }: {
   message: MessageSummary;
+  album?: MessageSummary[];
   own: boolean;
-  showDirectReceipt?: boolean;
+  directReceiptMessageId?: string;
   presence?: PresenceStatus;
   replyTo?: MessageSummary;
   onNavigateToMessage: (eventId: string) => void;
   onContextMenu?: (event: React.MouseEvent<HTMLElement>) => void;
+  onAlbumContextMenu?: (message: MessageSummary, event: React.MouseEvent<HTMLElement>) => void;
   onToggleReaction?: (emoji: string) => void;
+  onToggleAlbumReaction?: (message: MessageSummary, emoji: string) => void;
   reactionPeople?: Map<string, PersonSummary>;
   onPerson: (person: PersonSummary) => void;
   mediaScopeId?: string;
@@ -7650,15 +8007,17 @@ function MessageRow({
     ? emojiOnlyCount(message.text)
     : null;
   const previewUrl = firstLink(message.text);
+  const footerMessage = album?.at(-1) ?? message;
+  const showReceipt = own && directReceiptMessageId === footerMessage.event_id;
   return (
     <article
-      className={`message-row ${own ? "own" : ""} ${message.optimistic ? "optimistic" : ""}`}
+      className={`message-row ${own ? "own" : ""} ${message.optimistic ? "optimistic" : ""} ${album ? "media-album-row" : ""}`}
       data-message-id={message.event_id}
       onMouseDown={onContextMenu ? (event) => { if (event.button === 2) event.preventDefault(); } : undefined}
       onContextMenu={onContextMenu ? (event) => {
         event.preventDefault();
         window.getSelection()?.removeAllRanges();
-        onContextMenu?.(event);
+        onContextMenu(event);
       } : undefined}
     >
       <button onClick={() => onPerson(person)}><PresenceAvatar name={message.username} image={message.avatar} size={34} status={presence ?? "offline"} /></button>
@@ -7670,30 +8029,93 @@ function MessageRow({
           : <div className="message-reply-reference"><span>original message unavailable</span></div>)}
         {message.text && <p className={jumboEmojiCount ? `emoji-only emoji-only-${jumboEmojiCount}` : undefined}>{linkify(message.text)}</p>}
         {previewUrl && <LinkPreviewCard url={previewUrl} />}
-        {localAttachment
-          ? <LocalMessageMedia attachment={localAttachment} manifest={message.attachment} scopeId={mediaScopeId} uploadProgress={message.upload_progress} uploadError={message.upload_error} />
-          : message.attachment && <MessageMedia attachment={message.attachment} scopeId={mediaScopeId} />}
+        {album ? (
+          <MessageMediaAlbum
+            messages={album}
+            scopeId={mediaScopeId}
+            onContextMenu={onAlbumContextMenu}
+            onToggleReaction={onToggleAlbumReaction}
+            reactionPeople={reactionPeople}
+            onPerson={onPerson}
+          />
+        ) : localAttachment ? (
+          <LocalMessageMedia attachment={localAttachment} manifest={message.attachment} scopeId={mediaScopeId} uploadProgress={message.upload_progress} uploadError={message.upload_error} />
+        ) : message.attachment && <MessageMedia attachment={message.attachment} scopeId={mediaScopeId} />}
         <div className="message-footer">
-          <time className="message-time">{formatTime(message.created_at_millis)}</time>
-          {message.expires_after_read_seconds && (
-            <span className="message-expiry" title={`disappears ${formatDisappearingDuration(message.expires_after_read_seconds)} after it is read`} aria-label={`disappears ${formatDisappearingDuration(message.expires_after_read_seconds)} after it is read`}>
+          <time className="message-time">{formatTime(footerMessage.created_at_millis)}</time>
+          {footerMessage.expires_after_read_seconds && (
+            <span className="message-expiry" title={`disappears ${formatDisappearingDuration(footerMessage.expires_after_read_seconds)} after it is read`} aria-label={`disappears ${formatDisappearingDuration(footerMessage.expires_after_read_seconds)} after it is read`}>
               <TimerReset size={11} />
             </span>
           )}
-          {showDirectReceipt && own && message.read_at_millis ? (
+          {showReceipt && footerMessage.read_at_millis ? (
             <span className="direct-receipt read" title="read" aria-label="read">
               <Check size={11} />
               <Check size={11} />
             </span>
-          ) : showDirectReceipt && own && message.delivered_at_millis ? (
+          ) : showReceipt && footerMessage.delivered_at_millis ? (
             <span className="direct-receipt delivered" title="delivered" aria-label="delivered">
               <Check size={11} />
             </span>
           ) : null}
         </div>
-        {message.reactions && message.reactions.length > 0 && <MessageReactions reactions={message.reactions} people={reactionPeople} onToggle={onToggleReaction} onPerson={onPerson} />}
+        {!album && message.reactions && message.reactions.length > 0 && <MessageReactions reactions={message.reactions} people={reactionPeople} onToggle={onToggleReaction} onPerson={onPerson} />}
       </div>
     </article>
+  );
+}
+
+function MessageMediaAlbum({
+  messages,
+  scopeId,
+  onContextMenu,
+  onToggleReaction,
+  reactionPeople,
+  onPerson,
+}: {
+  messages: MessageSummary[];
+  scopeId?: string;
+  onContextMenu?: (message: MessageSummary, event: React.MouseEvent<HTMLElement>) => void;
+  onToggleReaction?: (message: MessageSummary, emoji: string) => void;
+  reactionPeople?: Map<string, PersonSummary>;
+  onPerson: (person: PersonSummary) => void;
+}) {
+  return (
+    <div className={`media-album media-album-${messages.length}`}>
+      {messages.map((message, index) => {
+        const localAttachment = message.local_attachment ?? sentMediaPreviewCache.get(message.event_id);
+        return (
+          <div
+            className={`media-album-tile media-album-tile-${index + 1} ${message.optimistic ? "optimistic" : ""}`}
+            key={message.event_id}
+            data-message-id={message.event_id}
+            onMouseDown={onContextMenu ? (event) => {
+              if (event.button === 2) event.preventDefault();
+            } : undefined}
+            onContextMenu={onContextMenu ? (event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              window.getSelection()?.removeAllRanges();
+              onContextMenu(message, event);
+            } : undefined}
+          >
+            {localAttachment ? (
+              <LocalMessageMedia attachment={localAttachment} manifest={message.attachment} scopeId={scopeId} uploadProgress={message.upload_progress} uploadError={message.upload_error} />
+            ) : message.attachment ? (
+              <MessageMedia attachment={message.attachment} scopeId={scopeId} />
+            ) : null}
+            {message.reactions && message.reactions.length > 0 && (
+              <MessageReactions
+                reactions={message.reactions}
+                people={reactionPeople}
+                onToggle={onToggleReaction ? (emoji) => onToggleReaction(message, emoji) : undefined}
+                onPerson={onPerson}
+              />
+            )}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -8267,6 +8689,7 @@ async function pendingMediaFromAttachment(
       })
     : null;
   return {
+    id: crypto.randomUUID(),
     name: file.name,
     mimeType: file.type,
     byteLength: file.size,
@@ -9665,6 +10088,7 @@ function ProfileAlbumDialog({
             ? prepareVideoPreviewSource(queued.previewUrl)
             : prepareMediaPreviewFromFile(preparedFile, "image");
           const pending: PendingMedia = {
+            id: crypto.randomUUID(),
             name: queued.file.name,
             mimeType: queued.file.type,
             byteLength: queued.file.size,
@@ -11770,6 +12194,60 @@ function sameLocalDay(leftMillis: number, rightMillis: number) {
   return left.getFullYear() === right.getFullYear()
     && left.getMonth() === right.getMonth()
     && left.getDate() === right.getDate();
+}
+
+const MEDIA_ALBUM_WINDOW_MILLIS = 5 * 60_000;
+
+type MediaMessageGroup<T extends MessageSummary> = {
+  messages: T[];
+};
+
+function messageMediaMime(message: MessageSummary) {
+  return message.local_attachment?.mime_type ?? message.attachment?.mime_type ?? "";
+}
+
+function messageMediaFileName(message: MessageSummary) {
+  return message.local_attachment?.file_name ?? message.attachment?.file_name ?? "";
+}
+
+function isCollageMediaMessage(message: MessageSummary) {
+  const mimeType = messageMediaMime(message);
+  return (mimeType.startsWith("image/") || mimeType.startsWith("video/"))
+    && !isKlipyStickerFileName(messageMediaFileName(message));
+}
+
+function canAppendToMediaAlbum(
+  album: MessageSummary[],
+  candidate: MessageSummary,
+) {
+  const previous = album.at(-1);
+  if (!previous || album.length >= MAX_COMPOSER_MEDIA_ITEMS) return false;
+  const elapsed = candidate.created_at_millis - previous.created_at_millis;
+  return isCollageMediaMessage(candidate)
+    && candidate.author_public_key === previous.author_public_key
+    && sameLocalDay(previous.created_at_millis, candidate.created_at_millis)
+    && elapsed >= 0
+    && elapsed <= MEDIA_ALBUM_WINDOW_MILLIS
+    && !candidate.text.trim()
+    && !candidate.reply_to_message_id
+    && !candidate.forwarded_from;
+}
+
+function groupMediaMessages<T extends MessageSummary>(messages: T[]) {
+  const groups: MediaMessageGroup<T>[] = [];
+  for (const message of messages) {
+    const previousGroup = groups.at(-1);
+    if (
+      previousGroup
+      && isCollageMediaMessage(previousGroup.messages[0])
+      && canAppendToMediaAlbum(previousGroup.messages, message)
+    ) {
+      previousGroup.messages.push(message);
+    } else {
+      groups.push({ messages: [message] });
+    }
+  }
+  return groups;
 }
 
 function formatMessageDate(millis: number) {
