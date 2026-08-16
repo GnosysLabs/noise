@@ -272,13 +272,14 @@ export function loadActivityInbox(
     if (!Array.isArray(parsed.items) || !Array.isArray(parsed.readIds) || !Array.isArray(parsed.seenScopes)) {
       return emptyActivityInbox();
     }
-    const hasBaseline = typeof parsed.baselineAt === "number";
+    const baselineAt = typeof parsed.baselineAt === "number" ? parsed.baselineAt : Date.now();
     const state = withoutDirectActivity({
       items: parsed.items.filter(isStoredNotification),
       readIds: parsed.readIds.filter((id): id is string => typeof id === "string"),
       seenScopes: parsed.seenScopes.filter((id): id is string => typeof id === "string"),
-      baselineAt: hasBaseline ? parsed.baselineAt : Date.now(),
+      baselineAt,
     });
+    const hasBaseline = typeof parsed.baselineAt === "number";
     if (!hasBaseline || state.items.length !== parsed.items.length) {
       saveActivityInbox(identityPublicKey, state, storage);
     }
