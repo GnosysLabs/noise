@@ -48,9 +48,10 @@ invitation locator, the commit extends the exact current control head, and it
 only adds the joining account. No existing group member or device participates
 in admission.
 
-Only the founder may author a commit that removes accounts: members publish
-signed self-removal requests, moderators publish signed ban requests, and a
-founder client converts valid requests into MLS removal commits.
+Any current member may apply a signed self-leave: the departing account
+publishes the request, and the next online member binds those requests into
+the removal epoch. Moderators still publish signed ban requests, and only the
+founder converts those into MLS removal commits.
 
 The central transaction lock admits only one child for a control head.
 Concurrent external joins automatically refetch the winning head and create a

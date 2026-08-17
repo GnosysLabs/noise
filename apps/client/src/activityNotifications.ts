@@ -1,3 +1,4 @@
+import { mentionedPublicKeys, prettyMentionText } from "./mentionSuggestions.ts";
 import type {
   Conversation,
   MessageSummary,
@@ -54,14 +55,21 @@ export function activityInboxStorageKey(identityPublicKey: string) {
 
 export function messageMentionsIdentity(
   text: string,
-  username: string,
-  noiseId?: string | null,
+  self: { public_key: string; username: string; noise_id?: string | null },
+  members: Array<{ public_key: string; username: string }> = [],
 ) {
-  return mentionNames(username, noiseId).some((name) => mentionPattern(name).test(text));
+  const roster = members.length > 0 ? members : [self];
+  if (mentionedPublicKeys(text, roster).has(self.public_key)) return true;
+  const noiseId = self.noise_id?.trim();
+  return Boolean(noiseId) && mentionPattern(noiseId!).test(text);
 }
 
-export function activityPreview(text: string, mimeType?: string | null) {
-  const trimmed = text.trim().replace(/\s+/g, " ");
+export function activityPreview(
+  text: string,
+  mimeType?: string | null,
+  people: Array<{ public_key: string; username: string }> = [],
+) {
+  const trimmed = prettyMentionText(text.trim().replace(/\s+/g, " "), people);
   if (trimmed) return trimmed.length > 86 ? `${trimmed.slice(0, 85)}…` : trimmed;
   if (mimeType?.startsWith("image/")) return "sent a photo";
   if (mimeType?.startsWith("video/")) return "sent a video";
@@ -141,6 +149,7 @@ export function notificationsFromMessages(
       .map((message) => message.message_id),
   );
   const items: ActivityNotification[] = [];
+  const roster = [self, ...people.values()];
   for (const message of messages) {
     if (message.optimistic || hidden.has(message.author_public_key)) continue;
     const actor = people.get(message.author_public_key) ?? {
@@ -157,14 +166,14 @@ export function notificationsFromMessages(
       directUsername: scope.directUsername,
     };
     if (message.author_public_key !== self.public_key) {
-      if (messageMentionsIdentity(message.text, self.username, self.noise_id)) {
+      if (messageMentionsIdentity(message.text, self, roster)) {
         items.push({
           id: `mention:${message.event_id}`,
           kind: "mention",
           eventId: message.event_id,
           createdAtMillis: message.created_at_millis,
           actor,
-          preview: activityPreview(message.text, message.attachment?.mime_type),
+          preview: activityPreview(message.text, message.attachment?.mime_type, roster),
           ...location,
         });
       }
@@ -178,7 +187,7 @@ export function notificationsFromMessages(
           eventId: message.event_id,
           createdAtMillis: message.created_at_millis,
           actor,
-          preview: activityPreview(message.text, message.attachment?.mime_type),
+          preview: activityPreview(message.text, message.attachment?.mime_type, roster),
           ...location,
         });
       }
@@ -198,7 +207,7 @@ export function notificationsFromMessages(
             eventId: message.event_id,
             createdAtMillis: message.created_at_millis,
             actor: reactor,
-            preview: activityPreview(message.text, message.attachment?.mime_type),
+            preview: activityPreview(message.text, message.attachment?.mime_type, roster),
             emoji: reaction.emoji,
             ...location,
           });
@@ -303,15 +312,9 @@ export function saveActivityInbox(
   }
 }
 
-function mentionNames(username: string, noiseId?: string | null) {
-  const names = [username.trim()].filter(Boolean);
-  if (noiseId?.trim()) names.push(noiseId.trim());
-  return [...new Set(names)];
-}
-
 function mentionPattern(name: string) {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(^|[^\\w@])@${escaped}(?=$|[^\\w])`, "i");
+  return new RegExp(`(^|[^\\w@])@${escaped}(?=$|[^\\w#])`, "i");
 }
 
 function sameDay(left: Date, right: Date) {

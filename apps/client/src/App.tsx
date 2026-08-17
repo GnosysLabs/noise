@@ -99,6 +99,9 @@ import {
   type ConversationScrollAnchor,
 } from "./conversationScroll";
 import { NewMessagesPill } from "./NewMessagesPill";
+import { MentionPicker } from "./MentionPicker";
+import { prettyMentionText } from "./mentionSuggestions";
+import { useMentionComposer } from "./useMentionComposer";
 import { ActivityInbox } from "./ActivityInbox";
 import { useActivityInbox } from "./useActivityInbox";
 import { loadLocalActivityConversations } from "./activityInboxSync";
@@ -106,6 +109,8 @@ import {
   notificationsFromGroupConversation,
   type ActivityNotification,
 } from "./activityNotifications";
+import { groupToHydrate } from "./groupSelection";
+import { noiseSignature } from "./noiseSignature";
 import type {
   AdultAccessSummary,
   AttachmentData,
@@ -124,6 +129,7 @@ import type {
   GroupSummary,
   GroupWatch,
   IdentitySummary,
+  JoinResult,
   LocalSummary,
   LinkPreview,
   MakeResult,
@@ -2825,7 +2831,7 @@ export default function App() {
     }
 
     if (sidebarMode === "groups") {
-      const activeGroup = local.groups.find((group) => group.is_active);
+      const activeGroup = groupToHydrate(local.groups, desiredGroupIdRef.current);
       if (!activeGroup) {
         setSummary(local);
         setConversation(null);
@@ -5317,7 +5323,7 @@ export default function App() {
                 relays,
               });
               if (!result) throw new Error("the group was not created");
-              await refresh();
+              await selectGroup(result.group);
               setDialog({
                 type: "frequency",
                 group: result.group.name,
@@ -5333,8 +5339,9 @@ export default function App() {
           onClose={() => setDialog(null)}
           onSubmit={(frequency) =>
             perform(async () => {
-              await noise({ action: "join", frequency, relays });
-              await refresh();
+              const result = await noise<JoinResult>({ action: "join", frequency, relays });
+              if (!result) throw new Error("the group could not be joined");
+              await selectGroup(result.group);
               setDialog(null);
             })
           }
@@ -7296,6 +7303,13 @@ function ConversationPanel({
   const sendController = useRef<AbortController | null>(null);
   useEffect(() => () => sendController.current?.abort(), []);
   useAutosizeComposer(composerInput, draft);
+  const mentions = useMentionComposer(
+    conversation.members,
+    selfPublicKey,
+    draft,
+    setDraft,
+    composerInput,
+  );
   const conversationKey = `${conversation.group.group_id}:${topic?.topic_id ?? "general"}`;
   const messageList = useChunkedMessageList(
     conversationKey,
@@ -7594,6 +7608,7 @@ function ConversationPanel({
                     onToggleReaction={(emoji) => void onReaction(item, emoji)}
                     onToggleAlbumReaction={(target, emoji) => void onReaction(target, emoji)}
                     reactionPeople={reactionPeople}
+                    mentionPeople={conversation.members}
                     onPerson={onPerson}
                     mediaScopeId={conversation.group.group_id}
                   />
@@ -7610,7 +7625,7 @@ function ConversationPanel({
             : (messageList.newMessageCount > 0 ? messageList.newMessageCount : unreadCount)}
           onClick={messageList.scrollToNewest}
         />
-        {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.group.group_id} onClose={() => setReplyingTo(null)} />}
+        {replyingTo && <ReplyTarget message={replyingTo} mentionPeople={conversation.members} mediaScopeId={conversation.group.group_id} onClose={() => setReplyingTo(null)} />}
         <ComposerMediaDrafts attachments={attachments} onRemove={removeAttachment} />
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
         <div className="composer-media-actions">
@@ -7628,20 +7643,36 @@ function ConversationPanel({
           <KlipyPicker disabled={busy || sending || !canSendMedia} onPick={sendKlipy} />
         </div>
         <input ref={fileInput} hidden multiple type="file" accept="image/*,video/*,audio/*" onChange={(event) => chooseMedia(Array.from(event.target.files ?? []))} />
-        <textarea
-          ref={composerInput}
-          rows={1}
-          value={draft}
-          disabled={!canSendMessages}
-          placeholder={canSendMessages ? `send to ${topic?.name ?? "General"}` : topic?.locked ? "this topic is locked" : "members cannot send messages"}
-          onChange={(event) => setDraft(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
-              event.preventDefault();
-              void submit();
-            }
-          }}
-        />
+        <div className="composer-input">
+          <MentionPicker
+            people={mentions.matches}
+            selectedIndex={mentions.selectedIndex}
+            onSelect={mentions.pick}
+            onHover={mentions.setSelectedIndex}
+            renderAvatar={(person) => {
+              const member = conversation.members.find((item) => item.public_key === person.public_key);
+              return <Avatar name={person.username} image={member?.avatar ?? null} size={28} />;
+            }}
+          />
+          <textarea
+            ref={composerInput}
+            rows={1}
+            value={draft}
+            disabled={!canSendMessages}
+            placeholder={canSendMessages ? `send to ${topic?.name ?? "General"}` : topic?.locked ? "this topic is locked" : "members cannot send messages"}
+            onChange={(event) => mentions.onDraftChange(event.target.value, event.currentTarget)}
+            onClick={(event) => mentions.syncCursor(event.currentTarget)}
+            onKeyUp={(event) => mentions.syncCursor(event.currentTarget)}
+            onSelect={(event) => mentions.syncCursor(event.currentTarget)}
+            onKeyDown={(event) => {
+              if (mentions.onKeyDown(event)) return;
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                void submit();
+              }
+            }}
+          />
+        </div>
         {sending ? (
           <button type="button" className="send-button" onClick={cancelSend} aria-label="cancel media upload" title="cancel media upload"><X size={17} /></button>
         ) : (
@@ -7988,6 +8019,7 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
                   if (target.optimistic) return;
                   setMessageMenu({ message: target, x: position.x, y: position.y });
                 }}
+                mentionPeople={[self, contact]}
                 onPerson={onPerson}
                 mediaScopeId={conversation.media_scope_id}
               />
@@ -8000,7 +8032,7 @@ function DirectConversationPanel({ conversation, contact, active, busy, self, se
           count={messageList.atBottom ? 0 : messageList.newMessageCount}
           onClick={messageList.scrollToNewest}
         />
-        {replyingTo && <ReplyTarget message={replyingTo} mediaScopeId={conversation.media_scope_id} onClose={() => setReplyingTo(null)} />}
+        {replyingTo && <ReplyTarget message={replyingTo} mentionPeople={[self, contact]} mediaScopeId={conversation.media_scope_id} onClose={() => setReplyingTo(null)} />}
         <ComposerMediaDrafts attachments={attachments} onRemove={removeAttachment} />
         {attachmentError && <div className="attachment-error">{attachmentError}</div>}
         <div className="composer-media-actions">
@@ -8111,8 +8143,8 @@ function DisappearingMessagesDialog({ currentSeconds, busy, onClose, onSelect }:
   );
 }
 
-function ReplyTarget({ message, mediaScopeId, onClose }: { message: MessageSummary; mediaScopeId?: string; onClose: () => void }) {
-  return <div className="reply-target"><Reply size={15} />{message.attachment && <ReplyMediaThumbnail message={message as MessageSummary & { attachment: MediaAttachment }} scopeId={mediaScopeId} />}<span><small>replying to {message.username}</small><strong>{replyPreview(message)}</strong></span><button onClick={onClose} aria-label="cancel reply"><X size={14} /></button></div>;
+function ReplyTarget({ message, mentionPeople, mediaScopeId, onClose }: { message: MessageSummary; mentionPeople?: Array<{ public_key: string; username: string }>; mediaScopeId?: string; onClose: () => void }) {
+  return <div className="reply-target"><Reply size={15} />{message.attachment && <ReplyMediaThumbnail message={message as MessageSummary & { attachment: MediaAttachment }} scopeId={mediaScopeId} />}<span><small>replying to {message.username}</small><strong>{replyPreview(message, mentionPeople)}</strong></span><button onClick={onClose} aria-label="cancel reply"><X size={14} /></button></div>;
 }
 
 function AppVersionFooter() {
@@ -8209,6 +8241,7 @@ function MessageRow({
   onToggleReaction,
   onToggleAlbumReaction,
   reactionPeople,
+  mentionPeople,
   onPerson,
   mediaScopeId,
 }: {
@@ -8224,6 +8257,7 @@ function MessageRow({
   onToggleReaction?: (emoji: string) => void;
   onToggleAlbumReaction?: (message: MessageSummary, emoji: string) => void;
   reactionPeople?: Map<string, PersonSummary>;
+  mentionPeople?: PersonSummary[];
   onPerson: (person: PersonSummary) => void;
   mediaScopeId?: string;
 }) {
@@ -8258,9 +8292,22 @@ function MessageRow({
         <div className="message-meta"><button onClick={() => onPerson(person)}>{message.username}</button></div>
         {forwardedPerson && <div className="message-forwarded"><Forward size={13} /><span>Forwarded from</span><button onClick={() => onPerson(forwardedPerson)}>{forwardedPerson.username}</button></div>}
         {message.reply_to_message_id && (replyTo
-          ? <button type="button" className="message-reply-reference navigable" onClick={() => onNavigateToMessage(replyTo.event_id)}>{replyTo.attachment && <ReplyMediaThumbnail message={replyTo as MessageSummary & { attachment: MediaAttachment }} scopeId={mediaScopeId} />}<span className="message-reply-copy"><strong>{replyTo.username}</strong><span>{replyPreview(replyTo)}</span></span></button>
+          ? <button type="button" className="message-reply-reference navigable" onClick={() => onNavigateToMessage(replyTo.event_id)}>{replyTo.attachment && <ReplyMediaThumbnail message={replyTo as MessageSummary & { attachment: MediaAttachment }} scopeId={mediaScopeId} />}<span className="message-reply-copy"><strong>{replyTo.username}</strong><span>{replyPreview(replyTo, mentionPeople)}</span></span></button>
           : <div className="message-reply-reference"><span>original message unavailable</span></div>)}
-        {message.text && <p className={jumboEmojiCount ? `emoji-only emoji-only-${jumboEmojiCount}` : undefined}>{linkify(message.text)}</p>}
+        {message.text && (
+          <p className={jumboEmojiCount ? `emoji-only emoji-only-${jumboEmojiCount}` : undefined}>
+            {linkify(message.text, mentionPeople, mentionPeople && {
+              onSelect: (person) => {
+                const member = mentionPeople.find((item) => item.public_key === person.public_key);
+                if (member) onPerson(member);
+              },
+              renderAvatar: (person) => {
+                const member = mentionPeople.find((item) => item.public_key === person.public_key);
+                return <Avatar name={person.username} image={member?.avatar ?? null} size={16} />;
+              },
+            })}
+          </p>
+        )}
         {previewUrl && <LinkPreviewCard url={previewUrl} />}
         {album ? (
           <MessageMediaAlbum
@@ -8700,8 +8747,8 @@ function ReactionChip({
   );
 }
 
-function replyPreview(message: MessageSummary) {
-  const text = message.text.trim();
+function replyPreview(message: MessageSummary, people: Array<{ public_key: string; username: string }> = []) {
+  const text = prettyMentionText(message.text.trim(), people);
   if (text) return text.length > 96 ? `${text.slice(0, 96)}…` : text;
   if (message.attachment?.mime_type.startsWith("image/")) return "photo";
   if (message.attachment?.mime_type.startsWith("video/")) return "video";
@@ -12106,27 +12153,6 @@ function BlockPersonDialog({ person, busy, onClose, onBlock }: { person: PersonS
 
 function PersonDialog({ person, canMessage, canBlock, onMessage, onAlbum, onBlock, onClose }: { person: PersonSummary; canMessage: boolean; canBlock: boolean; onMessage: () => void; onAlbum: () => void; onBlock: () => void; onClose: () => void }) {
   return <Modal onClose={onClose} compact><div className="person-card"><PresenceAvatar name={person.username} image={person.avatar} size={72} status={person.presence_status ?? "offline"} /><h2>{person.username}</h2><div className="noise-signature"><small>noise signature</small><strong>{noiseSignature(person.public_key)}</strong></div><p>{person.bio || "no bio yet"}</p><div className="person-actions">{canMessage && <button className="profile-message" onClick={onMessage}><MessageCircle size={15} /> dm</button>}<button className="profile-album" onClick={onAlbum}><Images size={15} /> {albumButtonLabel(person.album)}</button>{canBlock && <button className="profile-block" onClick={onBlock}><ShieldOff size={15} /> block</button>}</div></div></Modal>;
-}
-
-function noiseSignature(publicKey: string) {
-  const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-  try {
-    const padded = publicKey.padEnd(Math.ceil(publicKey.length / 4) * 4, "=");
-    const bytes = Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
-    if (bytes.length < 8) return "UNAVAILABLE";
-    let signature = "";
-    for (let characterIndex = 0; characterIndex < 12; characterIndex += 1) {
-      let value = 0;
-      for (let bitIndex = 0; bitIndex < 5; bitIndex += 1) {
-        const sourceBit = characterIndex * 5 + bitIndex;
-        value = (value << 1) | ((bytes[Math.floor(sourceBit / 8)] >> (7 - (sourceBit % 8))) & 1);
-      }
-      signature += alphabet[value];
-    }
-    return `${signature.slice(0, 6)}-${signature.slice(6)}`;
-  } catch {
-    return "UNAVAILABLE";
-  }
 }
 
 function CreateTopicDialog({

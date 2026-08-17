@@ -52,6 +52,7 @@ use base64::{
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use noise_core::{
     AcceptedMessage, AcceptedTopic, AccountCredentials, AccountVault, CentralInstallationAuthKey,
+    MemberState,
     DirectPushRequest, DirectPushTrigger, EncryptedBlob, GroupDeletion, GroupEventPayload,
     GroupMembership, GroupPresence, GroupProfile, GroupState, HistoryKeyLink, Identity,
     InviteRecord, InviteRotation, MlsAccountState, MlsControlLog, MlsEpochRecord,
@@ -1948,6 +1949,8 @@ impl ClientState {
         } else {
             self.groups.push(group);
             self.group_order_sequence = self.group_order_sequence.max(sequence);
+            self.group_joined_at_millis
+                .insert(group_id.clone(), current_millis());
         }
         self.active_group_id = Some(group_id);
     }
@@ -2694,6 +2697,7 @@ impl ClientState {
             .retain(|key, _| !topic_key_belongs_to_group(key, group_id));
         self.topic_activity_initialized
             .retain(|key| !topic_key_belongs_to_group(key, group_id));
+        self.group_joined_at_millis.remove(group_id);
     }
 
     fn is_blocked(&self, public_key: &str) -> bool {
@@ -6063,7 +6067,15 @@ impl NoiseClient {
             .cloned()
             .collect::<Vec<_>>();
         let legacy_view = GroupState::rebuild(&group, &legacy_events);
-        let mut control_log = self.fetch_mls_control_log(&relays, &group.group_id).await?;
+        let fetched_control_log = self.fetch_mls_control_log(&relays, &group.group_id).await?;
+        let local_log_is_ahead = local_control_log_is_ahead(
+            fetched_control_log.as_ref(),
+            state.mls_control_logs.get(&group.group_id),
+        );
+        let mut control_log = prefer_newer_control_log(
+            fetched_control_log,
+            state.mls_control_logs.get(&group.group_id),
+        );
         if let (Some(remote), Some(local)) = (
             control_log.as_ref(),
             state.mls_local_geneses.get(&group.group_id),
@@ -6142,7 +6154,9 @@ impl NoiseClient {
             .contains_key(&group.group_id);
         let has_legacy_self_join =
             has_self_join_locator && legacy_view.members.contains_key(&self_public_key);
-        if !local_has_mls_group && !has_self_join_locator {
+        if !local_has_mls_group
+            && (!has_self_join_locator || active_members.contains(&self_public_key))
+        {
             let needs_membership_proof =
                 state
                     .mls_join_requests
@@ -6188,6 +6202,7 @@ impl NoiseClient {
         if !active_members.contains(&self_public_key)
             && !has_pending_membership_proof
             && !has_legacy_self_join
+            && !local_log_is_ahead
         {
             // Erasing a group is the open group's job. A background admission
             // pass must never delete a conversation the user is not looking at.
@@ -6262,9 +6277,10 @@ impl NoiseClient {
         }
 
         let mut control_log = control_log.context("MLS control log is missing")?;
-        if state
-            .mls_group_state(&group.group_id)
-            .is_none_or(|mls| mls.epoch(&group.group_id).is_err())
+        if !active_members.contains(&self_public_key)
+            && state
+                .mls_group_state(&group.group_id)
+                .is_none_or(|mls| mls.epoch(&group.group_id).is_err())
             && let Some(locator) = state
                 .group_invitation_locators
                 .get(&group.group_id)
@@ -6336,22 +6352,7 @@ impl NoiseClient {
             // that stale leaf with a fresh signed device request so any current
             // member can admit this installation again without deleting the
             // group or losing its account-level membership.
-            let sequence = state.take_sequence();
-            let membership_proof =
-                SignedEvent::member_joined(&identity, &group, &state.profile, sequence)?;
-            let mut replacement = MlsAccountState::create(&identity)
-                .context("could not create a replacement MLS device")?;
-            let request = MlsJoinRequest::create_with_membership_proof(
-                &identity,
-                &mut replacement,
-                group.group_id.clone(),
-                membership_proof,
-            )
-            .context("could not create this device's recovery join request")?;
-            state.set_mls_group_state(&group.group_id, replacement);
-            state
-                .mls_join_requests
-                .insert(group.group_id.clone(), request.clone());
+            let request = queue_device_admission_request(&mut state, &identity, &group)?;
             state
                 .mls_control_logs
                 .insert(group.group_id.clone(), control_log);
@@ -6376,10 +6377,11 @@ impl NoiseClient {
         } else {
             Vec::new()
         };
-        // Only the founder's own client turns signed leave and ban requests into
-        // removals, so nobody else has to read them.
-        let applies_removals = is_owner && !admissions_only;
-        if is_current_member && (!join_requests.is_empty() || applies_removals) {
+        // Any current member can apply signed self-leaves. Ban removals still
+        // wait for the founder, who validates encrypted moderator state and
+        // rotates the invite.
+        let applies_bans = is_owner && !admissions_only;
+        if is_current_member {
             state
                 .mls_control_logs
                 .insert(group.group_id.clone(), control_log.clone());
@@ -6393,7 +6395,7 @@ impl NoiseClient {
                     .and_modify(|current| *current = (*current).max(request.created_at_millis))
                     .or_insert(request.created_at_millis);
             }
-            if applies_removals {
+            if applies_bans || !removals.is_empty() {
                 let current_view = rebuild_group_state(&state, &group, &events)?;
                 if let Some((candidate, record, applied_removals)) = prepare_pending_member_removal(
                     &state,
@@ -6402,6 +6404,7 @@ impl NoiseClient {
                     &current_view,
                     &control_log,
                     removals,
+                    applies_bans,
                 )? {
                     if applied_removals
                         .iter()
@@ -6786,73 +6789,102 @@ impl NoiseClient {
             .insert(group.group_id.clone(), locator.clone());
         let identity = state.identity()?;
         if let Some(mut control_log) = self.fetch_mls_control_log(&relays, &group.group_id).await? {
-            let mut admitted = false;
-            for _ in 0..4 {
-                let package = self
-                    .fetch_mls_external_join_package(&relays, &locator)
-                    .await?;
-                let (head_epoch, head_record_id) = control_log.head();
-                if package.group_id != group.group_id
-                    || package.epoch != head_epoch
-                    || package.control_record_id != head_record_id
-                {
-                    control_log = self
-                        .fetch_mls_control_log(&relays, &group.group_id)
-                        .await?
-                        .context("the group encryption head disappeared")?;
-                    replica_settle_delay().await;
-                    continue;
-                }
-                let mut candidate = MlsAccountState::create(&identity)
-                    .context("could not create this identity's encrypted group state")?;
-                let bundle = candidate
-                    .join_group_external(&identity, &group, &package)
-                    .context("could not enter this encrypted group")?;
-                let record = candidate
-                    .create_external_epoch_record(&identity, head_record_id, bundle)
-                    .context("could not authorize this encrypted group entry")?;
-                let next_package = candidate
-                    .external_join_package(&identity, &group, &record.record_id)
-                    .context("could not prepare the next immediate group join")?;
-                state.mls_pending_epochs.insert(
-                    group.group_id.clone(),
-                    PendingMlsEpoch {
-                        candidate: candidate.clone(),
-                        record: record.clone(),
-                    },
-                );
-                save_state_immediately(path, &state)?;
-                let request = MlsExternalJoinRequest {
-                    invitation_locator: locator.clone(),
-                    epoch: record.clone(),
-                    next_package,
-                };
-                match self.publish_mls_external_join(&relays, &request).await? {
-                    ControlHead::Extended => {
-                        state.set_mls_group_state(&group.group_id, candidate);
-                        state.mls_pending_epochs.remove(&group.group_id);
-                        control_log.epochs.push(record);
-                        state
-                            .mls_control_logs
-                            .insert(group.group_id.clone(), control_log.clone());
-                        save_state_immediately(path, &state)?;
-                        admitted = true;
+            let self_public_key = identity.public_key_base64();
+            let mut resume_existing = control_log_includes_account(&control_log, &self_public_key);
+            if !resume_existing {
+                let mut admitted = false;
+                let mut package_was_stale = false;
+                for _ in 0..4 {
+                    if control_log_includes_account(&control_log, &self_public_key) {
+                        resume_existing = true;
                         break;
                     }
-                    ControlHead::Changed => {
-                        state.mls_pending_epochs.remove(&group.group_id);
+                    let package = self
+                        .fetch_mls_external_join_package(&relays, &locator)
+                        .await?;
+                    let (head_epoch, head_record_id) = control_log.head();
+                    if package.group_id != group.group_id
+                        || package.epoch != head_epoch
+                        || package.control_record_id != head_record_id
+                    {
+                        package_was_stale = true;
                         control_log = self
                             .fetch_mls_control_log(&relays, &group.group_id)
                             .await?
                             .context("the group encryption head disappeared")?;
                         replica_settle_delay().await;
+                        continue;
+                    }
+                    package_was_stale = false;
+                    let mut candidate = MlsAccountState::create(&identity)
+                        .context("could not create this identity's encrypted group state")?;
+                    let bundle = candidate
+                        .join_group_external(&identity, &group, &package)
+                        .context("could not enter this encrypted group")?;
+                    let record = candidate
+                        .create_external_epoch_record(&identity, head_record_id, bundle)
+                        .context("could not authorize this encrypted group entry")?;
+                    let next_package = candidate
+                        .external_join_package(&identity, &group, &record.record_id)
+                        .context("could not prepare the next immediate group join")?;
+                    state.mls_pending_epochs.insert(
+                        group.group_id.clone(),
+                        PendingMlsEpoch {
+                            candidate: candidate.clone(),
+                            record: record.clone(),
+                        },
+                    );
+                    save_state_immediately(path, &state)?;
+                    let request = MlsExternalJoinRequest {
+                        invitation_locator: locator.clone(),
+                        epoch: record.clone(),
+                        next_package,
+                    };
+                    match self.publish_mls_external_join(&relays, &request).await? {
+                        ControlHead::Extended => {
+                            state.set_mls_group_state(&group.group_id, candidate);
+                            state.mls_pending_epochs.remove(&group.group_id);
+                            control_log.epochs.push(record);
+                            state
+                                .mls_control_logs
+                                .insert(group.group_id.clone(), control_log.clone());
+                            save_state_immediately(path, &state)?;
+                            admitted = true;
+                            break;
+                        }
+                        ControlHead::Changed => {
+                            state.mls_pending_epochs.remove(&group.group_id);
+                            control_log = self
+                                .fetch_mls_control_log(&relays, &group.group_id)
+                                .await?
+                                .context("the group encryption head disappeared")?;
+                            replica_settle_delay().await;
+                        }
                     }
                 }
+                if !admitted && !resume_existing {
+                    if package_was_stale {
+                        bail!("this group is not ready to accept joins yet");
+                    }
+                    bail!("several people joined at once; noise could not serialize this entry");
+                }
             }
-            anyhow::ensure!(
-                admitted,
-                "several people joined at once; noise could not serialize this entry"
-            );
+            if resume_existing && !local_mls_ready(&state, &group.group_id) {
+                let request = queue_device_admission_request(&mut state, &identity, &group)?;
+                state
+                    .mls_control_logs
+                    .insert(group.group_id.clone(), control_log);
+                save_state_immediately(path, &state)?;
+                self.publish_mls_join_request(&relays, &request).await?;
+            } else if resume_existing {
+                state
+                    .mls_control_logs
+                    .insert(group.group_id.clone(), control_log);
+                save_state_immediately(path, &state)?;
+            }
+            if resume_existing && local_mls_ready(&state, &group.group_id) {
+                return Ok(join_result_for(&group));
+            }
             let sequence = state.take_sequence();
             let joined = create_group_event(
                 &state,
@@ -6878,28 +6910,7 @@ impl NoiseClient {
             save_state_immediately(path, &state)?;
             self.publish_event(&relays, &membership_proof).await?;
         }
-        Ok(JoinResult {
-            group: GroupSummary {
-                group_id: group.group_id,
-                name: group.name,
-                description: group.description,
-                rules: group.rules,
-                content_rating: group.content_rating,
-                avatar: group.avatar,
-                background: group.background,
-                mobile_background: group.mobile_background,
-                accent_color: group.accent_color,
-                members_can_send_messages: group.members_can_send_messages,
-                members_can_send_media: group.members_can_send_media,
-                frequency: None,
-                owner_public_key: group.owner_public_key,
-                remote_deletion_supported: !group.authority_nonce_base64.is_empty(),
-                is_active: true,
-                unread_count: 0,
-                read_state_initialized: false,
-                safety_restriction: None,
-            },
-        })
+        Ok(join_result_for(&group))
     }
 
     pub fn start_direct(
@@ -14593,7 +14604,9 @@ fn rebuild_group_state(
         {
             bail!("this group must restore its encryption history before messages can sync")
         }
-        return Ok(GroupState::rebuild(group, events));
+        let mut view = GroupState::rebuild(group, events);
+        ensure_local_mls_member(&mut view, state, group);
+        return Ok(view);
     };
     log.verify().context("cached MLS control log is invalid")?;
     let mls = state
@@ -14634,12 +14647,52 @@ fn rebuild_group_state(
             record.member_accounts.iter().cloned().collect(),
         );
     }
-    Ok(GroupState::rebuild_with_epoch_keys(
+    let mut view = GroupState::rebuild_with_epoch_keys(
         group,
         events,
         &epoch_keys,
         &epoch_members,
-    ))
+    );
+    ensure_local_mls_member(&mut view, state, group);
+    Ok(view)
+}
+
+fn ensure_local_mls_member(view: &mut GroupState, state: &ClientState, group: &GroupMembership) {
+    let Ok(identity_public_key) = state.identity().map(|identity| identity.public_key_base64())
+    else {
+        return;
+    };
+    if view.members.contains_key(&identity_public_key) {
+        return;
+    }
+    let Some(log) = state.mls_control_logs.get(&group.group_id) else {
+        return;
+    };
+    let (head_epoch, _) = log.head();
+    if !log
+        .member_accounts_at(head_epoch)
+        .is_some_and(|members| members.iter().any(|member| member == &identity_public_key))
+    {
+        return;
+    }
+    let policy = state.profile.effective_direct_message_policy();
+    let joined_at_millis = current_membership_began_millis(log, &identity_public_key)
+        .or_else(|| state.group_joined_at_millis.get(&group.group_id).copied())
+        .unwrap_or_else(current_millis);
+    view.members.insert(
+        identity_public_key.clone(),
+        MemberState {
+            public_key: identity_public_key,
+            username: state.profile.username.clone(),
+            bio: state.profile.bio.clone(),
+            avatar: state.profile.avatar.clone(),
+            album: state.profile.album.clone(),
+            accepts_direct_messages: policy != DirectMessagePolicy::Nobody,
+            direct_message_policy: policy,
+            joined_at_millis,
+            profile_sequence: state.profile_sequence,
+        },
+    );
 }
 
 fn group_cache_has_usable_control_state(
@@ -15306,12 +15359,134 @@ fn control_log_leads_to(observation: &MlsControlLog, newest: &MlsControlLog) -> 
             .all(|(observed, expected)| observed.record_id == expected.record_id)
 }
 
+fn prefer_newer_control_log(
+    remote: Option<MlsControlLog>,
+    local: Option<&MlsControlLog>,
+) -> Option<MlsControlLog> {
+    match (remote, local) {
+        (None, Some(local)) => Some(local.clone()),
+        (Some(remote), None) => Some(remote),
+        (None, None) => None,
+        (Some(remote), Some(local)) => {
+            if control_log_leads_to(&remote, local) {
+                Some(local.clone())
+            } else {
+                Some(remote)
+            }
+        }
+    }
+}
+
+fn local_control_log_is_ahead(remote: Option<&MlsControlLog>, local: Option<&MlsControlLog>) -> bool {
+    match (remote, local) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(remote), Some(local)) => {
+            control_log_leads_to(remote, local) && local.epochs.len() > remote.epochs.len()
+        }
+    }
+}
+
+fn current_membership_began_millis(log: &MlsControlLog, account: &str) -> Option<u64> {
+    membership_began_millis(
+        &log.genesis.member_accounts,
+        log.genesis.created_at_millis,
+        log.epochs
+            .iter()
+            .map(|record| (record.created_at_millis, record.member_accounts.as_slice())),
+        account,
+    )
+}
+
+fn membership_began_millis<'a>(
+    genesis_members: &[String],
+    genesis_at: u64,
+    epochs: impl IntoIterator<Item = (u64, &'a [String])>,
+    account: &str,
+) -> Option<u64> {
+    let is_member = |members: &[String]| members.iter().any(|member| member == account);
+    let mut was_member = is_member(genesis_members);
+    let mut started = was_member.then_some(genesis_at);
+    for (created_at, members) in epochs {
+        let now_member = is_member(members);
+        if now_member && !was_member {
+            started = Some(created_at);
+        }
+        if !now_member {
+            started = None;
+        }
+        was_member = now_member;
+    }
+    started
+}
+
 /// Drop local encryption state that belongs to a superseded branch of the log.
 ///
 /// Competing epochs can only survive if the relays disagreed while two members
 /// admitted at once. A device that merged the losing commit holds an archive key
 /// nobody else derives, so it must rejoin instead of silently failing to read
 /// and write the group.
+fn control_log_includes_account(log: &MlsControlLog, public_key: &str) -> bool {
+    let (head_epoch, _) = log.head();
+    log.member_accounts_at(head_epoch)
+        .is_some_and(|members| members.iter().any(|member| member == public_key))
+}
+
+fn local_mls_ready(state: &ClientState, group_id: &str) -> bool {
+    state
+        .mls_group_state(group_id)
+        .is_some_and(|mls| mls.epoch(group_id).is_ok())
+}
+
+fn queue_device_admission_request(
+    state: &mut ClientState,
+    identity: &Identity,
+    group: &GroupMembership,
+) -> anyhow::Result<MlsJoinRequest> {
+    let sequence = state.take_sequence();
+    let membership_proof =
+        SignedEvent::member_joined(identity, group, &state.profile, sequence)?;
+    let mut replacement = MlsAccountState::create(identity)
+        .context("could not create a replacement MLS device")?;
+    let request = MlsJoinRequest::create_with_membership_proof(
+        identity,
+        &mut replacement,
+        group.group_id.clone(),
+        membership_proof,
+    )
+    .context("could not create this device's recovery join request")?;
+    state.set_mls_group_state(&group.group_id, replacement);
+    state
+        .mls_join_requests
+        .insert(group.group_id.clone(), request.clone());
+    Ok(request)
+}
+
+fn join_result_for(group: &GroupMembership) -> JoinResult {
+    JoinResult {
+        group: GroupSummary {
+            group_id: group.group_id.clone(),
+            name: group.name.clone(),
+            description: group.description.clone(),
+            rules: group.rules.clone(),
+            content_rating: group.content_rating,
+            avatar: group.avatar.clone(),
+            background: group.background.clone(),
+            mobile_background: group.mobile_background.clone(),
+            accent_color: group.accent_color.clone(),
+            members_can_send_messages: group.members_can_send_messages,
+            members_can_send_media: group.members_can_send_media,
+            frequency: None,
+            owner_public_key: group.owner_public_key.clone(),
+            remote_deletion_supported: !group.authority_nonce_base64.is_empty(),
+            is_active: true,
+            unread_count: 0,
+            read_state_initialized: false,
+            safety_restriction: None,
+        },
+    }
+}
+
 fn discard_superseded_mls_state(
     state: &mut ClientState,
     log: &MlsControlLog,
@@ -15359,6 +15534,7 @@ fn prepare_pending_member_removal(
     view: &GroupState,
     log: &MlsControlLog,
     mut requests: Vec<MlsRemovalRequest>,
+    allow_bans: bool,
 ) -> anyhow::Result<Option<(MlsAccountState, MlsEpochRecord, Vec<MlsRemovalRequest>)>> {
     let mls = state
         .mls_group_state(&group.group_id)
@@ -15380,17 +15556,23 @@ fn prepare_pending_member_removal(
         if request.group_id != group.group_id
             || !current_members.contains(&request.target_public_key)
             || !seen_targets.insert(request.target_public_key.clone())
+            || current_membership_began_millis(log, &request.target_public_key)
+                .is_some_and(|started| request.created_at_millis < started)
         {
             continue;
         }
         let authorized = match request.reason {
-            MlsRemovalReason::SelfLeft => request.requester_public_key == request.target_public_key,
+            MlsRemovalReason::SelfLeft => {
+                request.requester_public_key == request.target_public_key
+                    && request.target_public_key != owner
+            }
             MlsRemovalReason::Banned => {
                 let requester_is_owner = request.requester_public_key == owner;
                 let requester_is_moderator =
                     view.moderators.contains(&request.requester_public_key);
                 let target_is_moderator = view.moderators.contains(&request.target_public_key);
-                request.target_public_key != owner
+                allow_bans
+                    && request.target_public_key != owner
                     && (requester_is_owner || (requester_is_moderator && !target_is_moderator))
             }
         };
@@ -15406,9 +15588,20 @@ fn prepare_pending_member_removal(
     let bundle = candidate
         .remove_members(&group.group_id, &targets)
         .context("could not remove pending MLS members")?;
-    let record = candidate
-        .create_epoch_record(identity, previous_record_id, bundle)
-        .context("could not sign the member-removal MLS epoch")?;
+    let record = if allow_bans {
+        candidate
+            .create_epoch_record(identity, previous_record_id, bundle)
+            .context("could not sign the member-removal MLS epoch")?
+    } else {
+        candidate
+            .create_epoch_record_with_self_leaves(
+                identity,
+                previous_record_id,
+                bundle,
+                applied_requests.clone(),
+            )
+            .context("could not sign the member-removal MLS epoch")?
+    };
     let target_set = targets.into_iter().collect::<HashSet<_>>();
     let mut expected = current_members
         .difference(&target_set)
@@ -17082,6 +17275,180 @@ mod tests {
 
         assert_eq!(summary.identity.public_key, identity.public_key_base64());
         remove_state(&path).unwrap();
+    }
+
+    #[test]
+    fn leaving_and_rejoining_resets_the_join_baseline() {
+        let identity = Identity::generate();
+        let credentials = AccountCredentials {
+            noise_id: "123456789012".to_owned(),
+            locator: "ab".repeat(32),
+            vault_key_base64: STANDARD_NO_PAD.encode([7_u8; 32]),
+        };
+        let mut state = account_state(&identity, &credentials, test_profile(None), 1, 1);
+        let group = GroupMembership::create_owned("test", identity.public_key_base64());
+        let group_id = group.group_id.clone();
+        state.add_group(group.clone());
+        let first_join = *state.group_joined_at_millis.get(&group_id).unwrap();
+        state.tombstone_group(&group_id);
+        assert!(state.groups.is_empty());
+        assert!(!state.group_joined_at_millis.contains_key(&group_id));
+        state.add_group(group);
+        let second_join = *state.group_joined_at_millis.get(&group_id).unwrap();
+        assert!(second_join >= first_join);
+        assert_eq!(state.groups.len(), 1);
+    }
+
+    #[test]
+    fn control_log_membership_is_read_from_the_current_head() {
+        let founder = Identity::generate();
+        let other = Identity::generate();
+        let group = GroupMembership::create_owned("head", founder.public_key_base64());
+        let mut mls = MlsAccountState::create(&founder).unwrap();
+        let genesis = mls.create_group_genesis(&founder, &group).unwrap();
+        let log = MlsControlLog {
+            genesis,
+            epochs: Vec::new(),
+        };
+        assert!(control_log_includes_account(
+            &log,
+            &founder.public_key_base64()
+        ));
+        assert!(!control_log_includes_account(
+            &log,
+            &other.public_key_base64()
+        ));
+        assert!(!local_mls_ready(&account_state(
+            &other,
+            &test_credentials(),
+            test_profile(None),
+            1,
+            1,
+        ), &group.group_id));
+    }
+
+    #[test]
+    fn a_current_member_can_apply_a_signed_self_leave() {
+        let founder = Identity::generate();
+        let member = Identity::generate();
+        let leaver = Identity::generate();
+        let group = GroupMembership::create_owned("leave", founder.public_key_base64());
+        let group_id = group.group_id.clone();
+        let mut founder_mls = MlsAccountState::create(&founder).unwrap();
+        let mut member_mls = MlsAccountState::create(&member).unwrap();
+        let mut leaver_mls = MlsAccountState::create(&leaver).unwrap();
+        let member_request =
+            MlsJoinRequest::create(&member, &mut member_mls, group_id.clone()).unwrap();
+        let leaver_request =
+            MlsJoinRequest::create(&leaver, &mut leaver_mls, group_id.clone()).unwrap();
+        let genesis = founder_mls
+            .create_group_genesis(&founder, &group)
+            .unwrap();
+        let add_member = founder_mls
+            .add_member(&group_id, &member_request.key_package_base64)
+            .unwrap();
+        let add_member_record = founder_mls
+            .create_epoch_record(&founder, &genesis.record_id, add_member.clone())
+            .unwrap();
+        member_mls
+            .join_group(&group_id, add_member.welcome_base64.as_deref().unwrap())
+            .unwrap();
+        let add_leaver = member_mls
+            .add_member(&group_id, &leaver_request.key_package_base64)
+            .unwrap();
+        let add_leaver_record = member_mls
+            .create_epoch_record(&member, &add_member_record.record_id, add_leaver.clone())
+            .unwrap();
+        founder_mls.process_commit(&add_leaver).unwrap();
+        leaver_mls
+            .join_group(&group_id, add_leaver.welcome_base64.as_deref().unwrap())
+            .unwrap();
+        let log = MlsControlLog {
+            genesis,
+            epochs: vec![add_member_record, add_leaver_record],
+        };
+        log.verify().unwrap();
+
+        let mut state = account_state(&member, &test_credentials(), test_profile(None), 1, 1);
+        state.add_group(group.clone());
+        state.set_mls_group_state(&group_id, member_mls);
+        let view = GroupState::rebuild(&group, &[]);
+        let leave = MlsRemovalRequest::self_left(&leaver, group_id.clone()).unwrap();
+        let applied = prepare_pending_member_removal(
+            &state,
+            &member,
+            &group,
+            &view,
+            &log,
+            vec![leave],
+            false,
+        )
+        .unwrap()
+        .expect("a current member should apply a signed self-leave");
+        assert!(!applied
+            .1
+            .member_accounts
+            .contains(&leaver.public_key_base64()));
+        assert_eq!(applied.1.removal_requests.len(), 1);
+
+        let ban = MlsRemovalRequest::member_banned(
+            &founder,
+            group_id.clone(),
+            leaver.public_key_base64(),
+            false,
+        )
+        .unwrap();
+        assert!(
+            prepare_pending_member_removal(
+                &state,
+                &member,
+                &group,
+                &view,
+                &log,
+                vec![ban.clone()],
+                false,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let mut founder_state =
+            account_state(&founder, &test_credentials(), test_profile(None), 1, 1);
+        founder_state.add_group(group.clone());
+        founder_state.set_mls_group_state(&group_id, founder_mls);
+        let banned = prepare_pending_member_removal(
+            &founder_state,
+            &founder,
+            &group,
+            &view,
+            &log,
+            vec![ban],
+            true,
+        )
+        .unwrap()
+        .expect("the founder should still apply a ban");
+        assert!(!banned
+            .1
+            .member_accounts
+            .contains(&leaver.public_key_base64()));
+        assert!(banned.1.removal_requests.is_empty());
+    }
+
+    #[test]
+    fn a_leave_from_an_earlier_membership_does_not_apply_after_rejoin() {
+        let account = "alice".to_owned();
+        let first = vec![account.clone()];
+        let empty: Vec<String> = Vec::new();
+        let again = vec![account.clone()];
+        let started = membership_began_millis(
+            &[],
+            1,
+            [(10, first.as_slice()), (20, empty.as_slice()), (30, again.as_slice())],
+            &account,
+        );
+        assert_eq!(started, Some(30));
+        assert!(started.is_some_and(|started| 15 < started));
+        assert!(!started.is_some_and(|started| 40 < started));
     }
 
     #[test]

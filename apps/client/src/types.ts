@@ -421,6 +421,10 @@ export type MakeResult = {
   display_frequency: string;
 };
 
+export type JoinResult = {
+  group: GroupSummary;
+};
+
 export type AvatarData = {
   mime_type: string;
   data_base64: string;

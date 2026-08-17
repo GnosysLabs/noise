@@ -561,10 +561,10 @@ pub enum MlsRemovalReason {
     Banned,
 }
 
-/// A signed request for the founder to remove every MLS leaf belonging to an
-/// account. Self-leave requests are authorized directly by the departing
-/// account; ban requests are validated against the encrypted moderator state
-/// by the founder before a removal commit is created.
+/// A signed request to remove every MLS leaf belonging to an account.
+/// Self-leave requests are authorized by the departing account and may be
+/// applied by any current member. Ban requests are validated against the
+/// encrypted moderator state by the founder before a removal commit is created.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MlsRemovalRequest {
     pub version: u32,
@@ -790,11 +790,14 @@ pub struct MlsEpochRecord {
     pub record_id: String,
     pub previous_record_id: String,
     /// The account that authored this epoch. Any account inside the parent
-    /// epoch may author an admission; only the founder may author a removal.
+    /// epoch may author an admission or apply signed self-leaves. Only the
+    /// founder may author a ban removal.
     pub owner_public_key: String,
     pub member_accounts: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub external_join: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removal_requests: Vec<MlsRemovalRequest>,
     pub bundle: MlsCommitBundle,
     pub created_at_millis: u64,
     pub signature_base64: String,
@@ -808,6 +811,8 @@ struct UnsignedMlsEpochRecord<'a> {
     member_accounts: &'a [String],
     #[serde(skip_serializing_if = "is_false")]
     external_join: bool,
+    #[serde(skip_serializing_if = "<[MlsRemovalRequest]>::is_empty")]
+    removal_requests: &'a [MlsRemovalRequest],
     bundle: &'a MlsCommitBundle,
     created_at_millis: u64,
 }
@@ -821,26 +826,31 @@ impl MlsEpochRecord {
     ) -> Result<Self, NoiseError> {
         member_accounts.sort();
         member_accounts.dedup();
-        let mut record = Self {
-            version: MLS_CONTROL_VERSION,
-            record_id: String::new(),
-            previous_record_id: previous_record_id.into(),
-            owner_public_key: identity.public_key_base64(),
-            member_accounts,
-            external_join: false,
+        Self::create_signed(
+            identity,
+            previous_record_id,
             bundle,
-            created_at_millis: now_millis(),
-            signature_base64: String::new(),
-        };
-        let unsigned = record.unsigned_bytes()?;
-        record.record_id = blake3::hash(&unsigned).to_hex().to_string();
-        record.signature_base64 = identity.sign(&control_signing_bytes(
-            EPOCH_RECORD_CONTEXT,
-            &record.record_id,
-            &unsigned,
-        ));
-        record.verify()?;
-        Ok(record)
+            member_accounts,
+            false,
+            Vec::new(),
+        )
+    }
+
+    pub fn create_with_self_leaves(
+        identity: &Identity,
+        previous_record_id: impl Into<String>,
+        bundle: MlsCommitBundle,
+        member_accounts: Vec<String>,
+        removal_requests: Vec<MlsRemovalRequest>,
+    ) -> Result<Self, NoiseError> {
+        Self::create_signed(
+            identity,
+            previous_record_id,
+            bundle,
+            member_accounts,
+            false,
+            removal_requests,
+        )
     }
 
     pub fn create_external(
@@ -851,13 +861,35 @@ impl MlsEpochRecord {
     ) -> Result<Self, NoiseError> {
         member_accounts.sort();
         member_accounts.dedup();
+        Self::create_signed(
+            identity,
+            previous_record_id,
+            bundle,
+            member_accounts,
+            true,
+            Vec::new(),
+        )
+    }
+
+    fn create_signed(
+        identity: &Identity,
+        previous_record_id: impl Into<String>,
+        bundle: MlsCommitBundle,
+        mut member_accounts: Vec<String>,
+        external_join: bool,
+        mut removal_requests: Vec<MlsRemovalRequest>,
+    ) -> Result<Self, NoiseError> {
+        member_accounts.sort();
+        member_accounts.dedup();
+        removal_requests.sort_by(|left, right| left.request_id.cmp(&right.request_id));
         let mut record = Self {
             version: MLS_CONTROL_VERSION,
             record_id: String::new(),
             previous_record_id: previous_record_id.into(),
             owner_public_key: identity.public_key_base64(),
             member_accounts,
-            external_join: true,
+            external_join,
+            removal_requests,
             bundle,
             created_at_millis: now_millis(),
             signature_base64: String::new(),
@@ -875,22 +907,57 @@ impl MlsEpochRecord {
 
     /// Whether the parent epoch's membership authorizes this epoch transition.
     ///
-    /// Every account already inside the group may author an epoch that only
-    /// admits accounts, so a join never waits for one specific member to be
-    /// online. Removing an account stays with the founder, whose client is the
-    /// only one that validates signed self-leave and ban requests.
+    /// Every account already inside the group may admit the next member or
+    /// apply a signed self-leave, so those never wait for one specific member
+    /// to be online. Ban removals stay with the founder, who is the only
+    /// author that validates encrypted moderator state.
     #[must_use]
     pub fn authorizes_from(&self, founder_public_key: &str, parent_members: &[String]) -> bool {
-        let removes_accounts = parent_members
+        let removed = parent_members
             .iter()
-            .any(|member| !self.member_accounts.contains(member));
+            .filter(|member| !self.member_accounts.contains(member))
+            .collect::<Vec<_>>();
         if self.external_join {
             return !parent_members.contains(&self.owner_public_key)
                 && self.member_accounts.contains(&self.owner_public_key)
-                && !removes_accounts;
+                && removed.is_empty();
         }
-        parent_members.contains(&self.owner_public_key)
-            && (!removes_accounts || self.owner_public_key == founder_public_key)
+        if !parent_members.contains(&self.owner_public_key) {
+            return false;
+        }
+        if removed.is_empty() {
+            return true;
+        }
+        self.owner_public_key == founder_public_key
+            || self.authorizes_member_self_leaves(founder_public_key, &removed)
+    }
+
+    fn authorizes_member_self_leaves(
+        &self,
+        founder_public_key: &str,
+        removed: &[&String],
+    ) -> bool {
+        if removed.iter().any(|member| *member == founder_public_key) {
+            return false;
+        }
+        if self.removal_requests.len() != removed.len() {
+            return false;
+        }
+        let mut matched = HashSet::new();
+        for request in &self.removal_requests {
+            if request.verify().is_err()
+                || request.group_id != self.bundle.group_id
+                || request.reason != MlsRemovalReason::SelfLeft
+                || request.requester_public_key != request.target_public_key
+                || !removed
+                    .iter()
+                    .any(|member| *member == &request.target_public_key)
+                || !matched.insert(request.target_public_key.clone())
+            {
+                return false;
+            }
+        }
+        matched.len() == removed.len()
     }
 
     pub fn verify(&self) -> Result<(), NoiseError> {
@@ -930,6 +997,7 @@ impl MlsEpochRecord {
             owner_public_key: &self.owner_public_key,
             member_accounts: &self.member_accounts,
             external_join: self.external_join,
+            removal_requests: &self.removal_requests,
             bundle: &self.bundle,
             created_at_millis: self.created_at_millis,
         })?)
@@ -1546,16 +1614,46 @@ impl MlsAccountState {
         previous_record_id: impl Into<String>,
         bundle: MlsCommitBundle,
     ) -> Result<MlsEpochRecord, NoiseError> {
+        self.create_epoch_record_inner(identity, previous_record_id, bundle, Vec::new())
+    }
+
+    pub fn create_epoch_record_with_self_leaves(
+        &self,
+        identity: &Identity,
+        previous_record_id: impl Into<String>,
+        bundle: MlsCommitBundle,
+        removal_requests: Vec<MlsRemovalRequest>,
+    ) -> Result<MlsEpochRecord, NoiseError> {
+        self.create_epoch_record_inner(identity, previous_record_id, bundle, removal_requests)
+    }
+
+    fn create_epoch_record_inner(
+        &self,
+        identity: &Identity,
+        previous_record_id: impl Into<String>,
+        bundle: MlsCommitBundle,
+        removal_requests: Vec<MlsRemovalRequest>,
+    ) -> Result<MlsEpochRecord, NoiseError> {
         let current = self.epoch(&bundle.group_id)?;
         if current.epoch != bundle.epoch {
             return Err(NoiseError::InvalidMlsState);
         }
-        MlsEpochRecord::create(
-            identity,
-            previous_record_id,
-            bundle.clone(),
-            self.members(&bundle.group_id)?,
-        )
+        if removal_requests.is_empty() {
+            MlsEpochRecord::create(
+                identity,
+                previous_record_id,
+                bundle.clone(),
+                self.members(&bundle.group_id)?,
+            )
+        } else {
+            MlsEpochRecord::create_with_self_leaves(
+                identity,
+                previous_record_id,
+                bundle.clone(),
+                self.members(&bundle.group_id)?,
+                removal_requests,
+            )
+        }
     }
 
     pub fn create_external_epoch_record(
@@ -1887,11 +1985,12 @@ mod tests {
             &[alice_identity.public_key_base64()],
         ));
 
-        // The same member cannot evict anyone.
-        let bob_removes_charlie = bob
+        // The same member cannot evict anyone without that person's self-leave.
+        let mut bob_unilateral = bob.clone();
+        let bob_removes_charlie = bob_unilateral
             .remove_member(group_id, &charlie_identity.public_key_base64())
             .unwrap();
-        let bob_removal = bob
+        let bob_removal = bob_unilateral
             .create_epoch_record(
                 &bob_identity,
                 &add_charlie_record.record_id,
@@ -1912,7 +2011,32 @@ mod tests {
             .is_err()
         );
 
-        // The founder still can.
+        // A current member can apply that person's signed self-leave.
+        let charlie_left = MlsRemovalRequest::self_left(&charlie_identity, group_id).unwrap();
+        let mut bob_applies = bob.clone();
+        let bob_applies_leave = bob_applies
+            .remove_member(group_id, &charlie_identity.public_key_base64())
+            .unwrap();
+        let bob_leave = bob_applies
+            .create_epoch_record_with_self_leaves(
+                &bob_identity,
+                &add_charlie_record.record_id,
+                bob_applies_leave,
+                vec![charlie_left],
+            )
+            .unwrap();
+        MlsControlLog {
+            genesis: genesis.clone(),
+            epochs: vec![
+                add_bob_record.clone(),
+                add_charlie_record.clone(),
+                bob_leave,
+            ],
+        }
+        .verify()
+        .unwrap();
+
+        // The founder can still remove without embedding a request.
         let alice_removes_charlie = alice
             .remove_member(group_id, &charlie_identity.public_key_base64())
             .unwrap();
@@ -1962,7 +2086,7 @@ mod tests {
             .unwrap();
         MlsControlLog {
             genesis,
-            epochs: vec![external_record],
+            epochs: vec![external_record.clone()],
         }
         .verify()
         .unwrap();
@@ -1977,5 +2101,16 @@ mod tests {
                 .unwrap(),
             epoch_zero.archive_key_base64
         );
+
+        // A second frequency join from the same account is not a new child of
+        // the current head. The relay rejects it as unauthorized, not as a
+        // concurrent-join collision.
+        assert!(!external_record.authorizes_from(
+            &alice_identity.public_key_base64(),
+            &[
+                alice_identity.public_key_base64(),
+                bob_identity.public_key_base64(),
+            ],
+        ));
     }
 }

@@ -141,13 +141,15 @@ revealing account metadata.
   zero, and materializes the founder membership in one transaction.
 - Epoch writes lock the group control head, require an exact parent record and
   epoch, verify that the author belonged to the parent snapshot, and permit
-  removals only from the founder. An exact accepted retry is idempotent.
+  removals from the founder or from a current member applying signed
+  self-leaves. An exact accepted retry is idempotent.
 - Every accepted epoch stores its complete signed account-membership snapshot
   and atomically opens or closes current membership intervals before the
   transaction commits.
 - Join requests remain inert recovery records. A current invitation authorizes
-  its holder to append an external commit that only adds that holder. Only the
-  founder may author an epoch that removes an account.
+  its holder to append an external commit that only adds that holder. A current
+  member may author an epoch that only applies signed self-leaves. Only the
+  founder may author an epoch that removes an account by ban.
 - Each accepted MLS object creates a durable outbox record in the same
   transaction. Control-log and request reads reverify stored signed objects
   before returning them.

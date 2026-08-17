@@ -12,12 +12,21 @@ import {
   unreadActivityCount,
   withoutDirectActivity,
 } from "../src/activityNotifications.ts";
+import { mentionToken } from "../src/mentionSuggestions.ts";
 
 const self = {
   public_key: "self",
   username: "chris",
   noise_id: "abc123",
 };
+
+function identity(username: string, noiseId: string | null, publicKey = "self") {
+  return { public_key: publicKey, username, noise_id: noiseId };
+}
+
+function key(byte: number) {
+  return Buffer.from(Uint8Array.from({ length: 32 }, () => byte)).toString("base64");
+}
 
 function message(id: string, overrides: Record<string, unknown> = {}) {
   return {
@@ -37,16 +46,31 @@ function message(id: string, overrides: Record<string, unknown> = {}) {
 }
 
 test("detects @username and @noise-id mentions", () => {
-  assert.equal(messageMentionsIdentity("hey @chris look", "chris", "abc123"), true);
-  assert.equal(messageMentionsIdentity("hey @Chris!", "chris", null), true);
-  assert.equal(messageMentionsIdentity("see @abc123", "chris", "abc123"), true);
-  assert.equal(messageMentionsIdentity("christmas @christina", "chris", null), false);
-  assert.equal(messageMentionsIdentity("email chris@site.com", "chris", null), false);
+  assert.equal(messageMentionsIdentity("hey @chris look", identity("chris", "abc123")), true);
+  assert.equal(messageMentionsIdentity("hey @Chris!", identity("chris", null)), true);
+  assert.equal(messageMentionsIdentity("see @abc123", identity("chris", "abc123")), true);
+  assert.equal(messageMentionsIdentity("christmas @christina", identity("chris", null)), false);
+  assert.equal(messageMentionsIdentity("email chris@site.com", identity("chris", null)), false);
 });
 
 test("detects a display name that contains a space", () => {
-  assert.equal(messageMentionsIdentity("hi @kurby dog", "kurby dog", null), true);
-  assert.equal(messageMentionsIdentity("hi @kurby", "kurby dog", null), false);
+  assert.equal(messageMentionsIdentity("hi @kurby dog", identity("kurby dog", null)), true);
+  assert.equal(messageMentionsIdentity("hi @kurby", identity("kurby dog", null)), false);
+});
+
+test("does not notify every member who shares a display name", () => {
+  const sam = { public_key: key(1), username: "sam" };
+  const otherSam = { public_key: key(2), username: "sam" };
+  assert.equal(messageMentionsIdentity("hey @sam", identity("sam", null, sam.public_key), [sam, otherSam]), false);
+  assert.equal(messageMentionsIdentity("hey @sam", identity("sam", null, otherSam.public_key), [sam, otherSam]), false);
+  assert.equal(
+    messageMentionsIdentity(mentionToken(sam), identity("sam", null, sam.public_key), [sam, otherSam]),
+    true,
+  );
+  assert.equal(
+    messageMentionsIdentity(mentionToken(sam), identity("sam", null, otherSam.public_key), [sam, otherSam]),
+    false,
+  );
 });
 
 test("builds mention, reply, and reaction notifications", () => {
@@ -181,6 +205,12 @@ test("previously baselined ids reappear in the list as read", () => {
 
 test("preview prefers text and falls back to media", () => {
   assert.equal(activityPreview("  hello   there  "), "hello there");
+  assert.equal(
+    activityPreview(`hey ${mentionToken({ public_key: key(1), username: "sam" })}`, undefined, [
+      { public_key: key(1), username: "sam" },
+    ]),
+    "hey @sam",
+  );
   assert.equal(activityPreview("", "image/jpeg"), "sent a photo");
 });
 
