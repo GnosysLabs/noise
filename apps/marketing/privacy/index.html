@@ -6,14 +6,14 @@
     <meta name="theme-color" content="#09080c" />
     <meta
       name="description"
-      content="noise Privacy Policy: what the noise apps, website, and central service process, what stays encrypted, and the choices available to you."
+      content="noise Privacy Policy: how accounts, messages, uploads, calls, and browser data are handled by the noise service."
     />
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="noise" />
     <meta property="og:title" content="Privacy Policy | noise" />
     <meta
       property="og:description"
-      content="What noise processes, what stays encrypted, and how the central service works."
+      content="What noise processes and stores, how account security works, and the choices available to you."
     />
     <meta property="og:url" content="https://makenoise.chat/privacy/" />
     <meta property="og:image" content="https://makenoise.chat/og.png?v=wordmark-20260724" />
@@ -45,13 +45,13 @@
         <p class="section-kicker">Legal / Privacy</p>
         <h1>Privacy without<br />the vague promises.</h1>
         <p class="legal-intro">
-          noise is designed to work without your phone number, email address, legal name,
-          contact list, or location. This policy explains the information our central service
-          still needs to deliver, synchronize, secure, and moderate noise.
+          noise brings conversations, communities, and calls together in your browser. This
+          policy explains the account information, content, and activity our central service
+          processes to deliver, synchronize, secure, and moderate noise.
         </p>
         <div class="legal-meta">
           <span>Effective July 29, 2026</span>
-          <span>Last updated July 29, 2026</span>
+          <span>Last updated October 9, 2026</span>
         </div>
       </header>
 
@@ -72,15 +72,14 @@
             <p class="legal-number">01</p>
             <h2>Scope and who we are</h2>
             <p>
-              This Privacy Policy applies to the noise desktop applications, web application,
-              mobile applications, marketing website, and central service operated by Gnosys
-              Labs (together, the
-              “Gnosys Labs Services”). “noise,” “we,” “us,” and “our” refer to Gnosys Labs.
+              This Privacy Policy applies to the noise web application, marketing website,
+              and central service operated by Gnosys Labs (together, the “Gnosys Labs
+              Services”). “noise,” “we,” “us,” and “our” refer to Gnosys Labs.
             </p>
             <p>
-              The official noise apps use the Gnosys Labs central service rather than
-              user-selected infrastructure. Third-party infrastructure and media-search
-              providers remain separate services with their own privacy practices.
+              The noise web app uses the Gnosys Labs central service rather than user-selected
+              infrastructure. Third-party infrastructure and linked services have their own
+              privacy practices.
             </p>
           </section>
 
@@ -90,53 +89,50 @@
 
             <h3>Account and profile information</h3>
             <p>
-              noise creates a random noise ID and cryptographic identity. Your chosen display
-              name, avatar, and bio are profile information. noise does not require a phone
-              number, email address, legal name, address book, or location to create an account.
-              The app asks for a birth date to confirm that you are at least 18, but performs
-              that check on your device and stores only an age-attested setting—not the birth
-              date itself.
+              Creating an account requires an email address, a unique username, a display
+              name, and a password. Your profile may also include an avatar, banner, bio,
+              status, and other information you choose to share. Account records, profile
+              information, friends, blocks, space memberships, and preferences are stored by
+              the service. A phone number, address book, or location is not required to register.
             </p>
             <p>
-              Your password is used on your device to derive the credentials that unlock your
-              encrypted account vault. Gnosys Labs does not receive or store your plaintext
-              password and cannot recover a lost noise ID or password for you.
+              Your password is sent over HTTPS for account authentication. The service stores
+              a salted password hash rather than the plaintext password. Signed-in sessions
+              use a secure browser cookie. If you enable an authenticator, the service stores
+              an encrypted authenticator secret and hashed recovery codes, together with
+              session and security records needed to manage account access.
             </p>
 
             <h3>Messages, group activity, and media</h3>
             <p>
-              noise clients create signed group, direct-message, membership, moderation, and
-              profile events. Message bodies and media are encrypted on your device before
-              they are sent. The central service stores encrypted events and account vaults,
-              together with public keys, signatures, group and thread relationships, object
-              identifiers, timestamps, delivery and read state, safety state, deletion records,
-              and other protocol data needed to authenticate, deliver, synchronize, moderate,
-              and delete content.
+              The central service stores message text, uploaded files, profiles, space and
+              channel information, memberships, reactions, timestamps, and moderation records.
+              It also stores read state, notifications, drafts, saved messages, and reminders
+              so those features can work across signed-in browsers. Access is controlled by
+              account, membership, and channel permissions.
             </p>
             <p>
-              Encrypted media is stored as complete encrypted objects in private Cloudflare R2
-              object storage. Gnosys Labs and Cloudflare receive the encrypted object and
-              related storage metadata, but not the key held by noise clients to decrypt it.
+              Connections to the official service use HTTPS to encrypt data in transit.
+              Messages and uploads are not end-to-end encrypted: the service processes and
+              stores their contents, and server operators can access them. Do not treat noise
+              as a service in which only recipients hold the keys to message content.
             </p>
 
-            <h3>Safety reports</h3>
+            <h3>Safety and moderation</h3>
             <p>
-              If you choose “report to noise” for a serious safety issue, your app sends an
-              end-to-end encrypted report to the noise safety service. A report may include the
-              reported message text, your selected reason and description, group and event
-              identifiers, signed profile snapshots, public keys, timestamps, signatures,
-              encrypted-object identifiers, and locally computed hashes. It does not include
-              reported media bytes or media decryption keys. Authorized reviewers can decrypt
-              reports and may issue signed restrictions enforced by official noise apps.
+              The service processes blocks, message requests, role and channel permissions,
+              bans, timeouts, and moderation actions. These records help enforce access and
+              safety controls. If you contact us about abuse or a safety issue, we receive the
+              information and content you choose to provide.
             </p>
 
             <h3>Device and browser storage</h3>
             <p>
-              Desktop apps keep local identity state, message state, preferences, and media
-              caches on your device. The web app stores an encrypted browser vault in
-              IndexedDB and protects it with a non-exportable key generated by your browser.
-              Clearing site data, using private browsing, browser resets, operating-system
-              backups, or device-management tools can affect or copy that local data.
+              The web app uses cookies for signed-in sessions and browser storage for items
+              such as conversation drafts, interface preferences, selected conversations,
+              and media-device choices. This local storage is not an encrypted account vault.
+              Clearing site data or using private browsing can remove local state; it does
+              not delete content already stored by the service.
             </p>
 
             <h3>Network and diagnostic information</h3>
@@ -144,26 +140,24 @@
               When your device connects, network providers necessarily process information
               such as IP addresses, request timing, user-agent information, and traffic
               volume. The noise central service and its hosting and security providers may
-              receive this network-level information. Encrypted media is fetched through the
-              service’s object-storage path; centralization does not make network metadata
-              end-to-end encrypted.
+              receive this network-level information. HTTPS protects data in transit but does
+              not hide connection metadata from the providers that handle the connection.
             </p>
             <p>
               The Gnosys Labs website and service are not designed for advertising or
               behavioral tracking. Our hosting, security, database, and network providers may
               process request and security data to deliver and protect the service. The
-              marketing site contacts GitHub’s API to locate the current noise release when a
-              download link is shown.
+              data they process is subject to their own policies.
             </p>
 
-            <h3>GIF, sticker, clip, and link services</h3>
+            <h3>Calls, shared media, and links</h3>
             <p>
-              If you use the GIF keyboard, the central service sends your search terms and
-              request settings to KLIPY and returns media results to your app. Loading or
-              sending a selected result may also contact the media host identified in that
-              result. If you request a link preview, the central service fetches the linked
-              webpage to create that preview. Those providers may process request and
-              network-level information under their own policies.
+              When you join a voice or video call, your browser requests access to the
+              microphone, camera, or screen you choose to share. The service processes call
+              membership and connection information, and media infrastructure carries the
+              audio, video, or screen content you transmit. Other call participants receive
+              the content you share. Opening a link or externally hosted media may contact
+              that website or host, which can process request information under its own policy.
             </p>
 
             <h3>Communications with us</h3>
@@ -178,9 +172,9 @@
             <h2>How we use information</h2>
             <p>We process information only as reasonably necessary to:</p>
             <ul>
-              <li>create, restore, synchronize, and secure noise identities;</li>
-              <li>route and make encrypted groups, messages, profiles, and media available;</li>
-              <li>deliver device notifications and provide requested GIF and link services;</li>
+              <li>create, synchronize, and secure noise accounts;</li>
+              <li>deliver spaces, channels, messages, profiles, uploads, and calls;</li>
+              <li>provide in-app notifications, saved messages, reminders, and draft synchronization;</li>
               <li>provide moderation, deletion, abuse prevention, and network-integrity features;</li>
               <li>diagnose failures, protect the service, and improve reliability;</li>
               <li>respond to support, privacy, and legal requests; and</li>
@@ -188,8 +182,7 @@
             </ul>
             <p>
               We do not sell personal information. We do not use noise content for targeted
-              advertising, build advertising profiles, or operate a public people or group
-              directory.
+              advertising or build advertising profiles.
             </p>
           </section>
 
@@ -200,19 +193,20 @@
             <ul>
               <li>
                 <strong>Infrastructure providers.</strong> Hosting, content-delivery, DDoS
-                protection, database, object-storage, and similar providers—including
-                Cloudflare for encrypted media storage—process the data needed to provide
-                their services.
+                protection, database, storage, media relay, and similar providers process the
+                data needed to provide their services.
               </li>
               <li>
-                <strong>Feature providers.</strong> Apple processes iOS notification routing
-                information, KLIPY processes GIF-keyboard requests, and GitHub processes
-                release lookups from the marketing site. A linked webpage receives a request
-                from our service when you ask noise to create a preview.
+                <strong>Linked services.</strong> Websites and external media hosts you open
+                receive requests associated with those actions and apply their own privacy
+                policies.
               </li>
               <li>
-                <strong>Other noise users.</strong> People in a shared group or direct-message
-                thread receive the content and profile information you choose to share.
+                <strong>Other noise users.</strong> People with access to a shared space,
+                channel, conversation, or call receive the content and profile information
+                you share there. Anyone with a valid space invite can view its preview,
+                including its name, icon, banner, description, and aggregate member counts,
+                before joining; the preview does not include private messages or a member list.
               </li>
               <li>
                 <strong>Legal and safety recipients.</strong> We may preserve or disclose
@@ -226,9 +220,9 @@
               </li>
             </ul>
             <p>
-              Encryption limits what Gnosys Labs and infrastructure providers can read, but it does not
-              stop a recipient from saving, exporting, forwarding, or capturing content after
-              their client decrypts it.
+              Access controls do not stop a recipient from saving, exporting, forwarding,
+              or capturing content they can view. Messages and uploads are not end-to-end
+              encrypted.
             </p>
           </section>
 
@@ -236,19 +230,18 @@
             <p class="legal-number">05</p>
             <h2>Retention and deletion</h2>
             <p>
-              Local data remains on your device until the app removes it, you log out, leave a
-              group, delete your account, clear browser data, uninstall the app, or remove it
-              through your operating system. Operating-system and device backups may retain
-              copies beyond that point.
+              Local browser data can remain until the app removes it or you clear site data.
+              Logging out ends the session but does not necessarily clear every local draft,
+              preference, cached file, or backup. Clearing local data does not delete the
+              corresponding records stored by the service.
             </p>
             <p>
               Central-service data remains available for the time needed to operate the
               service, maintain account and group state, prevent abuse, meet legal duties, or
-              until it is deleted or expires under the applicable feature. Session challenges,
-              sessions, disappearing-message state, and temporary safety restrictions have
-              feature-specific expiry times. Encrypted message events and media may remain
-              until a valid deletion is processed, an account or group is deleted, or the
-              service removes them under its policies.
+              until it is deleted or expires under the applicable feature. Sessions, sign-in
+              challenges, invites, and timeouts have feature-specific expiry times. Messages,
+              uploads, account records, and other stored data may remain until a supported
+              deletion is processed or the service removes them under its policies.
             </p>
             <div class="legal-callout">
               <strong>Deletion still has real limits.</strong>
@@ -268,11 +261,11 @@
             <p class="legal-number">06</p>
             <h2>Security and early-alpha limits</h2>
             <p>
-              noise uses cryptographic identities, signed events, on-device encryption,
-              encrypted account vaults, encrypted push tokens, and private encrypted media
-              storage. No system is
-              perfectly secure. noise is early-alpha software, and its protocol and
-              implementation have not been represented as a completed independent security
+              noise uses HTTPS, salted password hashes, secure session cookies, and account
+              and channel access controls. Optional authenticator-based sign-in and session
+              management provide additional account controls. These protections are not
+              end-to-end encryption. No system is perfectly secure. noise is early-alpha
+              software, and its implementation has not been represented as a completed independent security
               audit. Do not rely on noise as a life-safety system or a guarantee of
               high-risk anonymity.
             </p>
@@ -300,9 +293,9 @@
             <p>
               You can change profile information and use deletion controls in the app. You may
               also email <a href="mailto:admin@gnosyslabs.xyz">admin@gnosyslabs.xyz</a>. Because
-              noise does not require an email address or legal identity, we may need your noise
-              ID or cryptographic proof from your account to locate data and verify that a
-              request is yours. We cannot decrypt content or recover credentials we do not have.
+              account requests must be verified, we may need your username, account email, or
+              other appropriate information to locate records and confirm that the request
+              is yours.
             </p>
           </section>
 
@@ -344,13 +337,12 @@
           <img class="wordmark-symbol" src="/noise-wave.png" alt="" />
           <span class="wordmark-text">noise</span>
         </a>
-        <p>Private groups, on your frequency.</p>
+        <p>Your people. Your space. Make noise.</p>
       </div>
       <div class="footer-links">
         <div>
           <strong>noise</strong>
           <a href="https://app.makenoise.chat">Web app</a>
-          <a href="https://github.com/GnosysLabs/noise">GitHub</a>
         </div>
         <div>
           <strong>Legal</strong>
