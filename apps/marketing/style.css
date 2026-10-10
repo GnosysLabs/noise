@@ -282,6 +282,10 @@ button {
   transform: rotate(-2deg);
 }
 
+.hero-copy {
+  min-width: 0;
+}
+
 .hero-intro {
   max-width: 660px;
   margin: 36px 0 0;
@@ -1303,22 +1307,28 @@ mark {
   transform: rotate(8deg);
 }
 
-.download-options {
+.download-choices {
   position: relative;
   z-index: 2;
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  margin-top: 75px;
+  grid-template-columns: minmax(0, 360px) minmax(0, 560px);
+  align-items: end;
+  gap: 28px;
+  width: min(100%, 948px);
+  margin-top: 48px;
+}
+
+.download-options {
+  height: 175px;
   border: 4px solid var(--white);
 }
 
 .download-option {
-  min-height: 230px;
+  height: 100%;
   display: flex;
   align-items: flex-start;
   flex-direction: column;
-  padding: 28px;
-  border-right: 4px solid var(--white);
+  padding: 16px 20px;
   background: var(--black);
   color: var(--white);
   text-align: left;
@@ -1342,10 +1352,10 @@ mark {
 }
 
 .download-option strong {
-  margin-top: 32px;
+  margin: 10px 0;
   font-family: var(--display);
-  font-size: clamp(48px, 5vw, 76px);
-  line-height: 1.1;
+  font-size: 40px;
+  line-height: 1.05;
 }
 
 .download-option b {
@@ -1373,6 +1383,11 @@ mark {
   width: 100%;
   height: 175px;
   border: 0;
+}
+
+.download-choices .download-widget {
+  width: 100%;
+  margin-top: 0;
 }
 
 .alpha-note {
@@ -1914,19 +1929,8 @@ footer {
     grid-column: auto;
   }
 
-  .download-options {
-    grid-template-columns: 1fr;
-  }
-
-  .download-option,
-  .download-option:last-child {
-    min-height: 175px;
-    border-right: 0;
-    border-bottom: 4px solid var(--white);
-  }
-
-  .download-option:last-child {
-    border-bottom: 0;
+  .download-choices {
+    grid-template-columns: minmax(0, 560px);
   }
 
   footer {
@@ -2201,8 +2205,8 @@ footer {
     display: none;
   }
 
-  .download-options {
-    margin-top: 55px;
+  .download-choices {
+    margin-top: 40px;
   }
 
   footer {
@@ -2321,9 +2325,6 @@ footer {
 .question-list details[open] summary::after { content: '−'; }
 .question-list p { max-width: 760px; margin: 0; padding: 0 32px 28px 0; color: var(--paper); font: 400 18px/1.6 var(--sans); }
 .question-list a { text-decoration: underline; text-underline-offset: 3px; color: var(--yellow); }
-.browser-options { grid-template-columns: 1fr; }
-.browser-options .download-option { border-right: 0; }
-.browser-options .download-option strong { font-size: clamp(28px, 3.8vw, 52px); }
 #groups, #inside, #privacy, #download { scroll-margin-top: 100px; }
 a:focus-visible, button:focus-visible, summary:focus-visible { outline: 3px solid var(--blue); outline-offset: 5px; }
 @media (max-width: 1050px) { .feature-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
