@@ -675,8 +675,17 @@ mark {
 
 .wall-flyer {
   position: absolute;
+  isolation: isolate;
   color: var(--black);
-  box-shadow: 13px 13px 0 rgba(0, 0, 0, 0.82);
+  filter: drop-shadow(13px 13px 0 rgba(0, 0, 0, 0.82));
+}
+
+/* Clip the paper, not the tape that straddles its top edge. */
+.wall-flyer::after {
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  content: "";
 }
 
 .wall-flyer::before,
@@ -695,7 +704,7 @@ mark {
 }
 
 .wall-flyer::before {
-  top: 7px;
+  top: -18px;
 }
 
 .wall-setlist::before {
@@ -722,11 +731,14 @@ mark {
   width: 58%;
   min-height: 290px;
   padding: 33px 34px 30px;
+  transform: rotate(-5deg);
+}
+
+.wall-flyer-red::after {
   background:
     repeating-linear-gradient(88deg, transparent 0 17px, rgba(17, 16, 14, 0.09) 17px 18px),
     var(--red);
   clip-path: polygon(0 2%, 8% 0, 17% 3%, 28% 0, 40% 2%, 54% 0, 65% 3%, 78% 0, 89% 2%, 100% 0, 98% 100%, 86% 97%, 72% 100%, 59% 97%, 45% 100%, 31% 97%, 18% 100%, 3% 97%);
-  transform: rotate(-5deg);
 }
 
 .wall-flyer-red strong {
@@ -753,12 +765,14 @@ mark {
   width: 56%;
   min-height: 285px;
   padding: 34px 31px 31px;
+  transform: rotate(3deg);
+}
+
+.wall-flyer-yellow::after {
   background:
     repeating-linear-gradient(-12deg, transparent 0 30px, rgba(17, 16, 14, 0.07) 30px 31px),
     var(--yellow);
-  color: var(--black);
   clip-path: polygon(2% 0, 16% 3%, 30% 0, 46% 2%, 61% 0, 77% 3%, 100% 0, 98% 97%, 83% 100%, 68% 97%, 52% 100%, 37% 97%, 20% 100%, 0 97%);
-  transform: rotate(3deg);
 }
 
 .wall-flyer-yellow strong {
