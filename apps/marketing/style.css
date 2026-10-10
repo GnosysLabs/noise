@@ -146,10 +146,11 @@ button {
 .site-header nav {
   display: flex;
   align-items: center;
-  gap: clamp(16px, 2.7vw, 42px);
+  gap: clamp(12px, 2vw, 28px);
 }
 
 .site-header nav a {
+  white-space: nowrap;
   padding: 7px 2px 4px;
   border-bottom: 3px solid transparent;
   font-family: var(--sans);
@@ -160,6 +161,10 @@ button {
 
 .site-header nav a:hover {
   border-bottom-color: var(--black);
+}
+
+.developer-link-short {
+  display: none;
 }
 
 .nav-cta {
@@ -1852,11 +1857,21 @@ footer {
     right: 10px;
     left: 10px;
     width: calc(100% - 20px);
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 10px;
   }
 
   .site-header nav {
+    justify-content: center;
+  }
+
+  .site-header nav a:not(.developer-link),
+  .developer-link-full {
     display: none;
+  }
+
+  .developer-link-short {
+    display: inline;
   }
 
   .hero {
