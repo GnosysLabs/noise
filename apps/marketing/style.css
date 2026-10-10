@@ -34,6 +34,11 @@ body {
   background: var(--paper);
 }
 
+/* Keep rotated poster artwork inside the page without creating a scroll container. */
+main {
+  overflow-x: clip;
+}
+
 body::before {
   position: fixed;
   z-index: 9999;
