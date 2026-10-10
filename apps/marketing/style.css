@@ -221,7 +221,7 @@ button {
   font-family: "Comic Sans MS", "Marker Felt", cursive;
   font-size: clamp(19px, 2vw, 32px);
   font-weight: 900;
-  line-height: 0.9;
+  line-height: 1.15;
   text-align: center;
   transform: rotate(-9deg);
 }
@@ -254,11 +254,11 @@ button {
 .hero h1 {
   margin: 0;
   font-family: var(--display);
-  font-size: clamp(74px, 9.5vw, 156px);
+  font-size: clamp(68px, 8.3vw, 138px);
   font-stretch: condensed;
   font-weight: 1000;
-  line-height: 0.74;
-  letter-spacing: -0.045em;
+  line-height: 1.1;
+  letter-spacing: 0.01em;
   text-transform: uppercase;
   transform: scaleX(0.92);
   transform-origin: left center;
@@ -273,7 +273,7 @@ button {
   color: var(--black);
   font-size: 0.47em;
   letter-spacing: 0.03em;
-  line-height: 0.85;
+  line-height: 1.1;
   transform: rotate(-2deg);
 }
 
@@ -343,7 +343,7 @@ button {
 
 .group-collage {
   position: relative;
-  min-height: 650px;
+  min-height: 740px;
 }
 
 .group-card {
@@ -366,8 +366,8 @@ button {
   margin: 24px 0 10px;
   font-family: var(--display);
   font-size: clamp(50px, 5vw, 72px);
-  line-height: 0.8;
-  letter-spacing: -0.025em;
+  line-height: 1.1;
+  letter-spacing: 0.01em;
 }
 
 .group-card p {
@@ -415,6 +415,7 @@ button {
   top: 27%;
   right: 0;
   min-height: 300px;
+  padding-bottom: 110px;
   background: var(--blue);
   color: var(--black);
   text-align: right;
@@ -429,7 +430,7 @@ button {
   border: 4px double var(--black);
   font-family: var(--display);
   font-size: 15px;
-  line-height: 0.9;
+  line-height: 1.1;
   text-align: center;
   transform: rotate(8deg);
 }
@@ -482,7 +483,7 @@ button {
   font-family: "Comic Sans MS", "Marker Felt", cursive;
   font-size: 20px;
   font-weight: 900;
-  line-height: 0.92;
+  line-height: 1.15;
   transform: rotate(8deg);
 }
 
@@ -562,8 +563,8 @@ button {
   margin: 0;
   font-family: var(--display);
   font-size: clamp(64px, 9vw, 138px);
-  line-height: 0.79;
-  letter-spacing: -0.035em;
+  line-height: 1.1;
+  letter-spacing: 0.01em;
 }
 
 mark {
@@ -591,7 +592,7 @@ mark {
   border-bottom: 4px solid var(--black);
   font-size: clamp(24px, 2.6vw, 38px);
   font-weight: 1000;
-  line-height: 1.06;
+  line-height: 1.2;
 }
 
 .manifesto-copy .scribbled-copy {
@@ -601,7 +602,7 @@ mark {
   font-family: "Comic Sans MS", "Marker Felt", cursive;
   font-size: clamp(24px, 3vw, 42px);
   font-weight: 900;
-  line-height: 0.9;
+  line-height: 1.15;
   transform: rotate(-6deg);
 }
 
@@ -651,7 +652,7 @@ mark {
 .room-wall {
   position: relative;
   isolation: isolate;
-  height: 650px;
+  height: 760px;
 }
 
 .room-wall::before {
@@ -706,7 +707,7 @@ mark {
 .wall-flyer strong {
   display: block;
   font-family: var(--display);
-  letter-spacing: -0.03em;
+  letter-spacing: 0.01em;
 }
 
 .wall-flyer-red {
@@ -726,7 +727,7 @@ mark {
 .wall-flyer-red strong {
   margin: 24px 0 18px;
   font-size: clamp(66px, 6.2vw, 96px);
-  line-height: 0.7;
+  line-height: 1.1;
 }
 
 .wall-flyer-red span {
@@ -758,7 +759,7 @@ mark {
 .wall-flyer-yellow strong {
   margin: 20px 0 17px;
   font-size: clamp(43px, 4.2vw, 67px);
-  line-height: 0.76;
+  line-height: 1.1;
 }
 
 .wall-flyer-yellow p {
@@ -802,7 +803,7 @@ mark {
   font-family: var(--display);
   font-size: clamp(24px, 2.5vw, 38px);
   font-weight: 1000;
-  line-height: 0.88;
+  line-height: 1.1;
 }
 
 .wall-setlist li span {
@@ -874,7 +875,7 @@ mark {
   color: var(--yellow);
   font-family: "Comic Sans MS", "Marker Felt", cursive;
   font-size: clamp(27px, 3.7vw, 53px);
-  line-height: 0.82;
+  line-height: 1.15;
   text-align: right;
   text-shadow: 3px 3px 0 var(--black);
   transform: rotate(-8deg);
@@ -891,6 +892,7 @@ mark {
   min-height: 520px;
   overflow: hidden;
   padding: clamp(28px, 4vw, 52px);
+  padding-bottom: 190px;
   border-right: 4px solid var(--white);
   border-bottom: 4px solid var(--white);
   color: var(--black);
@@ -909,7 +911,8 @@ mark {
   margin: 55px 0 20px;
   font-family: var(--display);
   font-size: clamp(58px, 6vw, 88px);
-  line-height: 0.79;
+  line-height: 1.1;
+  letter-spacing: 0.01em;
 }
 
 .room-card > p {
@@ -935,7 +938,7 @@ mark {
   background: var(--pink);
   font-family: var(--display);
   font-size: 22px;
-  line-height: 0.9;
+  line-height: 1.1;
   text-align: center;
   box-shadow: 5px 5px 0 var(--black);
   transform: rotate(7deg);
@@ -981,7 +984,7 @@ mark {
   border-radius: 50%;
   font-family: var(--display);
   font-size: 25px;
-  line-height: 0.85;
+  line-height: 1.1;
   text-align: center;
   transform: rotate(-10deg);
 }
@@ -1026,7 +1029,7 @@ mark {
   border-bottom: 5px solid var(--black);
   font-family: var(--display);
   font-size: clamp(36px, 4.5vw, 70px);
-  line-height: 0.9;
+  line-height: 1.1;
   transition: padding-left 150ms ease, background 150ms ease;
 }
 
@@ -1109,7 +1112,7 @@ mark {
 .privacy-list b {
   font-family: var(--display);
   font-size: clamp(30px, 3.5vw, 50px);
-  line-height: 0.9;
+  line-height: 1.1;
 }
 
 .privacy-list p {
@@ -1145,7 +1148,8 @@ mark {
 .frequency-poster strong {
   font-family: var(--display);
   font-size: clamp(55px, 7vw, 90px);
-  line-height: 0.72;
+  line-height: 1.1;
+  letter-spacing: 0.01em;
   text-align: center;
 }
 
@@ -1275,7 +1279,7 @@ mark {
   font-family: "Comic Sans MS", "Marker Felt", cursive;
   font-size: clamp(28px, 4vw, 58px);
   font-weight: 900;
-  line-height: 0.86;
+  line-height: 1.15;
   text-align: center;
   transform: rotate(8deg);
 }
@@ -1322,7 +1326,7 @@ mark {
   margin-top: 32px;
   font-family: var(--display);
   font-size: clamp(48px, 5vw, 76px);
-  line-height: 0.9;
+  line-height: 1.1;
 }
 
 .download-option b {
@@ -1353,7 +1357,7 @@ footer {
   margin: 28px 0 0;
   font-family: var(--display);
   font-size: clamp(30px, 4vw, 58px);
-  line-height: 0.85;
+  line-height: 1.1;
 }
 
 .footer-links {
@@ -1444,8 +1448,8 @@ footer {
   margin: 24px 0 28px;
   font-family: var(--display);
   font-size: clamp(70px, 10vw, 150px);
-  line-height: 0.78;
-  letter-spacing: -0.04em;
+  line-height: 1.1;
+  letter-spacing: 0.01em;
 }
 
 .legal-intro {
@@ -1530,13 +1534,14 @@ footer {
   margin: 0 0 28px;
   font-family: var(--display);
   font-size: clamp(42px, 5vw, 66px);
-  line-height: 0.88;
+  line-height: 1.15;
 }
 
 .legal-copy h3 {
   margin: 34px 0 11px;
   font-family: var(--display);
   font-size: 24px;
+  line-height: 1.2;
 }
 
 .legal-copy p {
@@ -1764,11 +1769,11 @@ footer {
   }
 
   .hero h1 {
-    font-size: clamp(78px, 10.5vw, 118px);
+    font-size: clamp(62px, 8.5vw, 92px);
   }
 
   .rooms-heading {
-    grid-template-columns: minmax(310px, 0.8fr) minmax(480px, 1.2fr);
+    grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
     gap: 42px;
   }
 
@@ -1777,7 +1782,7 @@ footer {
   }
 
   .room-wall {
-    height: 610px;
+    height: 740px;
   }
 
   .legal-layout {
@@ -1813,7 +1818,7 @@ footer {
 
   .group-collage {
     width: min(620px, 100%);
-    min-height: 640px;
+    min-height: 740px;
     margin: 0 auto;
   }
 
@@ -1838,7 +1843,7 @@ footer {
 
   .room-wall {
     width: min(100%, 680px);
-    height: 620px;
+    height: 740px;
     justify-self: center;
   }
 
@@ -1937,8 +1942,7 @@ footer {
   }
 
   .hero h1 {
-    font-size: clamp(69px, 22.5vw, 103px);
-    line-height: 0.76;
+    font-size: clamp(48px, 16vw, 88px);
   }
 
   .hero h1 span {
@@ -1959,7 +1963,7 @@ footer {
   }
 
   .group-collage {
-    min-height: 600px;
+    min-height: 680px;
   }
 
   .group-card {
@@ -1970,11 +1974,11 @@ footer {
 
   .group-card h2 {
     margin-top: 20px;
-    font-size: 51px;
+    font-size: clamp(40px, 13vw, 51px);
   }
 
   .card-band { left: 0; }
-  .card-neighbors { top: 29%; right: 0; }
+  .card-neighbors { top: 29%; right: 0; padding-bottom: 110px; }
   .card-friends { bottom: 0; left: 0; }
   .collage-note { right: 1%; font-size: 15px; }
 
@@ -2017,7 +2021,7 @@ footer {
 
   .room-wall {
     width: calc(100% + 4px);
-    height: 510px;
+    height: 660px;
   }
 
   .wall-flyer-red {
@@ -2085,6 +2089,7 @@ footer {
   .room-card {
     min-height: 430px;
     padding: 28px 23px;
+    padding-bottom: 175px;
   }
 
   .room-card h3 {
@@ -2255,13 +2260,13 @@ footer {
 .new-noise { border-top: 4px solid var(--black); }
 .new-noise-heading { display: grid; grid-template-columns: 1.4fr .6fr; align-items: end; gap: 48px; margin-bottom: 52px; }
 .new-noise h2,
-.noise-questions h2 { margin: 24px 0 0; font-family: var(--display); font-size: clamp(48px, 6.5vw, 90px); font-weight: 900; line-height: .98; letter-spacing: -.025em; }
+.noise-questions h2 { margin: 24px 0 0; font-family: var(--display); font-size: clamp(48px, 6.5vw, 90px); font-weight: 900; line-height: 1.1; letter-spacing: .01em; }
 .new-noise h2 span { color: var(--yellow); }
 .new-noise-heading > p { max-width: 340px; margin: 0 0 4px; font: 500 20px/1.5 var(--sans); color: var(--paper); }
 .feature-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
 .feature-grid article { display: flex; flex-direction: column; padding: 30px; border: 2px solid #4c4a43; background: #1b1a17; }
 .feature-number { color: var(--yellow); font-size: 11px; line-height: 1.5; font-weight: 700; letter-spacing: .04em; }
-.feature-grid h3 { margin: 24px 0 16px; font: 800 clamp(25px, 2.5vw, 34px)/1.1 var(--sans); letter-spacing: -.03em; }
+.feature-grid h3 { margin: 24px 0 16px; font: 800 clamp(25px, 2.5vw, 34px)/1.25 var(--sans); }
 .feature-grid p { margin: 0 0 28px; color: var(--paper); font: 400 17px/1.55 var(--sans); }
 .feature-tags { display: flex; flex-wrap: wrap; gap: 8px; margin-top: auto; }
 .feature-tags span { padding: 7px 8px; border: 1px solid #696650; color: var(--yellow); font-size: 10px; font-weight: 700; line-height: 1.4; }
