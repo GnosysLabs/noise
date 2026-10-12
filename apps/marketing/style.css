@@ -167,6 +167,13 @@ button {
   display: none;
 }
 
+.nav-actions {
+  display: flex;
+  align-items: center;
+  justify-self: end;
+  gap: 10px;
+}
+
 .nav-cta {
   justify-self: end;
   padding: 12px 14px 10px;
@@ -179,6 +186,11 @@ button {
   letter-spacing: 0.05em;
   box-shadow: 3px 3px 0 var(--red);
   transition: transform 120ms ease, box-shadow 120ms ease;
+}
+
+.nav-download {
+  background: transparent;
+  color: var(--black);
 }
 
 .nav-cta:hover {
@@ -1823,6 +1835,10 @@ footer {
   text-align: right;
 }
 
+@media (min-width: 851px) and (max-width: 1000px) {
+  .site-header nav a:not(.developer-link) { display: none; }
+}
+
 @media (max-width: 1050px) {
   .hero {
     grid-template-columns: 1fr 0.85fr;
@@ -1986,8 +2002,13 @@ footer {
 
   .wordmark-text { font-size: 19px; }
 
+  .site-header { gap: 6px; }
+  .site-header nav a { font-size: 10px; letter-spacing: 0; }
+
+  .nav-actions { gap: 6px; }
+
   .nav-cta {
-    padding: 10px 9px 8px;
+    padding: 10px 7px 8px;
     font-size: 9px;
   }
 
@@ -2353,4 +2374,8 @@ a:focus-visible, button:focus-visible, summary:focus-visible { outline: 3px soli
   .question-list summary { font-size: 20px; }
   .question-list p { font-size: 17px; padding-right: 0; }
   .frequency-poster { width: 100%; }
+}
+
+@media (max-width: 380px) {
+  .site-header .wordmark-text { display: none; }
 }
